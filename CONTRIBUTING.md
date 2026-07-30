@@ -411,3 +411,24 @@ By contributing to Aether Runtime, you agree that your contributions will be lic
 ## Thank You
 
 Every contribution, whether code, documentation, bug reports, or community support, makes Aether better. We appreciate your time and effort!
+
+
+## PRD v3.1 Contribution Requirements
+
+New PRD-layer features must include all of the following before review:
+
+- A functional reference implementation or an explicit metadata contract in the AEG artifact.
+- Unit tests for deterministic behavior and package serialization.
+- Documentation updates in `README.md`, `docs/aeg-format.md`, and the relevant architecture/runtime doc.
+- A research note in `docs/research.md` when the feature is paper-derived.
+- CI-safe behavior without requiring network, GPU, or paid services unless the test is marked accordingly.
+
+
+### v3.1 Layer Contributions
+
+When changing agentic, observability, fleet, distillation, CUDA graph, MLA, EAGLE-3, or multimodal code, contributors must:
+
+- Add deterministic unit tests for planner output and AEG artifact serialization.
+- Keep generated package contracts backward-compatible with `AEGPackage.load()`.
+- Avoid network-dependent tests; use local synthetic traces, architectures, and telemetry snapshots.
+- Update `docs/aeg-format.md` when a new artifact path is added to `manifest.artifacts`.

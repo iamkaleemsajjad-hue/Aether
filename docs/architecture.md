@@ -39,7 +39,7 @@ Architecture detection inspects the graph structure, not just the model name. Th
 
 ## Stage 2: The Aether Optimizer
 
-Six compiler passes transform the raw AEG-IR into an optimized graph:
+Nine compiler passes transform the raw AEG-IR into an optimized graph:
 
 1. **Operator Fusion** — fuse RMSNorm + QKV + RoPE + attention into megakernels.
 2. **Sensitivity Analysis** — compute `d(perplexity)/d(precision)` per layer.
@@ -89,3 +89,22 @@ Aether's backends are replaceable plugins. The `Backend` interface abstracts:
 - Transcription
 
 New backends can be added without changing the public API. This lets Aether leverage the best existing inference engines while adding Aether's own scheduling, caching, and compilation layers.
+
+
+## PRD v3.1 Layers
+
+Aether now writes operational metadata into every compiled AEG: `safety/` guardrails, `provenance/` manifests, `watermark/` configuration, `adapters/` LoRA slot manifests, `inference/` compute profiles, and `cuda_graphs/` capture manifests. These are functional metadata contracts today and are designed so hardware-specific runtimes can replace the reference implementations without changing the AEG format.
+
+
+## PRD v3.1 Platform Layers
+
+The implementation maps the late PRD platform requirements to explicit Python modules and AEG package contracts:
+
+- `aether.agentic.workflow` compiles tool traces into meta-tools, cascade routes, and KV reuse policy.
+- `aether.runtime.eagle` plans EAGLE-3 fusion layers, flattened tree verification, and low-acceptance fallback.
+- `aether.attention.mla` detects MLA-compatible families and emits latent-KV compression plans.
+- `aether.observability.gates` implements eval gates, live quality drift detection, and deterministic A/B rollout.
+- `aether.fleet.manager` provides heterogeneous node placement and hot-reload routing with rollback.
+- `aether.cuda.graphs` selects piecewise CUDA Graph capture buckets for prefill and decode.
+- `aether.distillation.pipeline` emits logit, feature, reasoning, and self-distillation plans.
+- `aether.inference.multimodal` creates a unified multimodal graph with ViT-DP and LLM-TP hints.

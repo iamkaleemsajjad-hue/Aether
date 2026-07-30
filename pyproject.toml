@@ -170,6 +170,9 @@ precision_assignment = "aether.compiler.stage2_optimizer.pass3_precision_assignm
 kv_cache_structuring = "aether.compiler.stage2_optimizer.pass4_kv_cache_structuring:KVCacheStructuringPass"
 moe_routing = "aether.compiler.stage2_optimizer.pass5_moe_routing:MoERoutingPass"
 parallelism_discovery = "aether.compiler.stage2_optimizer.pass6_parallelism_discovery:ParallelismDiscoveryPass"
+reasoning_graph = "aether.compiler.stage2_optimizer.pass7_reasoning_graph:ReasoningGraphPass"
+sparse_attention = "aether.compiler.stage2_optimizer.pass8_sparse_attention:SparseAttentionPass"
+pruning_sparsity = "aether.compiler.stage2_optimizer.pass9_pruning_sparsity:PruningSparsityPass"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aether"]

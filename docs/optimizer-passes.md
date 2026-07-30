@@ -101,3 +101,16 @@ export AETHER_OPTIMIZATION_LEVEL=2
 - Parallelism: Alpa, Megatron-LM, Seesaw, Ring Attention
 
 See [research.md](research.md) for the full paper mapping.
+
+
+## Pass 7: Reasoning Graph Compiler
+
+The reasoning graph pass emits `graph/reasoning_graph.aeg-ir` with explicit budget, early-exit, verification, and speculative-CoT metadata. Runtime implementations can execute this as a first-class workflow instead of treating reasoning as unstructured text generation.
+
+## Pass 8: Sparse Attention
+
+The sparse attention pass emits `graph/attention_head_patterns.json` with MInference-style vertical-slash, block-sparse, and A-shape head patterns. The plan activates only above the configured long-context threshold and retains dense attention as a fallback.
+
+## Pass 9: Pruning and Sparsity
+
+The pruning pass emits `weights/sparsity_masks.json` using a Wanda/SparseGPT-inspired importance policy. Sensitive layers receive lower sparsity, while eligible linear, QKV, FFN, and expert nodes receive 2:4 or unstructured mask metadata.

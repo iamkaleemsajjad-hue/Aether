@@ -124,3 +124,13 @@ The runtime exposes Prometheus-compatible metrics at `/v1/metrics`:
 - `kv_cache_hit_rate`
 - `throughput_tps`
 - `ttft_ms`
+
+
+## v3.1 Runtime Controls
+
+Runtime-facing PRD features are represented as small, testable control planes:
+
+- EAGLE-3 plans choose fusion layers and tree shape, then disable speculation when acceptance drops below the floor.
+- CUDA Graph selectors round dynamic batch and prefill sizes up to captured buckets, otherwise falling back to piecewise eager execution.
+- Hot-reload routers assign candidate traffic by stable request hash and can promote or rollback instantly.
+- Observability gates block rollout when required benchmark results are missing or exceed the configured regression budget.

@@ -116,7 +116,7 @@ class TestOptimizerPipeline:
         graph = ingestion._build_architecture_graph(AEGGraph(name="test"), small_architecture)  # noqa: SLF001
         pipeline = OptimizerPipeline(config)
         optimized, reports = pipeline.run(graph, small_architecture)
-        assert len(reports) == 6
+        assert len(reports) == 9
         assert all(r.status in ("applied", "skipped", "failed") for r in reports)
 
     def test_disable_pass(self) -> None:

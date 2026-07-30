@@ -22,6 +22,7 @@ ARCHITECTURE_PATTERNS = {
     "moe_family": {"ffn": "MoE", "router": "TopK"},
     "vision_family": {"encoder": "ViT", "cross_attn": True},
     "whisper_family": {"encoder": "Conv1D_Transformer", "decoder": "Transformer", "cross_attn": True},
+    "hybrid_ssm_family": {"ssm": "selective_scan", "stateful": True},
 }
 
 # Model architecture parameter defaults for common model sizes
@@ -45,6 +46,9 @@ KNOWN_MODEL_SPECS: dict[str, dict[str, Any]] = {
     "phi-3": {"family": "phi_family", "params_billion": 3.8, "layers": 32, "hidden_size": 3072, "heads": 32, "kv_heads": 32, "context_length": 4096, "vocab_size": 32064, "intermediate_size": 8192},
     "phi-4": {"family": "phi_family", "params_billion": 14.0, "layers": 40, "hidden_size": 5120, "heads": 40, "kv_heads": 10, "context_length": 16384, "vocab_size": 100352, "intermediate_size": 20480},
     "falcon-7b": {"family": "falcon_family", "params_billion": 7.0, "layers": 32, "hidden_size": 4544, "heads": 71, "kv_heads": 71, "context_length": 2048, "vocab_size": 65024, "intermediate_size": 18176},
+    "mamba-3": {"family": "hybrid_ssm_family", "params_billion": 7.0, "layers": 48, "hidden_size": 4096, "heads": 1, "kv_heads": 1, "context_length": 1048576, "vocab_size": 32000, "intermediate_size": 8192},
+    "jamba": {"family": "hybrid_ssm_family", "params_billion": 52.0, "layers": 56, "hidden_size": 4096, "heads": 32, "kv_heads": 8, "context_length": 262144, "vocab_size": 65536, "intermediate_size": 14336, "is_moe": True, "num_experts": 16, "num_activated_experts": 2},
+    "rwkv-7": {"family": "hybrid_ssm_family", "params_billion": 7.0, "layers": 32, "hidden_size": 4096, "heads": 1, "kv_heads": 1, "context_length": 1048576, "vocab_size": 65536, "intermediate_size": 8192},
 }
 
 
@@ -195,13 +199,16 @@ class ArchitectureDetector:
             "FalconForCausalLM": "falcon_family",
             "WhisperForConditionalGeneration": "whisper_family",
             "ViTForImageClassification": "vision_family",
+            "MambaForCausalLM": "hybrid_ssm_family",
+            "JambaForCausalLM": "hybrid_ssm_family",
+            "RwkvForCausalLM": "hybrid_ssm_family",
         }
         return mapping.get(arch_type, "llama_family")
 
     def _match_family(self, model: str) -> str:
         """Match a model name to an architecture family."""
         lower = model.lower().replace("-", "").replace("_", "")
-        for name_part in ["llama", "qwen", "gemma", "deepseek", "mixtral", "mistral", "phi", "falcon", "whisper", "vit"]:
+        for name_part in ["llama", "qwen", "gemma", "deepseek", "mixtral", "mistral", "phi", "falcon", "whisper", "vit", "mamba", "jamba", "bamba", "rwkv"]:
             if name_part in lower:
                 return ARCHITECTURE_BY_MODEL_PREFIX.get(name_part, "llama_family")
         return "llama_family"

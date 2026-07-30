@@ -95,3 +95,38 @@ jobs:
         with:
           name: docs-html
           path: docs/_build/html
+
+
+  v31-artifact-contract:
+    name: AEG v3.1 artifact contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Verify v3.1 package artifacts
+        run: pytest tests/unit/test_v31_features.py::test_compiled_package_contains_v31_artifacts --no-cov
+
+
+  v31-runtime-layer-contract:
+    name: PRD v3.1 Runtime Layer Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: pip install -e .[test]
+      - name: Validate v3.1 runtime layers
+        run: pytest tests/unit/test_v31_runtime_layers.py --no-cov

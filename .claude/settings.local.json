@@ -2,7 +2,15 @@
   "permissions": {
     "allow": [
       "WebSearch",
-      "Bash(xargs wc -l)"
+      "Bash(xargs wc -l)",
+      "Bash(python -m pytest -q --no-header)",
+      "Bash(python -m pytest -q)",
+      "Bash(python -m pytest tests/unit/test_v31_features.py tests/unit/test_v31_runtime_layers.py -p no:cacheprovider --no-header -q)",
+      "Bash(python -m pytest -p no:cacheprovider --no-header -q -o addopts=\"\" --co)",
+      "Bash(python -m pytest -p no:cacheprovider -o addopts=\"\" --co -q)",
+      "Bash(python -m pytest -o addopts=\"\" --co -q tests/unit/test_v31_features.py tests/unit/test_v31_runtime_layers.py)",
+      "Bash(python -m pytest -o addopts=\"\" --co -q --ignore=tests/unit/test_v31_features.py --ignore=tests/unit/test_v31_runtime_layers.py)",
+      "Bash(python -m pytest -p no:cacheprovider -q)"
     ]
   }
 }

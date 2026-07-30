@@ -431,6 +431,88 @@ class Compiler:
         else:
             ir = AEGIRModule.from_graph(graph)
         package.ir = ir
+        if hasattr(graph, "metadata"):
+            package.metadata = dict(getattr(graph, "metadata"))
+        primary_target = target_profiles[0].target_id if target_profiles else "cpu_avx512"
+        from aether.agentic import AgentWorkflowOptimizer, ToolCall
+        from aether.attention import MLAPlanner
+        from aether.cuda import CUDAGraphCapturePlan
+        from aether.distillation import DistillationPipeline
+        from aether.fleet import AetherFleetManager, FleetConfig, FleetNode, HotReloadRouter
+        from aether.inference.multimodal import default_multimodal_plan
+        from aether.observability import ABRolloutController, DriftMonitor, EvalGate
+        from aether.runtime.eagle import EAGLE3Planner
+
+        agentic_trace = [
+            ToolCall("retrieve", {"query": "string"}, average_latency_ms=18.0),
+            ToolCall("rerank", {"documents": "array"}, average_latency_ms=24.0),
+            ToolCall("generate", {"context": "string"}, average_latency_ms=90.0, writes_context=True),
+        ]
+        fleet_nodes = [
+            FleetNode("local-0", primary_target, gpu_count=1 if primary_target.startswith(("cuda", "rocm", "metal")) else 0, memory_gb=80.0),
+            FleetNode("portable-0", "cpu_avx512", memory_gb=max(16.0, architecture.params_billion * 2)),
+        ]
+        package.metadata.update({
+            "model_id": model_id,
+            "architecture": architecture.to_dict(),
+            "capabilities": [
+                "reasoning_graph",
+                "sparse_attention",
+                "pruning_sparsity",
+                "safety_guardrails",
+                "provenance",
+                "watermark",
+                "lora_adapters",
+                "rag_pipeline",
+                "agentic_workflow",
+                "multimodal_graph",
+                "eagle3_speculation",
+                "quantization_aware_compilation",
+                "observability",
+                "eval_gates",
+                "ab_rollout",
+                "fleet_management",
+                "hot_reload",
+                "distillation",
+                "cuda_graph_capture",
+                "mla_native",
+                "hybrid_ssm",
+            ],
+            "agentic_workflow": AgentWorkflowOptimizer(min_sequence_frequency=1).compile([agentic_trace]),
+            "eval_gates": EvalGate().manifest(),
+            "drift_monitor": DriftMonitor(baseline_win_rate=0.5).manifest(),
+            "ab_rollout": ABRolloutController("compile_default", candidate_percent=0.01).manifest(),
+            "fleet_deployment": AetherFleetManager(fleet_nodes).plan_manifest(
+                model_id,
+                FleetConfig(replicas=1, preferred_targets=tuple(profile.target_id for profile in target_profiles) or ("cpu_avx512",)),
+            ),
+            "hot_reload": HotReloadRouter(active_aeg=model_id).manifest(),
+            "distillation": DistillationPipeline().compile_manifest(
+                DistillationPipeline().plan(model_id, f"{model_id}-student", task_type="general"),
+            ),
+            "cuda_graphs": CUDAGraphCapturePlan(primary_target, max_context_length=architecture.context_length).to_dict(),
+            "mla_plan": MLAPlanner().plan(architecture, target=primary_target).to_dict(),
+            "eagle3": EAGLE3Planner().plan(architecture).to_dict(),
+            "multimodal_graph": default_multimodal_plan(model_id).to_graph(),
+            "metrics_schema": {
+                "version": "otel_metrics/1.0",
+                "metrics": [
+                    "tokens_per_second",
+                    "ttft_ms",
+                    "eagle3_accept_rate",
+                    "kv_hit_rate",
+                    "mla_compression_ratio",
+                    "reasoning_budget_used",
+                    "gpu_vram_utilization",
+                ],
+            },
+            "quantization_aware_compilation": {
+                "enabled": True,
+                "calibration_dataset": config.calibration_dataset,
+                "quality_budget_ppl_increase": config.quality_budget,
+                "precision_formats": ["BF16", "FP8", "FP4", "Q4_K_M", "Q3_K"],
+            },
+        })
 
         # Compute graph hash
         graph_hash = compute_graph_hash(ir)
@@ -464,8 +546,10 @@ class Compiler:
             1 for r in pass_reports if r.pass_name == "operator_fusion" and r.status == "applied"
         )
         fusion_passes = [r.details.get("fusion_pattern", "unknown") for r in pass_reports if r.pass_name == "operator_fusion"]
+        applied_passes = [r.pass_name for r in pass_reports if r.status == "applied"]
+        package.metadata["optimizer_passes"] = applied_passes
         optimization = OptimizationMetadata(
-            fusion_passes_applied=fusion_passes,
+            fusion_passes_applied=fusion_passes or applied_passes,
             fused_ops_count=fused_ops_count,
             sensitivity_calibration_dataset=config.calibration_dataset,
             quality_budget_ppl_increase=config.quality_budget,

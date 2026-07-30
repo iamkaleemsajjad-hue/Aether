@@ -35,3 +35,25 @@ Aether is an AI model compiler and runtime. The PRD maps to established systems 
 - Claims in user-facing docs must distinguish implemented behavior from roadmap targets.
 - Benchmarks must report hardware, backend, model, precision map, context length, batch shape, and warmup policy.
 - Any paper-derived speedup should be cited as source-system evidence until reproduced in Aether Bench.
+
+
+## v3.1 Research Addendum
+
+| Area | Source | Aether Implementation |
+|------|--------|-----------------------|
+| Long-context sparse attention | MInference, NeurIPS 2024 | Pass 8 emits `attention_head_patterns.json` with vertical-slash, block-sparse, and A-shape plans. |
+| Pruning and sparsity | SparseGPT and Wanda | Pass 9 emits `sparsity_masks.json` with sensitivity-aware sparsity targets. |
+| LoRA serving | LoRA, S-LoRA, Punica | `LoRAHotSwapEngine` applies per-request low-rank deltas in one batch. |
+| Hybrid SSM models | Mamba, Mamba-2, Jamba, RWKV | `HybridMemoryPool` snapshots KV and recurrent SSM state for speculative rollback. |
+| Watermarking | SynthID-Text and green-list token watermarking | `AetherOutputWatermark` applies deterministic green-list logit bias and z-score detection. |
+| Provenance | C2PA and EU AI Act transparency obligations | `ProvenanceManifest` records source model, compiler passes, eval gate results, and compliance status. |
+
+Additional source links:
+
+- MInference: https://arxiv.org/abs/2407.02490
+- SparseGPT: https://arxiv.org/abs/2301.00774
+- Wanda: https://arxiv.org/abs/2306.11695
+- LoRA: https://arxiv.org/abs/2106.09685
+- Punica: https://arxiv.org/abs/2310.18547
+- Mamba: https://arxiv.org/abs/2312.00752
+- SynthID-Text: https://www.nature.com/articles/s41586-024-08025-4
