@@ -1,0 +1,301 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aether-runtime"
+version = "0.1.0"
+description = "Aether Runtime — the compiler for AI models. Compile any model into a portable Aether Execution Graph (AEG) and run it on any hardware."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Aether Contributors", email = "dev@aether.dev" }
+]
+keywords = [
+    "ai",
+    "inference",
+    "compiler",
+    "llm",
+    "aeg",
+    "aether",
+    "machine-learning",
+    "transformers",
+    "quantization",
+    "moe",
+    "speculative-decoding",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Compilers",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    # Core data and numerical stack
+    "numpy>=1.24.0",
+    "safetensors>=0.4.0",
+    "huggingface-hub>=0.23.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.7.0",
+    "rich>=13.0.0",
+    "click>=8.1.0",
+    "toml>=0.10.2",
+    "packaging>=24.0",
+    "typing-extensions>=4.9.0",
+
+    # Model loading and tracing
+    "torch>=2.3.0",
+    "transformers>=4.41.0",
+    "tokenizers>=0.19.0",
+    "sentencepiece>=0.2.0",
+    "protobuf>=4.25.0",
+
+    # Optional but commonly used formats
+    "gguf>=0.1.0",
+    "onnx>=1.16.0",
+
+    # Server and API
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "starlette>=0.37.0",
+    "prometheus-client>=0.20.0",
+    "python-multipart>=0.0.9",
+
+    # Telemetry and utilities
+    "structlog>=24.1.0",
+    "platformdirs>=4.2.0",
+    "psutil>=5.9.0",
+    "httpx>=0.27.0",
+    "aiofiles>=23.2.0",
+    "anyio>=4.4.0",
+    "tenacity>=8.4.0",
+    "jsonschema>=4.22.0",
+    "tabulate>=0.9.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+# Backends (install only what your hardware needs)
+vllm = [
+    "vllm>=0.5.0",
+]
+llamacpp = [
+    "llama-cpp-python>=0.2.80",
+]
+trtllm = [
+    "tensorrt-llm>=0.11.0",
+]
+mlx = [
+    "mlx>=0.16.0; sys_platform == 'darwin'",
+]
+onnxruntime = [
+    "onnxruntime>=1.18.0",
+    "onnxruntime-gpu>=1.18.0; sys_platform == 'linux'",
+]
+triton = [
+    "triton>=2.3.0; sys_platform == 'linux'",
+]
+
+# Development tools
+lint = [
+    "ruff>=0.5.0",
+    "mypy>=1.10.0",
+    "types-pyyaml",
+    "types-toml",
+    "types-protobuf",
+    "types-tabulate",
+    "types-tqdm",
+]
+test = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    "pytest-xdist>=3.6.0",
+    "responses>=0.25.0",
+    "requests>=2.32.0",
+    "openai>=1.35.0",
+]
+docs = [
+    "sphinx>=7.3.0",
+    "myst-parser>=3.0.0",
+    "sphinx-rtd-theme>=2.0.0",
+    "sphinx-autodoc-typehints>=2.2.0",
+    "sphinx-click>=6.0.0",
+    "nbsphinx>=0.9.0",
+]
+benchmark = [
+    "datasets>=2.19.0",
+    "pandas>=2.2.0",
+    "scipy>=1.13.0",
+]
+
+# Convenience group that installs everything testable on CPU
+dev = [
+    "aether-runtime[lint,test,docs,benchmark]",
+]
+
+[project.urls]
+Homepage = "https://aether.dev"
+Documentation = "https://docs.aether.dev"
+Repository = "https://github.com/aether-dev/aether-runtime"
+Issues = "https://github.com/aether-dev/aether-runtime/issues"
+Discussions = "https://github.com/aether-dev/aether-runtime/discussions"
+
+[project.scripts]
+aether = "aether.cli:main"
+
+[project.entry-points."aether.backends"]
+torch = "aether.backends.torch_backend:TorchBackend"
+onnx = "aether.backends.onnx_backend:ONNXBackend"
+vllm = "aether.backends.vllm_backend:vLLMBackend"
+llamacpp = "aether.backends.llamacpp_backend:LlamaCppBackend"
+trtllm = "aether.backends.trtllm_backend:TensorRTLLMBackend"
+mlx = "aether.backends.mlx_backend:MLXBackend"
+
+[project.entry-points."aether.compiler.passes"]
+operator_fusion = "aether.compiler.stage2_optimizer.pass1_operator_fusion:OperatorFusionPass"
+sensitivity_analysis = "aether.compiler.stage2_optimizer.pass2_sensitivity_analysis:SensitivityAnalysisPass"
+precision_assignment = "aether.compiler.stage2_optimizer.pass3_precision_assignment:PrecisionAssignmentPass"
+kv_cache_structuring = "aether.compiler.stage2_optimizer.pass4_kv_cache_structuring:KVCacheStructuringPass"
+moe_routing = "aether.compiler.stage2_optimizer.pass5_moe_routing:MoERoutingPass"
+parallelism_discovery = "aether.compiler.stage2_optimizer.pass6_parallelism_discovery:ParallelismDiscoveryPass"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aether"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/docs",
+    "/examples",
+    "/benchmarks",
+    "/scripts",
+    "/research",
+    "/README.md",
+    "/LICENSE",
+    "/CONTRIBUTING.md",
+    "/CHANGELOG.md",
+    "/Makefile",
+]
+
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.1.0"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests", "examples", "benchmarks", "scripts"]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "F",  # Pyflakes
+    "I",  # isort
+    "N",  # pep8-naming
+    "W",  # pycodestyle warnings
+    "B",  # flake8-bugbear
+    "C4", # flake8-comprehensions
+    "UP", # pyupgrade
+    "SIM", # flake8-simplify
+    "TID", # flake8-tidy-imports
+    "TCH", # flake8-type-checking
+    "RUF", # ruff-specific rules
+    "D",  # pydocstyle
+]
+ignore = [
+    "D100",  # Missing docstring in public module
+    "D104",  # Missing docstring in public package
+    "D105",  # Missing docstring in magic method
+    "D107",  # Missing docstring in __init__
+    "D203",  # 1 blank line before class docstring
+    "D213",  # Multi-line docstring summary should start at the second line
+    "D406",  # Section name should end with a newline
+    "D407",  # Missing dashed underline after section
+    "D413",  # Missing blank line after last section
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["aether"]
+
+[tool.mypy]
+python_version = "3.10"
+packages = ["aether"]
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+ignore_missing_imports = true
+show_error_codes = true
+exclude = [
+    "^tests/",
+    "^examples/",
+    "^benchmarks/",
+    "^scripts/",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "-ra",
+    "--cov=aether",
+    "--cov-report=term-missing",
+    "--cov-report=xml",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests requiring model downloads",
+    "gpu: marks tests requiring a GPU",
+    "cuda: marks tests requiring CUDA",
+    "metal: marks tests requiring Apple Metal",
+    "rocm: marks tests requiring AMD ROCm",
+    "network: marks tests requiring network access",
+    "requires_backend: marks tests requiring a specific backend plugin",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:torch.*:",
+    "ignore::FutureWarning:transformers.*:",
+    "ignore::UserWarning",
+]
+
+[tool.coverage.run]
+source = ["src/aether"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/test_*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

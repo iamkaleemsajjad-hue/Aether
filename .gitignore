@@ -1,0 +1,148 @@
+# Aether Runtime — .gitignore
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dylib
+*.dll
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+*.whl
+
+# Virtual environments
+venv/
+.env/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+pythonenv*
+
+# Pip and package management
+pip-log.txt
+pip-delete-this-directory.txt
+poetry.lock
+Pipfile.lock
+requirements*.txt
+!requirements.txt
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.settings/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.dmypy.json
+.dmypy/
+.ruff_cache/
+.hypothesis/
+
+# Documentation builds
+docs/_build/
+docs/_static/
+docs/_templates/
+site/
+*.html.pdf
+*.doctrees
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Aether-specific runtime artifacts and cache
+.aether/
+~/.aether/
+*.aeg
+*.aeg-ir
+*.aeg-quant
+*.aeg-kernel
+*.aeg-cache
+aether-hub-cache/
+aether-kernel-cache/
+aether-model-cache/
+
+# Model weights and large downloaded artifacts
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.onnx
+*.mlmodel
+*.trt
+*.engine
+*.plan
+checkpoints/
+
+# Calibration and benchmark datasets (download at runtime)
+*.jsonl.gz
+*.parquet
+data/cache/
+calibration_data/
+wikitext-2/
+hellaswag/
+
+# Logs and local state
+*.log
+logs/
+*.pid
+*.sock
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+secrets/
+*.pem
+*.key
+*.crt
+config.yaml
+config.json
+!tests/data/config.yaml
+
+# CI/CD artifacts
+artifacts/
+.coverage.xml
+junit/
+test-results/
+
+# OS generated
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+*.rej

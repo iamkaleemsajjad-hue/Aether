@@ -1,0 +1,73 @@
+name: Integration tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 7 * * *"  # Nightly at 07:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration-tests:
+    name: Integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Run integration tests
+        run: pytest tests/integration -m "integration and not slow" --junitxml=integration-results.xml
+        env:
+          HF_HUB_ENABLE_HF_TRANSFER: "1"
+          AETHER_CACHE_DIR: ${{ runner.temp }}/aether-cache
+
+      - name: Upload integration results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-results-${{ matrix.os }}
+          path: integration-results.xml
+
+  end-to-end-smoke:
+    name: End-to-end smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Compile and run a tiny model
+        run: |
+          python -m aether compile Qwen/Qwen3-0.6B --output ./qwen3-0.6b.aeg
+          python -m aether run Qwen/Qwen3-0.6B --max-tokens 16 --prompt "Hello, my name is" --non-interactive
+        env:
+          AETHER_CACHE_DIR: ${{ runner.temp }}/aether-cache
