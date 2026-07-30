@@ -1316,3 +1316,605 @@ LLaVA 2023, InternVL2 2024, Fast-VLM 2025 (dynamic token compression), Qwen3-VL 
 ### A.10 Hardware
 
 NVIDIA Hopper GH100 2022 (FA-3 WGMMA TMA), NVIDIA Blackwell B200 2024 (FP4 FA-4 8TB/s), AMD MI300X 2023 (192GB HBM3 ROCm), Apple M4 2024 (Metal 4 Neural Engine), Qualcomm AI 100 2024 (QNN Hexagon DSP).
+
+---
+
+# PART II — ELITE-CLASS EXTENSIONS (v3.1)
+
+> Added July 2026 after reading 100+ research papers across long-context, pruning/sparsity, inference-time compute scaling, LoRA runtime fusion, SSM/hybrid architectures, model provenance, RAG-native compilation, and distillation pipelines.
+
+---
+
+## 28. Long-Context Engine (1M+ Token Native Support)
+
+### 28.1 The Problem at Million-Token Scale
+
+Processing 1M-token contexts requires four simultaneous strategies:
+
+- Strategy 1: Sparse Attention (MInference — 10x prefill speedup)
+- Strategy 2: Ring Attention (distribute sequence across GPUs)
+- Strategy 3: KV Compression (quantized tiered KV + MLA)
+- Strategy 4: Salience-Aware KV Eviction (keep only important tokens hot)
+
+### 28.2 MInference — Dynamic Sparse Attention (Pass 8, NEW)
+
+MInference (Microsoft Research, NeurIPS 2024 → SGLang/vLLM 2025) achieves up to 10x prefill speedup for 1M-token inputs on a single A100. Aether v3.1 compiles MInference patterns directly into the AEG artifact as Pass 8.
+
+Three sparse attention patterns identified per-head offline at compile time:
+- A-shape: Local + global token attention (local sink + beginning tokens)
+- Vertical-Slash: Diagonally shifted sparse attention bands
+- Block-Sparse: Fixed-size attention blocks with gaps
+
+`python
+# AEG-IR new op emitted by Pass 8
+aeg.minference_attention(q, k, v,
+    pattern_type="A_shape|vertical_slash|block_sparse",
+    sparsity_ratio=0.9,
+    head_pattern_map=@head_patterns)
+# Same output quality, 10x less compute for 1M-token prefill
+`
+
+MMInference (VLMs, 2025): Grid sparse pattern for spatial/temporal locality in video tokens — 8.3x speedup for 1M-token multimodal (video+text) inputs.
+
+Stored in AEG:
+- .aeg/graph/attention_head_patterns.json — per-head MInference pattern assignments
+- .aeg/kernels/{target}/minference_*.so — pre-compiled sparse attention kernels
+
+### 28.3 Ring Attention + Context Parallelism
+
+Context Parallelism (CP): Sequence sharded across GPUs in a ring topology. Each GPU holds 1/N of the sequence (e.g., 4-GPU CP = 250K tokens/GPU for 1M input). GPUs exchange KV blocks in ring pattern — no single GPU bottlenecks.
+
+Striped Attention: interleaved token distribution for better load balancing. Ulysses+Ring hybrid optimal for 128+ GPU clusters.
+
+New AEG parallelism plans:
+- .aeg/parallelism/4gpu_cp.json
+- .aeg/parallelism/8gpu_cp.json
+- .aeg/parallelism/32gpu_cp.json (4M+ tokens)
+
+### 28.4 Salience-Aware KV Eviction
+
+`python
+class SalienceKVEvictor:
+    """Research: StreamingLLM (2023), ScissorHands (2024), SnapKV (2025)"""
+    def score_salience(self, kv_block, attention_weights) -> float:
+        recency_score   = self._recency_weight(kv_block.position, self.window_size)
+        attention_score = attention_weights[kv_block.token_range].mean()
+        anchor_score    = 1.0 if kv_block.is_anchor else 0.0
+        return 0.5*attention_score + 0.3*recency_score + 0.2*anchor_score
+    # Lowest-salience KV blocks evicted to CPU DRAM tier first
+`
+
+### 28.5 AEG Long-Context Profile (in manifest)
+
+`json
+"long_context_profile": {
+  "max_context_tokens": 1000000,
+  "rope_extension_method": "yarn",
+  "sparse_attention_enabled": true,
+  "sparse_head_patterns": {...},
+  "ring_attention_enabled": true,
+  "min_gpus_for_1m_tokens": 4,
+  "kv_eviction_policy": "salience"
+}
+`
+
+---
+
+## 29. Model Pruning and Sparsity Compiler (Pass 9, NEW)
+
+### 29.1 Why Pruning Belongs in the Compiler
+
+Aether v3.1 integrates pruning as a compiler pass — sparsity structure compiled into AEG kernels, hardware-native 2:4 Sparse Tensor Cores targeted automatically.
+
+Pruning methods integrated:
+
+UNSTRUCTURED: SparseGPT (Hessian-based, no retraining), Wanda (|W| x ||X||_2 scoring, fastest), M-Wanda (multilingual), ROSE (reordering for SparseGPT)
+
+SEMI-STRUCTURED (2:4): Exactly 2 zeros per 4 consecutive weights. Native Sparse Tensor Core support on A100/H100/B200. Up to 2x GEMM throughput.
+
+STRUCTURED: Head pruning (LLM Surgeon), Channel pruning (IntraExpert Sparsity), Layer dropping (ShortGPT analysis — redundant layers).
+
+### 29.2 Pruning Pipeline
+
+`python
+class PruningPass:
+    """Pass 9: Sparsity analysis and mask emission into AEG-IR."""
+    STRATEGIES = {
+        "speed":     {"method": "wanda_24", "target": "2:4_semi_structured"},
+        "quality":   {"method": "sparsegpt", "target": "unstructured_50"},
+        "edge":      {"method": "structured_head_channel", "target": "50pct_smaller"},
+        "blackwell": {"method": "wanda_24", "target": "2:4_plus_fp4"},
+    }
+    # Wanda importance: |W| * ||X||_2 per weight element
+    # Masks baked into AEG-IR, sparse GEMM kernels emitted in Stage 3
+`
+
+### 29.3 Sparsity + Quantization Stacking
+
+- Stack 1 (Speed): 2:4 Wanda pruning + FP8 = ~2.5x throughput vs dense BF16
+- Stack 2 (Maximum/B200): 2:4 Wanda + FP4 = ~3.5x throughput vs dense BF16
+- Stack 3 (Edge): Structured 50% + INT4 = Qwen3-72B at effective 18B memory cost
+
+Sparsity metadata stored in .aeg/manifest.json.
+
+---
+
+## 30. Inference-Time Compute Scaling Engine (NEW)
+
+### 30.1 The Third Scaling Law
+
+In 2026, test-time compute scaling is projected to account for 75% of AI compute demand by 2030. Smaller models + more thinking tokens outperform larger models with no thinking time (proven by DeepSeek-R1, 2025).
+
+### 30.2 Aether Inference Compute Controller
+
+`python
+class InferenceComputeController:
+    """Research: Inference-Time Scaling (Google 2025), compute-optimal BoN,
+       ThreadWeaver parallel reasoning (2026), InferenceTimePessimism (2026)"""
+
+    STRATEGIES = {
+        "best_of_n": {"n_samples": 8, "selection": "reward_model", "parallel": True},
+        "beam_search": {"beam_width": 4, "length_penalty": 1.0},
+        "mcts": {"simulations": 32, "ucb_constant": 1.4, "max_depth": 10},
+        "adaptive": {
+            "complexity_classifier": "qwen3-1.7b",
+            "budget_map": {
+                "simple":    {"strategy": "greedy",    "max_tokens": 512},
+                "medium":    {"strategy": "best_of_4", "max_tokens": 2048},
+                "hard":      {"strategy": "beam_4",    "max_tokens": 8192},
+                "very_hard": {"strategy": "mcts",      "max_tokens": 32768},
+            }
+        }
+    }
+`
+
+### 30.3 Process Reward Model (PRM)
+
+`python
+class ProcessRewardModel:
+    """Scores intermediate reasoning steps.
+    Research: Let's Verify Step by Step (2023), Math-Shepherd (2024), OmegaPRM (2025)"""
+    def score(self, prompt: str, response: str) -> float:
+        steps = self._parse_reasoning_steps(response)
+        step_scores = [self.step_scorer(prompt, step) for step in steps]
+        return min(step_scores)  # conservative: minimum step quality
+`
+
+Stored in AEG:
+- .aeg/inference/compute_profiles.json — greedy/BoN/beam/MCTS configs + relative costs
+- .aeg/inference/prm_head.bin — compiled process reward model head
+
+
+---
+
+## 31. LoRA Runtime Fusion Engine (NEW)
+
+### 31.1 The Multi-Adapter Problem
+
+Enterprises deploy one base model with dozens of domain-specific LoRA adapters (legal, medical, coding, finance). Aether v3.1 introduces LoRA compilation as a first-class compiler feature.
+
+### 31.2 Three LoRA Compilation Modes
+
+Mode 1 — COMPILE (static merge): aether compile base_model --lora adapter.safetensors --merge. Single .aeg with weights baked in. W_merged = W_base + (alpha/r)BA. Zero inference overhead.
+
+Mode 2 — MULTI-SLOT (compiled multi-adapter): aether compile base_model --lora-slots 8. .aeg with 8 pre-allocated adapter slots. Swap adapters per-request with zero base model reload. Best for platforms serving multiple tasks.
+
+Mode 3 — DELTA-COMPRESS: aether compile base_model --lora legal.safetensors medical.safetensors coding.safetensors. Uses Pico method (output-side calibration). 4-8x smaller than uncompressed LoRA weights.
+
+### 31.3 LoRA Hot-Swap Engine (BGMV Kernel)
+
+`python
+class LoRAHotSwapEngine:
+    """Research: S-LoRA (2023), Punica BGMV kernel (2024),
+       Multi-LoRA vLLM (2025), Pico adapter calibration (2025)"""
+
+    def serve(self, request: InferenceRequest) -> str:
+        adapter = self.adapter_pool.get(request.adapter_id)
+        # BGMV: Batched Gather Matrix-Vector — different batch items
+        # can use different A,B matrices in same GPU kernel dispatch
+        return self._bgmv_forward(request.prompt, self.base_weights, adapter)
+`
+
+BGMV key insight: Standard GEMM requires same A,B for all batch items. BGMV allows different A,B matrices per batch item — enables true per-request adapter switching in a single fused kernel.
+
+### 31.4 LoRA in AEG Format
+
+`
+.aeg/adapters/
+├── manifest.json                 # list of embedded adapters + routing config
+├── legal_v2/
+│   ├── delta_A.bin              # LoRA A matrices (Pico compressed)
+│   ├── delta_B.bin              # LoRA B matrices
+│   └── config.json              # rank=64, alpha=128, target_modules
+├── medical_v1/
+└── coding_v3/
+`
+
+---
+
+## 32. SSM and Hybrid Architecture Support (NEW)
+
+### 32.1 Beyond Transformers
+
+Hybrid architectures (Jamba, Bamba, Mamba-3 2026) achieve up to 3x higher inference throughput than pure transformers for long sequences due to constant-time recurrent state vs quadratic attention.
+
+### 32.2 New AEG-IR SSM Opcodes
+
+`
+aeg.ssm_scan(x, A, B, C, D)           # Mamba selective scan
+aeg.ssm_state_update(state, x, dt)    # Mamba recurrent state update
+aeg.ssm_state_snapshot(state)         # State snapshot for spec decoding rollback
+aeg.rwkv_time_mix(x, state, w, u)     # RWKV WKV attention mechanism
+aeg.hybrid_dispatch(x, layer_type)    # Route to attn or SSM per layer type
+aeg.mimo_ssm(x, A, B, C, D, order=2) # Mamba-3 MIMO complex-valued formulation
+`
+
+### 32.3 Dual Memory Pool for Hybrid Models
+
+`python
+class HybridMemoryPool:
+    """Research: SGLang Hybrid Serving (Alibaba Cloud 2026),
+       State Snapshotting for Speculative Decoding on SSMs (2026)"""
+    def __init__(self):
+        self.kv_pool   = PagedKVCache()    # KV for transformer layers
+        self.ssm_pool  = SSMStatePool()    # Recurrent state for SSM layers
+        self.snapshots = StateSnapshotStore()  # for spec decoding rollback
+
+    def snapshot(self, request_id: str) -> Snapshot:
+        return self.snapshots.save(request_id,
+            kv_state=self.kv_pool.get(request_id),
+            ssm_state=self.ssm_pool.get(request_id))
+
+    def rollback(self, request_id: str, snapshot_id: str) -> None:
+        """Restore SSM state when speculative tokens are rejected."""
+        snapshot = self.snapshots.load(snapshot_id)
+        self.kv_pool.restore(request_id, snapshot.kv_state)
+        self.ssm_pool.restore(request_id, snapshot.ssm_state)
+`
+
+### 32.4 Supported Hybrid Patterns
+
+| Architecture | Attn Ratio | SSM Ratio | SSM Type |
+|---|---|---|---|
+| Jamba | 12.5% | 87.5% | Mamba |
+| Bamba | 25% | 75% | Mamba-2 |
+| Mamba-3 | 0% | 100% | MIMO complex-valued |
+| Zamba2 | 10% | 90% | Shared attention + Mamba |
+| RWKV-7 | 0% | 100% | Linear attention RNN |
+
+---
+
+## 33. Aether Distillation Pipeline (NEW)
+
+### 33.1 Compiled Distillation
+
+Aether v3.1 compiles both teacher and student models into AEG, then orchestrates knowledge transfer at the compiled graph level. Result: 5-30x cost reduction, 4x faster inference, 95-97% quality retention.
+
+### 33.2 Four Distillation Modes
+
+`python
+DISTILLATION_MODES = {
+    "response_based": {
+        "targets": ["logits", "token_probabilities"],
+        "loss": "forward_kl + cross_entropy",
+        "use_when": "black-box teacher access only"
+    },
+    "feature_based": {
+        "targets": ["hidden_states", "attention_maps"],
+        "loss": "MSE_hidden + CKA_attention",
+        "use_when": "white-box teacher — best quality transfer"
+    },
+    "reasoning_chain": {
+        "targets": ["thinking_tokens", "step_quality_scores"],
+        "loss": "reasoning_chain_alignment",
+        "use_when": "teacher is R1/o3-style reasoning model"
+    },
+    "self_distillation": {
+        "teacher": "same_model_larger_context",
+        "loss": "ICL_self_teacher",
+        "use_when": "no external teacher, anti-forgetting fine-tune (SDFT)"
+    }
+}
+`
+
+Research: MiniLLM (2024), DistiLLM (2024), DeepSeek-R1 Distillation (2025), Feature-Based Distillation (IEEE 2025), Self-Distillation SDFT (2026 — autonomous optimization).
+
+---
+
+## 34. RAG-Native Compilation (NEW)
+
+### 34.1 Compile the Entire RAG Pipeline
+
+Aether v3.1 treats the entire RAG pipeline as a compiled execution graph — LLM + retriever + reranker + embedding model are all compiled into a single AEG workflow.
+
+### 34.2 AEG RAG Pipeline Graph
+
+`
+.aeg/graph/rag_pipeline.aeg-ir:
+
+Stage 1: Query encoding
+  aeg.embedding_encode(query, @embedding_model_aeg) -> query_vector
+
+Stage 2: Parallel retrieval (all sources simultaneously)
+  aeg.async_retrieve([
+    aeg.vector_search(query_vector, @faiss_index, top_k=50),
+    aeg.bm25_search(query_text, @bm25_index, top_k=50),
+    aeg.graph_retrieve(query_entities, @kg_index, hops=2),
+  ]) -> candidates[150]
+
+Stage 3: Cross-encoder reranking
+  aeg.cross_encoder_rerank(query_text, candidates, @reranker_aeg, top_k=5)
+
+Stage 4: Context assembly + generation
+  aeg.context_pack(ranked_docs, max_tokens=4096)
+  aeg.generate(query_text, context, @llm_aeg) -> response
+`
+
+Compile-time optimizations: embedding + reranker compiled to same target as LLM; async_retrieve runs all sources in parallel; common RAG system prompts pinned to KV L2 cache; frequently-retrieved documents pre-cached (85% TTFT reduction for hot docs).
+
+---
+
+## 35. AEG Model Provenance and Watermarking (NEW)
+
+### 35.1 Regulatory Context (EU AI Act, Aug 2026)
+
+Every AEG compiled artifact must carry full provenance for EU AI Act compliance. Aether v3.1 bakes provenance into every .aeg at compile time.
+
+### 35.2 AEG Provenance Manifest
+
+`json
+".aeg/provenance/manifest.json": {
+  "model_hash": "sha256:a3f4b2c1...",
+  "compiler_version": "aether/3.1.0",
+  "source_model": {"id": "qwen3-72b", "license": "Apache-2.0"},
+  "transformations": [
+    {"pass": "operator_fusion", "version": "1.2"},
+    {"pass": "sensitivity_quantization", "calibration": "general", "budget": 0.02},
+    {"pass": "wanda_pruning", "sparsity": 0.5}
+  ],
+  "c2pa_binding": "c2pa://...",
+  "eu_ai_act": {
+    "risk_category": "limited_risk",
+    "transparency_obligations_met": true
+  },
+  "hardware_certification": {
+    "certified_targets": ["cuda_sm90", "cuda_sm100", "metal_m3"],
+    "eval_gate_passed": true,
+    "eval_results": {"hellaswag": 0.892, "mmlu": 0.847, "gsm8k": 0.913}
+  }
+}
+`
+
+### 35.3 SynthID-Style Output Watermarking
+
+`python
+class AetherOutputWatermark:
+    """Research: SynthID-Text (Google DeepMind 2024), green-list token watermarking.
+    EU AI Act Art. 50 — disclosure obligation for AI-generated content."""
+
+    def apply_watermark(self, logits: Tensor, context_ids: list[int]) -> Tensor:
+        context_hash = hash(tuple(context_ids[-16:]))
+        greenlist = self.greenlist_fn(context_hash)  # pseudo-random per context
+        logits[greenlist] += self.delta              # delta=1.0; invisible to readers
+        return logits
+
+    def detect_watermark(self, text: str) -> WatermarkResult:
+        z_score = self._compute_z_score(self.tokenizer.encode(text))
+        return WatermarkResult(
+            detected=z_score > 4.0,    # p < 0.00003 false positive rate
+            z_score=z_score)
+`
+
+### 35.4 Model IP Fingerprinting
+
+`python
+class AEGModelFingerprint:
+    """Research: MetaFinger (2024), ADV-TRA (2025), ZK-proof ownership (2026)"""
+
+    def embed(self, model_aeg: str, owner_id: str) -> str:
+        """Embed ownership fingerprint at COMPILE TIME — survives pruning+quantization."""
+        triggers = self._generate_trigger_set(owner_id, n=100)
+        return self._embed_fingerprint(model_aeg, triggers)
+
+    def verify(self, suspect_model: str, owner_id: str) -> FingerprintResult:
+        match_rate = self._test_trigger_responses(suspect_model, self._load_triggers(owner_id))
+        return FingerprintResult(is_derived=match_rate > 0.85, match_rate=match_rate)
+`
+
+---
+
+## 36. Adaptive Learning and Zero-Downtime Hot-Reload (NEW)
+
+### 36.1 The Tri-Layer Adaptation Framework (2026 Production Standard)
+
+| Layer | Mechanism | Cadence | Aether Feature |
+|---|---|---|---|
+| Facts | RAG + dynamic vector index | Milliseconds | AEG RAG Pipeline |
+| Style/Domain | LoRA adapter hot-swap | Daily/weekly | LoRA Fusion Engine |
+| Reasoning | DPO/GRPO fine-tune + compile | Monthly | Distillation Pipeline + A/B rollout |
+
+### 36.2 Zero-Downtime Model Updates
+
+`python
+class AetherHotReload:
+    """Load new AEG alongside old one, zero dropped requests."""
+
+    def hot_reload(self, new_aeg: str, traffic_pct: float = 0.0) -> str:
+        new_instance = Runtime.load_background(new_aeg)  # load while old serves
+        return self.ab_router.register(old=self.current, new=new_instance, split=traffic_pct)
+
+    def auto_rollout(self, experiment_id: str,
+                     step_pct: float = 0.1, step_interval_sec: int = 3600):
+        """Auto-increase new traffic if quality holds; rollback on regression."""
+        while self.ab_router.get_split(experiment_id) < 1.0:
+            metrics = self.monitor.compare(experiment_id)
+            if metrics.new_wins and not metrics.regression_detected:
+                self.ab_router.increase(experiment_id, step_pct)
+            elif metrics.regression_detected:
+                self.rollback(experiment_id); return
+            time.sleep(step_interval_sec)
+`
+
+---
+
+## 37. CUDA Graph Capture and Persistent Kernels (NEW)
+
+### 37.1 Eliminating CPU-GPU Overhead
+
+`
+Without CUDA Graphs:
+  CPU dispatches each kernel individually: attn -> FFN -> residual
+  GPU: execute -> idle -> execute -> idle
+  Overhead: 50-200us CPU overhead per decode step
+
+With Aether CUDA Graph Capture (stored in .aeg):
+  CPU: submit entire decode step as single CUDA Graph replay
+  GPU: execute entire decode step without interruption
+  Overhead: <5us per decode step
+  Result: 15-30% throughput improvement at small batch sizes (research: vLLM 2026)
+`
+
+### 37.2 AEG Pre-Captured Decode Graphs
+
+`
+.aeg/cuda_graphs/
+├── sm90_decode_b1.graph    # Batch=1 decode CUDA graph
+├── sm90_decode_b2.graph    # Batch=2
+├── sm90_decode_b4.graph
+├── sm90_decode_b8.graph
+├── sm90_decode_b16.graph
+├── sm90_decode_b32.graph
+└── sm90_prefill_chunked.graph
+`
+
+Piecewise CUDA Graph: captures parts excluding dynamic-shape ops; selects correct graph at runtime by rounding batch size up to next captured size. Research: vLLM CUDA Graphs dispatcher (2026).
+
+---
+
+## 38. Fleet Management and Multi-Node Orchestration (NEW)
+
+### 38.1 Enterprise Fleet
+
+`python
+class AetherFleetManager:
+    """Research: Helium workflow-aware serving (2026), Kubernetes AI operators."""
+
+    def deploy(self, model_aeg: str, fleet: FleetConfig) -> DeploymentHandle:
+        """Auto-detect hardware per node, deliver optimal kernel from Hub CDN."""
+        node_assignments = self._assign_targets(model_aeg, fleet.nodes)
+        deployments = []
+        for node, target in node_assignments.items():
+            kernel_url = self.hub.get_kernel_url(model_aeg, target)
+            deployments.append(self._deploy_node(node, model_aeg, kernel_url))
+        return DeploymentHandle(deployments, LoadBalancer(deployments))
+`
+
+### 38.2 Multi-Region Topology Example
+
+`
+Region 1 (US-East):  2x B200,    cuda_sm100 kernel from Hub CDN
+Region 2 (EU-West):  4x H100,    cuda_sm90  kernel from Hub CDN
+Region 3 (AP-South): 2x MI300X,  rocm_cdna3 kernel from Hub CDN
+Edge nodes:          Apple M4,   metal_m3   kernel from Hub CDN
+
+Same qwen3-72b.aeg artifact across ALL nodes.
+Hub CDN delivers the right compiled kernel for each hardware type.
+Zero recompilation on production nodes — ever.
+`
+
+---
+
+## 39. Complete AEG Format v3.1
+
+`
+model.aeg/
+├── FORMAT_VERSION                      "AEG/1.1"
+├── graph/
+│   ├── computation_graph.aeg-ir        Core transformer graph
+│   ├── reasoning_graph.aeg-ir          [3.0] Compiled CoT graph
+│   ├── rag_pipeline.aeg-ir             [3.1 NEW] RAG workflow graph
+│   └── attention_head_patterns.json    [3.1 NEW] MInference per-head patterns
+├── weights/
+│   ├── precision_map.json              Per-layer precision
+│   ├── model.aeg-quant                 Mixed-precision weights
+│   ├── sparsity_masks.bin              [3.1 NEW] Wanda/SparseGPT masks
+│   └── mla_compressed/                [3.0] MLA latent vectors
+├── adapters/                           [3.1 NEW] LoRA multi-slot
+│   ├── manifest.json
+│   └── {name}/delta_A.bin, delta_B.bin, config.json
+├── kernels/
+│   ├── cuda_sm70/ ... cuda_sm120/
+│   ├── metal_m1/ ... metal_m3/
+│   ├── rocm_rdna3/, rocm_cdna3/
+│   ├── openvino_npu/, qualcomm_qnn/
+│   └── cpu_avx512/, cpu_neon/
+├── cuda_graphs/                        [3.1 NEW] Pre-captured decode graphs
+│   └── {target}_decode_b{N}.graph
+├── parallelism/
+│   ├── 1gpu.json ... 8gpu.json
+│   ├── prefill_decode_split.json       [3.0]
+│   └── 32gpu_cp.json                   [3.1 NEW] Context parallelism 1M+ tokens
+├── inference/
+│   ├── compute_profiles.json           [3.1 NEW] BoN/beam/MCTS profiles
+│   └── prm_head.bin                    [3.1 NEW] Process reward model head
+├── safety/                             [3.0] Guardrail configs
+├── provenance/                         [3.1 NEW] Full provenance
+│   ├── manifest.json                   C2PA, EU AI Act, transformations
+│   └── fingerprint.json                IP fingerprint triggers
+├── watermark/                          [3.1 NEW] SynthID-style config
+│   └── config.json
+└── manifest.json                       Top-level with all hashes
+`
+
+---
+
+## 40. Complete Nine-Pass Optimizer (v3.1)
+
+| Pass | Name | Research Basis | Key Speedup |
+|---|---|---|---|
+| 1 | Operator Fusion | ClusterFusion NeurIPS 2025 | 1.6-2.0x, 40% fewer DRAM round-trips |
+| 2 | Sensitivity Analysis | AutoMixQ 2025, AMQ 2025 | Foundation for precision assignment |
+| 3 | Precision Assignment | NVFP4 Blackwell, MXFP4 OCP | Up to 4x on B200 vs H100 BF16 |
+| 4 | KV Cache Structuring | Mooncake 2024, DistServe 2024 | 90%+ KV reduction (MLA), 85% TTFT reduction (RAG) |
+| 5 | MoE Expert Routing | DeepSeek-V3 2024, FineMoE 2025 | 2.5x expert speedup |
+| 6 | Parallelism Discovery | Seesaw MLSys 2025, Alpa 2022 | 25-40% gain from dynamic resharding |
+| 7 | Reasoning Graph | Speculative CoT 2025, GoT 2023 | 21-66% latency reduction |
+| 8 | Sparse Attention | MInference NeurIPS 2024 | 10x prefill speedup at 1M tokens |
+| 9 | Pruning/Sparsity | Wanda 2023, SparseGPT 2022 | 2x GEMM via 2:4 Sparse TC |
+
+---
+
+## 41. Additional Research Foundation (New Papers, 100+ Total)
+
+### A.11 Long-Context and Sparse Attention
+
+MInference (NeurIPS 2024) — 10x prefill at 1M tokens, 3 sparse patterns, plug-and-play. MMInference (ICML 2025) — 8.3x for VLM video. Ring Attention (2023) — sequence parallelism ring topology. Striped Attention (2023) — load-balanced ring. DeepSpeed-Ulysses (2023) — TP+SP hybrid. SnapKV (2024) — important-token KV selection. ScissorHands (2024) — KV eviction. StreamingLLM (2023) — anchor token KV retention. YaRN (2023) — RoPE extension to 128K. LongRoPE (2024) — 2M context RoPE scaling. LLaMA-3-1M (2024) — 1M native context.
+
+### A.12 Pruning and Sparsity
+
+SparseGPT (2022) — Hessian one-shot pruning. Wanda (2023) — weight x activation importance, fastest. ROSE (2025) — reordering for SparseGPT. M-Wanda (2025) — multilingual extension. Elsa (2025) — ADMM extreme 90%+ sparsity. LLM Surgeon (2024) — structured head pruning. ShortGPT (2024) — layer redundancy. NVIDIA 2:4 Sparsity (Ampere 2020) — Sparse TC native. Accelerating Unstructured Sparse Inference (2026).
+
+### A.13 Inference-Time Compute Scaling
+
+Let's Verify Step by Step (2023) — PRM foundation. Math-Shepherd (2024) — automated PRM. OmegaPRM (2025) — MCTS-based PRM data collection. DeepSeek-R1 (2025) — RLVR + extended CoT proof. Inference-Time Scaling (Google 2025) — compute-optimal BoN, 4x over naive baseline. InferenceTimePessimism (2026) — monotonic scaling guarantee. ThreadWeaver (2026) — hardware-parallel reasoning. Recurrent Depth Models (2025) — latent space thinking.
+
+### A.14 LoRA and Adapter Serving
+
+LoRA (2022). QLoRA (2023) — 4-bit quantized LoRA. S-LoRA (2023) — serving thousands of adapters. Punica (2024) — BGMV kernel for multi-adapter batching. Pico (2025) — output-side calibration compression. vLLM Multi-LoRA (2025) — per-request adapter routing.
+
+### A.15 SSM and Hybrid Architectures
+
+Mamba (2023) — selective SSM. Mamba-2 (2024) — SSD structured SSM. Mamba-3 (March 2026) — MIMO complex-valued states. Jamba (2024) — Transformer+Mamba hybrid. Bamba (2024) — IBM 9B hybrid. Zamba2 (2025) — shared attention hybrid. RWKV-7 (2025) — linear attention RNN. SGLang Hybrid Serving (Alibaba 2026) — dual memory pool. State Snapshotting for Speculative Decoding on SSMs (2026).
+
+### A.16 Distillation and Compression
+
+Knowledge Distillation (Hinton 2015). MiniLLM (2024) — RL LLM distillation. DistiLLM (2024) — diverse distillation. DeepSeek-R1 Distillation (2025) — reasoning chain transfer. Feature-Based LLM Distillation (IEEE 2025) — hidden state matching. SDFT (2026) — self-distillation via ICL teacher. 5-30x cost reduction, 95-97% quality retention benchmarks.
+
+### A.17 Model Provenance and Safety
+
+SynthID-Text (Google DeepMind 2024) — green-list statistical watermarking. C2PA (2024) — Coalition for Content Provenance and Authenticity standard. EU AI Act (binding Aug 2026) — Art. 50 AI disclosure obligation. MetaFinger (2024) — model fingerprinting. ADV-TRA (2025) — adversarial trajectory fingerprinting. Zero-Knowledge Proof Model Ownership (2026) — privacy-preserving IP verification.
+
+### A.18 Systems and Infrastructure
+
+CUDA Graphs for LLM (2024-2026). vLLM CUDA Graphs Dispatcher (2026) — piecewise capture, dynamic shape dispatch. KTransformers (2025) — heterogeneous CPU/GPU inference. PPipe (USENIX 2025) — pipeline parallelism on mixed GPU clusters. Kubernetes AI Operators (2025) — production fleet management. LanceDB (2024) — embedded vector DB for edge RAG. Dynamic embedding streams (2026) — real-time RAG index updates.
+
