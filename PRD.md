@@ -1,1621 +1,1318 @@
 ﻿# Aether Runtime — Product Requirements Document (PRD)
 
-> **Version:** 2.0 — July 2026
-> **Status:** Foundational · Pre-Build
+> **Version:** 3.0 — July 2026
+> **Status:** Foundational · Active Development
 > **Tagline:** *"Compile once. Run on any hardware, forever."*
+> **Current Codebase:** 113 Python files · 16,810 lines · 595 KB — scaffold complete, Phase 1 implementation in progress
 
 ---
 
 ## The One-Line Pitch
 
-> **Aether is the compiler for AI models — not another inference wrapper.**
+> **Aether is the LLVM for AI models — a compiler that turns any model into a portable, optimized, hardware-universal artifact.**
 
-Just as LLVM transformed software by compiling C/C++ into an optimized intermediate representation that runs on any CPU, Aether compiles any AI model into an **Aether Execution Graph (AEG)** — a portable, hardware-agnostic, compiled artifact that executes with maximum performance on whatever hardware you have, today and in the future.
+Just as LLVM compiles C/C++ into a portable IR that runs optimally on any CPU, Aether compiles any AI model into an **Aether Execution Graph (AEG)** — a compiled artifact that runs with maximum hardware-native performance on any GPU, Apple Silicon, AMD, Intel NPU, or CPU, today and on every future accelerator.
 
 ---
 
 ## Table of Contents
 
-1. [Why This Exists — The Real Problem](#1-why-this-exists--the-real-problem)
-2. [The Killer Insight: Compilation, Not Wrapping](#2-the-killer-insight-compilation-not-wrapping)
-3. [The Aether Execution Graph (AEG) — The Core Innovation](#3-the-aether-execution-graph-aeg--the-core-innovation)
-4. [Competitive Landscape — Why Everything Else is Wrong](#4-competitive-landscape--why-everything-else-is-wrong)
-5. [The Moat — Why This Cannot Be Copied](#5-the-moat--why-this-cannot-be-copied)
-6. [Architecture — Five Compiler Stages](#6-architecture--five-compiler-stages)
-7. [Stage 1 — Model Ingestion and Graph Extraction](#7-stage-1--model-ingestion-and-graph-extraction)
-8. [Stage 2 — The Aether Optimizer (Six Graph-Level Passes)](#8-stage-2--the-aether-optimizer-six-graph-level-passes)
-9. [Stage 3 — Hardware Targeting and Kernel Emission](#9-stage-3--hardware-targeting-and-kernel-emission)
-10. [Stage 4 — The Self-Optimizing Runtime](#10-stage-4--the-self-optimizing-runtime)
-11. [Stage 5 — Developer Interface](#11-stage-5--developer-interface)
-12. [The AEG Format Specification](#12-the-aeg-format-specification)
-13. [Automatic Parallelism Discovery](#13-automatic-parallelism-discovery)
-14. [Disaggregated Prefill and Decode Architecture](#14-disaggregated-prefill-and-decode-architecture)
-15. [Tree-Speculative Decoding Engine](#15-tree-speculative-decoding-engine)
-16. [MoE-Aware Expert Routing Compiler](#16-moe-aware-expert-routing-compiler)
-17. [Developer API Specification](#17-developer-api-specification)
-18. [Target Audience and Personas](#18-target-audience-and-personas)
-19. [Open-Source Roadmap — Five Phases](#19-open-source-roadmap--five-phases)
-20. [Commercial Strategy and Moat](#20-commercial-strategy-and-moat)
-21. [Technical Risk Analysis](#21-technical-risk-analysis)
-22. [Success Metrics and KPIs](#22-success-metrics-and-kpis)
-23. [Glossary](#23-glossary)
-24. [Appendix A — Research Foundation](#appendix-a--research-foundation)
+1. [Why This Exists](#1-why-this-exists)
+2. [The Killer Insight — Compilation Not Wrapping](#2-the-killer-insight)
+3. [The AEG Format — Core Innovation](#3-the-aeg-format)
+4. [Competitive Landscape](#4-competitive-landscape)
+5. [The Moat](#5-the-moat)
+6. [Architecture — Five Compiler Stages](#6-architecture)
+7. [Stage 1 — Model Ingestion](#7-stage-1-model-ingestion)
+8. [Stage 2 — Six Optimizer Passes](#8-stage-2-optimizer)
+9. [Stage 3 — Hardware Kernel Emission](#9-stage-3-hardware-targeting)
+10. [Stage 4 — Self-Optimizing Runtime](#10-stage-4-runtime)
+11. [Stage 5 — Developer Interface](#11-stage-5-developer-interface)
+12. [NEW: Pass 7 — Reasoning Graph Compiler](#12-new-reasoning-graph-compiler)
+13. [NEW: MLA Native Support](#13-new-mla-native-support)
+14. [NEW: FP4 Blackwell Targeting](#14-new-fp4-blackwell-targeting)
+15. [NEW: Agentic Workflow Optimizer](#15-new-agentic-workflow-optimizer)
+16. [NEW: Multi-Modal Unified Graph](#16-new-multimodal-unified-graph)
+17. [NEW: EAGLE-3 Speculative Decoding](#17-new-eagle3-speculative-decoding)
+18. [NEW: Quantization-Aware Compilation Pipeline](#18-new-quantization-aware-pipeline)
+19. [NEW: Aether Observability Stack](#19-new-observability-stack)
+20. [NEW: AEG Safety & Guardrail Layer](#20-new-safety-guardrail-layer)
+21. [Developer API Specification](#21-developer-api)
+22. [Target Personas](#22-target-personas)
+23. [Open-Source Roadmap — Six Phases](#23-roadmap)
+24. [Commercial Strategy](#24-commercial-strategy)
+25. [Technical Risk Analysis](#25-technical-risks)
+26. [Success Metrics](#26-success-metrics)
+27. [Glossary](#27-glossary)
+28. [Appendix A — Research Foundation (60+ Papers)](#appendix-a)
 
 ---
 
-## 1. Why This Exists — The Real Problem
+## 1. Why This Exists
 
 ### 1.1 The Wrong Diagnosis
 
-Every existing AI inference tool diagnosed the problem as fragmentation and proposed the same solution: a better wrapper.
+Every existing AI inference tool diagnosed the problem as fragmentation and built a better wrapper:
 
-- **Ollama** wraps llama.cpp with a Docker-like UX.
-- **vLLM** wraps PyTorch with PagedAttention scheduling.
-- **SGLang** wraps vLLM with structured generation.
-- **TGI** wraps transformers with a production server.
-- **TensorRT-LLM** wraps CUDA kernels with a Python interface.
+- **Ollama** — wraps llama.cpp with Docker-like UX
+- **vLLM** — wraps PyTorch with PagedAttention scheduling
+- **SGLang** — wraps vLLM with structured generation
+- **TGI** — wraps transformers with a production server
+- **TensorRT-LLM** — wraps CUDA kernels with a Python API
 
-They are all wrappers. Every wrapper inherits the fundamental constraint of its substrate: it is **statically bound to a set of backends and hardware at build time**. None own the computation graph. None can see the whole model.
+They are all wrappers. Every wrapper inherits the fundamental constraint of its substrate: **statically bound to one set of backends and hardware at build time**. None own the computation graph. None can apply global, cross-layer optimizations.
 
-### 1.2 The Correct Diagnosis
+### 1.2 The Correct Diagnosis — No Portable Compiled Form
 
-The real problem is not fragmentation. The real problem is that **AI models have no portable compiled form**.
+| Software Ecosystem | Portable Compiled Form | Runs Everywhere? |
+|---|---|---|
+| C/C++ | LLVM IR → binary | Yes — any CPU with LLVM backend |
+| Java | JVM bytecode | Yes — any JVM |
+| AI Models (2026) | Raw weights (safetensors/GGUF) | **NO** — must re-setup per hardware |
 
-In software:
-- C code → LLVM IR → optimized binary for any CPU
-- Java code → JVM bytecode → runs anywhere a JVM exists
-- Web code → JavaScript → runs in any browser
+AI models have no portable compiled form. A 72B model in safetensors format requires completely different setup on NVIDIA (vLLM + CUDA), Apple (MLX), AMD (ROCm + vLLM), and Intel (OpenVINO). **Aether fixes this.**
 
-In AI inference (2026):
-- A model exists as `safetensors` (raw PyTorch weights)
-- To run on NVIDIA: install CUDA, install vLLM, configure CUDA graphs
-- To run on Apple Silicon: install MLX, re-export to MLX format
-- To run on AMD: recompile vLLM with ROCm flags
-- To run on Intel NPU: convert to ONNX, use OpenVINO EP
-- **There is no portable compiled form that runs everywhere**
-
-This is the problem Aether solves.
-
-### 1.3 The Analogy That Drives Everything
+### 1.3 The Analogy
 
 ```
-Before LLVM:                        After LLVM:
-  GCC → x86 only                    C/C++ → LLVM IR → x86
-  MSVC → Windows only                               → ARM
-  each compiler siloed                              → WASM
-                                                    → RISC-V
-                                                    → any future ISA
+Before LLVM:   GCC → x86 only | MSVC → Windows only | each compiler siloed
+After LLVM:    C++ → LLVM IR → x86 | ARM | WASM | RISC-V | any future ISA
 
-Before Aether:                      After Aether:
-  safetensors → CUDA only           Any model → AEG → NVIDIA GPU
-  GGUF → llama.cpp only                             → Apple Silicon
-  TRT engine → H100 only                            → AMD GPU
-  each format siloed                                → Intel NPU
-                                                    → CPU
-                                                    → any future accelerator
+Before Aether: safetensors → CUDA only | GGUF → llama.cpp only | each format siloed
+After Aether:  Any model → AEG → NVIDIA (sm70–sm100) | Apple Silicon | AMD | Intel | CPU
 ```
 
-The Aether Execution Graph (AEG) is the LLVM IR for AI models.
+### 1.4 Market Scale (2026)
 
-### 1.4 Market Context
-
-- Global AI inference infrastructure: **$300B+ by 2030**, growing at 30% CAGR
-- 65% of enterprises use hybrid AI (cloud + on-prem) — desperately need hardware portability
-- Over 50% of professional developers use AI tools daily — they demand infrastructure that just works
-- Total addressable market: the entire AI inference stack
+- AI inference infrastructure TAM: **$300B+ by 2030**, 30% CAGR
+- 65% of enterprises use hybrid AI (cloud + on-prem) — desperate for hardware portability
+- DeepSeek-R1, Qwen3, Llama 3.3 are open weights — **inference tooling is the product**
+- NVIDIA Blackwell (B200) deployed at scale — new FP4 precision requires compiler support
+- MoE models (DeepSeek-V3-671B) dominate frontier — require specialized compiler passes
 
 ---
 
-## 2. The Killer Insight: Compilation, Not Wrapping
+## 2. The Killer Insight
 
 ### 2.1 What Every Tool Gets Wrong
 
-Every existing inference tool operates on the **eager execution** model:
+All existing tools use the eager execution model:
+```
+Request → Framework (PyTorch) → Kernel Dispatch → Hardware
+```
+
+Each tool adds its own patch at a different layer — none see the whole model. None own the graph.
+
+### 2.2 What Aether Does
 
 ```
-Request → Framework (PyTorch/JAX) → Kernel Dispatch → Hardware
-```
+Any Model → [Extract Graph] → [Optimize] → [Target] → .aeg artifact
+                Stage 1          Stage 2    Stage 3
 
-Optimizations are fragmented across layers, hardware-specific, and impossible to compose globally:
-- vLLM patches memory management (PagedAttention)
-- SGLang patches prefix reuse (RadixAttention)
-- TensorRT-LLM patches kernel speed (FP8 fusion)
-
-None of them see the whole graph. None own the IR. None can apply optimizations that cross the boundary between layers they don't control.
-
-### 2.2 What Aether Does Instead
-
-```
-Any Model Format                  Aether Compiler Pipeline
-(safetensors / GGUF /    →  Extract Graph → Optimize → Target → AEG
- ONNX / MLX / .pt)            (Stage 1)    (Stage 2)  (Stage 3)
-
-AEG + Hardware Profile   →  Aether Runtime  →  Tokens / Embeddings
-                              (Stage 4)
+.aeg + Hardware → [Aether Runtime] → Tokens / Embeddings
+                      Stage 4
 ```
 
 Aether **owns the computation graph**. It can:
-- Fuse attention + RoPE + layer norm into a single GPU kernel (40% fewer memory round-trips)
-- Automatically shard a 70B model across 4 GPUs with zero user config
-- Recompile the critical path when hardware changes
-- Cache compiled kernels so you never recompile the same model twice
-- Apply mixed-precision quantization guided by mathematical sensitivity analysis
+- Fuse RMSNorm + QKV + RoPE into a single GPU megakernel (40% fewer DRAM round-trips)
+- Apply MLA native compression passes (90%+ KV cache reduction for DeepSeek-family models)
+- Target FP4 on Blackwell (4x throughput vs H100 on same model)
+- Compile reasoning chains as executable graphs with budget control
+- Auto-shard 70B models across 4 GPUs with zero user configuration
+- Cache compiled kernels globally — every user who compiles contributes to the network
 
-This is **compilation, not wrapping**. This is the difference that matters.
-
-### 2.3 The Developer Experience
+### 2.3 Developer Experience
 
 **Without Aether:**
 ```bash
-# Install CUDA 12.4, cuDNN 9.x              (2+ hours, driver hell)
-# pip install vllm                           (20 min, dependency conflicts)
-# Model is in GGUF — convert to safetensors  (30 min, precision loss unknown)
-# Configure tensor parallelism for 4 GPUs   (read 4 docs, trial and error)
-# Move to MacBook — redo with MLX            (another 2 hours)
-# Deploy to cloud — redo with TRT-LLM        (another 4 hours)
+# NVIDIA: install CUDA + cuDNN + vLLM (hours), handle tensor parallel config manually
+# Apple: install MLX, re-export model to MLX format (hours)
+# AMD: rebuild vLLM with ROCm flags (hours)
+# Move model to different hardware: repeat from scratch
+# Total: days of infrastructure before first token
 ```
 
 **With Aether:**
 ```bash
 pip install aether
-aether compile qwen3-72b    # Compiles once → .aeg artifact
-aether run qwen3-72b        # Runs on whatever hardware you have
-# Move the .aeg file to any machine → it runs, optimally, instantly
+aether compile qwen3-72b          # 4 minutes → qwen3-72b.aeg
+aether run qwen3-72b              # runs on whatever hardware you have
+# Move qwen3-72b.aeg to any machine → runs identically, optimally, instantly
 ```
 
 ---
 
-## 3. The Aether Execution Graph (AEG) — The Core Innovation
+## 3. The AEG Format
 
-The **Aether Execution Graph** is Aether's central technical invention. It is a portable, versioned, content-addressed, compiled representation of an AI model's computation graph — optimized by the Aether compiler and executable on any supported hardware.
+The **Aether Execution Graph (AEG)** is Aether's central invention. A portable, versioned, content-addressed, compiled representation of an AI model — ready to execute on any supported hardware.
 
-### 3.1 What an AEG Contains
+### 3.1 AEG Package Layout
 
 ```
 qwen3-72b.aeg/
-├── FORMAT_VERSION                    "AEG/1.0"
+├── FORMAT_VERSION               "AEG/1.0"
 ├── graph/
-│   ├── computation_graph.aeg-ir      Hardware-agnostic operator graph (like LLVM IR)
-│   ├── metadata.json                 Model family, params, context length, modalities
-│   └── graph.sha256                  Content-addressed integrity hash
+│   ├── computation_graph.aeg-ir   Hardware-agnostic operator graph (like LLVM IR)
+│   ├── reasoning_graph.aeg-ir     [NEW v3.0] Compiled reasoning/CoT execution graph
+│   ├── metadata.json              Architecture, modalities, capabilities
+│   └── graph.sha256               Content-addressed hash (global cache key)
 ├── weights/
-│   └── quantized/
-│       ├── precision_map.json        Per-layer precision assignments
-│       └── model.aeg-quant           Mixed-precision compressed weights
+│   ├── precision_map.json         Per-layer precision (sensitivity-guided)
+│   ├── model.aeg-quant            Mixed-precision compressed weights
+│   └── mla_compressed/            [NEW v3.0] MLA latent vectors (if MLA architecture)
+│       └── latent_kv.bin
 ├── kernels/
-│   ├── cuda_sm89/                    Pre-compiled CUDA kernels for RTX 4090 (Ada)
-│   ├── cuda_sm90/                    Pre-compiled for H100 (Hopper)
-│   ├── cuda_sm100/                   Pre-compiled for B200 (Blackwell)
-│   ├── metal_m3/                     Pre-compiled Metal kernels for M3/M4/M5
-│   ├── rocm_rdna3/                   Pre-compiled for RX 7900 XTX
-│   └── cpu_avx512/                   Vectorized CPU kernels
+│   ├── cuda_sm70/                 NVIDIA V100 (FP16 Tensor Cores)
+│   ├── cuda_sm80/                 NVIDIA A100 (BF16 TMA)
+│   ├── cuda_sm89/                 NVIDIA RTX 4090 (FP8 Ada)
+│   ├── cuda_sm90/                 NVIDIA H100 (WGMMA + FA-3)
+│   ├── cuda_sm100/                NVIDIA B200 (FP4 Blackwell — NEW v3.0)
+│   ├── cuda_sm120/                NVIDIA Rubin (future-proofed — NEW v3.0)
+│   ├── metal_m1/                  Apple M1/M2 (Metal Shading Language)
+│   ├── metal_m3/                  Apple M3/M4/M5 (Metal 4 TensorOps)
+│   ├── rocm_rdna3/                AMD RX 7000 (HIP + WMMA)
+│   ├── rocm_cdna3/                AMD MI300X (192GB HBM3)
+│   ├── openvino_npu/              Intel Arc NPU
+│   ├── cpu_avx512/                x86 AVX-512 + AMX
+│   └── cpu_neon/                  ARM NEON (Apple, Qualcomm Snapdragon)
 ├── parallelism/
-│   ├── 1gpu.json                     Single-GPU execution plan
-│   ├── 2gpu.json                     2-GPU tensor parallel plan
-│   ├── 4gpu.json                     4-GPU tensor + pipeline parallel plan
-│   └── 8gpu.json                     8-GPU full distributed plan
-└── manifest.json                     Top-level manifest (all hashes, compilation metadata)
+│   ├── 1gpu.json                  Single-GPU execution plan
+│   ├── 2gpu.json                  2-GPU TP plan
+│   ├── 4gpu.json                  4-GPU TP + PP plan
+│   ├── 8gpu.json                  8-GPU full distributed plan
+│   └── prefill_decode_split.json  [NEW v3.0] Disaggregated P/D pool configs
+├── safety/                        [NEW v3.0] Guardrail layer
+│   ├── prompt_guard.json          Prompt injection detection config
+│   └── output_filter.json         Content policy filter parameters
+└── manifest.json                  Top-level manifest + all hashes
 ```
 
-### 3.2 The AEG-IR: Hardware-Agnostic Operator Graph
-
-The `computation_graph.aeg-ir` is a textual/binary IR inspired by MLIR but specialized for transformer-family models:
+### 3.2 The AEG-IR — Hardware-Agnostic Operator Graph
 
 ```
-# AEG-IR v1.0 — Qwen3-72B Transformer Layer 0
+# AEG-IR v1.0 — Qwen3-72B Layer 0 (with v3.0 extensions)
 
-func @transformer_layer(%x: tensor<*xbf16>, %pos: i64) -> tensor<*xbf16> {
-  // RMSNorm — fuseable with QKV projection (flagged by Pass 1)
+func @transformer_layer(%x: tensor<*xbf16>, %pos: i64, %reasoning_budget: i32) -> tensor<*xbf16> {
+  // RMSNorm — fuseable with QKV (Pass 1)
   %norm = aeg.rmsnorm(%x, %weight[0]) {eps = 1e-6}
 
-  // QKV projection — fused with RoPE by Aether Optimizer
+  // QKV + RoPE — fused megakernel by Pass 1
   %q, %k, %v = aeg.qkv_proj(%norm, %wq[0], %wk[0], %wv[0])
-  %q_rope = aeg.rope(%q, %pos) {theta = 1000000.0}
-  %k_rope = aeg.rope(%k, %pos) {theta = 1000000.0}
+  %q_rope = aeg.rope(%q, %pos) {theta = 1000000.0, rope_type = "yarn"}
+  %k_rope = aeg.rope(%k, %pos) {theta = 1000000.0, rope_type = "yarn"}
 
-  // Grouped Query Attention — AEG tracks GQA structure natively
+  // GQA — native AEG semantic (not lowered to matmuls)
   %attn = aeg.gqa(%q_rope, %k_rope, %v) {
     num_heads = 64, num_kv_heads = 8, head_dim = 128,
     kv_cache = @global_kv_cache[layer=0],
-    fa_variant = "flash_attention_3"
+    fa_variant = "flash_attention_3",           // selected by Stage 3 per target
+    kv_precision = "fp8",                       // KV cache quantization [NEW v3.0]
+    mla_compression = false,                    // true for DeepSeek-family
+    reasoning_budget_gate = @reasoning_budget,  // [NEW v3.0] CoT budget control
   }
 
-  // Output projection + residual
-  %o_proj = aeg.linear(%attn, %wo[0])
-  %residual = aeg.add(%x, %o_proj)
-
-  // FFN (SwiGLU) — tagged LOW sensitivity for aggressive quantization
+  // FFN (SwiGLU) — sensitivity=LOW → Q4_K_M (from Pass 3)
   %ffn = aeg.swiglu_ffn(%residual, %wg[0], %wu[0], %wd[0])
     {sensitivity = LOW, precision_hint = Q4_K_M}
+
   return aeg.add(%residual, %ffn)
+}
+
+// [NEW v3.0] Reasoning graph node — compiled CoT execution
+func @reasoning_step(%context: tensor<*xbf16>, %budget: i32) -> (tensor<*xbf16>, i32) {
+  %thought = aeg.reasoning_forward(%context, @transformer_layer)
+    {max_tokens = %budget, early_exit_threshold = 0.95}
+  %remaining = aeg.budget_decrement(%budget, %thought.length)
+  return (%thought.hidden, %remaining)
 }
 ```
 
-**Key properties of AEG-IR:**
-- **Semantic richness:** Operations carry high-level semantics (GQA, SwiGLU, RoPE) enabling smarter fusion decisions impossible in generic IRs
-- **Compiler annotations:** Sensitivity hints, sharding hints, cache directives are first-class citizens
-- **Versioned and stable:** AEG-IR v1.x readable by all future Aether versions (mirrors LLVM backward compatibility)
-- **Content-addressed:** SHA-256 of the graph IR forms the global cache key for distributed kernel caching
-
-### 3.3 AEG vs. LLVM — The Full Analogy
+### 3.3 AEG vs. LLVM Comparison
 
 | Concept | LLVM | Aether AEG |
 |---|---|---|
-| **Source Languages** | C, C++, Rust, Swift | SafeTensors, GGUF, ONNX, MLX, PyTorch |
+| **Source Languages** | C, C++, Rust, Swift, Julia | SafeTensors, GGUF, ONNX, MLX, PyTorch |
 | **Intermediate Representation** | LLVM IR | AEG-IR |
-| **Optimizer Passes** | mem2reg, loop-unroll, DCE | op-fusion, sensitivity-quant, shard-plan, moe-route |
-| **Target Backends** | x86, ARM, WASM, RISC-V | CUDA sm70-sm100, Metal M1-M5, ROCm, OpenVINO, CPU |
-| **Output Artifact** | `.o` / `.so` / binary | `.aeg` (compiled model artifact) |
+| **Optimizer Passes** | mem2reg, loop-unroll, SROA, DCE | op-fusion, sensitivity-quant, shard-plan, moe-route, reasoning-graph, mla-compress |
+| **Target Backends** | x86, ARM, WASM, RISC-V | CUDA sm70–sm120, Metal M1–M5, ROCm, OpenVINO, CPU |
+| **Output Artifact** | `.o` / `.so` / binary | `.aeg` compiled model package |
 | **Distributed Cache** | ccache | Aether Hub (content-addressed kernel cache) |
 | **Portability Promise** | Any LLVM binary on any supported ISA | Any `.aeg` on any supported hardware |
-| **Format Stability** | LLVM IR backward-compatible 10+ years | AEG/1.x stable forever |
+| **Format Stability** | LLVM IR backward-compat 10+ years | AEG/1.x stable forever |
+| **New (v3.0)** | — | Reasoning graph, MLA latent vectors, FP4, safety layer |
 
 ---
 
-## 4. Competitive Landscape — Why Everything Else is Wrong
+## 4. Competitive Landscape
 
-### 4.1 The Full Landscape
+### 4.1 Full 2026 Landscape
 
-| Tool | Approach | Owns | Missing |
+| Tool | Type | Owns | Missing |
 |---|---|---|---|
-| **vLLM** | Wrapper (PagedAttention scheduling) | Memory scheduler | Computation graph, portability, compilation |
-| **llama.cpp** | Wrapper (GGUF runtime) | CPU/GPU kernels | Compiler pipeline, graph ownership |
-| **Ollama** | Wrapper (Docker UX over llama.cpp) | Developer UX | Everything technical |
-| **TensorRT-LLM** | Compiler (NVIDIA-only, closed format) | CUDA kernel fusion | Non-NVIDIA hardware, open format, community |
-| **Modular MAX** | Compiler (MLIR/Mojo, commercially closed) | Graph compiler, performance | Open format, ecosystem, community |
-| **ONNX Runtime** | Runtime (ONNX format only) | Execution providers | LLM-specific ops, dynamic serving |
-| **SGLang** | Wrapper (structured generation) | Prefix caching | Compilation, portability, graph ownership |
-| **IREE** | Compiler (MLIR-based, hardware-universal) | Hardware universality | LLM-specific optimizations, developer UX |
-| **Aether** | **AI Model Compiler (open, LLM-specialized)** | **Portable compiled format (AEG)** | **Nothing — this is the gap** |
+| **vLLM** | Wrapper | PagedAttention, production API | Graph ownership, compilation, portability |
+| **llama.cpp** | Wrapper | GGUF runtime, CPU/GPU kernels | Compiler, portability beyond GGUF |
+| **Ollama** | Wrapper | Developer UX | Everything technical |
+| **SGLang** | Wrapper + Scheduler | RadixAttention, structured gen | Compilation, format ownership |
+| **TensorRT-LLM** | Compiler (NVIDIA-only) | CUDA kernel fusion, FP8/FP4 | Non-NVIDIA, open format, community |
+| **Modular MAX** | Compiler (closed) | Graph compiler, Mojo kernels | Open source, open format, community |
+| **ONNX Runtime** | Runtime (ONNX only) | Execution providers | LLM-specific ops, speculative decoding |
+| **IREE** | Compiler (MLIR) | Hardware universality | LLM-specific optimization, developer UX |
+| **Triton** | Kernel language | Custom CUDA/ROCm kernels | Model-level compilation, portability |
+| **lm-evaluation-harness** | Evaluation only | Benchmark tooling | Runtime, compilation |
+| **Aether** | **AI Model Compiler (open)** | **Portable AEG format + compiler** | **Nothing — this is the gap** |
 
-### 4.2 The White Space Nobody Owns
+### 4.2 What Nobody Has (2026)
 
 ```
-     ┌──────────────────────────────────────────────────────────┐
-     │   OPEN-SOURCE AI MODEL COMPILER                           │
-     │   + portable compiled format (AEG)                        │
-     │   + LLM-specialized optimizer passes (6 of them)          │
-     │   + hardware-universal (NVIDIA + AMD + Apple + Intel)     │
-     │   + developer-first UX (one command)                      │
-     │   + community kernel cache (network effect moat)          │
-     │                                                            │
-     │                   ← AETHER LIVES HERE                     │
-     └──────────────────────────────────────────────────────────┘
+     ┌─────────────────────────────────────────────────────────────┐
+     │   OPEN-SOURCE AI MODEL COMPILER                              │
+     │   + portable compiled format (AEG) ← only Aether            │
+     │   + LLM-specialized optimizer (7 passes) ← only Aether      │
+     │   + hardware-universal (NVIDIA + AMD + Apple + Intel)        │
+     │   + FP4 Blackwell support ← only TRT-LLM (closed)           │
+     │   + MLA native compilation pass ← nothing open has this      │
+     │   + reasoning graph compiler ← COMPLETELY NEW                │
+     │   + agentic workflow optimizer ← COMPLETELY NEW              │
+     │   + community kernel cache (network effect moat)             │
+     │                                                               │
+     │                     ← AETHER LIVES HERE                      │
+     └─────────────────────────────────────────────────────────────┘
 ```
-
-TensorRT-LLM is closest on compilation but NVIDIA-exclusive and closed. IREE is hardware-universal but no LLM optimization and poor UX. Modular MAX is not open source. **No open-source, LLM-specialized, hardware-universal AI model compiler exists. That is Aether's gap.**
-
-### 4.3 Why "Unified API" Was Never Enough
-
-A YC partner would ask: *"Why can't I write a 200-line script that dispatches to vLLM on NVIDIA and MLX on Apple?"*
-
-They'd be right. You can. That's not a company.
-
-Aether's answer is technical and irreversible: **we own the compiled model format**. Once compiled to AEG, every optimization Aether adds in the future applies automatically on re-load — without recompilation. You cannot "script" your way to a format that gains new kernel optimizations as hardware evolves.
 
 ---
 
-## 5. The Moat — Why This Cannot Be Copied
+## 5. The Moat
 
 ### 5.1 The Kernel Cache Network Effect (Aether Hub)
 
 ```
-User A compiles qwen3-72b on H100      → uploads cuda_sm90 kernels to Hub
-User B runs qwen3-72b on H100          → downloads pre-compiled kernels from Hub
-                                          → zero compilation time for User B
-User C compiles qwen3-72b on RTX 4090  → uploads cuda_sm89 kernels to Hub
+User A compiles qwen3-72b on H100 → uploads cuda_sm90 kernels to Hub
+User B compiles qwen3-72b on B200 → uploads cuda_sm100 + FP4 kernels
+User C runs qwen3-72b on H100   → downloads pre-compiled kernels → zero wait
 ...
-After 1,000+ users: every model x hardware combination is pre-compiled
-New user on any hardware               → instant startup, always
+After 10,000 users: every model × hardware pair is pre-compiled
+Every new user gets instant startup on any hardware
 ```
 
-This is the same network effect that makes npm, PyPI, and Docker Hub impossible to replicate from scratch. **The Hub becomes the moat.**
+This is the npm/Docker Hub flywheel. **The Hub becomes the moat.**
 
-### 5.2 The AEG Format Lock-In (The Good Kind)
+### 5.2 AEG Format Ownership
 
-Once the ecosystem adopts AEG as the distribution format for compiled models, Aether controls the compiler. This mirrors:
-- LLVM's position in native code compilation
-- Docker's OCI image format
-- npm's position in JavaScript packaging
+Once the ecosystem adopts AEG as the distribution format for compiled models:
+- HuggingFace hosts `.aeg` alongside `.safetensors`
+- Model publishers compile to AEG at release time
+- Hardware vendors implement first-class AEG targets
+- CI/CD pipelines compile to AEG artifacts
 
-Hardware vendors will want their accelerators to be first-class AEG targets. Model publishers will distribute `.aeg` alongside `.safetensors`. CI pipelines will compile to AEG artifacts.
+Mirrors Docker OCI, npm package.json, LLVM IR. Format adoption is irreversible.
 
-### 5.3 Sensitivity-Guided Quantization (Research Advantage)
+### 5.3 Sensitivity-Guided Quantization Moat
 
-Aether's quantization is not rule-based. It is **sensitivity-analysis-driven**:
-
+Aether's quantization is mathematically grounded (not rule-based):
 ```
-For each layer L in the computation graph:
-  sensitivity[L] = d(perplexity) / d(precision of L)
+sensitivity[layer] = d(perplexity) / d(precision_bits_of_layer)
 ```
+This requires owning the computation graph. **No wrapper can replicate this.**
 
-This produces a per-layer sensitivity map that guides mixed-precision quantization with theoretical guarantees on quality loss. No wrapper-based system can replicate this without owning the graph.
+### 5.4 Reasoning Graph Moat (NEW v3.0)
 
-**Research basis:** AutoMixQ (2025), AMQ Framework (2025), GPTQ sensitivity analysis, AWQ activation-aware quantization.
+Aether compiles chain-of-thought reasoning as an executable graph with:
+- Budget-controlled token allocation per reasoning step
+- Early exit when confidence threshold is reached
+- Speculative CoT: draft reasoning chains verified by target model
+- 21–66% latency reduction on complex reasoning tasks
 
-### 5.4 Distribution Size Advantage
+No other tool compiles reasoning as a first-class graph operation. **This is unique.**
 
-| Format | Size (72B model) |
-|---|---|
-| BF16 safetensors | ~144 GB |
-| AEG (mixed precision, sensitivity-guided) | ~38 GB |
-| GGUF Q4_K_M | ~41 GB (no compiled kernels, no parallelism plans) |
+### 5.5 MLA Native Compilation Moat (NEW v3.0)
 
-The `.aeg` is smaller AND contains pre-compiled kernels AND contains parallelism plans. It is strictly better than GGUF for distribution.
+DeepSeek-V3, Kimi K2, GLM-5 all use Multi-Head Latent Attention (MLA). Aether compiles MLA natively:
+- Stores compressed latent KV vectors (not full KV states) in the AEG artifact
+- Weight absorption trick compiled into kernel at Stage 3 — no runtime decompression overhead
+- 90%+ KV cache reduction vs. standard GQA compilation
+- Makes trillion-parameter models servable on 4× H100 instead of 8×
 
 ---
 
-## 6. Architecture — Five Compiler Stages
+## 6. Architecture — Five Compiler Stages + Two New Systems
 
 ```
-╔════════════════════════════════════════════════════════════════════════════╗
-║                        AETHER COMPILER PIPELINE                            ║
-╠════════════════════════════════════════════════════════════════════════════╣
-║                                                                            ║
-║  INPUT: Any Model Format                                                   ║
-║  SafeTensors | GGUF | ONNX | MLX | PyTorch.pt                             ║
-║                          │                                                 ║
-║  ┌───────────────────────▼─────────────────────────────────────────────┐  ║
-║  │ STAGE 1 — MODEL INGESTION & GRAPH EXTRACTION                        │  ║
-║  │  Architecture detection · Weight loading · Graph tracing → AEG-IR  │  ║
-║  └───────────────────────┬─────────────────────────────────────────────┘  ║
-║                          │ AEG-IR (unoptimized)                           ║
-║  ┌───────────────────────▼─────────────────────────────────────────────┐  ║
-║  │ STAGE 2 — AETHER OPTIMIZER (Six Graph-Level Compiler Passes)        │  ║
-║  │  Pass 1: Operator Fusion       (RoPE+QKV+Norm → megakernel)        │  ║
-║  │  Pass 2: Sensitivity Analysis  (d_perplexity/d_precision per layer) │  ║
-║  │  Pass 3: Precision Assignment  (mixed-precision via sensitivity map) │  ║
-║  │  Pass 4: KV Cache Structuring  (PagedKV nodes + RadixTree hints)    │  ║
-║  │  Pass 5: MoE Expert Routing    (hot/warm/cold tiering + sparsity)   │  ║
-║  │  Pass 6: Parallelism Discovery (automatic sharding strategy search)  │  ║
-║  └───────────────────────┬─────────────────────────────────────────────┘  ║
-║                          │ AEG-IR (optimized)                             ║
-║  ┌───────────────────────▼─────────────────────────────────────────────┐  ║
-║  │ STAGE 3 — HARDWARE TARGETING & KERNEL EMISSION                      │  ║
-║  │  Targets: CUDA sm70-sm100 / Metal M1-M5 / ROCm / OpenVINO / CPU   │  ║
-║  │  FlashAttention-3 · FP8/INT4 GEMMs · Kernels → Aether Hub         │  ║
-║  └───────────────────────┬─────────────────────────────────────────────┘  ║
-║                          │ .aeg artifact                                  ║
-║  ┌───────────────────────▼─────────────────────────────────────────────┐  ║
-║  │ STAGE 4 — SELF-OPTIMIZING RUNTIME                                   │  ║
-║  │  Loads .aeg · Disaggregated prefill/decode · Tree-speculative      │  ║
-║  │  decoding · Global KV cache · Dynamic precision adjustment          │  ║
-║  └───────────────────────┬─────────────────────────────────────────────┘  ║
-║                          │                                                 ║
-║  ┌───────────────────────▼─────────────────────────────────────────────┐  ║
-║  │ STAGE 5 — DEVELOPER INTERFACE                                       │  ║
-║  │  Python SDK · REST API · OpenAI-compat · CLI · gRPC (Phase 3)     │  ║
-║  └─────────────────────────────────────────────────────────────────────┘  ║
-╚════════════════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        AETHER COMPILER PIPELINE v3.0                         ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║  INPUT: Any Model Format                                                     ║
+║  SafeTensors | GGUF | ONNX | MLX | PyTorch.pt | HuggingFace Hub ID          ║
+║                            |                                                 ║
+║  ┌─────────────────────────▼────────────────────────────────────────────┐   ║
+║  │ STAGE 1 — MODEL INGESTION & GRAPH EXTRACTION                         │   ║
+║  │ Architecture detection · Weight loading · Graph tracing → AEG-IR    │   ║
+║  │ [NEW] MLA structure detection · Shared expert analysis              │   ║
+║  └─────────────────────────┬────────────────────────────────────────────┘   ║
+║                            │ AEG-IR (unoptimized)                           ║
+║  ┌─────────────────────────▼────────────────────────────────────────────┐   ║
+║  │ STAGE 2 — AETHER OPTIMIZER (Seven Graph-Level Passes)                │   ║
+║  │  Pass 1: Operator Fusion      (RoPE+QKV+Norm → megakernel)          │   ║
+║  │  Pass 2: Sensitivity Analysis (d_ppl/d_precision per layer)         │   ║
+║  │  Pass 3: Precision Assignment (mixed BF16/FP8/FP4/INT4 per layer)   │   ║
+║  │  Pass 4: KV Cache Structuring (PagedKV + RadixTree + MLA latents)   │   ║
+║  │  Pass 5: MoE Expert Routing   (hot/warm/cold + sparsity + shared)   │   ║
+║  │  Pass 6: Parallelism Discovery(auto TP/PP/EP/CP sharding)           │   ║
+║  │  Pass 7: Reasoning Graph      [NEW] CoT graph + budget compiler      │   ║
+║  └─────────────────────────┬────────────────────────────────────────────┘   ║
+║                            │ AEG-IR (optimized)                             ║
+║  ┌─────────────────────────▼────────────────────────────────────────────┐   ║
+║  │ STAGE 3 — HARDWARE TARGETING & KERNEL EMISSION                       │   ║
+║  │  CUDA sm70-sm100 + [NEW] sm100 FP4 (Blackwell) + sm120 (Rubin)     │   ║
+║  │  Metal M1-M5 · ROCm · OpenVINO · CPU · [NEW] Qualcomm QNN          │   ║
+║  │  FA-3 / [NEW] FA-4 (Blackwell) · FP8/FP4 GEMMs · MLA kernels      │   ║
+║  └─────────────────────────┬────────────────────────────────────────────┘   ║
+║                            │ .aeg artifact                                  ║
+║  ┌─────────────────────────▼────────────────────────────────────────────┐   ║
+║  │ STAGE 4 — SELF-OPTIMIZING RUNTIME                                    │   ║
+║  │  Loads .aeg · EAGLE-3 speculative decoding · Disaggregated P/D      │   ║
+║  │  Tiered KV cache · Dynamic precision · [NEW] Agentic scheduler      │   ║
+║  │  [NEW] Reasoning budget manager · [NEW] Multi-modal graph dispatch  │   ║
+║  │  [NEW] Safety guardrail layer · [NEW] OpenTelemetry observability   │   ║
+║  └─────────────────────────┬────────────────────────────────────────────┘   ║
+║                            │                                                 ║
+║  ┌─────────────────────────▼────────────────────────────────────────────┐   ║
+║  │ STAGE 5 — DEVELOPER INTERFACE                                        │   ║
+║  │  Python SDK · REST API (OpenAI-compat) · CLI · gRPC · [NEW] JS SDK  │   ║
+║  │  [NEW] Eval gates · [NEW] A/B rollout API · [NEW] Fleet management  │   ║
+║  └──────────────────────────────────────────────────────────────────────┘   ║
+║                                                                              ║
+║  CROSS-CUTTING SYSTEMS (v3.0)                                               ║
+║  ┌─────────────────────────────────────────────────────────────────────┐    ║
+║  │ Aether Hub — content-addressed kernel cache + AEG model registry   │    ║
+║  │ Aether Observability — OpenTelemetry tracing + metrics + eval gates│    ║
+║  │ Aether Safety — prompt guard + output filter + audit logging       │    ║
+║  └─────────────────────────────────────────────────────────────────────┘    ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 ```
 
 ---
 
-## 7. Stage 1 — Model Ingestion and Graph Extraction
+## 7. Stage 1 — Model Ingestion
 
-### 7.1 Supported Input Formats
+### 7.1 Supported Input Formats (v3.0 Complete List)
 
-| Format | Origin | Ingestion Method |
-|---|---|---|
-| **SafeTensors** | HuggingFace / modern standard | Direct weight loading + config.json architecture parsing |
-| **GGUF** | llama.cpp ecosystem | GGUF header parsing + weight dequantization for graph tracing |
-| **ONNX** | Cross-framework standard | ONNX protobuf graph → AEG-IR lowering |
-| **MLX** | Apple ecosystem | MLX module tracing → AEG-IR |
-| **PyTorch `.pt` / `.bin`** | Legacy format | `torch.export` graph capture → AEG-IR |
+| Format | Source | Ingestion Method | Status |
+|---|---|---|---|
+| **SafeTensors** | HuggingFace | Weight loading + config.json arch parsing | Phase 1 |
+| **GGUF** | llama.cpp | Binary header parsing + K/I-quant dequant | Phase 1 |
+| **ONNX** | Cross-framework | Protobuf graph → AEG-IR lowering | Phase 1 |
+| **MLX** | Apple ecosystem | MLX module tracing → AEG-IR | Phase 2 |
+| **PyTorch `.pt`** | Legacy | `torch.export` graph capture → AEG-IR | Phase 1 |
+| **HuggingFace Hub ID** | Cloud | Auto-download + compile pipeline | Phase 1 |
+| **AWQ quant** | Quantized models | AWQ weight loading with scale recovery | Phase 2 |
+| **GPTQ quant** | Quantized models | GPTQ weight loading + Marlin kernel emit | Phase 2 |
+| **TensorRT engine** | NVIDIA-compiled | Engine plan → AEG wrapper | Phase 3 |
 
-### 7.2 Architecture Detection
-
-Aether identifies model architecture by inspecting the computation graph structure, not the model name — making it robust to custom models, fine-tuned variants, and future architectures:
+### 7.2 Architecture Detection (v3.0 Expanded)
 
 ```python
 ARCHITECTURE_PATTERNS = {
-    "llama_family":    {"attn": "GQA",        "ffn": "SwiGLU",  "norm": "RMSNorm"},
-    "qwen_family":     {"attn": "GQA+QKNorm", "ffn": "SwiGLU",  "rope": "YaRN"},
-    "gemma_family":    {"attn": "MQA",         "ffn": "GeGLU",   "norm": "RMSNorm"},
-    "deepseek_family": {"attn": "MLA",         "ffn": "MoE",     "rope": "NTK-aware"},
-    "moe_family":      {"ffn": "MoE",          "router": "TopK"},
-    "vision_family":   {"encoder": "ViT",      "cross_attn": True},
+    # Standard transformer families
+    "llama_family":    {"attn": "GQA",         "ffn": "SwiGLU",   "norm": "RMSNorm"},
+    "qwen_family":     {"attn": "GQA+QKNorm",  "ffn": "SwiGLU",   "rope": "YaRN"},
+    "gemma_family":    {"attn": "MQA",          "ffn": "GeGLU",    "norm": "RMSNorm"},
+    "phi_family":      {"attn": "MHA",          "ffn": "SwiGLU",   "norm": "LayerNorm"},
+    "mistral_family":  {"attn": "GQA+SW-Attn",  "ffn": "SwiGLU",   "window": True},
+
+    # MLA families (NEW v3.0)
+    "deepseek_family": {"attn": "MLA",          "ffn": "MoE",      "rope": "NTK-aware",
+                        "shared_experts": True, "mla_rank": 512},
+    "kimi_family":     {"attn": "MLA",          "ffn": "MoE",      "rope": "YaRN"},
+    "glm_family":      {"attn": "MLA",          "ffn": "SwiGLU"},
+
+    # MoE families
+    "moe_generic":     {"ffn": "MoE",           "router": "TopK"},
+    "mixtral_family":  {"attn": "GQA",          "ffn": "MoE",      "num_experts": 8},
+
+    # Vision-Language (NEW v3.0)
+    "qwen_vl_family":  {"encoder": "ViT-Dynamic","cross_attn": "early_fusion",
+                        "visual_tokens": "dynamic", "image_rope": True},
+    "llava_family":    {"encoder": "CLIP-ViT",  "connector": "MLP"},
+    "internvl_family": {"encoder": "InternViT", "cross_attn": "late_fusion"},
+
+    # Reasoning models (NEW v3.0)
+    "reasoning_family": {"cot_mode": True,      "budget_tokens": True,
+                         "early_exit": True,     "reflection": True},
+
+    # SSM / non-transformer (NEW v3.0)
+    "mamba_family":    {"type": "SSM",           "selective_scan": True},
+    "rwkv_family":     {"type": "linear_attn",   "token_shift": True},
 }
 ```
 
-### 7.3 Graph Tracing
+### 7.3 MLA Structure Detection (NEW v3.0)
 
-After weight loading, Aether executes a **symbolic trace** through the model's forward pass using a representative calibration input. This trace produces a complete AEG-IR capturing:
-- Every tensor operation and its data types
-- Control flow (e.g., MoE routing branches)
-- Data dependencies (for automatic parallelism planning)
-- KV cache access patterns (for cache graph nodes)
-- Per-layer sensitivity to quantization (calibration set evaluation)
+For DeepSeek, Kimi K2, GLM-5, and any model using Multi-Head Latent Attention:
 
-The trace is cached by model SHA-256. If the model hash matches a previous trace, the AEG-IR is loaded from cache directly — no recompilation.
+```python
+class MLADetector:
+    """Detects MLA architecture and extracts compression parameters."""
 
-### 7.4 CLI
+    def detect(self, graph: AEGGraph) -> MLAConfig | None:
+        """Return MLA config if model uses Multi-Head Latent Attention."""
+        # Look for low-rank projection pattern: Q/K/V projected through small bottleneck
+        for layer in graph.layers:
+            if self._has_low_rank_kv_projection(layer):
+                return MLAConfig(
+                    kv_lora_rank=self._detect_lora_rank(layer),      # e.g., 512
+                    kv_head_dim=self._detect_head_dim(layer),         # e.g., 128
+                    q_lora_rank=self._detect_q_rank(layer),           # e.g., 1536
+                    rope_decoupled=self._detect_decoupled_rope(layer), # True for DeepSeek
+                    weight_absorption_possible=True,
+                )
+        return None
+```
 
-```bash
-aether compile qwen3-72b                         # Compile from HuggingFace Hub
-aether compile ./my-model/ --format safetensors  # Compile local model
-aether compile llama3-70b --target cuda_sm90     # Target-specific compilation
-aether compile qwen3-72b --upload                # Compile + upload AEG to Hub
-aether graph qwen3-72b                           # Inspect AEG-IR after compilation
+### 7.4 Shared Expert Detection (NEW v3.0)
+
+For DeepSeek-style MoE with always-active shared experts:
+
+```python
+def detect_shared_experts(graph: AEGGraph) -> SharedExpertConfig | None:
+    """Detect DeepSeek-style shared experts that activate for every token."""
+    for layer in graph.moe_layers:
+        if hasattr(layer, "shared_expert_count") and layer.shared_expert_count > 0:
+            return SharedExpertConfig(
+                count=layer.shared_expert_count,         # typically 1-2
+                always_active=True,                       # never offloaded to CPU
+                memory_budget_fraction=0.05,              # 5% of GPU HBM reserved
+            )
+    return None
 ```
 
 ---
 
-## 8. Stage 2 — The Aether Optimizer (Six Graph-Level Passes)
+## 8. Stage 2 — Seven Optimizer Passes
 
-This is the heart of Aether's technical differentiation. Six compiler passes transform the raw AEG-IR into an optimized graph that no human would hand-write and no wrapper-based tool can replicate.
+### Pass 1: Operator Fusion (Updated v3.0)
 
-### 8.1 Pass 1: Operator Fusion
-
-Aether identifies fuseable operation sequences and merges them into hardware-specific megakernels:
+Identifies fuseable sequences and merges into hardware megakernels:
 
 ```
-Before Fusion (6 separate GPU kernel launches — 6x DRAM round-trips):
+Before Fusion (6 kernel launches — 6x DRAM round-trips):
   rmsnorm → q_proj → k_proj → v_proj → rope_q → rope_k
 
 After Fusion (1 megakernel — 1x DRAM round-trip):
   fused_qkv_rope_norm(x, wq, wk, wv, pos)
-  - RMSNorm + QKV projection + RoPE in a single GPU pass
-  - 3.2x fewer memory accesses (RTX 4090 measurement)
-  - ~40% TTFT reduction on prefill-heavy workloads
+
+[NEW v3.0] MLA-aware fusion:
+  mla_compress_kv(x, w_kv_a, w_kv_b) → fused_latent_kv_rope
+  Stores only latent KV vector — 10x smaller KV cache node
 ```
 
-**Research basis:** ClusterFusion (NeurIPS 2025) — ClusterReduce/ClusterGather primitives; Modular MAX fusion benchmarks; FlashAttention-3 kernel design. Published: 1.6–2.0x speedup from advanced operator fusion.
+**Updated research basis:**
+- ClusterFusion (NeurIPS 2025): ClusterReduce/ClusterGather — 1.6–2.0x speedup
+- FlashAttention-4 (Blackwell 2026): asymmetric pipeline design, 1613 TFLOPs/s on B200
+- Agentic MLIR (2026): LLM-planned transform IR for automated pass ordering
 
-### 8.2 Pass 2: Sensitivity Analysis
+### Pass 2: Sensitivity Analysis (Updated v3.0)
 
-This pass computes a **precision sensitivity score** for every layer using automated differentiation:
+Computes per-layer sensitivity using calibration set differentiation:
 
 ```python
+# v3.0: Extended sensitivity scoring
 sensitivity_map = {}
 for layer in graph.layers:
     baseline_ppl = evaluate_perplexity(model, calibration_set, full_precision)
-    with quantize_layer(layer, target_precision="INT4"):
-        quantized_ppl = evaluate_perplexity(model, calibration_set)
-    # Higher score = more sensitive = protect with higher precision
-    sensitivity_map[layer] = (quantized_ppl - baseline_ppl) / bits_saved(layer)
+    for precision in [INT4, FP8, FP4, Q4_K_M, IQ3_XS]:
+        with quantize_layer(layer, precision):
+            quant_ppl = evaluate_perplexity(model, calibration_set)
+        sensitivity_map[layer][precision] = (quant_ppl - baseline_ppl) / bits_saved(layer, precision)
+
+# [NEW v3.0] Task-specific calibration sets
+CALIBRATION_SETS = {
+    "reasoning": "aime-2024 + gsm8k + math-500",    # for o1/R1-style models
+    "coding":    "humaneval + mbpp + swebench-lite",  # for Qwen-Coder, CodeLlama
+    "general":   "wikitext-2 + hellaswag + mmlu",    # default
+    "multilingual": "flores-200 + xcopa",             # for multilingual models
+}
 ```
 
-This is **mathematically grounded quantization**, not a heuristic rule table.
+**New research:** AutoMixQ (2025), AMQ Framework (2025), GPTQ + Marlin kernels for INT4, NVFP4/MXFP4 for Blackwell.
 
-**Research basis:** AutoMixQ (2025), AMQ: Automated Mixed-Precision Quantization (2025), GPTQ sensitivity analysis, AWQ activation-aware quantization.
+### Pass 3: Precision Assignment (Updated — FP4 Support)
 
-### 8.3 Pass 3: Precision Assignment
+Per-layer precision now includes FP4 for Blackwell targets:
 
-Using the sensitivity map, every layer receives its optimal precision under the user's quality budget:
+| Sensitivity | Typical Layers | Default | Blackwell B200 |
+|---|---|---|---|
+| > 0.9 (critical) | Embedding, LM Head | BF16 | BF16 |
+| 0.7–0.9 (high) | Attn Q/K, first layers | FP8 | FP8 |
+| 0.4–0.7 (medium) | Attn V/O, middle | Q4_K_M | FP4 (NVFP4) |
+| < 0.4 (low) | FFN deep layers | IQ3_XS | FP4 (NVFP4) |
+| MLA latent vectors | KV compression | BF16 | BF16 (loss-sensitive) |
 
-| Sensitivity Score | Typical Layers | Assigned Precision |
-|---|---|---|
-| > 0.9 (critical) | Embedding table, LM Head | BF16 (always) |
-| 0.7–0.9 (high) | Attention Q/K projections, first layers | FP8 or Q6_K |
-| 0.4–0.7 (medium) | Attention V/O projections, middle layers | Q4_K_M |
-| < 0.4 (low) | FFN Gate/Up/Down in deep layers | Q3_K or IQ3_XS |
+**FP4 target:** 4x throughput vs H100 on B200; 9 PFLOPS peak dense FP4 compute; 95–99% accuracy retention with dual-level scaling.
 
-**Measured quality:** Sensitivity-guided mixed precision achieves ≤1.8% perplexity increase at average Q4 bit-width vs. 3.5–5% for uniform quantization (validated on wikitext-2 / hellaswag).
-
-### 8.4 Pass 4: KV Cache Structuring
-
-The AEG-IR is annotated with explicit KV cache graph nodes containing:
-- Physical block size matched to hardware page size (zero fragmentation)
-- Radix tree prefix hints for shared system prompt caching
-- Tier offload thresholds: GPU HBM → CPU DRAM → NVMe
-- Cross-session sharing policy (multiple users share one set of system prompt KV blocks)
-
-**Research basis:** PagedAttention (SOSP 2023), SGLang RadixAttention, Mooncake KV-centric disaggregation (13–40% cost reduction), EvolKV evolutionary allocation, FlexGen NVMe offload.
-
-### 8.5 Pass 5: MoE Expert Routing Optimization
-
-For MoE models (DeepSeek-R1-671B, Mixtral-8x22B, Qwen-MoE), Aether applies a specialized compilation pass:
+### Pass 4: KV Cache Structuring (Updated — MLA + Cross-Session)
 
 ```
-Raw MoE Graph:                         Aether-Compiled MoE Graph:
-  token → router                         token → threshold-based router (DynaMoE)
-  top-K dispatch to expert 0..N          activation-aware expert grouping:
-  scatter/gather overhead                  hot experts (>5% activation) → GPU HBM
-                                           warm experts (0.1-5%)       → CPU DRAM + prefetch
-                                           cold experts (<0.1%)         → NVMe lazy load
-                                         intra-expert sparsity kernels (skip dead channels)
-                                         CommitMoE-style prefetch scheduling
+Standard KV Cache (GQA):
+  Per layer: store K[seq, kv_heads, head_dim] + V[seq, kv_heads, head_dim]
+  Memory: ~2.0 GB per request at 128K context (Qwen3-72B, GQA-8)
+
+[NEW v3.0] MLA Compressed KV Cache (DeepSeek-family):
+  Per layer: store compressed_kv[seq, lora_rank] only (rank=512)
+  Memory: ~0.2 GB per request at 128K context
+  Reduction: 90%+ KV cache savings (57x in some configurations)
+  Reconstruction: weight absorption compiled into kernel — zero runtime overhead
+
+[NEW v3.0] Cross-Session KV Sharing:
+  System prompts shared across all sessions → one KV block per prompt hash
+  RAG documents shared across concurrent users → deduplicated KV blocks
+  Expected hit rate: 40–70% in RAG/agentic workloads
+  Tier: L4 Aether Hub CDN for globally common system prompts
 ```
 
-**Measured results:**
-- 2.5x expert layer speedup from intra-expert sparsity (vLLM MoE research 2025)
-- 83% inference cost reduction vs. naive dense-equivalent serving
-- Adaptive compute: simple tokens activate fewer experts; complex tokens activate more
+**Research:** Mooncake Conductor KV-cache-aware routing, PrefillOnly (memory-efficient prefill), LMCache for MoE KV management.
 
-**Research basis:** MoE-Infinity, CommitMoE, FinDEP, DynaMoE, DA-MoE, intra-expert sparsity (vLLM 2025).
+### Pass 5: MoE Expert Routing (Updated — Shared Experts + Fine-Grained)
 
-### 8.6 Pass 6: Automatic Parallelism Discovery
+```
+[NEW v3.0] DeepSeek-V3 Fine-Grained Routing (256 experts, top-8):
+  shared experts:
+    - count: 1 (always activated for every token)
+    - always pinned to GPU HBM — never offloaded
+    - compiled as static kernel, not dispatched through router
 
-For multi-GPU deployment, Aether uses an **agentic search** over the parallelism strategy space:
+  routed experts classification (256 total, top-8 activated):
+    hot (>2% activation):    ~25 experts → GPU HBM resident
+    warm (0.02-2%):         ~100 experts → CPU DRAM + CommitMoE prefetch
+    cold (<0.02%):          ~131 experts → NVMe lazy-load
+
+[NEW v3.0] Auxiliary-Loss-Free Router Compilation:
+  DeepSeek's bias-term gating (not auxiliary loss)
+  Compiles to: router(x) = softmax(x @ W_gate + bias_per_expert)
+  No auxiliary loss term in inference graph → cleaner kernel emission
+
+Intra-Expert Sparsity (existing, now extended):
+  Identify zero-channel masks per expert on calibration data
+  Emit sparse GEMM kernels skipping dead channels → 2.5x expert speedup
+```
+
+**Research:** DeepSeek-V3 technical report (fine-grained 256-expert MoE), FineMoE (semantic prefetch), MoE-Infinity, CommitMoE, ISCA 2026 prefill-aware expert placement.
+
+### Pass 6: Parallelism Discovery (Updated — Disaggregated Plans)
 
 ```python
 class ParallelismSolver:
-    def search(self, graph: AEGGraph, hardware: HardwareProfile) -> ShardingPlan:
-        search_space = ParallelismSearchSpace(
-            tensor_parallel_degrees=[1, 2, 4, 8],
-            pipeline_stages=[1, 2, 4],
-            expert_parallel_degrees=[1, 2, 4],   # MoE only
-            context_parallel_degrees=[1, 2, 4],  # long context
-        )
-        # Stage-aware: prefill and decode use different optimal strategies
-        # Seesaw MLSys 2025: dynamic re-sharding yields 25-40% throughput gain
-        prefill_plan = self._search(graph, hardware, phase="prefill")
-        decode_plan  = self._search(graph, hardware, phase="decode")
+    def search(self, graph: AEGGraph, hw: HardwareProfile) -> ShardingPlan:
+        # [NEW v3.0] separate plans for prefill pool vs decode pool
+        prefill_plan = self._search(graph, hw, phase="prefill",
+            priorities=["TP_high", "batch_max"])     # compute-bound: max TP
+        decode_plan  = self._search(graph, hw, phase="decode",
+            priorities=["TP_low", "batch_small"])    # memory-bound: min TP, max batch
+
+        # [NEW v3.0] MLA-aware: latent KV is smaller → fit more decode batches
+        if graph.has_mla:
+            decode_plan.batch_size_multiplier = 10   # 10x more concurrent requests
+
+        # [NEW v3.0] Vision encoder uses DP, not TP (avoids all-reduce overhead)
+        if graph.has_vision_encoder:
+            return ShardingPlan(
+                vision_encoder_strategy="data_parallel",
+                language_backbone_strategy=decode_plan,
+            )
         return ShardingPlan(prefill=prefill_plan, decode=decode_plan)
 ```
 
-Pre-computed sharding plans for 1/2/4/8 GPU configurations are stored in the `.aeg` artifact. At runtime, the correct plan loads automatically — **zero user configuration**.
+**Research:** Seesaw MLSys 2025 (dynamic re-sharding 25–40% gain), vLLM/SGLang hybrid ViT-DP + LLM-TP for VLM inference (2026), DistServe 3–4x goodput.
 
-**Research basis:** Alpa (2022) cost-model auto-parallelism, Seesaw dynamic re-sharding (MLSys 2025), Megatron-LM TP/PP/DP, Ring Attention / Ulysses context parallelism.
+### Pass 7: Reasoning Graph Compiler (NEW v3.0)
+
+This is Aether's most differentiated new pass, designed for o1/R1/Claude-style reasoning models:
+
+```
+Traditional Inference Graph:
+  input → [single forward pass] → output token
+
+[NEW] Aether Reasoning Graph:
+  input → [initialize reasoning budget B]
+    → reasoning_step_0 → check_confidence → [continue / early_exit]
+    → reasoning_step_1 → check_confidence → [continue / early_exit]
+    → ... up to N steps
+    → synthesis_step → output
+
+Compiled representation (stored in .aeg/graph/reasoning_graph.aeg-ir):
+  func @reasoning_loop(%ctx, %budget: i32) -> tensor<*xbf16> {
+    %state = %ctx
+    %remaining = %budget
+    while(%remaining > 0) {
+      %thought = aeg.reasoning_forward(%state, @transformer_layer)
+        {early_exit_threshold = 0.95}
+      %confidence = aeg.reasoning_confidence(%thought)
+      %state = aeg.update_context(%state, %thought)
+      %remaining = aeg.budget_decrement(%remaining, %thought.length)
+      if aeg.should_exit(%confidence, %remaining) { break }
+    }
+    return aeg.synthesis(%state, @transformer_layer)
+  }
+```
+
+**Speculative CoT (integrated with Stage 4 speculation engine):**
+```
+Draft Model generates reasoning chain (cheap)
+Target Model verifies/corrects reasoning chain (expensive, but once)
+Result: 21–66% latency reduction on complex reasoning (MATH-500, AIME-2024)
+```
+
+**Research:** Tree-of-Thoughts (ToT), Graph-of-Thoughts (GoT), Speculative CoT (SCoT) 21–66% reduction, Diagram of Thought, GAN-CoT iterative refinement, RLVR (Reinforcement Learning with Verifiable Rewards).
 
 ---
 
 ## 9. Stage 3 — Hardware Targeting and Kernel Emission
 
-### 9.1 Target Profiles
+### 9.1 Updated Target Profiles (v3.0)
 
-| Target ID | Hardware | Key Capability |
+| Target ID | Hardware | New in v3.0 | Key Capability |
+|---|---|---|---|
+| `cuda_sm70` | NVIDIA V100 | — | Tensor Cores, FP16 |
+| `cuda_sm80` | NVIDIA A100 | — | BF16 TMA |
+| `cuda_sm89` | NVIDIA RTX 4090 | — | FP8 Ada Tensor Cores |
+| `cuda_sm90` | NVIDIA H100/H200 | FA-3 production | WGMMA + TMA + FP8 |
+| `cuda_sm100` | NVIDIA B200 | **FP4 Blackwell NEW** | FP4 + 8TB/s + FA-4 |
+| `cuda_sm120` | NVIDIA Rubin (2027) | **Future-proofed NEW** | Next-gen (placeholder) |
+| `metal_m1` | Apple M1/M2 | — | Metal Shading Language |
+| `metal_m3` | Apple M3/M4/M5 | Metal 4 TensorOps | Neural Engine, BF16 |
+| `rocm_rdna3` | AMD RX 7000 | — | HIP + WMMA |
+| `rocm_cdna3` | AMD MI300X | — | 192GB HBM3, 5.3TB/s |
+| `openvino_npu` | Intel Arc NPU | — | OpenVINO NPU runtime |
+| `qualcomm_qnn` | Qualcomm AI 100 | **NEW v3.0** | QNN SDK, Hexagon DSP |
+| `cpu_avx512` | Modern x86_64 | AMX tensor tiles | AVX-512 + AMX |
+| `cpu_neon` | ARM (Apple, Snapdragon) | — | NEON SIMD |
+
+### 9.2 FlashAttention-3 and FlashAttention-4 (NEW v3.0)
+
+| Target | Attention Implementation | Details |
 |---|---|---|
-| `cuda_sm70` | NVIDIA V100 (Volta) | Tensor Cores, FP16 |
-| `cuda_sm80` | NVIDIA A100 (Ampere) | BF16 Tensor Cores, TMA |
-| `cuda_sm89` | NVIDIA RTX 4090 (Ada) | FP8, DLSS Tensor Cores |
-| `cuda_sm90` | NVIDIA H100 (Hopper) | WGMMA, FlashAttention-3 |
-| `cuda_sm100` | NVIDIA B200 (Blackwell) | 5th-gen Tensor Cores, 192GB HBM3e |
-| `metal_m1` | Apple M1/M2 | Metal Shading Language |
-| `metal_m3` | Apple M3/M4/M5 | Metal 4 TensorOps, Neural Accelerator |
-| `rocm_rdna3` | AMD RX 7000 | HIP, WMMA |
-| `rocm_cdna3` | AMD MI300X | 192GB HBM3, 5.3 TB/s bandwidth |
-| `openvino_npu` | Intel Arc NPU | OpenVINO NPU runtime |
-| `cpu_avx512` | Modern x86_64 | AVX-512 + AMX tensor acceleration |
-| `cpu_neon` | ARM (Apple, Qualcomm) | NEON SIMD intrinsics |
+| `cuda_sm90` (H100/H200) | **FlashAttention-3** | WGMMA + TMA; 840 TFLOPs BF16; 1.2+ PFLOPs FP8; asynchronous producer/consumer warp split |
+| `cuda_sm100` (B200) | **FlashAttention-4 NEW** | ~1613 TFLOPs/s; redesigned pipeline for B200's asymmetric scaling; larger tile sizes |
+| `cuda_sm80` (A100) | FlashAttention-2 | TMA-based; production standard |
+| `metal_m3` | Metal 4 TensorOps | Apple Neural Engine attention |
+| Others | xFormers memory-efficient | Fallback for all other targets |
 
-### 9.2 Kernel Specialization
+**FA-3 details:** Asynchronous execution + warp specialization. Producer warps use TMA to load K/V tiles asynchronously while consumer warps perform GEMM. 33% faster than FP16 with FP8 incoherent processing.
 
-For each target, Aether emits the highest-performance implementation of each critical operation:
+### 9.3 FP4 Blackwell Kernel Emission (NEW v3.0)
 
-**FlashAttention variants (selected by target):**
-- `cuda_sm90+`: FlashAttention-3 (WGMMA + TMA, 1.5–2x over FA-2)
-- `cuda_sm80`: FlashAttention-2
-- `metal_m3+`: Metal 4 neural engine attention
-- All others: xFormers memory-efficient attention
+```python
+class BlackwellKernelEmitter:
+    """Emits FP4 kernels for NVIDIA Blackwell (sm_100) architecture."""
 
-**Quantized GEMM (selected by target and precision):**
-- FP8 GEMM on sm89+ (H100/RTX 4090): NVIDIA cuBLAS FP8 + custom epilogue fusion
-- INT4 GEMM: ExLlamaV2 GPTQ kernels (fastest available INT4 GEMM)
-- BF16 GEMM: cuBLAS / hipBLAS / Accelerate (platform-optimal)
+    NVFP4_FORMAT = "E2M1"                # 4-bit float: 2 exponent, 1 mantissa
+    MXFP4_FORMAT = "microscaling_fp4"    # Microscaling FP4 (MXFP4 standard)
 
-### 9.3 The Kernel Cache — Aether Hub
+    def emit_fp4_gemm(self, layer: AEGNode, precision_map: dict) -> KernelDescriptor:
+        """Emit FP4 GEMM kernel for layers with sensitivity < 0.4."""
+        if precision_map.get(layer.name) == "FP4":
+            return KernelDescriptor(
+                kernel_type="fp4_gemm_blackwell",
+                format=self.NVFP4_FORMAT,
+                scaling="per_tensor_fp32",    # dual-level scaling for accuracy
+                peak_compute="9_pflops",
+                memory_footprint_ratio=0.25,  # vs BF16
+                accuracy_retention="95-99%",
+            )
 
-Every compiled kernel is stored with a content-addressed key:
-
+    def emit_fp4_attention(self, attn_node: AEGNode) -> KernelDescriptor:
+        """Emit FP4 attention + FlashAttention-4 for Blackwell."""
+        return KernelDescriptor(
+            kernel_type="flash_attention_4_fp4",
+            tflops_peak=1613,
+            pipeline="asymmetric_blackwell",
+            kv_cache_format="fp4_kv",         # KV cache in FP4 for max context
+        )
 ```
-cache_key = SHA-256(model_graph_hash + target_profile + optimizer_version)
-kernel_url = "hub.aether.dev/kernels/{cache_key}.tar.gz"
-```
 
-Kernels uploaded to **Aether Hub** (public, free, opt-in) are downloaded on first use by any Aether user worldwide. After community adoption, nearly every popular model × hardware combination has pre-compiled kernels available — eliminating compilation time entirely for subsequent users.
+**Impact:** On B200, FP4 across medium/low sensitivity layers yields 4x inference throughput vs H100 baseline. Models previously requiring 8× H100 fit on 2× B200.
+
+### 9.4 MLA Kernel Emission (NEW v3.0)
+
+```python
+class MLAKernelEmitter:
+    """Emits MLA kernels that absorb projection weights at compile time."""
+
+    def emit_mla_attention(self, mla_config: MLAConfig, target: str) -> KernelDescriptor:
+        """Emit MLA attention with weight absorption compiled in."""
+        # Weight absorption: merge W_kv_b into W_o at compile time
+        # Result: no separate decompression step during inference
+        absorbed_weights = self._absorb_weights(
+            w_kv_b=mla_config.kv_up_proj,
+            w_o=mla_config.output_proj,
+        )
+        return KernelDescriptor(
+            kernel_type="mla_absorbed_attention",
+            kv_lora_rank=mla_config.kv_lora_rank,        # e.g., 512
+            stored_kv_size_ratio=0.05,                    # 5% vs standard GQA
+            rope_type="decoupled",                        # separate positional RoPE
+            absorbed_weights=absorbed_weights,            # baked into kernel
+            kv_cache_compression_ratio=0.1,              # 90%+ reduction
+        )
+```
 
 ---
 
-## 10. Stage 4 — The Self-Optimizing Runtime
+## 10. Stage 4 — Self-Optimizing Runtime
 
-### 10.1 Startup Flow
+### 10.1 Startup Flow (v3.0)
 
 ```
-When you run: aether run qwen3-72b
+aether run qwen3-72b
 
-1. Detect hardware fingerprint (GPU name, VRAM, compute capability, driver version)
-2. Load qwen3-72b.aeg manifest
+1. Detect hardware fingerprint (GPU model, VRAM, SM version, driver, NVLink topology)
+2. Load manifest from qwen3-72b.aeg
 3. Select pre-compiled kernel set for detected hardware
-   a. Hub cache hit: download pre-compiled kernels (seconds)
-   b. No cache hit: compile locally + upload to Hub in background
-4. Load sharding plan matching detected GPU count from .aeg/parallelism/
-5. Allocate KV cache across memory tiers (GPU HBM / CPU DRAM / NVMe)
-6. Start disaggregated prefill/decode scheduler
-7. Start tree-speculative decoding engine (if draft model available)
-8. Ready to serve
+   - Hub cache hit: download in seconds, zero recompilation
+   - No cache hit: compile locally + upload to Hub in background
+4. Load sharding plan matching GPU count from .aeg/parallelism/
+5. Initialize KV cache across tiers (GPU HBM / CPU DRAM / NVMe / Hub CDN)
+6. [NEW v3.0] Initialize MLA compressed KV store (if MLA architecture)
+7. [NEW v3.0] Initialize reasoning budget manager (if reasoning model)
+8. Start disaggregated prefill/decode scheduler
+9. Start EAGLE-3 speculative decoding engine
+10. [NEW v3.0] Initialize safety guardrail layer
+11. [NEW v3.0] Start OpenTelemetry trace exporter
+12. Ready to serve
 ```
 
-### 10.2 Disaggregated Prefill/Decode Scheduler
+### 10.2 EAGLE-3 Speculative Decoding Engine (Updated — Replacing OPT-Tree)
 
-Following DistServe, Mooncake, and NVIDIA Dynamo (production defaults in 2026):
-
-```
-Incoming Request
-       |
-       v
-PREFILL SCHEDULER         (compute-bound — processes all input tokens in parallel)
-  - Chunk large prefills (<=2048 tokens/chunk) to maintain TTFT SLO
-  - Batch compatible prefills together
-  - Execute QKV + attention for all input tokens simultaneously
-  - Transfer KV state to Decode Scheduler
-       |
-       | KV state transfer (shared memory / RDMA in multi-node mode)
-       v
-DECODE SCHEDULER          (memory-bandwidth-bound — generates tokens one at a time)
-  - Continuous batching: iteration-level request admission (Orca/vLLM style)
-  - Tree-speculative decoding: verify draft tree in single forward pass
-  - Stream tokens to clients
-```
-
-**Published results:** DistServe 3–4x goodput improvement; Mooncake 13–40% compute cost reduction at Moonshot AI's production scale.
-
-### 10.3 Tree-Speculative Decoding Engine
-
-Aether implements an **adaptive tree speculative decoding** engine:
+v3.0 upgrades the speculative engine from OPT-Tree to **EAGLE-3** (multi-layer feature fusion), which is now the production standard in vLLM, SGLang, and TensorRT-LLM:
 
 ```
-Draft Model (qwen3-1.5b, auto-selected)
-  generates adaptive draft tree (OPT-Tree algorithm):
-       +--- "the"  --- "cat"
-root --+--- "a"    --- "dog" --- "ran"
-       +--- "this" --- "thing"
+EAGLE-3 Architecture:
+  Standard speculative decoding: uses final hidden state only for draft head
+  EAGLE-3: multi-layer feature fusion → aggregates ALL transformer layers
 
-Target Model (qwen3-72b)
-  verifies ENTIRE TREE in ONE forward pass (tree-masked causal attention — DeFT)
-  accepts longest valid path → up to 6x throughput vs. single-token decode
+  Layer 0 hidden: [h_0]
+  Layer 16 hidden: [h_16]     All layers fused via
+  Layer 32 hidden: [h_32] →   lightweight aggregator → draft head
+  Layer 48 hidden: [h_48]
+  Layer 64 hidden: [h_64]
+
+  Result: draft model has global context → significantly higher acceptance rate
+  EAGLE-3.1 extension: addresses "attention drift" in long sequences
+  Group Tree Optimization (GTO): aligns draft training with decoding-time tree policy
 ```
 
-**Measured results from component research:**
-- JetSpec (2026): up to 9.64x speedup on code completion workloads
-- DeFT (ICLR 2025 Spotlight): 3.59x attention latency reduction via KV-Guided Grouping
-- OPT-Tree: maximizes expected acceptance length per target model call
-- **Aether target: 3–6x throughput improvement** on latency-sensitive workloads
+**Implementation in AEG Runtime:**
+```python
+class EAGLE3Engine:
+    """EAGLE-3 speculative decoding with multi-layer feature fusion."""
 
-### 10.4 Global KV Cache Manager
+    def __init__(self, target_model_id: str, draft_heads: int = 4) -> None:
+        self.target = target_model_id
+        self.draft_model = self._load_eagle3_head(draft_heads)
+        # EAGLE-3.1: attention drift correction
+        self.drift_correction = True
 
-| Cache Tier | Storage | What is Stored | Eviction |
-|---|---|---|---|
-| **L1 — GPU HBM** | On-device VRAM | Active request KV blocks | LRU + request priority |
-| **L2 — CPU DRAM** | System RAM | Prefix cache, recently evicted blocks | Cost-aware LRU |
-| **L3 — NVMe SSD** | Persistent storage | Long system prompt KV, RAG KV | TTL + access frequency |
-| **L4 — Aether Hub** | CDN | Common system prompt KV (globally shared) | CDN invalidation |
+    def build_draft_tree(self, hidden_states: list[Tensor], max_depth: int = 6,
+                         max_width: int = 5) -> DraftTreeNode:
+        """Build OPT-Tree using ALL hidden states (EAGLE-3 multi-layer fusion)."""
+        # Aggregate hidden states from all layers
+        fused_features = self._fuse_hidden_states(hidden_states)
+        return self._opt_tree_construct(fused_features, max_depth, max_width)
 
-**Prefix cache:** Identical prompt prefixes (system prompts, RAG documents, in-context examples) are stored as KV blocks indexed by RadixTree. Cache hit rates of 40–70% in agentic/RAG workloads — those tokens are never recomputed.
-
-### 10.5 Dynamic Precision Adjustment
-
-Under memory pressure, the runtime transparently downgrades precision:
-
-```
-Memory pressure detected (VRAM > 90%):
-  -> Identify lowest-sensitivity layers (from AEG metadata: sensitivity_map)
-  -> Swap BF16 weights to Q4 representation in-place (no service interruption)
-  -> Log precision downgrade event to /v1/metrics
-
-Memory pressure resolved (VRAM < 70%):
-  -> Restore BF16 weights for high-sensitivity layers
-  -> Resume full quality serving
+    def verify_tree_deft(self, draft_tree: DraftTreeNode,
+                         target_logits: Tensor) -> list[int]:
+        """Verify using DeFT KV-Guided Grouping (3.59x attn latency reduction)."""
+        flat_tokens, group_indices = self._flatten_tree_deft(draft_tree)
+        verified = self._tree_masked_attention(flat_tokens, group_indices, target_logits)
+        return self._accept_longest_path(verified, draft_tree)
 ```
 
-Automatic. Transparent. Reversible. No existing tool does this.
+**Measured performance (2026 production benchmarks):**
+- Standard chat (Qwen3-72B + Qwen3-1.5B draft): 3–4x throughput improvement
+- Code completion (JetSpec causal parallel): up to 9.64x speedup
+- Reasoning (Speculative CoT): 21–66% latency reduction
+- High-batch feasibility: gamma-tolerance analysis shows >=75% acceptance rate at batch ≤ 32
+
+### 10.3 KV Cache Manager (v3.0 — MLA + Cross-Session)
+
+| Tier | Storage | What | Eviction | New in v3.0 |
+|---|---|---|---|---|
+| **L1 — GPU HBM** | On-device VRAM | Active KV + MLA latents | LRU + priority | MLA latent storage |
+| **L2 — CPU DRAM** | System RAM | Prefix cache, warm KV | Cost-aware LRU | Cross-session sharing |
+| **L3 — NVMe SSD** | Persistent | Long prompts, RAG KV | TTL + frequency | Persistent across restarts |
+| **L4 — Aether Hub** | CDN global | Common system prompt KV | CDN TTL | Cross-user sharing |
+
+**KV Cache Quantization (NEW v3.0):**
+```python
+KV_CACHE_PRECISION_STRATEGY = {
+    "recent_tokens":    "FP8",    # last 2048 tokens — high precision
+    "middle_tokens":    "INT4",   # tokens 2048–32768 — moderate compression
+    "distant_tokens":   "INT2",   # tokens >32768 — aggressive compression
+    # Result: 70% KV cache memory reduction at <1% quality loss on long context
+}
+```
+
+### 10.4 Disaggregated Prefill/Decode Scheduler (v3.0)
+
+```
+PREFILL SCHEDULER:
+  Chunked prefill: <=2048 tokens/chunk (Sarathi-Serve design)
+  Interleaved with decode iterations: no head-of-line blocking
+  [NEW] Prefill-aware expert placement: hot MoE experts pre-loaded before prefill chunk
+  [NEW] Mooncake Conductor: KV-cache-aware routing to minimize data movement
+
+DECODE SCHEDULER:
+  Continuous batching: iteration-level admission (Orca design)
+  EAGLE-3 tree verification: entire draft tree in one forward pass
+  [NEW] Reasoning budget tracking: decrement budget per thinking token
+  [NEW] Dynamic model routing: simple queries → fast model; complex → full model
+
+CROSS-CUTTING:
+  PrefillOnly mode: prefill-heavy workloads retain only final-layer KV (NEW v3.0)
+  MuxWise: spatial-temporal multiplexing to meet strict SLOs (NEW v3.0)
+```
+
+### 10.5 Dynamic Precision Adjustment (v3.0)
+
+```python
+class DynamicPrecisionManager:
+    """Auto-adjusts precision under memory pressure using sensitivity map."""
+
+    # v3.0: now includes FP4 as a new compression target
+    DOWNGRADE_SEQUENCE = ["BF16 → FP8 → FP4 → Q4_K_M → IQ3_XS"]
+
+    def under_pressure(self, vram_utilization: float) -> None:
+        if vram_utilization > 0.90:
+            # Downgrade lowest-sensitivity layers first (from AEG precision_map)
+            for layer in self.sorted_by_sensitivity_asc():
+                new_precision = self.next_lower_precision(layer.current_precision)
+                self.apply_precision_change(layer, new_precision, log=True)
+                if self.vram_utilization() < 0.80:
+                    break
+
+    def [NEW_v30]_fp4_compress_kv(self) -> None:
+        """[NEW] Compress KV cache to FP4 under extreme memory pressure."""
+        for tier in [L1_GPU, L2_CPU]:
+            tier.compress_kv(precision="INT2", except_recent_tokens=2048)
+```
 
 ---
 
 ## 11. Stage 5 — Developer Interface
 
-### 11.1 The Core Promise
+### 11.1 Complete Python SDK (v3.0)
 
 ```python
-from aether import Runtime
+from aether import Runtime, Compiler, CompilerConfig, RuntimeConfig
 
-rt = Runtime()
+# ── Compiler ─────────────────────────────────────────────────────────────────
+compiler = Compiler(config=CompilerConfig(
+    quality_budget=0.02,
+    calibration_dataset="general",      # or "reasoning", "coding", "multilingual"
+    targets=["auto"],
+    optimization_level=2,
+    enable_moe_compiler=True,
+    enable_mla_compiler=True,           # [NEW v3.0] MLA native compilation
+    enable_reasoning_graph=True,        # [NEW v3.0] CoT graph compilation
+    enable_fp4=True,                    # [NEW v3.0] FP4 Blackwell targeting
+    upload_kernels=True,
+))
 
-# First run: downloads .aeg from Hub, loads pre-compiled kernels for your hardware
-# Subsequent runs: instant (everything cached locally)
-response = rt.generate("qwen3-72b", "Explain the P vs NP problem")
-print(response.text)
-print(f"TPS: {response.metrics.throughput_tps}")
-print(f"TTFT: {response.metrics.ttft_ms}ms")
-print(f"Kernel: {response.metrics.kernel_target}")        # e.g. "cuda_sm90"
-print(f"Precision: {response.metrics.active_precision}")  # e.g. "mixed_fp8_q4"
-print(f"Draft accept rate: {response.metrics.spec_accept_rate}")  # e.g. 0.82
-```
+aeg = compiler.compile("deepseek-r1-671b")
+print(aeg.graph_summary())        # fusion stats
+print(aeg.precision_map())        # per-layer precision (now includes FP4)
+print(aeg.mla_config())           # [NEW] MLA compression parameters
+print(aeg.reasoning_graph())      # [NEW] compiled CoT graph
+print(aeg.quality_report())
+aeg.save("./deepseek-r1-671b.aeg")
+aeg.upload()
 
-### 11.2 The Compilation API
+# ── Runtime ──────────────────────────────────────────────────────────────────
+rt = Runtime(config=RuntimeConfig(
+    optimize_for="latency",
+    speculative_decoding="eagle3",      # [NEW v3.0] EAGLE-3 (not OPT-Tree default)
+    reasoning_budget=16384,             # [NEW v3.0] max thinking tokens for CoT
+    enable_safety_layer=True,           # [NEW v3.0] prompt guard + output filter
+    telemetry_endpoint="otel://...",    # [NEW v3.0] OpenTelemetry endpoint
+    model_routing={                     # [NEW v3.0] cascade routing
+        "simple": "qwen3-8b",
+        "complex": "qwen3-72b",
+        "reasoning": "deepseek-r1-671b",
+    },
+))
 
-```python
-from aether import Compiler
+# Text generation
+resp = rt.generate("qwen3-72b", "Explain quantum entanglement", max_tokens=512)
+print(resp.text)
+print(f"TPS: {resp.metrics.throughput_tps}")
+print(f"TTFT: {resp.metrics.ttft_ms}ms")
+print(f"EAGLE-3 accept rate: {resp.metrics.spec_accept_rate}")   # e.g. 0.87
+print(f"KV hit rate: {resp.metrics.kv_cache_hit_rate}")          # e.g. 0.62
+print(f"Precision: {resp.metrics.active_precision}")             # e.g. "mixed_fp8_fp4"
+print(f"MLA compression: {resp.metrics.mla_kv_compression}")    # [NEW] e.g. "10x"
 
-compiler = Compiler()
-
-# Dry-run: inspect what compilation would produce
-plan = compiler.plan("qwen3-72b", hardware="auto")
-print(plan.fusion_opportunities)       # Fuseable op sequences found
-print(plan.estimated_memory_gb)        # Memory estimates per precision
-print(plan.estimated_compile_time_s)   # Expected compilation duration
-
-# Compile any model to AEG format
-aeg = compiler.compile(
-    model="qwen3-72b",                    # HuggingFace ID, local path, or GGUF
-    targets=["cuda_sm90", "metal_m3"],    # Explicit, or None for "all available"
-    quality_budget=0.02,                  # Max 2% perplexity increase
-    calibration_dataset="wikitext-2",     # For sensitivity analysis (Pass 2)
+# Reasoning with budget
+resp = rt.generate(
+    "deepseek-r1-671b",
+    "Solve AIME 2024 Problem 15...",
+    reasoning_budget=8192,              # [NEW] token budget for thinking
+    reasoning_mode=True,               # [NEW] enable reasoning graph
+    stream_thinking=False,             # [NEW] hide thinking tokens from output
 )
 
-# Inspect the compiled artifact
-print(aeg.graph_summary())    # Operator fusion summary: ops merged, memory saved
-print(aeg.precision_map())    # Per-layer precision assignments
-print(aeg.quality_report())   # Measured PPL change vs. BF16 baseline
-print(aeg.sharding_plans())   # Parallelism plans for 1/2/4/8 GPU
-
-# Save / distribute / upload
-aeg.save("./qwen3-72b.aeg")
-aeg.upload(hub="hub.aether.dev")  # Upload to Aether Hub (opt-in, free)
-```
-
-### 11.3 Python SDK — Full Reference
-
-```python
-from aether import Runtime, Compiler
-
-rt = Runtime(
-    optimize_for="latency",       # "latency" | "throughput" | "quality"
-    speculative_decoding=True,
-    prefill_chunk_size=2048,
-    dynamic_precision=True,
+# [NEW v3.0] Cascade routing
+resp = rt.generate_cascade(
+    query="What is 2+2?",              # routed to qwen3-8b (simple)
+)
+resp2 = rt.generate_cascade(
+    query="Prove the Riemann hypothesis",  # routed to deepseek-r1-671b (reasoning)
 )
 
-# --- Text Generation ---
-response = rt.generate(
+# [NEW v3.0] Agentic context manager (long multi-turn with KV reuse)
+async with rt.agentic_session("qwen3-72b", system="You are a coding assistant") as session:
+    resp = await session.generate("Write a binary search tree in Python")
+    resp2 = await session.generate("Now add a delete method")
+    # KV cache from turn 1 is reused in turn 2 — zero re-prefill cost
+
+# [NEW v3.0] Eval gate — validate before serving
+eval_results = rt.eval_gate(
     model="qwen3-72b",
-    prompt="Write a sonnet about distributed systems",
-    max_tokens=512,
-    temperature=0.7,
-    stream=False,
+    benchmarks=["hellaswag", "mmlu", "gsm8k"],
+    baseline_model="qwen3-72b-bf16",
+    max_regression=0.02,               # fail if >2% regression on any benchmark
 )
+if not eval_results.passed:
+    raise ValueError(f"Eval gate failed: {eval_results.regressions}")
 
-# --- Streaming ---
-for chunk in rt.generate("qwen3-72b", "Tell me a story", stream=True):
-    print(chunk.delta, end="", flush=True)
-
-# --- Chat ---
-response = rt.chat(
-    model="qwen3-72b",
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user",   "content": "What is a transformer model?"}
-    ]
-)
-
-# --- Embeddings ---
-vectors = rt.embed(
-    model="nomic-embed-text",
-    input=["Hello world", "Quantum entanglement explained"]
-)
-
-# --- Reranking ---
-ranked = rt.rerank(
-    model="bge-reranker-v2",
-    query="What is CUDA?",
-    documents=["CUDA is a parallel computing platform...", "Python is a language..."]
-)
-
-# --- Vision ---
-response = rt.generate(
-    model="qwen2.5-vl-72b",
-    prompt="Describe this image in detail",
-    images=["path/to/image.jpg"]
-)
-
-# --- Transcription ---
-transcript = rt.transcribe(
-    model="whisper-large-v3",
-    audio="path/to/audio.mp3",
-    language="en"
-)
-
-# --- Async API ---
-import asyncio
-async def main():
-    response = await rt.agenerate("qwen3-72b", "Hello async world")
-    async for chunk in rt.agenerate("qwen3-72b", "Story", stream=True):
-        print(chunk.delta, end="")
-
-# --- Hardware and Diagnostics ---
-hw = rt.hardware()           # Full hardware fingerprint
-results = rt.benchmark("qwen3-72b")  # Performance benchmark
-
-# --- Model Management ---
-rt.pull("qwen3-8b")          # Download + compile AEG
-rt.list()                    # List compiled models
-rt.info("qwen3-72b")         # Metadata + precision map
-rt.remove("qwen3-8b")        # Remove cached AEG
-```
-
-### 11.4 REST API
-
-```
-POST   /v1/generate          Text completion
-POST   /v1/chat              Chat completion (OpenAI-compatible)
-POST   /v1/embeddings        Embedding generation
-POST   /v1/rerank            Document reranking
-POST   /v1/transcribe        Audio transcription
-
-POST   /v1/compile           Compile a model to AEG (async job)
-GET    /v1/compile/{job_id}  Compilation job status and progress
-
-GET    /v1/models            List compiled models
-POST   /v1/models/pull       Download and compile model
-DELETE /v1/models/{name}     Remove compiled model
-GET    /v1/models/{name}     Model info and compilation metadata
-GET    /v1/models/{name}/graph    Inspect AEG-IR
-
-GET    /v1/hardware          Hardware fingerprint
-GET    /v1/kernels           Active kernel targets
-GET    /v1/metrics           Prometheus-compatible inference metrics
-GET    /v1/health            Health check
-```
-
-### 11.5 OpenAI Compatibility
-
-```python
-from openai import OpenAI
-
-# Point any OpenAI SDK to Aether — zero code changes
-client = OpenAI(
-    base_url="http://localhost:11434/v1",
-    api_key="aether"   # any value is accepted
-)
-
-response = client.chat.completions.create(
-    model="qwen3-72b",
-    messages=[{"role": "user", "content": "Hello!"}]
+# [NEW v3.0] A/B rollout
+rt.ab_rollout(
+    model_a="qwen3-72b-v1",
+    model_b="qwen3-72b-v2",
+    traffic_split=0.1,                 # 10% to v2 initially
+    auto_rollout=True,                 # increase traffic if v2 wins
+    rollback_on_regression=True,
 )
 ```
 
-Works immediately with LangChain, LlamaIndex, CrewAI, AutoGen, OpenHands, and any OpenAI SDK v1+ tool.
+### 11.2 REST API v3.0
 
-### 11.6 CLI
+```
+# Inference (v1 compatible, new fields added)
+POST   /v1/generate           Text completion + [NEW] reasoning_budget, reasoning_mode
+POST   /v1/chat               Chat (OpenAI-compatible, OpenAI Responses API-compatible)
+POST   /v1/embeddings         Embedding generation
+POST   /v1/rerank             Document reranking
+POST   /v1/transcribe         Audio transcription
+POST   /v1/generate/cascade   [NEW v3.0] Cascade model routing
 
-```bash
 # Compilation
-aether compile qwen3-72b                        # Compile to AEG
-aether compile qwen3-72b --quality-budget 0.01  # Stricter quality target
-aether compile qwen3-72b --target cuda_sm90     # Hardware-specific compilation
-aether compile qwen3-72b --upload               # Compile + share to Hub
+POST   /v1/compile            Compile model to AEG (async job)
+GET    /v1/compile/{job_id}   Job status and progress
 
 # Model management
-aether pull qwen3-8b                            # Download pre-compiled AEG from Hub
-aether pull qwen3-8b --compile-local            # Force local compilation
-aether list                                     # List all compiled models
-aether info qwen3-72b                           # Metadata + precision map
-aether rm qwen3-8b                              # Remove cached AEG
-aether graph qwen3-72b                          # Print AEG-IR (human-readable)
+GET    /v1/models             List compiled models
+POST   /v1/models/pull        Download + compile from Hub or HF
+DELETE /v1/models/{name}      Remove
+GET    /v1/models/{name}      Info + AEG metadata
+GET    /v1/models/{name}/graph     AEG-IR inspection
+GET    /v1/models/{name}/mla       [NEW] MLA compression stats
+GET    /v1/models/{name}/reasoning [NEW] Reasoning graph inspection
 
-# Serving
-aether serve                                    # Start runtime daemon
-aether serve --port 11434 --host 0.0.0.0
-aether stop
-aether status
+# Operations (NEW v3.0)
+POST   /v1/eval               Run eval gate benchmark suite
+GET    /v1/eval/{job_id}      Eval results
+POST   /v1/ab/start           Start A/B rollout
+GET    /v1/ab/{experiment_id} A/B experiment stats
+POST   /v1/ab/rollback        Rollback to model_a
 
-# Running
-aether run qwen3-8b                             # Interactive REPL
-aether run qwen3-72b --stream                   # Streaming output
-
-# Benchmarking
-aether bench qwen3-72b                          # Benchmark on current hardware
-aether bench qwen3-72b --compare vllm           # Side-by-side comparison
-aether bench --all                              # Benchmark all compiled models
-
-# Hardware and diagnostics
-aether hw                                       # Hardware fingerprint
-aether kernels                                  # List active kernel targets
-aether logs                                     # Runtime logs
+# Observability
+GET    /v1/metrics            Prometheus-compatible metrics
+GET    /v1/traces             [NEW] OpenTelemetry trace export
+GET    /v1/health             Health check + GPU status
+GET    /v1/hardware           Hardware fingerprint
+GET    /v1/kernels            Active kernel targets
 ```
 
 ---
 
-## 12. The AEG Format Specification
+## 12. NEW: Reasoning Graph Compiler (Pass 7 Deep Dive)
 
-### 12.1 Metadata Schema
+This is the most architecturally novel component of Aether v3.0 — the first compiler pass that treats chain-of-thought reasoning as a first-class compiled artifact.
 
-```json
-{
-  "model_id": "Qwen/Qwen3-72B-Instruct",
-  "aether_version": "1.0",
-  "compiled_at": "2026-07-01T10:00:00Z",
-  "graph_hash": "sha256:abc123...",
-  "architecture": {
-    "family": "qwen_family",
-    "params_billion": 72.0,
-    "layers": 80,
-    "heads": 64,
-    "kv_heads": 8,
-    "context_length": 131072,
-    "vocab_size": 152064,
-    "attention_type": "GQA",
-    "ffn_type": "SwiGLU",
-    "is_moe": false
-  },
-  "optimization": {
-    "fusion_passes_applied": ["qkv_rope_norm", "ffn_swiglu", "residual_add"],
-    "fused_ops_count": 156,
-    "sensitivity_calibration_dataset": "wikitext-2",
-    "quality_budget_ppl_increase": 0.02,
-    "actual_ppl_increase": 0.018,
-    "precision_distribution": {
-      "BF16": "12%",
-      "FP8": "28%",
-      "Q4_K_M": "52%",
-      "IQ3_XS": "8%"
+### 12.1 The Problem
+
+Reasoning models (DeepSeek-R1, Claude 3.7, o3, Qwen3) generate thousands of thinking tokens before producing an answer. Current inference engines treat these as plain text generation — no compiler visibility, no optimization, no budget enforcement.
+
+This means:
+- No early exit when reasoning confidence is high (wasted compute)
+- No speculative reasoning (expensive target model does all thinking)
+- No compiled reasoning strategy per model (re-learned at runtime)
+- No global budget control (model may think for 32K tokens on a simple question)
+
+### 12.2 The Aether Solution — Compiled Reasoning Graphs
+
+Stage 1 detects reasoning architecture. Stage 2 Pass 7 compiles CoT graph into .aeg at path .aeg/graph/reasoning_graph.aeg-ir. The runtime loads the reasoning graph from AEG. Speculative CoT uses a lightweight draft model to generate thoughts which the target model then verifies (21-66% latency reduction on complex reasoning tasks).
+
+### 12.3 Reasoning Budget Controller
+
+`python
+class ReasoningBudgetController:
+    COMPLEXITY_BUDGET_MAP = {
+        "simple":  512,
+        "medium":  2048,
+        "hard":    8192,
+        "max":     32768,
     }
-  },
-  "kernels": {
-    "targets": ["cuda_sm89", "cuda_sm90", "metal_m3", "cpu_avx512"],
-    "flash_attention_variant": "flash_attention_3"
-  },
-  "memory_requirements": {
-    "bf16_gb": 144.0,
-    "compiled_min_gb": 38.5,
-    "recommended_gb": 48.0
-  }
+
+    def compute_budget(self, prompt: str, explicit_budget: int | None) -> int:
+        if explicit_budget:
+            return explicit_budget
+        complexity = self.estimate_complexity(prompt)
+        return self.COMPLEXITY_BUDGET_MAP[complexity]
+`
+
+---
+
+## 13. NEW: MLA Native Support
+
+Multi-Head Latent Attention (MLA) is used by DeepSeek-V3 (671B), Kimi K2, GLM-5. It provides 90%+ KV cache reduction. Aether v3.0 supports MLA natively.
+
+Standard GQA: K_cache [seq, kv_heads=8, head_dim=128] + V_cache = 256 MB per request at 8K context across 128 layers.
+MLA Compressed: C_KV [seq, lora_rank=512] only = 12.8 MB per request at 8K context (20x reduction).
+
+Weight Absorption: W_kv_b is merged into W_o at compile time. The up-projection from latent to full K/V is NEVER materialized in VRAM. Zero runtime decompression overhead.
+
+For DeepSeek-R1-671B on H100 with 4x tensor parallelism:
+- Without Aether MLA: 8x H100 required
+- With Aether MLA Native Compilation: 4x H100 sufficient
+- KV cache for 100 concurrent requests at 32K context: 1.6 GB vs 80+ GB standard
+
+---
+
+## 14. NEW: FP4 Blackwell Targeting
+
+### 14.1 Blackwell vs Hopper
+
+| Spec | H100 | B200 | Gain |
+|---|---|---|---|
+| Native FP4 | No | Yes (NVFP4+MXFP4) | — |
+| FP4 compute | — | 9.0 PFLOPS dense | — |
+| Memory | 80 GB HBM3 | 192 GB HBM3e | 2.4x |
+| Bandwidth | 3.35 TB/s | 8.0 TB/s | 2.4x |
+| Inference throughput | Baseline | ~4x vs H100 | 4x |
+
+FP4 Model Size: Qwen3-72B BF16 = 144 GB (requires 2x H100). Qwen3-72B with Aether FP4 = ~36 GB (fits 1x B200 with room for larger context).
+
+MXFP4 (Microscaling): OCP open standard. 16 elements share one FP8 scaling factor. Format E2M1 (4-bit: 2 exponent + 1 mantissa + 1 sign).
+
+---
+
+## 15. NEW: Agentic Workflow Optimizer
+
+### 15.1 The Problem
+
+Agent tasks making 10 LLM calls with a 2000-token system prompt:
+- Without Aether: 20,000 tokens prefilled (wasted)
+- With Aether: 2,000 tokens (KV cache reused across all turns)
+- Savings: 90% prefill reduction for long-context agentic workflows
+
+### 15.2 Cascade Model Routing
+
+`python
+ROUTING_STRATEGY = {
+    "simple_factual":  "qwen3-8b",
+    "code_generation": "qwen3-72b",
+    "math_reasoning":  "deepseek-r1-671b",
+    "multimodal":      "qwen3-vl-72b",
 }
-```
-
-### 12.2 Versioning and Stability Guarantee
-
-AEG format versions follow semantic versioning with explicit stability contracts:
-- **AEG/1.x** — Stable forever. All 1.x `.aeg` files will be readable by all future Aether versions.
-- **AEG/2.x** — When introduced, backward-compatibility mode maintained for 3 years.
-
-This mirrors LLVM IR's stability guarantee. A model compiled today will still run on Aether 5.0 in 2031.
+`
 
 ---
 
-## 13. Automatic Parallelism Discovery
+## 16. NEW: Multi-Modal Unified Graph
 
-### 13.1 The Problem Today
+VLMs treated as unified computation graphs (not ViT + LLM glued together). New AEG ops: aeg.vision_encode, aeg.audio_encode, aeg.early_fuse, aeg.dynamic_resolution_resize.
 
-Running a 70B model across 4 GPUs requires expert knowledge:
-- Tensor parallelism degree (how to split weight matrices)
-- Pipeline parallelism stages (how to cut the model across nodes)
-- Expert parallelism (for MoE models)
-- Context parallelism (for long-context workloads)
-- Which mix is optimal for prefill vs. decode phases
+Hybrid Parallelism: ViT-DP (data parallel, no all-reduce) + LLM-TP (tensor parallel). Rationale: TP causes expensive all-reduce for small ViT (<10B params). DP avoids this.
 
-**Aether eliminates this entirely.** Pre-computed plans are stored in the `.aeg` artifact at compile time.
-
-### 13.2 Runtime Plan Loading
-
-```bash
-aether serve qwen3-72b
-# [INFO] Detected: 4x NVIDIA H100 80GB (NVLink 4.0)
-# [INFO] Loading pre-computed 4-GPU sharding plan from qwen3-72b.aeg
-# [INFO] Prefill: tensor_parallel=4, pipeline_stages=1
-# [INFO] Decode:  tensor_parallel=2, pipeline_stages=2 (re-sharding per Seesaw)
-# [INFO] Ready to serve in 8.3 seconds.
-```
-
-No `TENSOR_PARALLEL_SIZE=4` flag. No manual pipeline configuration. Zero user configuration.
-
-### 13.3 Heterogeneous Mesh Support (Phase 3)
-
-For the most advanced topology, Aether supports mixed hardware as a single logical inference cluster:
-
-```
-MacBook M3 Max (64GB unified memory)
-  Runs qwen3-8b as draft model via Metal kernels
-  Contributes tree speculation proposals
-
-Desktop RTX 4090 (24GB VRAM)
-  Runs qwen3-72b as target model via CUDA sm89 kernels
-  Verifies draft tree in one forward pass
-
-Cloud H100 (on-demand burst)
-  Handles overflow requests and very long context (>128K tokens)
-```
-
-**No existing tool has an analog.** Aether treats heterogeneous local + cloud resources as a single logical inference cluster.
+Visual Token Compression: 75% token reduction with <2% quality loss using dynamic token merging (Fast-VLM approach). Reduces quadratic attention cost for high-res images.
 
 ---
 
-## 14. Disaggregated Prefill and Decode Architecture
+## 17. NEW: EAGLE-3 Speculative Engine
 
-### 14.1 The Head-of-Line Blocking Problem
-
-In traditional co-located serving, a long prefill request blocks all concurrent decode requests:
-
-```
-Traditional (co-located GPU):
-  ===== PREFILL(50K tokens, 8 seconds) ========================>
-                                                         DECODE(A) — user waits 8s
-                                                         DECODE(B) — user waits 8s
-
-Aether Disaggregated:
-  Prefill Pool: ===== PREFILL(50K) ==========================>
-                                       KV transfer -->
-  Decode Pool:  DECODE(A) ----------------------------------------> no wait
-                DECODE(B) ----------------------------------------> no wait
-```
-
-### 14.2 Single-GPU Logical Disaggregation (Chunked Prefill)
-
-- Long prefills are split into <=2048 token chunks
-- Each chunk interleaved with one decode iteration per active request
-- TTFT remains bounded regardless of prompt length
-
-### 14.3 Multi-GPU Physical Disaggregation
-
-- **Prefill replicas:** High tensor parallelism, compute-optimized; batch many prefills simultaneously
-- **Decode replicas:** Lower tensor parallelism, memory-bandwidth-optimized; maximum decode batch size
-- **KV transfer:** Via shared GPU memory (single-node) or RDMA InfiniBand (multi-node)
-
-**Published results:** DistServe 3–4x goodput improvement; Mooncake 13–40% compute cost reduction in production.
-
----
-
-## 15. Tree-Speculative Decoding Engine
-
-### 15.1 Beyond Standard Speculation
-
-Standard speculative decoding proposes a linear chain of tokens:
-- Draft: token_A → token_B → token_C → token_D
-- Target: verifies 4 tokens in 1 forward pass
-- Problem: if token_A is wrong, all subsequent proposals are wasted
-
-### 15.2 Aether's Adaptive Tree Speculation
-
-Aether proposes a **branching tree** explored simultaneously in one target forward pass:
-
-```
-Draft proposals (OPT-Tree adaptive tree construction):
-
-                +--- "the"  --- "cat"  --- "sat"
-  root ---------+--- "a"    --- "dog"  --- "ran"
-                +--- "this" --- "thing"
-
-Target model verifies ALL 7 tokens in ONE forward pass
-(tree-masked causal attention via DeFT KV-Guided Grouping)
-
-Accept longest valid path from root -> up to 7 tokens per call
-```
-
-### 15.3 Performance Profile
-
-| Component | Research Result | Aether Use |
+| Approach | Acceptance Rate | Speedup |
 |---|---|---|
-| **OPT-Tree** | Maximizes expected acceptance length | Adaptive tree topology per decoding step |
-| **DeFT (ICLR 2025)** | 3.59x attention latency reduction | Tree attention kernel emitted at Stage 3 |
-| **JetSpec (2026)** | Up to 9.64x speedup (code workloads) | Draft head architecture for same-family models |
-| **PCT pruning** | Removes low-value branches | Dynamic tree pruning before target verification |
+| Standard | 0.6–0.7 | 2–3x |
+| EAGLE-2 | 0.7–0.8 | 3–4x |
+| EAGLE-3 | 0.8–0.9 | 3–5x |
+| JetSpec | Very high (code) | 9.64x |
+| Speculative CoT | Task-specific | 21-66% |
 
-**Aether target: 3–6x throughput improvement** on latency-sensitive chat and coding workloads.
-
-### 15.4 Draft Model Auto-Selection
-
-```python
-DRAFT_FAMILIES = {
-    "qwen3-72b":        "qwen3-1.5b",
-    "llama3.3-70b":     "llama3.2-1b",
-    "deepseek-r1-671b": "deepseek-r1-8b",
-    "gemma-2-27b":      "gemma-2-2b",
-}
-# Validation: acceptance_rate checked on calibration set
-# If acceptance_rate < 0.70: try next candidate or fall back to standard decoding
-# Typical acceptance rates: 0.75-0.90 for same-family models
-```
+EAGLE-3: Multi-layer feature fusion aggregates ALL transformer layers for draft head. EAGLE-3.1: addresses attention drift in long sequences. DeFT: tree flattened to groups sharing KV — 3.59x attention latency reduction. GTO: aligns draft training with decoding-time tree policy.
 
 ---
 
-## 16. MoE-Aware Expert Routing Compiler
+## 18. NEW: Quantization-Aware Compilation Pipeline
 
-### 16.1 The MoE Problem Nobody Has Solved at the Compiler Level
+Complete format support: BF16, FP8 (E4M3/E5M2), FP4 (NVFP4 E2M1) NEW, MXFP4 NEW, INT8, INT4 (Q4_K_M), INT4 (AWQ), INT4 (GPTQ+Marlin), IQ3_XS, IQ2_XXS, FP4 KV Cache NEW, INT8 KV Cache NEW, INT2 KV Cache NEW.
 
-MoE models (DeepSeek-R1-671B, Mixtral-8x22B, Qwen-MoE-57B) activate only 2–8 experts per token from a bank of 8–256 experts. The challenges:
-- All expert weights must be accessible — DeepSeek-R1 weights exceed 1.3 TB
-- Dynamic routing creates non-uniform GPU utilization
-- Expert dispatch involves expensive scatter/gather operations
-
-**Current tools treat MoE as a dense model** and pay the full memory and dispatch penalty. Aether compiles MoE routing as a **first-class compiler pass**.
-
-### 16.2 MoE Compilation Output
-
-```
-Input MoE graph node: {router, expert_bank[256], top_k=8}
-
-Step 1: Activation profiling on calibration set
-  -> hot experts (>5% activation rate):  51 experts
-  -> warm experts (0.1-5%):             128 experts
-  -> cold experts (<0.1%):               77 experts
-
-Step 2: Expert placement annotations stored in AEG
-  -> hot experts:  pin to GPU HBM (always resident)
-  -> warm experts: stage in CPU DRAM + CommitMoE prefetch pipeline
-  -> cold experts: NVMe lazy-load on demand
-
-Step 3: Intra-expert sparsity kernel specialization
-  -> identify always-zero activation channels per expert
-  -> emit sparse GEMM kernels that skip dead channels
-  -> result: 2.5x expert layer speedup (vLLM MoE 2025)
-
-Step 4: Threshold-based router replacement (DynaMoE)
-  -> replace rigid top-K with adaptive threshold routing
-  -> simple tokens: fewer experts activated (faster, less memory)
-  -> complex tokens: more experts activated (better quality)
-```
-
-### 16.3 MoE Results
-
-| Metric | Naive (current tools) | Aether MoE Compiler |
-|---|---|---|
-| Expert layer throughput | 1x baseline | 2.5x |
-| Memory for DeepSeek-R1-671B | >1.3 TB | ~320 GB (hot+warm tiering) |
-| Inference cost vs. early MoE | 1x | 0.17x (83% reduction) |
-| Expert activation compute | Fixed top-K | Adaptive (0.5–2x experts per token) |
+Eval Gate: Mandatory quality benchmark before production. Tests on hellaswag, mmlu, gsm8k, math-500, humaneval per task type. Fails if >2% regression vs baseline.
 
 ---
 
-## 17. Developer API Specification
+## 19. NEW: Aether Observability Stack
 
-*(Full Python SDK covered in Section 11. This section covers configuration reference and REST API details.)*
-
-### 17.1 Configuration Reference
-
-```python
-from aether import CompilerConfig, RuntimeConfig
-
-# Compiler configuration
-compiler_config = CompilerConfig(
-    quality_budget=0.02,                # Max 2% perplexity increase (guides quantization)
-    calibration_dataset="wikitext-2",   # Dataset for sensitivity analysis
-    targets=["auto"],                   # "auto" = detect current hardware
-    optimization_level=2,               # 0=none, 1=basic, 2=full (default), 3=aggressive
-    enable_moe_compiler=True,           # MoE-aware compilation pass
-    upload_kernels=True,                # Opt-in to Aether Hub kernel sharing
-    cache_dir="~/.aether",
-)
-
-# Runtime configuration
-runtime_config = RuntimeConfig(
-    optimize_for="latency",             # "latency" | "throughput" | "quality"
-    speculative_decoding=True,          # Enable tree-speculative decoding
-    speculative_tree_depth=4,           # Max tree depth (default: auto)
-    prefill_chunk_size=2048,            # Tokens per prefill chunk
-    max_batch_size=256,                 # Max concurrent requests
-    kv_cache_dtype="fp8",               # KV cache precision (fp8 / fp16 / bf16)
-    kv_cache_cpu_gb=32,                 # CPU DRAM KV cache budget
-    kv_cache_nvme_gb=200,               # NVMe KV cache budget
-    dynamic_precision=True,             # Allow precision downgrade under memory pressure
-    disaggregate_prefill_decode=False,  # Enable for multi-GPU cluster mode
-)
-```
-
-### 17.2 Response Object
-
-```python
-response = rt.generate("qwen3-72b", "Hello!")
-
-response.text                          # Generated text
-response.usage.prompt_tokens           # Input token count
-response.usage.completion_tokens       # Output token count
-response.metrics.throughput_tps        # Tokens per second
-response.metrics.ttft_ms               # Time to first token (ms)
-response.metrics.p95_latency_ms        # P95 latency
-response.metrics.kernel_target         # Active hardware target (e.g. "cuda_sm90")
-response.metrics.active_precision      # Active precision (e.g. "mixed_fp8_q4")
-response.metrics.spec_accept_rate      # Speculative decoding acceptance rate
-response.metrics.kv_cache_hit_rate     # KV cache prefix hit rate
-response.metrics.memory_pressure       # Current VRAM utilization (0.0 - 1.0)
-```
+OpenTelemetry-native tracing for every request phase. Key metrics: tokens/sec, TTFT P50/P95/P99, EAGLE-3 accept rate, KV hit rate, MLA compression ratio, reasoning budget used, GPU VRAM utilization. Quality drift monitoring: alerts if live win-rate drops >5% vs baseline.
 
 ---
 
-## 18. Target Audience and Personas
+## 20. NEW: AEG Safety and Guardrail Layer
 
-### Persona 1 — The Application Developer (Primary — 70% of users)
-
-**Who:** Full-stack or backend developer building AI-powered products.
-**Pain:** Infrastructure complexity prevents shipping. Never touched a CUDA kernel.
-**Aether answer:** `aether pull qwen3-8b && aether serve` — done. No CUDA knowledge required.
-**Wow moment:** *"I moved to a new MacBook and it just worked. Same command, same .aeg file."*
-
-### Persona 2 — The ML Infrastructure Engineer (Power user — 20%)
-
-**Who:** Specialist who owns AI infrastructure for a team or company.
-**Pain:** Manually tunes different backends for each model and hardware combination.
-**Aether answer:** Full compilation API, per-layer precision map, AEG-IR inspection, benchmark vs. vLLM.
-**Wow moment:** *"I got 40% better throughput than our hand-tuned vLLM config in 30 minutes — with a report proving it."*
-
-### Persona 3 — The Researcher (Secondary — 15%)
-
-**Who:** Academic or industrial researcher running experiments on diverse hardware.
-**Pain:** Environment setup consumes more time than actual research.
-**Aether answer:** Reproducible `.aeg` artifacts. Share the compiled model, not the setup instructions.
-**Wow moment:** *"I shared a .aeg file with collaborators at three institutions. Identical results everywhere."*
-
-### Persona 4 — The Enterprise Architect (Commercial — 5% of users, 80% of revenue)
-
-**Who:** Senior technical decision-maker deploying AI across cloud and on-premises fleet.
-**Pain:** Vendor lock-in. No portability between cloud GPU providers.
-**Aether answer:** AEG format runs on any hardware. Fleet management via Aether Cloud.
-**Wow moment:** *"We migrated our entire inference fleet from H100 to AMD MI300X with zero model re-deployment work."*
+Compiled into .aeg/safety/: prompt_guard.json, output_filter.json, audit_log.json. Runtime safety: prompt injection detection, content policy enforcement, immutable audit trail for compliance. Configurable thresholds. All decisions logged with SHA-256 request hash.
 
 ---
 
-## 19. Open-Source Roadmap — Five Phases
+## 21. Developer API (Complete v3.0 CLI Reference)
 
-### Phase 1 — Compiler Foundation (Months 1–4)
-
-**Theme:** *"The AEG format ships. The model compilation story is real."*
-
-- [ ] `aether` Python package (pip installable, Linux / macOS / Windows)
-- [ ] Graph tracer: SafeTensors + GGUF → AEG-IR
-- [ ] Architecture detector: Llama, Qwen, Gemma, Mistral, DeepSeek families
-- [ ] **AEG format v1.0 specification (public, stable, versioned)**
-- [ ] Optimizer Pass 1: Operator fusion (QKV + RoPE + Norm → megakernel)
-- [ ] Hardware targeting: CUDA kernels (sm80, sm89, sm90)
-- [ ] Hardware targeting: CPU (AVX-512, NEON)
-- [ ] Basic runtime: loads AEG, dispatches kernels, serves requests
-- [ ] Python SDK: `generate()`, `chat()`, `embed()`
-- [ ] OpenAI-compatible REST API via `aether serve`
-- [ ] CLI: `compile`, `pull`, `run`, `serve`, `list`, `rm`, `info`, `graph`
-- [ ] Content-addressed kernel cache (`~/.aether/kernels/`)
-- [ ] **Aether Hub MVP:** kernel upload/download API (opt-in)
-- [ ] Documentation site + AEG format specification (aeg-spec.aether.dev)
-- [ ] GitHub Actions CI (Linux / macOS / Windows)
-
-**Success Criteria:**
-```bash
-pip install aether
-aether compile llama3-8b    # Compiles to AEG in under 5 minutes
-aether run llama3-8b        # Generates text on any supported hardware
-# Move .aeg file to different hardware -> runs identically
-```
-
----
-
-### Phase 2 — Optimizer Depth (Months 5–9)
-
-**Theme:** *"The compiler makes models measurably better than naive deployment."*
-
-- [ ] Optimizer Pass 2: Sensitivity Analysis (d_perplexity/d_precision per layer)
-- [ ] Optimizer Pass 3: Mixed-precision assignment from sensitivity map
-- [ ] Optimizer Pass 4: KV Cache graph structuring (PagedKV nodes + radix hints)
-- [ ] Compiler plan dry-run API (`compiler.plan()`)
-- [ ] Quality report generation (measured PPL change vs. BF16)
-- [ ] Tree-Speculative Decoding Engine (OPT-Tree adaptive tree)
-- [ ] DeFT-style tree-masked attention kernel
-- [ ] Disaggregated prefill/decode scheduler (chunked prefill)
-- [ ] Radix-tree prefix cache engine
-- [ ] Metal target: Apple M-series (M1–M5) kernel compilation
-- [ ] ROCm target: AMD RDNA3/CDNA3 kernel compilation
-- [ ] Aether Hub v2: kernel versioning + model manifest registry
-- [ ] `aether bench` with side-by-side comparison vs. vLLM
-- [ ] Prometheus metrics endpoint (`/v1/metrics`)
-- [ ] Dynamic precision adjustment under memory pressure
-
-**Success Criteria:** Aether-compiled models achieve >=20% higher throughput than user's best hand-configured backend on 80% of hardware/model combinations, with <=2% quality loss.
+`ash
+aether compile <model>
+aether compile --target cuda_sm100
+aether compile --fp4
+aether compile --mla-native
+aether compile --reasoning-graph
+aether compile --calibration reasoning
+aether compile --eval-gate
+aether compile --dry-run
+aether run <model.aeg>
+aether serve <model.aeg>
+aether graph <model.aeg>
+aether graph --reasoning
+aether graph --mla
+aether precision-map <model.aeg>
+aether hardware
+aether bench <model.aeg> --compare vllm
+aether eval <model.aeg> --suite reasoning
+aether hub login
+aether hub push <model.aeg>
+aether hub pull <model_id>
+aether hub search <query>
+aether ab start model_a.aeg model_b.aeg
+aether safety check <model.aeg>
+aether trace export --format otlp
+aether mla-stats <model.aeg>
+aether reasoning analyze <model.aeg>
+`
 
 ---
 
-### Phase 3 — Parallelism and Scale (Months 10–16)
+## 22. Target Personas
 
-**Theme:** *"70B models on 4 consumer GPUs with zero configuration."*
-
-- [ ] Optimizer Pass 6: Automatic Parallelism Discovery (Alpa/Seesaw inspired solver)
-- [ ] Pre-computed sharding plans (1/2/4/8 GPU) stored in AEG at compile time
-- [ ] Tensor Parallelism runtime (NVLink/PCIe aware)
-- [ ] Pipeline Parallelism runtime (multi-node)
-- [ ] Stage-aware re-sharding (different plan for prefill vs. decode phases)
-- [ ] MoE-Aware Expert Routing Compiler (Pass 5)
-- [ ] Expert placement tiering (hot GPU / warm CPU / cold NVMe)
-- [ ] Intra-expert sparsity kernels
-- [ ] Context Parallelism for long sequences (Ring Attention)
-- [ ] KV cache NVMe offload (L3 tier)
-- [ ] Physical disaggregation (prefill/decode on separate nodes via RDMA)
-- [ ] Heterogeneous mesh (local draft + remote target speculative decoding)
-- [ ] ONNX ingestion path (ONNX → AEG-IR)
-- [ ] Plugin SDK for third-party hardware backends
-- [ ] `aether cluster` CLI for multi-node management
-
-**Success Criteria:** 72B model on 4x RTX 4090 at >85% MFU; zero TENSOR_PARALLEL_SIZE flags; setup time <2 minutes.
-
----
-
-### Phase 4 — Ecosystem (Months 17–24)
-
-**Theme:** *"AEG becomes the distribution format for compiled AI models."*
-
-- [ ] MLX ingestion path (Apple MLX → AEG-IR)
-- [ ] OpenVINO / Intel NPU target
-- [ ] AEG Model Registry: versioned, verified compiled model artifacts
-- [ ] HuggingFace Hub integration: Aether detects and downloads pre-compiled AEG variants
-- [ ] SDK bindings: JavaScript/TypeScript, Rust, Go
-- [ ] Fine-tuning integration (LoRA/QLoRA → AEG re-compilation with adapter merging)
-- [ ] Aether Bench: public leaderboard (hardware x model x optimizer version)
-- [ ] WASM target (browser-side inference from AEG — experimental)
-- [ ] Enterprise Preview: monitoring dashboard, fleet management, RBAC
-
----
-
-### Phase 5 — Compiler as Platform (Month 25+)
-
-**Theme:** *"Aether is the LLVM of AI. Hardware vendors target AEG."*
-
-- [ ] AEG Compiler API: third-party hardware target SDK (chip vendors integrate directly)
-- [ ] Custom hardware target onboarding (NPU, FPGA, custom AI ASICs)
-- [ ] Aether Labs: community-contributed compiler passes as plugins
-- [ ] Multi-modal compilation: vision encoder + language decoder as unified AEG graph
-- [ ] Reasoning graph compilation: chain-of-thought as a compiled, optimizable execution graph
-- [ ] Hardware co-design: expose AEG-IR semantics to chip vendors for ISA design feedback
-
----
-
-## 20. Commercial Strategy and Moat
-
-### 20.1 The Open-Core Model
-
-```
-Open Source (Forever Free)                  Aether Cloud (Paid)
-------------------------------------        -----------------------------------
-Aether compiler + all optimizer passes      Managed compilation (GPU time)
-AEG format + all hardware targets           Private AEG artifact registry
-Aether runtime + all features               Fleet management dashboard
-Aether Hub (kernel sharing, public)         Multi-machine orchestration
-Community support                           Team collaboration + RBAC
-                                            SLA-guaranteed compilation times
-                                            Enterprise SSO + audit logs
-                                            Priority kernel slots on Hub
-                                            Custom hardware target SLAs
-```
-
-### 20.2 Revenue Streams
-
-| Stream | Pricing | Why It Works |
-|---|---|---|
-| **Aether Cloud** | Usage-based (compilation GPU-hours + serving tokens) | Compilation is GPU-intensive; teams outsource it |
-| **Enterprise Hub** | Per-seat annual license | Private kernel cache + compliance requirements |
-| **Hardware Vendor Partnerships** | License fee for first-class AEG target status | NVIDIA/AMD/Apple/Intel pay to be first-class in AEG |
-| **Managed Serving** | Per-GPU-hour | Teams without GPU infrastructure run on Aether's fleet |
-
-### 20.3 The Network Effect Flywheel
-
-```
-Developers compile models
-       |
-       v
-Kernels uploaded to Hub
-       |
-       v
-Hub grows -> cold-start time approaches zero
-       |
-       v
-Zero cold-start -> more developers adopt Aether
-       |
-       v
-More adoption -> AEG artifacts appear on HuggingFace
-       |
-       v
-HuggingFace has AEG -> Aether becomes default distribution format
-       |
-       v
-Default format -> hardware vendors implement AEG targets natively
-       |
-       v
-Native hardware support -> Aether owns the IR layer for AI
-```
-
-This is the Linux kernel flywheel. Linux took 10 years. Aether targets 5, with a better initial developer experience and a clear format moat.
-
-### 20.4 Go-to-Market
-
-**Stage 1 — GitHub-First (Months 1–6):**
-Ship Phase 1 with a genuinely shocking demo: *the same `.aeg` file running identically on RTX 4090, M3 Max, and AMD MI300X, in a single 90-second video.* The `aether graph` command showing the fusion pass output and precision map is the technical hook. Target: HuggingFace community, AI/ML Twitter, Hacker News.
-
-**Stage 2 — Community to Commercial (Months 6–18):**
-Aether Hub creates the network effect loop. The benchmark comparison tool builds reputation as the tool that actually measures performance gains from compilation. Internal champions convert enterprises to paid Cloud tier.
-
-**Stage 3 — Enterprise (Months 18+):**
-Direct sales for fleet management, private model registry, and compliance features. Hardware vendor partnerships for official AEG targets.
-
-### 20.5 Infrastructure Company Comparables
-
-| Company | Open-Source Core | Moat | Outcome |
-|---|---|---|---|
-| **HashiCorp** | Terraform | HCL format ownership | Acquired $6.4B |
-| **Docker** | Docker Engine | OCI image format | ~$2.1B |
-| **Grafana Labs** | Grafana | Dashboard + PromQL format | >$6B valuation |
-| **Elastic** | Elasticsearch | Index + query DSL | IPO ~$3B |
-| **LLVM Project** | Compiler IR | LLVM IR format | Foundation of entire native software ecosystem |
-| **Aether** | Compiler + AEG format | Compiled model format | TBD |
-
----
-
-## 21. Technical Risk Analysis
-
-| Risk | Probability | Impact | Mitigation |
-|---|---|---|---|
-| AEG-IR fails to capture emerging non-transformer architectures (SSM, RWKV) | Medium | High | Custom op extensibility in AEG-IR v1.0; treat unknown ops as pass-through; community reporting |
-| Kernel cache coherence bugs (wrong kernel for hardware revision) | Medium | High | Hardware fingerprint includes driver version; strict content-addressing; runtime output validation |
-| Graph tracing fails for heavily dynamic models | High | Medium | Fallback to operator-library mode; document tracing requirements; collect community reports |
-| TensorRT-LLM adds an open portable format | Low | High | Ship AEG v1.0 with stability guarantee first; community adoption creates switching cost |
-| Compilation time annoys users on first run | High | Medium | Pre-compile all top-50 HuggingFace models to AEG before launch day |
-| Modular MAX open-sources | Medium | Medium | AEG format + Hub network effect are structural advantages that require equal open commitment to match |
-| Memory safety bugs in mixed-precision runtime | High | High | Extensive VRAM pressure chaos testing; conservative safety margins; formal verification of quant pass |
-| Hardware vendors ship proprietary closed compilers | Medium | Low | History: open beats closed for portability (LLVM beat all proprietary IRs) |
-
-### 21.1 Build vs. Integrate Decisions
-
-| Component | Decision | Rationale |
-|---|---|---|
-| AEG-IR specification | **Build** (core IP) | Must be owned; defines the moat |
-| All six optimizer passes | **Build** (core IP) | Graph-level; cannot be delegated |
-| CUDA kernels (FA-3, GEMM) | **Integrate** (FA-3, ExLlamaV2) | Research excellence exists; emit via Stage 3 |
-| Disaggregated scheduler | **Build** | Unique KV cache and disaggregation design |
-| Graph tracer | **Build** (thin torch.export wrapper) | Need AEG-IR output format |
-| Hardware detection | **Build** | Hardware fingerprinting unique to Aether |
-| REST API | **Build** (FastAPI/Starlette) | Core developer experience surface |
-| Aether Hub backend | **Build** | Content-addressed kernel store; moat infrastructure |
-
----
-
-## 22. Success Metrics and KPIs
-
-### 22.1 Developer Adoption (Open Source)
-
-| Metric | 6 Months | 12 Months | 24 Months |
-|---|---|---|---|
-| GitHub Stars | 3,000 | 15,000 | 50,000+ |
-| pip installs/month | 10,000 | 100,000 | 1,000,000+ |
-| AEG files compiled (unique models) | 1,000 | 50,000 | 500,000 |
-| Kernel cache Hub entries | 500 | 10,000 | 200,000+ |
-| Active contributors | 30 | 150 | 500 |
-| Supported model architectures | 5 | 15 | 30+ |
-| Supported hardware targets | 4 | 8 | 14+ |
-
-### 22.2 Technical Performance Targets
-
-| Metric | Target | Measurement Method |
-|---|---|---|
-| **Compilation throughput** | >=20% higher TPS vs. best hand-configured vLLM | A/B benchmark suite, published methodology |
-| **Quality preservation** | <=2.0% perplexity increase vs. BF16 at mixed precision | LLM-Eval on wikitext-2 / Hellaswag / MMLU |
-| **TTFT reduction (fused kernels)** | >=30% TTFT reduction vs. unfused eager execution | Request latency benchmark, 95th percentile |
-| **Tree speculation throughput** | >=3x TPS on latency-sensitive chat/coding | Single-request throughput benchmark |
-| **Compilation time (Hub cache hit)** | <30 seconds | End-to-end timing from `aether pull` |
-| **AEG portability** | 100% identical output across hardware for same AEG | Cross-hardware correctness regression suite |
-| **Memory safety** | >=99.9% uptime under sustained VRAM pressure | 72-hour chaos testing with concurrent overload |
-
-### 22.3 Commercial (Post-Phase 3)
-
-| Metric | 18 Months | 24 Months |
-|---|---|---|
-| Paid customers | 20 | 100 |
-| ARR | $100K | $1M |
-| Enterprise pilots | 5 | 25 |
-| Hardware vendor partnerships | 1 | 3 |
-| GPU-hours managed via Aether Cloud | 50K/month | 500K/month |
-
----
-
-## 23. Glossary
-
-| Term | Definition |
+| Persona | What They Want |
 |---|---|
-| **AEG** | Aether Execution Graph — Aether's portable compiled model format and artifact |
-| **AEG-IR** | Aether Execution Graph Intermediate Representation — hardware-agnostic operator graph |
-| **Aether Hub** | Public, content-addressed kernel cache and compiled model registry |
-| **Operator Fusion** | Merging multiple sequential ops into a single GPU kernel to eliminate intermediate DRAM writes |
-| **Sensitivity Analysis** | Computing d(perplexity)/d(precision) per layer to guide mixed-precision quantization mathematically |
-| **Mixed Precision** | Assigning different numeric formats to different layers based on measured sensitivity |
-| **Tree Speculation** | Speculative decoding that proposes a branching tree of draft tokens, all verified in one target forward pass |
-| **OPT-Tree** | Adaptive draft tree construction algorithm maximizing expected token acceptance length |
-| **DeFT** | Decoding with Flash Tree-Attention — hardware-efficient tree attention via KV-Guided Grouping |
-| **JetSpec** | Causal parallel draft heads achieving up to 9.64x speedup in speculative decoding |
-| **PagedAttention** | vLLM's OS-inspired non-contiguous KV memory management (used in Aether's KV cache) |
-| **RadixAttention** | SGLang's radix-tree KV prefix cache (Aether's prefix cache) |
-| **Disaggregated P/D** | Physical separation of prefill and decode phases onto different hardware pools |
-| **MoE** | Mixture of Experts — sparse model activating only a subset of parameters per token |
-| **Intra-Expert Sparsity** | Skipping always-zero activation channels within an expert for additional speedup |
-| **Tensor Parallelism** | Distributing individual weight matrices across multiple GPUs in parallel |
-| **Pipeline Parallelism** | Distributing model layers sequentially across multiple GPU nodes |
-| **Context Parallelism** | Distributing long input sequences across multiple GPUs (Ring Attention / Ulysses) |
-| **Automatic Parallelism** | Compiler-discovered sharding strategy requiring zero user configuration |
-| **MLIR** | Multi-Level Intermediate Representation — LLVM's compiler IR framework |
-| **StableHLO** | Open-standard ML model IR from Google/OpenXLA; AEG-IR follows its stability model |
-| **IREE** | Intermediate Representation Execution Environment — MLIR-based universal ML runtime |
-| **Kernel Cache** | Content-addressed store of pre-compiled GPU kernels keyed by graph hash + hardware target |
-| **Goodput** | Rate of inference requests successfully meeting latency SLO constraints |
-| **MFU** | Model FLOP Utilization — fraction of theoretical GPU FLOPS actually utilized |
-| **TTFT** | Time to First Token — request-to-first-generated-token latency |
-| **TPS** | Tokens Per Second — inference throughput metric |
-| **GGUF** | GPT-Generated Unified Format — llama.cpp's quantized model format |
-| **BF16 / FP8 / Q4** | Brain Float 16 / 8-bit float / 4-bit integer — numeric precision formats |
-| **FlashAttention-3** | Memory-efficient attention using WGMMA + TMA on H100+ (1.5–2x over FA-2) |
+| MLOps Engineer | compile once, run everywhere |
+| Startup CTO | pip install and serve in 5 minutes |
+| Research Lab | AEG artifacts on NVIDIA + AMD + Apple |
+| Enterprise AI Platform | Eval gates, A/B rollout, safety, observability |
+| Edge Developer | Portable AEG targeting Intel NPU / Qualcomm |
+| OSS Contributor | Target plugin API + Hub kernel upload |
+| Fine-tuning Engineer | LoRA adapter + base model = new AEG |
+| Agentic AI Developer | Agentic sessions, KV reuse, cascade routing |
 
 ---
 
-## Appendix A — Research Foundation
+## 23. Open-Source Roadmap — Six Phases
 
-This PRD is grounded in the following research works. Each maps directly to a specific Aether feature or design decision.
+Phase 1 (Months 1-6): Core compiler working end-to-end. SafeTensors loader, GGUF parser, perplexity calibration, llama.cpp dispatch, eval gate.
 
-### A.1 Compiler and Intermediate Representations
+Phase 2 (Months 7-12): GPU native. FA-2/3, vLLM backend, FP8 production, EAGLE-3 full, disaggregated scheduler real, Hub HTTP API.
 
-| Paper / Project | Year | Aether Feature |
-|---|---|---|
-| **MLIR: A Compiler Infrastructure for the End of Moore's Law** — Lattner et al. | 2021 | AEG-IR design; multi-level dialect model preserving high-level semantics |
-| **IREE: Intermediate Representation Execution Environment** — openxla/iree | 2022+ | Hardware-universal runtime design reference; MLIR lowering pipeline |
-| **StableHLO: Portability and Stability for ML Compilers** — OpenXLA | 2023+ | AEG-IR stability and versioning model; 5-year backward compat promise |
-| **Meta LLM Compiler: Foundation Models of Compiler Optimization** | 2024 | AI-driven pass ordering; automated compiler optimization selection |
-| **Modular MAX Graph Compiler** (MLIR + Mojo kernels) | 2024+ | Dense model compilation performance reference; operator fusion benchmarks |
-| **ClusterFusion: Intra-Kernel Communication for Transformer Fusion** — NeurIPS 2025 | 2025 | Megakernel fusion; ClusterReduce/ClusterGather; 1.6–2.0x speedup |
+Phase 3 (Months 13-18): Multi-hardware. Metal M3/M4, ROCm, FP4 Blackwell sm100, MLA native, OpenVINO NPU, Qualcomm QNN, Hub CDN.
 
-### A.2 Speculative Decoding and Tree Attention
+Phase 4 (Months 19-24): Reasoning and Agentic. Pass 7 reasoning graph, EAGLE-3 speculative CoT, budget controller, agentic KV sessions, cascade router, meta-tool compiler, multi-modal VLMs.
 
-| Paper | Year | Aether Feature |
-|---|---|---|
-| **SpecInfer: Tree-based Speculative Inference** | 2023 | Tree speculation foundation; draft tree verification |
-| **OPT-Tree: Speculative Decoding with Adaptive Draft Tree Structure** | 2024 | Adaptive tree construction; expected acceptance length maximization |
-| **DeFT: Decoding with Flash Tree-Attention** — ICLR 2025 Spotlight | 2025 | KV-Guided Grouping; 3.59x attention latency reduction |
-| **JetSpec: Scaling Speculative Decoding** | 2026 | 9.64x speedup; causal parallel draft heads |
-| **EDD: Effective Draft Decoder via Soft Prompts** — ACL 2025 | 2025 | Higher-quality draft generation |
-| **Pruned Candidate Trees (PCT)** — ACL 2025 | 2025 | Dynamic branch pruning before target verification |
-| **EAGLE-3: Scalable Speculative Decoding** | 2025 | Draft model architecture reference |
+Phase 5 (Months 25-30): Observability and Safety. OpenTelemetry production, eval CI/CD, A/B rollout, drift monitoring, safety guardrails, fleet management.
 
-### A.3 KV Cache and Memory Management
-
-| Paper | Year | Aether Feature |
-|---|---|---|
-| **PagedAttention: Efficient Memory Management for LLM Serving** — Kwon et al., SOSP 2023 | 2023 | Paged KV block management; virtual memory model |
-| **SGLang: Efficient Execution of Structured LM Programs** — Zheng et al. | 2024 | RadixAttention prefix cache; AEG-IR radix tree hints |
-| **DistServe: Disaggregating Prefill and Decoding** | 2024 | Disaggregated scheduler; 3–4x goodput improvement |
-| **Mooncake: A KVCache-centric Disaggregated Architecture** | 2024 | Production disaggregation results; 13–40% cost reduction |
-| **EvolKV: Evolutionary KV Cache Optimization** | 2025 | Adaptive KV allocation; tier-aware eviction policies |
-| **FlexGen: High-Throughput Inference with a Single GPU** — Sheng et al. | 2023 | NVMe KV cache offloading (L3 tier design) |
-| **LoopServe: Multi-Turn KV Cache Reuse** | 2025 | Cross-session KV sharing; rolling context cache |
-
-### A.4 Quantization and Mixed Precision
-
-| Paper | Year | Aether Feature |
-|---|---|---|
-| **GPTQ: Accurate Post-Training Quantization** | 2022 | Quantization sensitivity reference |
-| **AWQ: Activation-aware Weight Quantization** | 2023 | Activation-weighted quantization guidance |
-| **AutoMixQ: Automated Mixed-Precision Quantization** | 2025 | Sensitivity analysis pass design; per-layer precision assignment |
-| **AMQ: Accurate Mixed-Precision Quantization** | 2025 | Quality benchmarks; 30–40% PPL improvement vs. uniform quantization |
-| **MoQAE: Mixture of Quantization-Aware Experts** | 2025 | Adaptive precision per input type |
-| **ExLlamaV2** (community project) | 2024 | Fastest INT4 GEMM kernels; integrated via Stage 3 kernel emission |
-
-### A.5 MoE Inference Optimization
-
-| Paper | Year | Aether Feature |
-|---|---|---|
-| **MoE-Infinity: Offloading-Efficient MoE Serving** | 2025 | Expert offload tiering (hot/warm/cold); activation-aware caching |
-| **CommitMoE: Expert Prefetching for Memory-Constrained Serving** | 2025 | Expert prefetch scheduling; hiding expert load latency |
-| **FinDEP: Fine-Grained Disaggregated Expert Parallelism** | 2025 | Expert compute/communication overlap |
-| **DynaMoE: Dynamic Expert Allocation** | 2025 | Threshold-based routing; adaptive expert count per token |
-| **DA-MoE: Attention-Guided Dynamic Expert Allocation** | 2025 | Token importance-based routing |
-| **Intra-Expert Sparsity Analysis** (vLLM 2025) | 2025 | 2.5x expert layer speedup from dead activation channel pruning |
-
-### A.6 Parallelism and Distributed Inference
-
-| Paper | Year | Aether Feature |
-|---|---|---|
-| **Alpa: Automating Inter/Intra-Operator Parallelism** | 2022 | Parallelism solver design; cost model-based search |
-| **Megatron-LM: Training Multi-Billion Parameter Models** | 2019–2025 | TP/PP/DP/EP/CP parallelism primitive reference |
-| **Seesaw: Dynamic Model Re-sharding for LLM Inference** — MLSys 2025 | 2025 | Stage-aware parallelism; separate plans for prefill vs. decode |
-| **Ring Attention / Ulysses Context Parallelism** | 2023–2024 | Long-context parallelism across multiple GPUs |
-| **Splitwise: Efficient Generative LLM Inference via Phase Splitting** | 2023 | Prefill/decode disaggregation analysis |
-
-### A.7 Key Open-Source Projects Studied
-
-| Project | What Aether Learns | What Aether Does Differently |
-|---|---|---|
-| **vLLM** | PagedAttention; continuous batching; OpenAI-compat API | Owns computation graph; compilation, not wrapping |
-| **SGLang** | RadixAttention; prefix caching; structured generation | AEG-IR carries radix hints at compile time |
-| **TensorRT-LLM** | Kernel fusion; FP8 GEMM; compiled engine concept | Open-source; hardware-universal; open format |
-| **llama.cpp** | GGUF format; K/I-quants; cross-platform CPU/GPU | AEG supersedes GGUF as distribution format |
-| **MLX** | Apple Silicon native; unified memory; lazy eval | AEG ingests MLX; Metal kernels emitted natively |
-| **ONNX Runtime** | Execution Provider model; graph optimization | AEG-IR is LLM-specialized (ONNX is general-purpose) |
-| **Modular MAX** | MLIR-based graph compilation; Mojo kernels | Open-source; community ecosystem; open format |
-| **IREE** | MLIR lowering pipeline; hardware universality | LLM-specialized ops; developer UX; Aether Hub |
-| **Ollama** | Docker-like UX; single command model management | Compilation, not serving; AEG supersedes GGUF |
-| **NVIDIA Dynamo** | Disaggregated serving; RDMA KV transfer at scale | Not NVIDIA-exclusive; open runtime; open format |
+Phase 6 (Months 31-36): Ecosystem. HuggingFace AEG hosting, GitHub Actions, TypeScript/Rust/Go SDKs, VS Code plugin, LoRA compilation, Hub premium.
 
 ---
 
-*End of Aether Runtime PRD v2.0*
+## 24. Commercial Strategy
 
-*Authored July 2026.*
-*The AEG format specification is versioned independently at* `aeg-spec.aether.dev`
-*This document is the product vision. Implementation decisions may evolve as architecture matures.*
+Open Source (Apache-2.0): Compiler, AEG format, Runtime, CLI, SDKs, Hub 50GB free, NVIDIA+AMD+Apple+CPU targets.
+
+Aether Cloud (Paid): Cloud compilation, unlimited Hub+CDN, eval CI/CD automation, A/B+drift monitoring, priority kernel slots. .10/compile-GPU-hour, /mo flat tier.
+
+Aether Enterprise: Private Hub, compiled safety policies, fleet management, 24h support SLA, custom hardware target development. From ,000/yr.
+
+---
+
+## 25. Technical Risk Analysis
+
+| Risk | Mitigation |
+|---|---|
+| TRT-LLM goes open source | Portability moat + Hub acceleration |
+| vLLM adds compilation | AEG format + Hub lock-in + multimodal + reasoning |
+| FP4 accuracy worse than expected | Eval gate mandatory, fallback to FP8 |
+| MLA weight absorption correctness | Mathematical verification + unit tests per paper |
+| EAGLE-3 acceptance varies | Adaptive fallback to standard decoding |
+| Hub CDN cold-start | Seed with top-50 models pre-compiled |
+
+---
+
+## 26. Success Metrics
+
+Phase 1: compile qwen3-8b < 6 min, first token < 2s cold start, TTFT H100 < 200ms at 1024 tokens, throughput within 10% of vLLM.
+Phase 2: EAGLE-3 accept rate >75%, Hub hot-start <5s vs 45s cold, FP8 vs BF16 <0.5% PPL regression.
+Phase 3: Same AEG on H100+MI300X+M4+CPU, Blackwell FP4 3.5-4x vs H100 BF16, MLA <0.2% PPL regression.
+Phase 4: Reasoning budget saves >30% tokens on AIME-2024, agentic KV reuse >80% prefill reduction.
+
+---
+
+## 27. Glossary
+
+AEG = Aether Execution Graph. AEG-IR = hardware-agnostic operator graph. MLA = Multi-Head Latent Attention (90%+ KV savings). NVFP4 = NVIDIA FP4 E2M1 format. MXFP4 = OCP Microscaling FP4. EAGLE-3 = multi-layer fusion speculative decoding 3-5x. JetSpec = causal parallel tree 9.64x coding. Speculative CoT = draft reasoning verified by target 21-66% savings. DeFT = Flattened Tree 3.59x attn. GTO = Group Tree Optimization. FA-3 = FlashAttention-3 840 TFLOPs BF16. FA-4 = FlashAttention-4 1613 TFLOPs Blackwell. Disaggregated P/D = separate prefill and decode pools. Chunked Prefill = Sarathi-Serve technique. RadixAttention = SGLang KV radix tree. Fine-grained MoE = 256+ experts. Auxiliary-Loss-Free = DeepSeek bias-term gating. Eval Gate = mandatory quality benchmark. Cascade Routing = complexity-based model selection. Meta-Tool = compiled frequent tool call sequence.
+
+---
+
+## Appendix A — Research Foundation (60+ Papers)
+
+### A.1 Compiler and IR
+
+PagedAttention (SOSP 2023), MLIR (2021), LLVM (2004), ClusterFusion NeurIPS 2025 (1.6-2.0x fusion speedup), Agentic MLIR 2026 (LLM-planned transforms), torch.compile (2023).
+
+### A.2 Speculative Decoding
+
+Speculative Decoding (Chen et al. 2023), EAGLE-2 (2024), EAGLE-3 (2025) multi-layer fusion, EAGLE-3.1 (2026) attention drift fix, JetSpec (2026) 9.64x causal parallel, OPT-Tree (2024) adaptive tree, DeFT ACL 2025 3.59x, GTO (2025), Speculative CoT 21-66% (2025), EDD ACL 2025, Pruned Candidate Trees ACL 2025.
+
+### A.3 KV Cache and Memory
+
+PagedAttention SOSP 2023, SGLang RadixAttention 2024, DistServe 2024 3-4x goodput, Mooncake 2024 Conductor scheduler, PrefillOnly 2025 final-layer KV, EvolKV 2025 adaptive allocation, FlexGen 2023 NVMe offload, LoopServe 2025 cross-session reuse, LMCache 2025 MoE KV, MuxWise 2026 SLO-aware scheduling.
+
+### A.4 Quantization and Precision
+
+GPTQ 2022, AWQ 2023, Marlin kernels 2024, AutoMixQ 2025, AMQ 2025, FlashAttention-3 FP8 2024, NVFP4 NVIDIA 2025, MXFP4 OCP 2025, FP4 KV Cache 2026.
+
+### A.5 Attention Mechanisms
+
+FlashAttention 2022, FlashAttention-2 2023, FlashAttention-3 Shah et al. 2024 (840 TFLOPs BF16), FlashAttention-4 2026 (1613 TFLOPs Blackwell), MLA DeepSeek-V2 2024, MHA2MLA 2025, GQA 2023, FlashDecoding 2024.
+
+### A.6 MoE and Expert Routing
+
+DeepSeekMoE 2024 (shared experts), DeepSeek-V3 2024 (256-expert fine-grained), Auxiliary-Loss-Free 2024 (bias-term gating), FineMoE 2025 (semantic prefetch), MoE-Infinity 2025, ISCA 2026 prefill-aware placement.
+
+### A.7 Parallelism and Scheduling
+
+Megatron-LM 2021 (TP), Alpa 2022 (auto-parallelism), Seesaw MLSys 2025 (25-40% dynamic resharding), Sarathi-Serve 2023 (chunked prefill), Orca 2022 (continuous batching).
+
+### A.8 Reasoning and Agentic
+
+Chain-of-Thought Wei et al. 2022, Tree-of-Thoughts 2023, Graph-of-Thoughts 2023, Speculative CoT 2025, RLVR 2024, AWO Agent Workflow Optimization 2025, Helium Workflow-Aware Serving 2026.
+
+### A.9 Multi-Modal
+
+LLaVA 2023, InternVL2 2024, Fast-VLM 2025 (dynamic token compression), Qwen3-VL 2025 (early-fusion), AttentionPack 2025, ViT-DP + LLM-TP hybrid parallelism 2026.
+
+### A.10 Hardware
+
+NVIDIA Hopper GH100 2022 (FA-3 WGMMA TMA), NVIDIA Blackwell B200 2024 (FP4 FA-4 8TB/s), AMD MI300X 2023 (192GB HBM3 ROCm), Apple M4 2024 (Metal 4 Neural Engine), Qualcomm AI 100 2024 (QNN Hexagon DSP).
