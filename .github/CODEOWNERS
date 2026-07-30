@@ -1,0 +1,43 @@
+# Aether Runtime — CODEOWNERS
+
+# Global default owners
+* @aether-dev/maintainers
+
+# Core AEG format and IR (requires stability review)
+src/aether/core/ @aether-dev/compiler-team
+research/ @aether-dev/compiler-team
+
+# Compiler passes and calibration
+src/aether/compiler/ @aether-dev/compiler-team
+
+# Backends and target emission
+src/aether/backends/ @aether-dev/runtime-team
+src/aether/targets/ @aether-dev/runtime-team
+src/aether/kernels/ @aether-dev/runtime-team
+
+# Runtime, scheduler, KV cache, speculative decoding
+src/aether/runtime/ @aether-dev/runtime-team
+
+# Distributed and parallelism
+src/aether/parallelism/ @aether-dev/runtime-team
+src/aether/moe/ @aether-dev/runtime-team
+
+# Server, API, CLI
+src/aether/server/ @aether-dev/api-team
+src/aether/cli.py @aether-dev/api-team
+
+# Hub and model registry
+src/aether/hub/ @aether-dev/platform-team
+
+# Quantization
+src/aether/quantization/ @aether-dev/compiler-team
+
+# Documentation and examples
+docs/ @aether-dev/docs-team
+examples/ @aether-dev/docs-team
+*.md @aether-dev/docs-team
+
+# CI/CD and build configuration
+.github/ @aether-dev/platform-team
+pyproject.toml @aether-dev/platform-team
+Makefile @aether-dev/platform-team

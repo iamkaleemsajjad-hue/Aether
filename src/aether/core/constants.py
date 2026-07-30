@@ -1,0 +1,513 @@
+"""
+Aether core constants — version strings, target IDs, defaults, and architecture patterns.
+
+This module defines all version strings, valid target identifiers, supported model
+architecture patterns, default directories, and other runtime-visible constants
+shared across the entire Aether codebase.
+"""
+
+from __future__ import annotations
+
+from typing import ClassVar
+
+# ── Aether version ────────────────────────────────────────────────────────────
+
+AETHER_VERSION: str = "0.1.0"
+"""Current version of the Aether Runtime package."""
+
+AETHER_VERSION_TUPLE: tuple[int, int, int] = (0, 1, 0)
+"""Machine-readable version tuple (major, minor, patch)."""
+
+# ── AEG format version ─────────────────────────────────────────────────────────
+
+AEG_FORMAT_VERSION: str = "AEG/1.0"
+"""Current AEG format version string. Embedded in every AEG manifest."""
+
+AEG_FORMAT_VERSION_MAJOR: int = 1
+"""AEG format major version. Changed only on breaking changes."""
+
+AEG_FORMAT_VERSION_MINOR: int = 0
+"""AEG format minor version. Incremented for backward-compatible additions."""
+
+AEG_MINIMUM_COMPATIBLE_VERSION: str = "AEG/1.0"
+"""Oldest AEG format version the current runtime can read."""
+
+# ── File extensions ────────────────────────────────────────────────────────────
+
+AEG_FILE_EXTENSION: str = ".aeg"
+"""Standard file extension for compiled AEG artifacts."""
+
+AEG_IR_FILE_EXTENSION: str = ".aeg-ir"
+"""Extension for standalone AEG-IR graph files."""
+
+AEG_QUANT_FILE_EXTENSION: str = ".aeg-quant"
+"""Extension for AEG weight files."""
+
+AEG_MANIFEST_FILENAME: str = "manifest.json"
+"""Canonical name of the AEG manifest file inside a package."""
+
+AEG_GRAPH_FILENAME: str = "computation_graph.aeg-ir"
+"""Canonical name of the AEG-IR graph file inside a package."""
+
+AEG_PRECISION_MAP_FILENAME: str = "precision_map.json"
+"""Canonical name of the precision map file."""
+
+# ── Hardware target identifiers ────────────────────────────────────────────────
+
+SUPPORTED_TARGETS: dict[str, str] = {
+    # NVIDIA
+    "cuda_sm70": "NVIDIA V100 (Volta)",
+    "cuda_sm80": "NVIDIA A100 (Ampere)",
+    "cuda_sm89": "NVIDIA RTX 4090 (Ada)",
+    "cuda_sm90": "NVIDIA H100 (Hopper)",
+    "cuda_sm100": "NVIDIA B200 (Blackwell)",
+    # Apple
+    "metal_m1": "Apple M1/M2",
+    "metal_m3": "Apple M3/M4/M5",
+    # AMD
+    "rocm_rdna3": "AMD RX 7000 Series",
+    "rocm_cdna3": "AMD MI300X",
+    # Intel
+    "openvino_npu": "Intel Arc NPU",
+    # CPU
+    "cpu_avx512": "x86_64 (AVX-512)",
+    "cpu_neon": "ARM (NEON SIMD)",
+}
+"""Mapping of target IDs to human-readable hardware descriptions."""
+
+SUPPORTED_TARGET_IDS: frozenset[str] = frozenset(SUPPORTED_TARGETS.keys())
+"""Set of all valid target IDs for validation."""
+
+BACKEND_BY_TARGET: dict[str, list[str]] = {
+    "cuda_sm70": ["pytorch", "tensorrt-llm"],
+    "cuda_sm80": ["vllm", "pytorch", "tensorrt-llm"],
+    "cuda_sm89": ["vllm", "pytorch", "tensorrt-llm"],
+    "cuda_sm90": ["vllm", "pytorch", "tensorrt-llm"],
+    "cuda_sm100": ["vllm", "pytorch", "tensorrt-llm"],
+    "metal_m1": ["mlx", "llama.cpp", "pytorch"],
+    "metal_m3": ["mlx", "llama.cpp", "pytorch"],
+    "rocm_rdna3": ["pytorch", "llama.cpp"],
+    "rocm_cdna3": ["vllm", "pytorch"],
+    "openvino_npu": ["onnxruntime", "pytorch"],
+    "cpu_avx512": ["llama.cpp", "onnxruntime", "pytorch"],
+    "cpu_neon": ["llama.cpp", "onnxruntime", "pytorch"],
+}
+"""Priority-ordered backend candidates for each target."""
+
+# ── Supported model architecture families ──────────────────────────────────────
+
+SUPPORTED_ARCHITECTURES: dict[str, dict[str, str | bool]] = {
+    "llama_family": {
+        "attn": "GQA",
+        "ffn": "SwiGLU",
+        "norm": "RMSNorm",
+        "rope": True,
+        "is_moe": False,
+    },
+    "qwen_family": {
+        "attn": "GQA_QKNorm",
+        "ffn": "SwiGLU",
+        "norm": "RMSNorm",
+        "rope": "YaRN",
+        "is_moe": False,
+    },
+    "gemma_family": {
+        "attn": "MQA",
+        "ffn": "GeGLU",
+        "norm": "RMSNorm",
+        "rope": True,
+        "is_moe": False,
+    },
+    "deepseek_family": {
+        "attn": "MLA",
+        "ffn": "MoE",
+        "norm": "RMSNorm",
+        "rope": "NTK_aware",
+        "is_moe": True,
+    },
+    "moe_family": {
+        "ffn": "MoE",
+        "router": "TopK",
+        "is_moe": True,
+    },
+    "mistral_family": {
+        "attn": "GQA",
+        "ffn": "SwiGLU",
+        "norm": "RMSNorm",
+        "rope": True,
+        "is_moe": False,
+    },
+    "phi_family": {
+        "attn": "GQA",
+        "ffn": "GELU",
+        "norm": "LayerNorm",
+        "is_moe": False,
+    },
+    "falcon_family": {
+        "attn": "MQA",
+        "ffn": "GELU",
+        "norm": "LayerNorm",
+        "is_moe": False,
+    },
+    "vision_family": {
+        "encoder": "ViT",
+        "cross_attn": True,
+    },
+    "whisper_family": {
+        "encoder": "Conv1D_Transformer",
+        "decoder": "Transformer",
+        "cross_attn": True,
+    },
+}
+"""Architecture detection patterns keyed by family name."""
+
+ARCHITECTURE_BY_MODEL_PREFIX: dict[str, str] = {
+    "llama": "llama_family",
+    "qwen": "qwen_family",
+    "gemma": "gemma_family",
+    "deepseek": "deepseek_family",
+    "mixtral": "moe_family",
+    "mistral": "mistral_family",
+    "phi": "phi_family",
+    "falcon": "falcon_family",
+    "whisper": "whisper_family",
+    "vit": "vision_family",
+}
+"""Model name prefix to architecture family mapping."""
+
+# ── Default paths ──────────────────────────────────────────────────────────────
+
+DEFAULT_CACHE_DIR: str = "~/.aether"
+"""Default Aether cache directory. Override with AETHER_CACHE_DIR env var."""
+
+DEFAULT_MODEL_CACHE_SUBDIR: str = "models"
+"""Subdirectory under cache for downloaded AEG artifacts."""
+
+DEFAULT_KERNEL_CACHE_SUBDIR: str = "kernels"
+"""Subdirectory under cache for compiled kernel blobs."""
+
+DEFAULT_CONFIG_SUBDIR: str = "config"
+"""Subdirectory under cache for user configuration."""
+
+DEFAULT_LOG_SUBDIR: str = "logs"
+"""Subdirectory under cache for runtime logs."""
+
+DEFAULT_HUB_CACHE_SUBDIR: str = "hub"
+"""Subdirectory under cache for Hub metadata."""
+
+# ── Aether Hub ─────────────────────────────────────────────────────────────────
+
+DEFAULT_HUB_URL: str = "https://hub.aether.dev"
+"""Default URL for the Aether Hub API."""
+
+HUB_API_VERSION: str = "v1"
+"""Hub API version string."""
+
+HUB_UPLOAD_TIMEOUT_S: int = 300
+"""Upload timeout in seconds."""
+
+HUB_DOWNLOAD_TIMEOUT_S: int = 120
+"""Download timeout in seconds."""
+
+HUB_RETRY_ATTEMPTS: int = 3
+"""Number of retries for Hub API calls."""
+
+HUB_RETRY_BACKOFF_S: float = 2.0
+"""Exponential backoff base in seconds."""
+
+# ── Compiler defaults ──────────────────────────────────────────────────────────
+
+DEFAULT_QUALITY_BUDGET: float = 0.02
+"""Default maximum allowed perplexity increase (2%)."""
+
+DEFAULT_CALIBRATION_DATASET: str = "wikitext-2"
+"""Default calibration dataset for sensitivity analysis."""
+
+DEFAULT_CALIBRATION_TOKENS: int = 131072
+"""Default number of tokens to draw from the calibration dataset."""
+
+DEFAULT_OPTIMIZATION_LEVEL: int = 2
+"""Default optimization level: 0=none, 1=basic, 2=full, 3=aggressive."""
+
+DEFAULT_FUSION_PASS: bool = True
+"""Whether operator fusion is enabled by default."""
+
+DEFAULT_SENSITIVITY_PASS: bool = True
+"""Whether sensitivity analysis is enabled by default."""
+
+DEFAULT_PRECISION_PASS: bool = True
+"""Whether precision assignment is enabled by default."""
+
+DEFAULT_KV_CACHE_PASS: bool = True
+"""Whether KV cache structuring is enabled by default."""
+
+DEFAULT_MOE_ROUTING_PASS: bool = True
+"""Whether MoE routing optimization is enabled by default."""
+
+DEFAULT_PARALLELISM_PASS: bool = True
+"""Whether parallelism discovery is enabled by default."""
+
+# ── Runtime defaults ───────────────────────────────────────────────────────────
+
+DEFAULT_OPTIMIZE_FOR: str = "latency"
+"""Default optimization objective: latency, throughput, or quality."""
+
+DEFAULT_SPECULATIVE_DECODING: bool = True
+"""Whether tree-speculative decoding is enabled by default."""
+
+DEFAULT_SPECULATIVE_TREE_DEPTH: int = 4
+"""Default draft tree depth for speculative decoding."""
+
+DEFAULT_PREFILL_CHUNK_SIZE: int = 2048
+"""Default maximum tokens per prefill chunk."""
+
+DEFAULT_MAX_BATCH_SIZE: int = 256
+"""Default maximum number of concurrent requests per batch."""
+
+DEFAULT_KV_CACHE_DTYPE: str = "fp8"
+"""Default KV cache numeric format."""
+
+DEFAULT_KV_CACHE_CPU_GB: int = 32
+"""Default CPU DRAM budget for KV cache (GB)."""
+
+DEFAULT_KV_CACHE_NVME_GB: int = 200
+"""Default NVMe SSD budget for KV cache (GB)."""
+
+DEFAULT_DYNAMIC_PRECISION: bool = True
+"""Whether dynamic precision adjustment is enabled by default."""
+
+DEFAULT_DISAGGREGATE_SERVE: bool = False
+"""Whether disaggregated prefill/decode is enabled by default."""
+
+DEFAULT_SERVER_PORT: int = 11434
+"""Default port for the Aether REST server."""
+
+DEFAULT_SERVER_HOST: str = "localhost"
+"""Default host for the Aether REST server."""
+
+DEFAULT_TEMPERATURE: float = 0.7
+"""Default generation temperature."""
+
+DEFAULT_MAX_TOKENS: int = 1024
+"""Default maximum generation tokens."""
+
+DEFAULT_TOP_P: float = 0.9
+"""Default top-p sampling parameter."""
+
+# ── Precision constants ────────────────────────────────────────────────────────
+
+PRECISION_SIZES_BYTES: dict[str, float] = {
+    "BF16": 2.0,
+    "FP16": 2.0,
+    "FP32": 4.0,
+    "FP8": 1.0,
+    "Q8_0": 1.0,
+    "Q6_K": 0.75,
+    "Q4_K_M": 0.5,
+    "Q4_0": 0.5,
+    "Q3_K": 0.375,
+    "Q3_K_S": 0.375,
+    "IQ3_XS": 0.375,
+    "Q2_K": 0.25,
+    "INT4": 0.5,
+    "INT8": 1.0,
+    "INT16": 2.0,
+}
+"""Memory size in bytes per element for each precision format."""
+
+PRECISION_BITS: dict[str, int] = {
+    "BF16": 16,
+    "FP16": 16,
+    "FP32": 32,
+    "FP8": 8,
+    "Q8_0": 8,
+    "Q6_K": 6,
+    "Q4_K_M": 4,
+    "Q4_0": 4,
+    "Q3_K": 3,
+    "Q3_K_S": 3,
+    "IQ3_XS": 3,
+    "Q2_K": 2,
+    "INT4": 4,
+    "INT8": 8,
+    "INT16": 16,
+}
+"""Effective bit width of each precision format."""
+
+# ── Sensitivity thresholds ─────────────────────────────────────────────────────
+
+SENSITIVITY_CRITICAL_THRESHOLD: float = 0.9
+"""Layers with sensitivity above this are assigned BF16."""
+
+SENSITIVITY_HIGH_THRESHOLD: float = 0.7
+"""Layers with sensitivity above this are assigned FP8 or Q6_K."""
+
+SENSITIVITY_MEDIUM_THRESHOLD: float = 0.4
+"""Layers with sensitivity above this are assigned Q4_K_M."""
+
+# ── MoE thresholds ─────────────────────────────────────────────────────────────
+
+MOE_HOT_THRESHOLD: float = 0.05
+"""Experts with activation rate above this are hot (GPU HBM)."""
+
+MOE_WARM_THRESHOLD: float = 0.001
+"""Experts with activation rate above this are warm (CPU DRAM + prefetch)."""
+
+MOE_HOT_ACTIVATION_LIMIT: int = 1024
+"""Number of calibration tokens per expert for hot classification."""
+
+# ── Speculative decoding ───────────────────────────────────────────────────────
+
+DRAFT_FAMILIES: dict[str, str] = {
+    "qwen3-72b": "qwen3-1.5b",
+    "qwen3-8b": "qwen3-0.6b",
+    "llama3.3-70b": "llama3.2-1b",
+    "llama3.1-8b": "llama3.2-1b",
+    "deepseek-r1-671b": "deepseek-r1-8b",
+    "deepseek-v3": "deepseek-r1-8b",
+    "gemma-2-27b": "gemma-2-2b",
+    "gemma-2-9b": "gemma-2-2b",
+    "mixtral-8x22b": "mixtral-8x7b",
+}
+"""Suggested draft model for each target model."""
+
+MINIMUM_ACCEPTANCE_RATE: float = 0.70
+"""Minimum draft acceptance rate before falling back to standard decoding."""
+
+# ── Performance and memory ─────────────────────────────────────────────────────
+
+PREFILL_MEMORY_OVERHEAD_FACTOR: float = 1.2
+"""Multiplier for prefill memory estimation."""
+
+DECODE_MEMORY_OVERHEAD_FACTOR: float = 1.1
+"""Multiplier for decode memory estimation."""
+
+KV_CACHE_BLOCK_SIZE: int = 16
+"""Number of KV slots per block in the paged cache."""
+
+KV_CACHE_ALLOCATION_ALIGNMENT: int = 256
+"""Memory alignment for KV block allocations."""
+
+MAX_TENSOR_PARALLEL_DEGREE: int = 8
+"""Maximum supported tensor parallelism degree."""
+
+MAX_PIPELINE_PARALLEL_STAGES: int = 8
+"""Maximum supported pipeline parallelism stages."""
+
+MAX_CONTEXT_PARALLEL_DEGREE: int = 8
+"""Maximum supported context parallelism degree."""
+
+MAX_EXPERT_PARALLEL_DEGREE: int = 8
+"""Maximum supported expert parallelism degree."""
+
+# ── Bounds and limits ──────────────────────────────────────────────────────────
+
+MAX_CONTEXT_LENGTH: int = 262144
+"""Maximum supported context length in tokens."""
+
+MAX_BATCH_SIZE_HARD_LIMIT: int = 4096
+"""Hard limit on batch size regardless of configuration."""
+
+MAX_PREFILL_CHUNK_SIZE: int = 65536
+"""Maximum prefill chunk size in tokens."""
+
+MAX_MODEL_NAME_LENGTH: int = 256
+"""Maximum model name/ID length."""
+
+MAX_CACHE_KEY_LENGTH: int = 128
+"""Maximum length of a content-addressed cache key."""
+
+# ── Error messages ─────────────────────────────────────────────────────────────
+
+ERR_MODEL_NOT_FOUND: str = "Model '{}' not found in local cache or on Hub."
+ERR_MODEL_NOT_COMPILED: str = "Model '{}' has not been compiled yet. Run `aether compile {}` first."
+ERR_UNSUPPORTED_FORMAT: str = "Unsupported model format: '{}'. Supported: {}."
+ERR_UNSUPPORTED_TARGET: str = "Unsupported target '{}'. Supported targets: {}."
+ERR_BACKEND_NOT_FOUND: str = "No backend available for target '{}'. Install the required backend package."
+ERR_TARGET_NOT_FOUND: str = "No kernel or backend plan found for target '{}'. Compile with this target first."
+ERR_CACHE_MISS: str = "Cache miss for key '{}'. Kernel must be compiled locally."
+ERR_AEG_VERSION_MISMATCH: str = "AEG format '{}' is not compatible with runtime version '{}'."
+ERR_AEG_INTEGRITY: str = "AEG integrity check failed for file '{}'. Expected hash: {} != actual: {}."
+ERR_DOWNLOAD_FAILED: str = "Failed to download '{}' from '{}'. Status: {}."
+ERR_UPLOAD_FAILED: str = "Failed to upload to '{}'. Status: {}."
+ERR_CALIBRATION_FAILED: str = "Calibration failed for model '{}' on dataset '{}'. {}"
+ERR_SENSITIVITY_FAILED: str = "Sensitivity analysis failed at layer {}. {}"
+ERR_COMPILATION_FAILED: str = "Compilation failed for model '{}'. {}"
+ERR_RUNTIME_INIT_FAILED: str = "Runtime initialization failed: {}"
+ERR_MEMORY_EXCEEDED: str = "Estimated memory ({:.1f} GB) exceeds available VRAM ({:.1f} GB)."
+ERR_CONCURRENCY_EXCEEDED: str = "Concurrent request limit ({}) exceeded."
+KERNEL_CACHE_KEY_FMT: str = "{graph_hash}:{target_id}:{aether_version}"
+
+
+class ConstantsMeta(type):
+    """Metaclass preventing instantiation and modification of constants classes."""
+
+    _locked: bool = False
+
+    def __init__(cls, name: str, bases: tuple[type, ...], namespace: dict) -> None:
+        super().__init__(name, bases, namespace)
+        cls._locked = True
+
+    def __setattr__(cls, name: str, value: object) -> None:
+        if cls._locked:
+            msg = f"Cannot modify constant {name}"
+            raise AttributeError(msg)
+        super().__setattr__(name, value)
+
+    def __delattr__(cls, name: str) -> None:
+        if cls._locked:
+            msg = f"Cannot delete constant {name}"
+            raise AttributeError(msg)
+        super().__delattr__(name)
+
+
+class PrecisionConstants(metaclass=ConstantsMeta):
+    """Runtime-friendly precision constants container.
+
+    Provides method-based access to precision metadata for use in
+    configuration and assignment logic.
+    """
+
+    SIZES_BYTES: ClassVar[dict[str, float]] = PRECISION_SIZES_BYTES
+    BITS: ClassVar[dict[str, int]] = PRECISION_BITS
+    CRITICAL_THRESHOLD: ClassVar[float] = SENSITIVITY_CRITICAL_THRESHOLD
+    HIGH_THRESHOLD: ClassVar[float] = SENSITIVITY_HIGH_THRESHOLD
+    MEDIUM_THRESHOLD: ClassVar[float] = SENSITIVITY_MEDIUM_THRESHOLD
+
+    @classmethod
+    def size_bytes(cls, precision: str) -> float:
+        """Return the size in bytes per element for a given precision."""
+        return cls.SIZES_BYTES.get(precision.upper(), 2.0)
+
+    @classmethod
+    def bit_width(cls, precision: str) -> int:
+        """Return the effective bit width for a given precision."""
+        return cls.BITS.get(precision.upper(), 16)
+
+    @classmethod
+    def is_quantized(cls, precision: str) -> bool:
+        """Return True if the precision is a quantized format."""
+        return precision.upper().startswith("Q") or precision.upper().startswith("I")
+
+
+class HardwareConstants(metaclass=ConstantsMeta):
+    """Hardware definition constants."""
+
+    TARGETS: ClassVar[dict[str, str]] = SUPPORTED_TARGETS
+    TARGET_IDS: ClassVar[frozenset[str]] = SUPPORTED_TARGET_IDS
+    BACKEND_MAP: ClassVar[dict[str, list[str]]] = BACKEND_BY_TARGET
+
+    @classmethod
+    def target_name(cls, target_id: str) -> str:
+        """Return the human-readable name for a target ID."""
+        return cls.TARGETS.get(target_id, f"Unknown ({target_id})")
+
+    @classmethod
+    def is_valid(cls, target_id: str) -> bool:
+        """Check whether a target ID is valid."""
+        return target_id in cls.TARGET_IDS
+
+    @classmethod
+    def backends_for(cls, target_id: str) -> list[str]:
+        """Return the priority-ordered list of backends for a target."""
+        return cls.BACKEND_MAP.get(target_id, ["pytorch"])
