@@ -61,6 +61,7 @@ SUPPORTED_TARGETS: dict[str, str] = {
     "cuda_sm89": "NVIDIA RTX 4090 (Ada)",
     "cuda_sm90": "NVIDIA H100 (Hopper)",
     "cuda_sm100": "NVIDIA B200 (Blackwell)",
+    "cuda_sm120": "NVIDIA Rubin (future)",
     # Apple
     "metal_m1": "Apple M1/M2",
     "metal_m3": "Apple M3/M4/M5",
@@ -69,6 +70,7 @@ SUPPORTED_TARGETS: dict[str, str] = {
     "rocm_cdna3": "AMD MI300X",
     # Intel
     "openvino_npu": "Intel Arc NPU",
+    "qualcomm_qnn": "Qualcomm Snapdragon NPU",
     # CPU
     "cpu_avx512": "x86_64 (AVX-512)",
     "cpu_neon": "ARM (NEON SIMD)",
@@ -84,11 +86,13 @@ BACKEND_BY_TARGET: dict[str, list[str]] = {
     "cuda_sm89": ["vllm", "pytorch", "tensorrt-llm"],
     "cuda_sm90": ["vllm", "pytorch", "tensorrt-llm"],
     "cuda_sm100": ["vllm", "pytorch", "tensorrt-llm"],
+    "cuda_sm120": ["vllm", "pytorch", "tensorrt-llm"],
     "metal_m1": ["mlx", "llama.cpp", "pytorch"],
     "metal_m3": ["mlx", "llama.cpp", "pytorch"],
     "rocm_rdna3": ["pytorch", "llama.cpp"],
     "rocm_cdna3": ["vllm", "pytorch"],
     "openvino_npu": ["onnxruntime", "pytorch"],
+    "qualcomm_qnn": ["onnxruntime", "pytorch"],
     "cpu_avx512": ["llama.cpp", "onnxruntime", "pytorch"],
     "cpu_neon": ["llama.cpp", "onnxruntime", "pytorch"],
 }
@@ -158,6 +162,12 @@ SUPPORTED_ARCHITECTURES: dict[str, dict[str, str | bool]] = {
         "decoder": "Transformer",
         "cross_attn": True,
     },
+    "hybrid_ssm_family": {
+        "attn": "hybrid",
+        "ssm": "selective_scan",
+        "stateful": True,
+        "is_moe": False,
+    },
 }
 """Architecture detection patterns keyed by family name."""
 
@@ -172,6 +182,11 @@ ARCHITECTURE_BY_MODEL_PREFIX: dict[str, str] = {
     "falcon": "falcon_family",
     "whisper": "whisper_family",
     "vit": "vision_family",
+    "llava": "vision_family",
+    "mamba": "hybrid_ssm_family",
+    "jamba": "hybrid_ssm_family",
+    "bamba": "hybrid_ssm_family",
+    "rwkv": "hybrid_ssm_family",
 }
 """Model name prefix to architecture family mapping."""
 
@@ -247,6 +262,15 @@ DEFAULT_MOE_ROUTING_PASS: bool = True
 DEFAULT_PARALLELISM_PASS: bool = True
 """Whether parallelism discovery is enabled by default."""
 
+DEFAULT_REASONING_GRAPH_PASS: bool = True
+"""Whether reasoning graph compilation is enabled by default."""
+
+DEFAULT_SPARSE_ATTENTION_PASS: bool = True
+"""Whether sparse attention pattern compilation is enabled by default."""
+
+DEFAULT_PRUNING_PASS: bool = True
+"""Whether pruning and sparsity mask planning is enabled by default."""
+
 # ── Runtime defaults ───────────────────────────────────────────────────────────
 
 DEFAULT_OPTIMIZE_FOR: str = "latency"
@@ -310,6 +334,9 @@ PRECISION_SIZES_BYTES: dict[str, float] = {
     "IQ3_XS": 0.375,
     "Q2_K": 0.25,
     "INT4": 0.5,
+    "FP4": 0.5,
+    "NVFP4": 0.5,
+    "MXFP4": 0.5,
     "INT8": 1.0,
     "INT16": 2.0,
 }
@@ -329,6 +356,9 @@ PRECISION_BITS: dict[str, int] = {
     "IQ3_XS": 3,
     "Q2_K": 2,
     "INT4": 4,
+    "FP4": 4,
+    "NVFP4": 4,
+    "MXFP4": 4,
     "INT8": 8,
     "INT16": 16,
 }

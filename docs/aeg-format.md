@@ -147,3 +147,36 @@ Every AEG file is content-addressed using SHA-256. The `graph_hash` is the hash 
 ## Distribution
 
 AEG packages may be distributed as directories or compressed tar archives (`.tar.gz`). The `.aeg` extension is reserved for both forms. Future AEG versions may introduce additional compression options.
+
+
+## AEG v3.1 Extension Directories
+
+The current package writer emits backward-compatible v3.1 extension directories while keeping the manifest format at AEG/1.x compatibility:
+
+- `graph/reasoning_graph.aeg-ir`: compiled reasoning workflow metadata.
+- `graph/rag_pipeline.aeg-ir`: RAG workflow graph contract.
+- `graph/attention_head_patterns.json`: sparse attention head pattern plan.
+- `weights/precision_map.json`: root precision map mirror for v3.1 readers.
+- `weights/sparsity_masks.json`: pruning and sparse-kernel eligibility plan when available.
+- `parallelism/prefill_decode_split.json`: disaggregated prefill/decode pool contract.
+- `inference/compute_profiles.json`: greedy, beam, best-of-N, and MCTS cost profiles.
+- `safety/`: prompt guard, output filter, and audit-log configuration.
+- `provenance/`: model provenance manifest and fingerprint metadata.
+- `watermark/`: SynthID-style statistical watermark configuration.
+- `adapters/`: LoRA adapter manifest and slot configuration.
+- `cuda_graphs/`: piecewise CUDA graph capture manifest.
+
+Each emitted extension file is hashed into `manifest.artifacts` for integrity tracking.
+
+
+## AEG v3.1 Platform Artifacts
+
+Compiled packages now include deterministic manifests for the PRD v3.1 platform surface:
+
+- `agentic/workflow_cache.json` stores meta-tool sequences, cascade routes, and context-cache policy.
+- `observability/eval_gates.json`, `observability/drift_monitor.json`, and `observability/metrics_schema.json` define production gates and telemetry.
+- `rollout/ab_config.json` stores deterministic A/B bucket assignment and rollback triggers.
+- `fleet/deployment_plan.json` and `fleet/hot_reload.json` describe heterogeneous placement and candidate promotion/rollback.
+- `distillation/plan.json` defines teacher/student modes, datasets, loss weights, and eval gates.
+- `cuda_graphs/capture_manifest.json` records decode and prefill graph buckets plus persistent kernels.
+- `mla/plan.json`, `speculation/eagle3.json`, and `multimodal/graph.json` cover MLA, EAGLE-3, and unified VLM/RAG workflows.

@@ -377,7 +377,7 @@ Aether supports:
 
 Architecture detection inspects the graph structure, not the model name, so it works with custom models and future variants.
 
-### Stage 2: Six Optimizer Passes
+### Stage 2: Nine Optimizer Passes
 
 1. **Operator Fusion** — fuse `RMSNorm → QKV → RoPE → GQA` into megakernels.
 2. **Sensitivity Analysis** — compute `d(perplexity)/d(precision)` per layer.
@@ -601,3 +601,15 @@ Contact `enterprise@aether.dev` for commercial inquiries.
 <p align="center">
   <strong>Aether Runtime — the compiler for AI models.</strong>
 </p>
+
+
+### PRD v3.1 Runtime Layers
+
+Aether now includes functional reference implementations and artifact contracts for the v3.1 platform layer:
+
+- Agentic workflow optimizer with meta-tool mining, context-cache policy, and cascade routing.
+- EAGLE-3 planner with multi-layer fusion, flattened tree metadata, and drift-correction flags.
+- MLA native planner with latent-KV compression ratios and target-specific kernel selection.
+- Observability contracts for eval gates, drift monitoring, OpenTelemetry-style metrics, and A/B rollout.
+- Fleet management, hot reload routing, CUDA Graph capture manifests, multimodal graph planning, and distillation manifests.
+

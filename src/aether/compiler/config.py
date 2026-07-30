@@ -22,8 +22,11 @@ from aether.core.constants import (
     DEFAULT_OPTIMIZATION_LEVEL,
     DEFAULT_PARALLELISM_PASS,
     DEFAULT_PRECISION_PASS,
+    DEFAULT_PRUNING_PASS,
     DEFAULT_QUALITY_BUDGET,
+    DEFAULT_REASONING_GRAPH_PASS,
     DEFAULT_SENSITIVITY_PASS,
+    DEFAULT_SPARSE_ATTENTION_PASS,
 )
 from aether.core.exceptions import CompilerConfigError
 from aether.core.types import HardwareTarget
@@ -69,6 +72,24 @@ class CompilerConfig:
 
     enable_parallelism_discovery: bool = DEFAULT_PARALLELISM_PASS
     """Enable automatic parallelism discovery pass (Pass 6)."""
+
+    enable_reasoning_graph: bool = DEFAULT_REASONING_GRAPH_PASS
+    """Enable reasoning graph compilation pass (Pass 7)."""
+
+    enable_sparse_attention: bool = DEFAULT_SPARSE_ATTENTION_PASS
+    """Enable sparse attention pattern compilation pass (Pass 8)."""
+
+    enable_pruning: bool = DEFAULT_PRUNING_PASS
+    """Enable pruning and sparsity planning pass (Pass 9)."""
+
+    reasoning_budget_tokens: int = 512
+    """Default token budget for compiled reasoning graph nodes."""
+
+    sparse_attention_context_threshold: int = 32768
+    """Context length where MInference-style sparse attention plans activate."""
+
+    pruning_target_sparsity: float = 0.5
+    """Target sparsity for Wanda/SparseGPT-style mask planning."""
 
     upload_kernels: bool = False
     """Opt-in to upload compiled kernels to Aether Hub after compilation."""
@@ -154,6 +175,12 @@ class CompilerConfig:
         if self.kv_cache_dtype not in ("fp8", "fp16", "bf16"):
             msg = f"Unknown kv_cache_dtype: {self.kv_cache_dtype}"
             raise CompilerConfigError(msg)
+        if self.reasoning_budget_tokens < 1:
+            msg = f"reasoning_budget_tokens must be >= 1, got {self.reasoning_budget_tokens}"
+            raise CompilerConfigError(msg)
+        if not 0.0 <= self.pruning_target_sparsity < 1.0:
+            msg = f"pruning_target_sparsity must be in [0, 1), got {self.pruning_target_sparsity}"
+            raise CompilerConfigError(msg)
         for target in self.targets:
             if target == "auto":
                 continue
@@ -198,6 +225,12 @@ class CompilerConfig:
             "enable_kv_cache_structuring": self.enable_kv_cache_structuring,
             "enable_moe_routing": self.enable_moe_routing,
             "enable_parallelism_discovery": self.enable_parallelism_discovery,
+            "enable_reasoning_graph": self.enable_reasoning_graph,
+            "enable_sparse_attention": self.enable_sparse_attention,
+            "enable_pruning": self.enable_pruning,
+            "reasoning_budget_tokens": self.reasoning_budget_tokens,
+            "sparse_attention_context_threshold": self.sparse_attention_context_threshold,
+            "pruning_target_sparsity": self.pruning_target_sparsity,
             "upload_kernels": self.upload_kernels,
             "cache_dir": self.cache_dir,
             "hub_url": self.hub_url,
@@ -235,6 +268,12 @@ class CompilerConfig:
             enable_kv_cache_structuring=data.get("enable_kv_cache_structuring", DEFAULT_KV_CACHE_PASS),
             enable_moe_routing=data.get("enable_moe_routing", DEFAULT_MOE_ROUTING_PASS),
             enable_parallelism_discovery=data.get("enable_parallelism_discovery", DEFAULT_PARALLELISM_PASS),
+            enable_reasoning_graph=data.get("enable_reasoning_graph", DEFAULT_REASONING_GRAPH_PASS),
+            enable_sparse_attention=data.get("enable_sparse_attention", DEFAULT_SPARSE_ATTENTION_PASS),
+            enable_pruning=data.get("enable_pruning", DEFAULT_PRUNING_PASS),
+            reasoning_budget_tokens=data.get("reasoning_budget_tokens", 512),
+            sparse_attention_context_threshold=data.get("sparse_attention_context_threshold", 32768),
+            pruning_target_sparsity=data.get("pruning_target_sparsity", 0.5),
             upload_kernels=data.get("upload_kernels", False),
             cache_dir=data.get("cache_dir", DEFAULT_CACHE_DIR),
             hub_url=data.get("hub_url"),

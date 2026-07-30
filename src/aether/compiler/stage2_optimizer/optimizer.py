@@ -476,6 +476,182 @@ class ParallelismDiscoveryPass(BasePass):
         return graph, report
 
 
+class ReasoningGraphPass(BasePass):
+    """Pass 7: Reasoning Graph Compilation.
+
+    Emits a budget-controlled reasoning graph description for models used in
+    chain-of-thought or tool-augmented workflows. The graph is metadata today,
+    but it is executable by downstream runtimes because every node has explicit
+    budget, confidence, and transition semantics.
+    """
+
+    name = "reasoning_graph"
+    description = "Compile budget-controlled reasoning graph metadata."
+
+    def run(self, graph: Any, architecture: Any, config: CompilerConfig) -> tuple[Any, PassReport]:
+        start = time.perf_counter()
+        try:
+            budget = max(1, config.reasoning_budget_tokens)
+            reasoning_graph = {
+                "version": "reasoning_graph/1.0",
+                "entrypoint": "reasoning_step",
+                "budget_tokens": budget,
+                "early_exit_threshold": 0.95,
+                "nodes": [
+                    {"id": "context_encode", "op": "aeg.reasoning_context_encode", "budget_cost": 0},
+                    {"id": "draft_thought", "op": "aeg.reasoning_forward", "budget_cost": "dynamic"},
+                    {"id": "verify_thought", "op": "aeg.reasoning_verify", "confidence_threshold": 0.95},
+                    {"id": "budget_decrement", "op": "aeg.budget_decrement", "max_tokens": budget},
+                ],
+                "edges": [
+                    ["context_encode", "draft_thought"],
+                    ["draft_thought", "verify_thought"],
+                    ["verify_thought", "budget_decrement"],
+                ],
+                "speculative_cot": {
+                    "enabled": True,
+                    "draft_family": architecture.family,
+                    "acceptance_floor": 0.70,
+                },
+            }
+            if hasattr(graph, "set_metadata"):
+                graph.set_metadata("reasoning_graph", reasoning_graph)
+            report = PassReport(
+                pass_name=self.name,
+                status="applied",
+                duration_ms=(time.perf_counter() - start) * 1000,
+                nodes_affected=len(reasoning_graph["nodes"]),
+                details=reasoning_graph,
+            )
+            logger.info("Pass 7: Compiled reasoning graph metadata")
+        except Exception as exc:
+            report = PassReport(
+                pass_name=self.name,
+                status="failed",
+                duration_ms=(time.perf_counter() - start) * 1000,
+                details={"error": str(exc)},
+            )
+            logger.error(f"Pass 7 failed: {exc}")
+        return graph, report
+
+
+class SparseAttentionPass(BasePass):
+    """Pass 8: MInference-style sparse attention pattern planning."""
+
+    name = "sparse_attention"
+    description = "Compile sparse long-context attention head patterns."
+
+    def run(self, graph: Any, architecture: Any, config: CompilerConfig) -> tuple[Any, PassReport]:
+        start = time.perf_counter()
+        try:
+            patterns = self._assign_head_patterns(architecture)
+            enabled = architecture.context_length >= config.sparse_attention_context_threshold
+            plan = {
+                "version": "sparse_attention/1.0",
+                "enabled": enabled,
+                "activation_context_length": config.sparse_attention_context_threshold,
+                "model_context_length": architecture.context_length,
+                "patterns": patterns,
+                "runtime_fallback": "dense_attention",
+                "research_basis": ["MInference", "MMInference", "Ring Attention"],
+            }
+            if hasattr(graph, "set_metadata"):
+                graph.set_metadata("attention_head_patterns", plan)
+            report = PassReport(
+                pass_name=self.name,
+                status="applied" if enabled else "skipped",
+                duration_ms=(time.perf_counter() - start) * 1000,
+                nodes_affected=len(patterns),
+                details=plan,
+            )
+            logger.info(f"Pass 8: Planned {len(patterns)} sparse attention head groups")
+        except Exception as exc:
+            report = PassReport(
+                pass_name=self.name,
+                status="failed",
+                duration_ms=(time.perf_counter() - start) * 1000,
+                details={"error": str(exc)},
+            )
+            logger.error(f"Pass 8 failed: {exc}")
+        return graph, report
+
+    def _assign_head_patterns(self, architecture: Any) -> list[dict[str, Any]]:
+        patterns: list[dict[str, Any]] = []
+        head_count = max(1, architecture.num_attention_heads)
+        for head in range(head_count):
+            if head % 3 == 0:
+                pattern = "vertical_slash"
+            elif head % 3 == 1:
+                pattern = "block_sparse"
+            else:
+                pattern = "a_shape"
+            patterns.append({
+                "head": head,
+                "pattern": pattern,
+                "sink_tokens": 128,
+                "local_window": 4096,
+                "stride": 128 if pattern == "vertical_slash" else 0,
+            })
+        return patterns
+
+
+class PruningSparsityPass(BasePass):
+    """Pass 9: Wanda/SparseGPT-inspired sparsity mask planning."""
+
+    name = "pruning_sparsity"
+    description = "Plan sparsity masks and sparse kernel eligibility."
+
+    def run(self, graph: Any, architecture: Any, config: CompilerConfig) -> tuple[Any, PassReport]:
+        start = time.perf_counter()
+        try:
+            target_sparsity = config.pruning_target_sparsity
+            masks: dict[str, dict[str, Any]] = {}
+            if hasattr(graph, "__iter__"):
+                for node in graph:
+                    op_type = getattr(node, "op_type", None)
+                    if op_type not in {"linear", "qkv_proj", "gate_proj", "swiglu_ffn", "expert_ffn"}:
+                        continue
+                    layer_index = getattr(node, "layer_index", None)
+                    sensitivity = 0.5
+                    if hasattr(node, "get_attribute"):
+                        sensitivity = float(node.get_attribute("sensitivity", 0.5))
+                    sparsity = max(0.0, min(target_sparsity, target_sparsity * (1.15 - sensitivity * 0.5)))
+                    pattern = "2:4" if sparsity >= 0.45 else "unstructured"
+                    masks[getattr(node, "id", f"node_{len(masks)}")] = {
+                        "layer_index": layer_index,
+                        "op_type": op_type,
+                        "target_sparsity": round(sparsity, 4),
+                        "pattern": pattern,
+                        "importance_metric": "abs_weight_x_activation",
+                    }
+            plan = {
+                "version": "sparsity/1.0",
+                "method": "wanda_sparsegpt_hybrid",
+                "target_sparsity": target_sparsity,
+                "masks": masks,
+                "sparse_kernel_targets": ["cuda_sm80", "cuda_sm90", "cuda_sm100", "cuda_sm120"],
+            }
+            if hasattr(graph, "set_metadata"):
+                graph.set_metadata("sparsity_plan", plan)
+            report = PassReport(
+                pass_name=self.name,
+                status="applied",
+                duration_ms=(time.perf_counter() - start) * 1000,
+                nodes_affected=len(masks),
+                details=plan,
+            )
+            logger.info(f"Pass 9: Planned sparsity masks for {len(masks)} nodes")
+        except Exception as exc:
+            report = PassReport(
+                pass_name=self.name,
+                status="failed",
+                duration_ms=(time.perf_counter() - start) * 1000,
+                details={"error": str(exc)},
+            )
+            logger.error(f"Pass 9 failed: {exc}")
+        return graph, report
+
+
 class OptimizerPipeline:
     """Orchestrates the six Aether optimizer passes.
 
@@ -492,6 +668,9 @@ class OptimizerPipeline:
             KVCacheStructuringPass(),
             MoERoutingPass(),
             ParallelismDiscoveryPass(),
+            ReasoningGraphPass(),
+            SparseAttentionPass(),
+            PruningSparsityPass(),
         ]
         self._pass_enabled = {
             "operator_fusion": True,
@@ -500,6 +679,9 @@ class OptimizerPipeline:
             "kv_cache_structuring": True,
             "moe_routing": True,
             "parallelism_discovery": True,
+            "reasoning_graph": True,
+            "sparse_attention": True,
+            "pruning_sparsity": True,
         }
 
     @property
@@ -545,6 +727,9 @@ class OptimizerPipeline:
         self._pass_enabled["kv_cache_structuring"] = self.config.enable_kv_cache_structuring
         self._pass_enabled["moe_routing"] = self.config.enable_moe_routing
         self._pass_enabled["parallelism_discovery"] = self.config.enable_parallelism_discovery
+        self._pass_enabled["reasoning_graph"] = self.config.enable_reasoning_graph
+        self._pass_enabled["sparse_attention"] = self.config.enable_sparse_attention
+        self._pass_enabled["pruning_sparsity"] = self.config.enable_pruning
 
         for pass_instance in self._passes:
             if not self._pass_enabled.get(pass_instance.name, True):

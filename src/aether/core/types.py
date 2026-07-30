@@ -118,6 +118,9 @@ class Precision(enum.Enum):
     FP8 = "FP8"
     FP8_E4M3 = "FP8_E4M3"
     FP8_E5M2 = "FP8_E5M2"
+    FP4 = "FP4"
+    NVFP4 = "NVFP4"
+    MXFP4 = "MXFP4"
     Q8_0 = "Q8_0"
     Q6_K = "Q6_K"
     Q4_K_M = "Q4_K_M"
@@ -140,6 +143,9 @@ class Precision(enum.Enum):
             Precision.FP8: 8,
             Precision.FP8_E4M3: 8,
             Precision.FP8_E5M2: 8,
+            Precision.FP4: 4,
+            Precision.NVFP4: 4,
+            Precision.MXFP4: 4,
             Precision.Q8_0: 8,
             Precision.Q6_K: 6,
             Precision.Q4_K_M: 4,
@@ -230,7 +236,7 @@ class PrecisionTier(enum.IntEnum):
         mapping = {
             PrecisionTier.FULL: [Precision.BF16],
             PrecisionTier.HIGH: [Precision.FP8, Precision.Q6_K],
-            PrecisionTier.MEDIUM: [Precision.Q4_K_M, Precision.Q4_0],
+            PrecisionTier.MEDIUM: [Precision.FP4, Precision.NVFP4, Precision.MXFP4, Precision.Q4_K_M, Precision.Q4_0],
             PrecisionTier.LOW: [Precision.Q3_K, Precision.Q3_K_S, Precision.IQ3_XS],
             PrecisionTier.MINIMAL: [Precision.Q2_K, Precision.Q2_K_S],
         }
@@ -283,11 +289,13 @@ class HardwareTarget(enum.Enum):
     CUDA_SM89 = "cuda_sm89"
     CUDA_SM90 = "cuda_sm90"
     CUDA_SM100 = "cuda_sm100"
+    CUDA_SM120 = "cuda_sm120"
     METAL_M1 = "metal_m1"
     METAL_M3 = "metal_m3"
     ROCM_RDNA3 = "rocm_rdna3"
     ROCM_CDNA3 = "rocm_cdna3"
     OPENVINO_NPU = "openvino_npu"
+    QUALCOMM_QNN = "qualcomm_qnn"
     CPU_AVX512 = "cpu_avx512"
     CPU_NEON = "cpu_neon"
 
@@ -300,11 +308,13 @@ class HardwareTarget(enum.Enum):
             HardwareTarget.CUDA_SM89: "NVIDIA",
             HardwareTarget.CUDA_SM90: "NVIDIA",
             HardwareTarget.CUDA_SM100: "NVIDIA",
+            HardwareTarget.CUDA_SM120: "NVIDIA",
             HardwareTarget.METAL_M1: "Apple",
             HardwareTarget.METAL_M3: "Apple",
             HardwareTarget.ROCM_RDNA3: "AMD",
             HardwareTarget.ROCM_CDNA3: "AMD",
             HardwareTarget.OPENVINO_NPU: "Intel",
+            HardwareTarget.QUALCOMM_QNN: "Qualcomm",
             HardwareTarget.CPU_AVX512: "CPU",
             HardwareTarget.CPU_NEON: "CPU",
         }[self]
@@ -318,11 +328,13 @@ class HardwareTarget(enum.Enum):
             HardwareTarget.CUDA_SM89: "NVIDIA RTX 4090 (Ada)",
             HardwareTarget.CUDA_SM90: "NVIDIA H100 (Hopper)",
             HardwareTarget.CUDA_SM100: "NVIDIA B200 (Blackwell)",
+            HardwareTarget.CUDA_SM120: "NVIDIA Rubin (future)",
             HardwareTarget.METAL_M1: "Apple M1/M2",
             HardwareTarget.METAL_M3: "Apple M3/M4/M5",
             HardwareTarget.ROCM_RDNA3: "AMD RX 7000 Series",
             HardwareTarget.ROCM_CDNA3: "AMD MI300X",
             HardwareTarget.OPENVINO_NPU: "Intel Arc NPU",
+            HardwareTarget.QUALCOMM_QNN: "Qualcomm Snapdragon NPU",
             HardwareTarget.CPU_AVX512: "x86_64 (AVX-512)",
             HardwareTarget.CPU_NEON: "ARM (NEON SIMD)",
         }[self]
@@ -336,11 +348,13 @@ class HardwareTarget(enum.Enum):
             HardwareTarget.CUDA_SM89: ["vllm", "pytorch", "tensorrt-llm"],
             HardwareTarget.CUDA_SM90: ["vllm", "pytorch", "tensorrt-llm"],
             HardwareTarget.CUDA_SM100: ["vllm", "pytorch", "tensorrt-llm"],
+            HardwareTarget.CUDA_SM120: ["vllm", "pytorch", "tensorrt-llm"],
             HardwareTarget.METAL_M1: ["mlx", "llama.cpp", "pytorch"],
             HardwareTarget.METAL_M3: ["mlx", "llama.cpp", "pytorch"],
             HardwareTarget.ROCM_RDNA3: ["pytorch", "llama.cpp"],
             HardwareTarget.ROCM_CDNA3: ["vllm", "pytorch"],
             HardwareTarget.OPENVINO_NPU: ["onnxruntime", "pytorch"],
+            HardwareTarget.QUALCOMM_QNN: ["onnxruntime", "pytorch"],
             HardwareTarget.CPU_AVX512: ["llama.cpp", "onnxruntime", "pytorch"],
             HardwareTarget.CPU_NEON: ["llama.cpp", "onnxruntime", "pytorch"],
         }[self]
