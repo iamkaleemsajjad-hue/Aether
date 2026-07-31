@@ -204,6 +204,14 @@ class PrecisionAdjustmentError(RuntimeError):
     """Raised when dynamic precision adjustment fails."""
 
 
+class ModelNotFoundError(RuntimeError):
+    """Raised when a requested model is not loaded in the registry."""
+
+    def __init__(self, message: str, model_id: str | None = None) -> None:
+        super().__init__(message)
+        self.model_id = model_id
+
+
 class QuantizationError(AetherError):
     """Raised when quantization or dequantization fails."""
 
