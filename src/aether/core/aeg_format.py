@@ -280,12 +280,36 @@ class AEGPackage:
         self.precision_map: dict[str, str] = {}
         self.sharding_plans: dict[int, ShardingPlan] = {}
         self.metadata: dict[str, Any] = {}
+        #: Quantized weights staged for :meth:`save`, keyed by weight name. A
+        #: package without these is graph-only and cannot run inference.
+        self.weights: dict[str, Any] = {}
+        self._weight_store: Any = None
         self._is_loaded = False
 
     @property
     def is_loaded(self) -> bool:
         """Return True if the package has been fully loaded into memory."""
         return self._is_loaded
+
+    def weight_store(self) -> Any:
+        """Return the package's :class:`~aether.core.weight_store.WeightStore`.
+
+        The store is created lazily and its index read on first use, so opening a
+        package does not pay the cost of touching weights that may never be read.
+        """
+        from aether.core.weight_store import WeightStore
+
+        existing = getattr(self, "_weight_store", None)
+        if existing is None:
+            existing = WeightStore(self.root / "weights" / "quantized")
+            existing.load_index()
+            self._weight_store = existing
+        return existing
+
+    @property
+    def has_weights(self) -> bool:
+        """True when this package carries the weights needed for inference."""
+        return self.weight_store().exists
 
     @property
     def model_id(self) -> str | None:
@@ -361,6 +385,10 @@ class AEGPackage:
         precision_path = self.root / "weights" / "quantized" / "precision_map.json"
         if precision_path.exists():
             self.precision_map = json.loads(precision_path.read_text(encoding="utf-8"))
+        # Drop any cached weight index so it is re-read from this package's blob.
+        # Tensors themselves stay lazy via weight_store(), keeping load() cheap
+        # for large models.
+        self._weight_store = None
         # Load sharding plans
         parallelism_dir = self.root / "parallelism"
         if parallelism_dir.exists():
@@ -424,6 +452,14 @@ class AEGPackage:
             precision_json, encoding="utf-8"
         )
         (self.root / "weights" / "precision_map.json").write_text(precision_json, encoding="utf-8")
+        # Write quantized weights, without which the package cannot run inference
+        if self.weights:
+            from aether.core.weight_store import WeightStore
+
+            store = WeightStore(self.root / "weights" / "quantized")
+            written = store.save(self.weights)
+            self.metadata["weight_bytes"] = written
+            self.metadata["weight_tensor_count"] = len(self.weights)
         # Write sharding plans
         for num_gpus, plan in self.sharding_plans.items():
             plan_path = self.root / "parallelism" / f"{num_gpus}gpu.json"

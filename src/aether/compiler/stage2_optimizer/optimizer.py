@@ -601,34 +601,39 @@ class PruningSparsityPass(BasePass):
     name = "pruning_sparsity"
     description = "Plan sparsity masks and sparse kernel eligibility."
 
+    #: Ops whose weight matrices are eligible for pruning.
+    PRUNABLE_OPS = frozenset({"linear", "qkv_proj", "gate_proj", "swiglu_ffn", "expert_ffn"})
+
+    #: Minimum sparsity at which 2:4 semi-structured pruning is preferred. A
+    #: tolerance is applied because the sensitivity-scaled target lands on
+    #: 0.44999999999999996 at default settings, which would otherwise never
+    #: select 2:4 despite 2:4 being exactly the 50%-sparsity pattern requested.
+    NM_SPARSITY_THRESHOLD = 0.45
+    NM_SPARSITY_TOLERANCE = 1e-6
+
     def run(self, graph: Any, architecture: Any, config: CompilerConfig) -> tuple[Any, PassReport]:
         start = time.perf_counter()
         try:
             target_sparsity = config.pruning_target_sparsity
             masks: dict[str, dict[str, Any]] = {}
+            computed = 0
             if hasattr(graph, "__iter__"):
                 for node in graph:
                     op_type = getattr(node, "op_type", None)
-                    if op_type not in {"linear", "qkv_proj", "gate_proj", "swiglu_ffn", "expert_ffn"}:
+                    if op_type not in self.PRUNABLE_OPS:
                         continue
-                    layer_index = getattr(node, "layer_index", None)
-                    sensitivity = 0.5
-                    if hasattr(node, "get_attribute"):
-                        sensitivity = float(node.get_attribute("sensitivity", 0.5))
-                    sparsity = max(0.0, min(target_sparsity, target_sparsity * (1.15 - sensitivity * 0.5)))
-                    pattern = "2:4" if sparsity >= 0.45 else "unstructured"
-                    masks[getattr(node, "id", f"node_{len(masks)}")] = {
-                        "layer_index": layer_index,
-                        "op_type": op_type,
-                        "target_sparsity": round(sparsity, 4),
-                        "pattern": pattern,
-                        "importance_metric": "abs_weight_x_activation",
-                    }
+                    entry = self._plan_node(node, op_type, target_sparsity, config)
+                    if entry.get("mask_computed"):
+                        computed += 1
+                    masks[getattr(node, "id", f"node_{len(masks)}")] = entry
+
             plan = {
-                "version": "sparsity/1.0",
-                "method": "wanda_sparsegpt_hybrid",
+                "version": "sparsity/1.1",
+                "method": config.pruning_metric,
                 "target_sparsity": target_sparsity,
                 "masks": masks,
+                "masks_computed": computed,
+                "masks_planned_only": len(masks) - computed,
                 "sparse_kernel_targets": ["cuda_sm80", "cuda_sm90", "cuda_sm100", "cuda_sm120"],
             }
             if hasattr(graph, "set_metadata"):
@@ -640,7 +645,10 @@ class PruningSparsityPass(BasePass):
                 nodes_affected=len(masks),
                 details=plan,
             )
-            logger.info(f"Pass 9: Planned sparsity masks for {len(masks)} nodes")
+            logger.info(
+                f"Pass 9: {computed} masks computed, {len(masks) - computed} planned "
+                f"across {len(masks)} prunable nodes"
+            )
         except Exception as exc:
             report = PassReport(
                 pass_name=self.name,
@@ -650,6 +658,102 @@ class PruningSparsityPass(BasePass):
             )
             logger.error(f"Pass 9 failed: {exc}")
         return graph, report
+
+    def _plan_node(
+        self, node: Any, op_type: str, target_sparsity: float, config: CompilerConfig
+    ) -> dict[str, Any]:
+        """Plan — and where weights are attached, actually compute — a node's mask.
+
+        Sensitivity from Pass 2 modulates the per-node target so fragile layers are
+        pruned less aggressively. When the node carries a real weight matrix the
+        mask is computed and its achieved sparsity recorded; otherwise the entry
+        stays a plan for a later stage that does have the weights.
+        """
+        sensitivity = 0.5
+        if hasattr(node, "get_attribute"):
+            sensitivity = float(node.get_attribute("sensitivity", 0.5))
+        sparsity = max(0.0, min(target_sparsity, target_sparsity * (1.15 - sensitivity * 0.5)))
+        pattern = (
+            "2:4"
+            if sparsity >= self.NM_SPARSITY_THRESHOLD - self.NM_SPARSITY_TOLERANCE
+            else "unstructured"
+        )
+
+        entry: dict[str, Any] = {
+            "layer_index": getattr(node, "layer_index", None),
+            "op_type": op_type,
+            "target_sparsity": round(sparsity, 4),
+            "pattern": pattern,
+            "importance_metric": config.pruning_metric,
+            "sensitivity": round(sensitivity, 4),
+            "mask_computed": False,
+        }
+
+        weights = self._node_weights(node)
+        if weights is None:
+            entry["reason"] = "no weight tensor attached to graph node"
+            return entry
+
+        from aether.quantization.pruning import build_mask, verify_nm_pattern
+
+        metric = config.pruning_metric
+        activation_norms = self._node_activation_norms(node, weights.shape[1])
+        if metric in ("wanda", "sparsegpt") and activation_norms is None:
+            # Wanda needs calibration activations; fall back rather than fabricate.
+            metric = "magnitude"
+            entry["metric_fallback"] = "magnitude (no calibration activations)"
+
+        # N:M sparsity requires the input dimension to divide the group size.
+        if pattern == "2:4" and weights.shape[1] % 4 != 0:
+            pattern = "unstructured"
+            entry["pattern"] = pattern
+            entry["pattern_fallback"] = f"in_features={weights.shape[1]} not divisible by 4"
+
+        mask = build_mask(
+            weights,
+            target_sparsity=sparsity,
+            pattern=pattern,
+            metric=metric,
+            activation_norms=activation_norms,
+        )
+        entry["mask_computed"] = True
+        entry["importance_metric"] = metric
+        entry["achieved_sparsity"] = round(mask.achieved_sparsity, 4)
+        entry["kept"] = mask.kept_count
+        entry["pruned"] = mask.pruned_count
+        if pattern == "2:4":
+            entry["nm_pattern_valid"] = verify_nm_pattern(mask.mask, 2, 4)
+        if hasattr(node, "add_attribute"):
+            node.add_attribute("pruning_mask", mask)
+            node.add_attribute("achieved_sparsity", mask.achieved_sparsity)
+        return entry
+
+    def _node_weights(self, node: Any) -> Any:
+        """Return a node's 2-D weight matrix, or None when it carries no weights."""
+        import numpy as np
+
+        for attr in ("weight", "weights"):
+            candidate = getattr(node, attr, None)
+            if candidate is None and hasattr(node, "get_attribute"):
+                candidate = node.get_attribute(attr, None)
+            if candidate is None:
+                continue
+            arr = np.asarray(candidate)
+            if arr.ndim == 2 and arr.size > 0:
+                return arr.astype(np.float32)
+        return None
+
+    def _node_activation_norms(self, node: Any, in_features: int) -> Any:
+        """Return per-input-feature calibration activation norms, if recorded."""
+        import numpy as np
+
+        if not hasattr(node, "get_attribute"):
+            return None
+        norms = node.get_attribute("activation_norms", None)
+        if norms is None:
+            return None
+        arr = np.asarray(norms, dtype=np.float32).ravel()
+        return arr if arr.size == in_features else None
 
 
 class OptimizerPipeline:

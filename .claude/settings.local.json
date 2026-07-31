@@ -10,7 +10,28 @@
       "Bash(python -m pytest -p no:cacheprovider -o addopts=\"\" --co -q)",
       "Bash(python -m pytest -o addopts=\"\" --co -q tests/unit/test_v31_features.py tests/unit/test_v31_runtime_layers.py)",
       "Bash(python -m pytest -o addopts=\"\" --co -q --ignore=tests/unit/test_v31_features.py --ignore=tests/unit/test_v31_runtime_layers.py)",
-      "Bash(python -m pytest -p no:cacheprovider -q)"
+      "Bash(python -m pytest -p no:cacheprovider -q)",
+      "Bash(python -m pytest tests -q)",
+      "Bash(python -c \"import torch; print\\(torch.__version__, 'cuda:', torch.cuda.is_available\\(\\)\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python scripts/_check_quant.py)",
+      "Bash(python -c *)",
+      "Bash(python -m pytest tests/unit/test_quantization.py tests/unit/test_compiler.py -q -p no:cacheprovider --no-cov)",
+      "Bash(python -m pytest tests/unit/test_codecs.py -q -p no:cacheprovider --no-cov)",
+      "Bash(python -m pytest tests/unit/test_packing.py -q -p no:cacheprovider --no-cov)",
+      "Bash(python -m pytest tests/unit/test_quantization.py -q -p no:cacheprovider --no-cov)",
+      "Bash(python -m pytest tests -q -p no:cacheprovider --no-cov)",
+      "Bash(python -m pytest tests/unit/test_pruning.py -q -p no:cacheprovider --no-cov)",
+      "Bash(python -m pytest tests/unit/test_pruning.py tests/unit/test_codecs.py tests/unit/test_quantization.py tests/unit/test_packing.py -q -p no:cacheprovider --no-cov)",
+      "Bash(python scripts/_fix_shims.py)",
+      "Bash(python -m pytest tests/unit/test_optimizer_passes.py -q -p no:cacheprovider --no-cov)",
+      "Bash(python -m pytest tests -q -p no:cacheprovider)",
+      "Bash(python -m pytest tests/unit/test_safetensors_ingestion.py -q -p no:cacheprovider --no-cov)",
+      "Bash(grep -E \"^\\(g\\\\+\\\\+|gcc\\)\\\\.exe$\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(python scripts/_check_kernels.py)",
+      "Bash(python -m pytest tests/unit/test_native_cpu_kernels.py -q -p no:cacheprovider --no-cov)",
+      "Bash(python scripts/_check_engine.py)"
     ]
   }
 }
