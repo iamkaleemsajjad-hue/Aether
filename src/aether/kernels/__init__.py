@@ -10,6 +10,13 @@ from aether.kernels.gemm import GEMMKernel
 from aether.kernels.ffn import FFNKernel
 from aether.kernels.rope import RoPEKernel
 from aether.kernels.norm import RMSNormKernel, LayerNormKernel
+from aether.kernels.native_cpu import (
+    CompilerToolchain,
+    NativeCPUKernels,
+    NativeKernelError,
+    detect_toolchain,
+    get_native_kernels,
+)
 
 __all__ = [
     "Kernel",
@@ -19,4 +26,10 @@ __all__ = [
     "RoPEKernel",
     "RMSNormKernel",
     "LayerNormKernel",
+    # Natively compiled CPU kernels
+    "NativeCPUKernels",
+    "NativeKernelError",
+    "CompilerToolchain",
+    "detect_toolchain",
+    "get_native_kernels",
 ]

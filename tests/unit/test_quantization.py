@@ -29,19 +29,103 @@ class TestQuantizationFormat:
 
 class TestQuantizeDequantize:
     def test_roundtrip_q4(self) -> None:
-        weights = np.random.randn(64, 64).astype(np.float32)
+        weights = np.random.RandomState(0).randn(64, 64).astype(np.float32)
         qt = quantize_tensor(weights, "Q4_K_M", block_size=32)
         assert qt.precision == "Q4_K_M"
         assert qt.shape == (64, 64)
         dequantized = dequantize_tensor(qt)
         assert dequantized.shape == weights.shape
-        mse = np.mean((dequantized - weights) ** 2)
-        assert mse < 1.0
+        # A 4-bit affine grid over unit-normal data lands near 0.08 RMSE. The old
+        # bound of mse < 1.0 was loose enough to pass a codec that collapsed
+        # entire blocks to a constant, which is how that bug went unnoticed.
+        rmse = float(np.sqrt(np.mean((dequantized - weights) ** 2)))
+        assert rmse < 0.15, f"Q4_K_M RMSE {rmse:.4f} is worse than the format allows"
+
+    @pytest.mark.parametrize(
+        ("precision", "max_rmse"),
+        [
+            ("BF16", 0.005),
+            ("FP16", 0.001),
+            ("Q8_0", 0.01),
+            ("FP8", 0.05),
+            ("Q6_K", 0.03),
+            ("NF4", 0.10),
+            ("Q4_K_M", 0.10),
+            ("Q3_K", 0.20),
+            ("Q2_K", 0.45),
+        ],
+    )
+    def test_roundtrip_error_within_format_budget(self, precision: str, max_rmse: float) -> None:
+        weights = np.random.RandomState(1).randn(64, 64).astype(np.float32)
+        dequantized = dequantize_tensor(quantize_tensor(weights, precision, block_size=32))
+        rmse = float(np.sqrt(np.mean((dequantized - weights) ** 2)))
+        assert rmse < max_rmse, f"{precision} RMSE {rmse:.4f} exceeds budget {max_rmse}"
+
+    @pytest.mark.parametrize("precision", ["Q4_K_M", "NF4", "Q3_K", "Q2_K", "FP4", "Q6_K"])
+    def test_sub_byte_formats_are_bit_packed(self, precision: str) -> None:
+        """Payload bytes must reflect the real bit width, not a padded int8 array."""
+        weights = np.random.RandomState(2).randn(64, 64).astype(np.float32)
+        qt = quantize_tensor(weights, precision, block_size=32)
+        assert qt.packed
+        expected = (weights.size * qt.bits + 7) // 8
+        assert qt.payload_bytes == expected
+
+    @pytest.mark.parametrize(
+        ("precision", "min_ratio"),
+        [("Q8_0", 1.7), ("Q6_K", 2.0), ("Q4_K_M", 3.0), ("Q3_K", 3.5), ("Q2_K", 5.0)],
+    )
+    def test_compression_ratio_is_real(self, precision: str, min_ratio: float) -> None:
+        """Every format once reported the same 1.88x because all used int8."""
+        weights = np.random.RandomState(3).randn(128, 128).astype(np.float32)
+        qt = quantize_tensor(weights, precision, block_size=32)
+        assert qt.compression_ratio >= min_ratio
+
+    @pytest.mark.parametrize("size", [1, 7, 31, 33, 100, 1000])
+    def test_non_multiple_of_block_size_preserves_shape(self, size: int) -> None:
+        weights = np.random.RandomState(size).randn(size).astype(np.float32)
+        for precision in ("Q4_K_M", "NF4", "Q3_K", "FP8"):
+            dequantized = dequantize_tensor(quantize_tensor(weights, precision, block_size=32))
+            assert dequantized.shape == weights.shape
+
+    @pytest.mark.parametrize("shape", [(3, 5), (7, 11, 2), (1, 1), (64, 1)])
+    def test_arbitrary_shapes_survive_roundtrip(self, shape: tuple[int, ...]) -> None:
+        weights = np.random.RandomState(4).randn(*shape).astype(np.float32)
+        assert dequantize_tensor(quantize_tensor(weights, "Q4_K_M", 32)).shape == shape
+
+    def test_all_negative_tensor_is_not_collapsed(self) -> None:
+        """Regression: the old scale used block.max(), destroying negative blocks."""
+        weights = np.linspace(-1.0, -0.5, 256, dtype=np.float32)
+        dequantized = dequantize_tensor(quantize_tensor(weights, "Q4_K_M", 32))
+        assert np.abs(weights - dequantized).max() < 0.02
+        assert len(np.unique(dequantized)) > 1
+
+    @pytest.mark.parametrize("precision", ["Q4_K_M", "NF4", "FP8", "INT8", "Q8_0"])
+    def test_structural_zeros_survive(self, precision: str) -> None:
+        """Pruned weights must stay exactly zero after quantization."""
+        weights = np.random.RandomState(5).randn(64, 64).astype(np.float32)
+        weights[weights < 0.5] = 0.0
+        dequantized = dequantize_tensor(quantize_tensor(weights, precision, 32))
+        assert np.all(dequantized[weights == 0.0] == 0.0)
 
     def test_bf16_no_quant(self) -> None:
         weights = np.random.randn(16, 16).astype(np.float32)
         qt = quantize_tensor(weights, "BF16", block_size=32)
         assert qt.precision == "BF16"
+
+    def test_bf16_stores_sixteen_bits_per_element(self) -> None:
+        """BF16 is a 16-bit format, so it must not occupy float32 storage."""
+        weights = np.random.RandomState(6).randn(64, 64).astype(np.float32)
+        qt = quantize_tensor(weights, "BF16", block_size=32)
+        assert qt.payload_bytes == weights.size * 2
+        assert qt.compression_ratio == pytest.approx(1.0)
+
+    def test_rejects_invalid_block_size(self) -> None:
+        with pytest.raises(ValueError, match="block_size must be positive"):
+            quantize_tensor(np.zeros(8, dtype=np.float32), "Q4_K_M", block_size=0)
+
+    def test_rejects_unknown_precision(self) -> None:
+        with pytest.raises(ValueError, match="Unknown precision"):
+            quantize_tensor(np.zeros(8, dtype=np.float32), "Q5_FAKE", block_size=32)
 
 
 class TestQuantizer:

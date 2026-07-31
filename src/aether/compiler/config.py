@@ -91,6 +91,14 @@ class CompilerConfig:
     pruning_target_sparsity: float = 0.5
     """Target sparsity for Wanda/SparseGPT-style mask planning."""
 
+    pruning_metric: str = "wanda"
+    """Importance metric for Pass 9 masks: ``magnitude``, ``wanda``, or ``sparsegpt``.
+
+    ``wanda`` and ``sparsegpt`` weight each weight by its input channel's
+    calibration activation norm; they fall back to ``magnitude`` when a node has
+    no recorded activations.
+    """
+
     upload_kernels: bool = False
     """Opt-in to upload compiled kernels to Aether Hub after compilation."""
 
@@ -181,6 +189,12 @@ class CompilerConfig:
         if not 0.0 <= self.pruning_target_sparsity < 1.0:
             msg = f"pruning_target_sparsity must be in [0, 1), got {self.pruning_target_sparsity}"
             raise CompilerConfigError(msg)
+        if self.pruning_metric not in ("magnitude", "wanda", "sparsegpt"):
+            msg = (
+                f"Unknown pruning_metric: {self.pruning_metric}. "
+                f"Supported: magnitude, wanda, sparsegpt"
+            )
+            raise CompilerConfigError(msg)
         for target in self.targets:
             if target == "auto":
                 continue
@@ -231,6 +245,7 @@ class CompilerConfig:
             "reasoning_budget_tokens": self.reasoning_budget_tokens,
             "sparse_attention_context_threshold": self.sparse_attention_context_threshold,
             "pruning_target_sparsity": self.pruning_target_sparsity,
+            "pruning_metric": self.pruning_metric,
             "upload_kernels": self.upload_kernels,
             "cache_dir": self.cache_dir,
             "hub_url": self.hub_url,
@@ -274,6 +289,7 @@ class CompilerConfig:
             reasoning_budget_tokens=data.get("reasoning_budget_tokens", 512),
             sparse_attention_context_threshold=data.get("sparse_attention_context_threshold", 32768),
             pruning_target_sparsity=data.get("pruning_target_sparsity", 0.5),
+            pruning_metric=data.get("pruning_metric", "wanda"),
             upload_kernels=data.get("upload_kernels", False),
             cache_dir=data.get("cache_dir", DEFAULT_CACHE_DIR),
             hub_url=data.get("hub_url"),

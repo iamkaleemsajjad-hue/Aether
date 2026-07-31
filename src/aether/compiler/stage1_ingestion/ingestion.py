@@ -125,12 +125,155 @@ class IngestionPipeline:
         return "auto"
 
     def _ingest_safetensors(self, model: str, architecture: ModelArchitecture) -> AEGGraph:
-        """Ingest a model from SafeTensors weights."""
+        """Ingest a model from SafeTensors weights.
+
+        Builds the architecture skeleton, then attaches the real weight tensors
+        read off disk so downstream passes (sensitivity, pruning, quantization)
+        operate on actual values rather than metadata alone.
+        """
         graph = AEGGraph(name=f"{architecture.family}_{architecture.params_billion}B", architecture=architecture)
         logger.info(f"Ingesting SafeTensors weights for {architecture.params_billion}B model")
-        # Create a stylized AEG graph from the architecture
         self._build_architecture_graph(graph, architecture)
+        self._attach_safetensors_weights(graph, model)
         return graph
+
+    def _attach_safetensors_weights(self, graph: AEGGraph, model: str) -> int:
+        """Load weights from disk and bind them to matching graph nodes.
+
+        Returns the number of nodes that received a weight tensor. Missing files or
+        an unavailable ``safetensors`` package are logged and skipped rather than
+        raised: the architecture graph is still valid and useful without weights.
+        """
+        if not HAS_SAFETENSORS:
+            logger.warning("safetensors not installed; graph built without weights")
+            graph.set_metadata("weights_attached", 0)
+            return 0
+
+        path = Path(model)
+        if not path.exists():
+            logger.info("Model path %s is not local; graph built without weights", model)
+            graph.set_metadata("weights_attached", 0)
+            return 0
+
+        from aether.compiler.stage1_ingestion.safetensors_loader import SafeTensorsLoader
+
+        try:
+            tensors = SafeTensorsLoader(path).load()
+        except Exception as exc:
+            logger.warning("Could not read SafeTensors weights from %s: %s", model, exc)
+            graph.set_metadata("weights_attached", 0)
+            return 0
+
+        attached = self._bind_weights(graph, tensors)
+        graph.set_metadata("weights_attached", attached)
+        graph.set_metadata("weight_tensor_count", len(tensors))
+        logger.info("Attached %d/%d weight tensors to graph nodes", attached, len(tensors))
+        return attached
+
+    def _bind_weights(self, graph: AEGGraph, tensors: dict[str, Any]) -> int:
+        """Match checkpoint tensor names to graph node ids and attach the arrays.
+
+        Checkpoint layouts vary across model families, so matching is done by
+        normalising both sides to a comparable suffix rather than by exact name.
+        """
+        import numpy as np
+
+        lookup: dict[tuple[int | None, str | None], list[tuple[str, Any]]] = {}
+        for name, tensor in tensors.items():
+            key = self._normalise_weight_name(name)
+            # A key without a component identifies nothing: several unrelated
+            # names reduce to (layer, None), which would match each other.
+            if key[1] is None:
+                continue
+            value = tensor.numpy() if hasattr(tensor, "numpy") else np.asarray(tensor)
+            lookup.setdefault(key, []).append((name, value))
+
+        attached = 0
+        for node in graph:
+            if not hasattr(node, "add_attribute"):
+                continue
+            key = self._normalise_weight_name(getattr(node, "id", ""))
+            if key[1] is None:
+                continue
+            candidates = lookup.get(key)
+            if not candidates:
+                continue
+            # A node may stand in for several checkpoint tensors (a fused QKV node
+            # covers q/k/v); attach the first and record the full set.
+            source_name, value = candidates[0]
+            node.add_attribute("weight", value)
+            node.add_attribute("weight_shape", list(value.shape))
+            node.add_attribute("weight_source", source_name)
+            if len(candidates) > 1:
+                node.add_attribute("fused_weight_sources", [n for n, _ in candidates])
+            attached += 1
+        return attached
+
+    #: Checkpoint component names mapped to the graph's node-id vocabulary. Node
+    #: ids are coarser than checkpoint names (one ``qkv`` node stands in for
+    #: separate q/k/v projections), so several tensors can map to one node. Every
+    #: canonical name also maps to itself so node ids resolve through the same
+    #: table as checkpoint names.
+    _COMPONENT_ALIASES: dict[str, str] = {
+        # Checkpoint spellings.
+        "q_proj": "qkv",
+        "k_proj": "qkv",
+        "v_proj": "qkv",
+        "qkv_proj": "qkv",
+        "o_proj": "out_proj",
+        "embed_tokens": "embedding",
+        "wte": "embedding",
+        "input_layernorm": "rmsnorm",
+        "post_attention_layernorm": "ffn_norm",
+        "down_proj": "ffn",
+        "up_proj": "gate_proj",
+        # Canonical names, as used in graph node ids.
+        "qkv": "qkv",
+        "out_proj": "out_proj",
+        "embedding": "embedding",
+        "rmsnorm": "rmsnorm",
+        "ffn_norm": "ffn_norm",
+        "ffn": "ffn",
+        "gate_proj": "gate_proj",
+        "lm_head": "lm_head",
+    }
+
+    #: Structural path segments that carry no identifying information.
+    _IGNORED_SEGMENTS = frozenset({"model", "transformer", "module", "self_attn", "attn", "mlp", "weight"})
+
+    @classmethod
+    def _normalise_weight_name(cls, name: str) -> tuple[int | None, str | None]:
+        """Reduce a tensor or node name to a ``(layer_index, component)`` key.
+
+        Checkpoints and graph nodes disagree on both separators (``.`` vs ``_``)
+        and component naming (``self_attn.q_proj`` vs ``qkv``), so names are parsed
+        into a structured key instead of string-matched. Returns ``(None, None)``
+        when nothing identifiable can be extracted.
+        """
+        import re
+
+        tokens = [t for t in re.split(r"[._]", name.lower()) if t]
+        layer_index: int | None = None
+        component: str | None = None
+
+        for position, token in enumerate(tokens):
+            # "layer"/"layers" followed by its index.
+            if token in ("layer", "layers", "blocks", "h") and position + 1 < len(tokens):
+                if tokens[position + 1].isdigit():
+                    layer_index = int(tokens[position + 1])
+                continue
+            if token.isdigit() or token in cls._IGNORED_SEGMENTS:
+                continue
+            # Rebuild multi-token component names such as "q" + "proj".
+            for width in (3, 2, 1):
+                candidate = "_".join(tokens[position : position + width])
+                if candidate in cls._COMPONENT_ALIASES:
+                    component = cls._COMPONENT_ALIASES[candidate]
+                    break
+            if component is not None:
+                break
+
+        return layer_index, component
 
     def _ingest_gguf(self, model: str, architecture: ModelArchitecture) -> AEGGraph:
         """Ingest a GGUF model."""
@@ -165,6 +308,9 @@ class IngestionPipeline:
         graph = AEGGraph(name=f"{architecture.family}_auto", architecture=architecture)
         logger.info(f"Auto-ingesting model: {model}")
         self._build_architecture_graph(graph, architecture)
+        # A local directory may still hold SafeTensors shards even when format
+        # detection fell through to "auto"; attach them when they are there.
+        self._attach_safetensors_weights(graph, model)
         return graph
 
     def _build_architecture_graph(self, graph: AEGGraph, architecture: ModelArchitecture) -> AEGGraph:

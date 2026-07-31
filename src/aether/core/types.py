@@ -772,6 +772,10 @@ class ModelArchitecture:
             self.num_kv_heads = self.num_attention_heads
         if self.params_billion == 0.0 and self.layers > 0 and self.hidden_size > 0:
             self.params_billion = self._estimate_params()
+        # A positive expert count *is* what makes a model MoE. Keeping the flag
+        # independent let `num_experts=32, is_moe=False` silently disable Pass 5.
+        if self.num_experts > 0:
+            self.is_moe = True
 
     def _estimate_params(self) -> float:
         """Rough estimate of parameter count in billions."""

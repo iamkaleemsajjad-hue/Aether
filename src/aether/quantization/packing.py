@@ -28,47 +28,62 @@ class BitPacker:
     def pack(self, values: np.ndarray) -> np.ndarray:
         """Pack an array of integers into a compact bit-packed representation.
 
+        Element ``i`` occupies bits ``[i * bit_width, (i + 1) * bit_width)`` of the
+        stream, little-endian within each byte. Fully vectorized: a 7B-parameter
+        tensor packs in seconds rather than hours.
+
         Args:
-            values: Integer array with values in [0, 2^bit_width).
+            values: Integer array with values in ``[0, 2^bit_width)``. Values wider
+                than ``bit_width`` are masked to their low bits.
 
         Returns:
-            Bit-packed uint8 array.
+            Bit-packed uint8 array of length ``ceil(n * bit_width / 8)``.
         """
-        flat = values.ravel().astype(np.uint64)
-        n = len(flat)
-        out_size = (n * self.bit_width + 7) // 8
-        mask = (1 << self.bit_width) - 1
-        packed = np.zeros(out_size, dtype=np.uint8)
-        for i in range(n):
-            bit_pos = i * self.bit_width
-            byte_idx = bit_pos // 8
-            bit_offset = bit_pos % 8
-            val = int(flat[i]) & mask
-            packed[byte_idx] |= (val << bit_offset) & 0xFF
-            if bit_offset + self.bit_width > 8 and byte_idx + 1 < out_size:
-                packed[byte_idx + 1] |= (val >> (8 - bit_offset)) & 0xFF
-        return packed
+        flat = np.ascontiguousarray(values).ravel().astype(np.uint8)
+        if flat.size == 0:
+            return np.zeros(0, dtype=np.uint8)
+        if self.bit_width >= 8:
+            return flat.copy()
+        # Expand each byte to its 8 little-endian bits, keep the low bit_width.
+        bits = np.unpackbits(flat[:, None], axis=1, bitorder="little")[:, : self.bit_width]
+        return np.packbits(bits.reshape(-1), bitorder="little")
 
     def unpack(self, packed: np.ndarray, count: int) -> np.ndarray:
         """Unpack a bit-packed representation back to integers.
+
+        Inverse of :meth:`pack`. Fully vectorized.
 
         Args:
             packed: Packed uint8 array.
             count: Number of elements to extract.
 
         Returns:
-            Unpacked uint8 array of shape (count,).
+            Unpacked uint8 array of shape ``(count,)``.
+
+        Raises:
+            ValueError: If ``packed`` holds fewer bits than ``count`` requires.
         """
-        result = np.zeros(count, dtype=np.uint8)
-        for i in range(count):
-            bit_pos = i * self.bit_width
-            byte_idx = bit_pos // 8
-            bit_offset = bit_pos % 8
-            val = packed[byte_idx] >> bit_offset
-            if bit_offset + self.bit_width > 8 and byte_idx + 1 < len(packed):
-                val |= packed[byte_idx + 1] << (8 - bit_offset)
-            result[i] = val & ((1 << self.bit_width) - 1)
-        return result
+        if count <= 0:
+            return np.zeros(0, dtype=np.uint8)
+        buf = np.ascontiguousarray(packed).ravel().astype(np.uint8)
+        if self.bit_width >= 8:
+            if buf.size < count:
+                msg = f"packed buffer holds {buf.size} elements, need {count}"
+                raise ValueError(msg)
+            return buf[:count].copy()
+
+        needed_bits = count * self.bit_width
+        if buf.size * 8 < needed_bits:
+            msg = (
+                f"packed buffer holds {buf.size * 8} bits, need {needed_bits} "
+                f"for {count} elements at {self.bit_width}-bit"
+            )
+            raise ValueError(msg)
+        bits = np.unpackbits(buf, bitorder="little")[:needed_bits].reshape(count, self.bit_width)
+        # Zero-extend each group back to 8 bits before repacking into bytes.
+        padded = np.zeros((count, 8), dtype=np.uint8)
+        padded[:, : self.bit_width] = bits
+        return np.packbits(padded, axis=1, bitorder="little").reshape(-1)
 
     def __repr__(self) -> str:
         return f"BitPacker(bit_width={self.bit_width}, elems_per_byte={self.elements_per_byte})"
