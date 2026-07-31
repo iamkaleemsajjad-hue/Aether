@@ -411,7 +411,7 @@ class Compiler:
             from aether.utils.file_io import aether_cache_dir
 
             cache_root = aether_cache_dir(config.cache_dir)
-            output_path = cache_root / "models" / f"{model_id}{AEGPackage}".replace("AEGPackage", ".aeg")
+            output_path = cache_root / "models" / f"{model_id}.aeg"
         else:
             output_path = Path(output_path)
 
@@ -523,8 +523,35 @@ class Compiler:
             if report.pass_name == "precision_assignment":
                 precision_map.update(report.details.get("precision_map", {}))
         if not precision_map:
-            precision_map = {f"layer_{i}": "BF16" for i in range(architecture.layers)}
+            precision_map = {f"layer_{i}": "Q4_K_M" for i in range(architecture.layers)}
         package.set_precision_map(precision_map)
+
+        # ── Quantize and persist weights into the AEG blob ──────────────────
+        # This is the key step that makes the package self-contained: every
+        # weight-bearing graph node is quantized to its assigned precision and
+        # written into weights/quantized/model.aeg-quant so downstream
+        # load_engine_from_package() can reconstruct the full forward pass.
+        try:
+            from aether.compiler.weight_quantizer import quantize_graph_weights
+
+            from aether.core.graph import AEGGraph
+
+            if isinstance(graph, AEGGraph):
+                quant_stats = quantize_graph_weights(
+                    graph=graph,
+                    package=package,
+                    precision_map=precision_map,
+                    default_precision="Q4_K_M",
+                    block_size=32,
+                )
+                logger.info(
+                    "Quantized %d weight tensors (%d bytes) for %s",
+                    quant_stats.tensors_written,
+                    quant_stats.bytes_written,
+                    model_id,
+                )
+        except Exception as exc:  # noqa: BLE001 — weight quant is best-effort
+            logger.warning("Weight quantization failed (graph-only package): %s", exc)
 
         # Sharding plans
         from aether.core.aeg_format import create_default_sharding_plans
