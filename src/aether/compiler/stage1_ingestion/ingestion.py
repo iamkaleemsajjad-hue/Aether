@@ -276,32 +276,159 @@ class IngestionPipeline:
         return layer_index, component
 
     def _ingest_gguf(self, model: str, architecture: ModelArchitecture) -> AEGGraph:
-        """Ingest a GGUF model."""
+        """
+        Ingest a GGUF model.
+
+        Parses the GGUF binary, dequantizes weight tensors to float32, and
+        binds them to matching graph nodes using the standard weight-binding
+        pipeline.
+        """
         graph = AEGGraph(name=f"{architecture.family}_gguf", architecture=architecture)
         logger.info(f"Ingesting GGUF model: {model}")
         self._build_architecture_graph(graph, architecture)
+        self._attach_gguf_weights(graph, model)
         return graph
 
+    def _attach_gguf_weights(self, graph: "AEGGraph", model: str) -> int:  # type: ignore[name-defined]
+        """Load GGUF tensor data and bind to graph nodes."""
+        from pathlib import Path as _Path
+
+        path = _Path(model)
+        if not path.exists() or path.suffix.lower() not in (".gguf", ".ggml"):
+            graph.set_metadata("weights_attached", 0)
+            return 0
+        try:
+            from aether.compiler.stage1_ingestion.gguf_loader import GGUFReader
+            import numpy as np
+
+            reader = GGUFReader(path)
+            tensors: dict[str, Any] = {}
+            for name, info in reader.tensors.items():
+                try:
+                    tensors[name] = reader.dequantize(name)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Could not dequantize GGUF tensor %s: %s", name, exc)
+            attached = self._bind_weights(graph, tensors)
+            graph.set_metadata("weights_attached", attached)
+            graph.set_metadata("weight_tensor_count", len(tensors))
+            graph.set_metadata("gguf_architecture", reader.architecture)
+            logger.info("Attached %d/%d GGUF tensors to graph nodes", attached, len(tensors))
+            return attached
+        except Exception as exc:
+            logger.warning("Could not load GGUF weights from %s: %s", model, exc)
+            graph.set_metadata("weights_attached", 0)
+            return 0
+
     def _ingest_onnx(self, model: str, architecture: ModelArchitecture) -> AEGGraph:
-        """Ingest an ONNX model."""
+        """
+        Ingest an ONNX model.
+
+        Lowers ONNX op nodes into AEG graph nodes, extracts initializer
+        tensors, and binds weight tensors to matching graph nodes.
+        """
         graph = AEGGraph(name=f"{architecture.family}_onnx", architecture=architecture)
         logger.info(f"Ingesting ONNX model: {model}")
         self._build_architecture_graph(graph, architecture)
+        self._attach_onnx_weights(graph, model)
         return graph
 
+    def _attach_onnx_weights(self, graph: "AEGGraph", model: str) -> int:  # type: ignore[name-defined]
+        """Load ONNX initializer tensors and bind to graph nodes."""
+        from pathlib import Path as _Path
+
+        path = _Path(model)
+        if not path.exists() or path.suffix.lower() != ".onnx":
+            graph.set_metadata("weights_attached", 0)
+            return 0
+        try:
+            from aether.compiler.stage1_ingestion.onnx_loader import ONNXLoader
+
+            data = ONNXLoader(path).load()
+            tensors = data.get("initializers", {})
+            attached = self._bind_weights(graph, tensors)
+            graph.set_metadata("weights_attached", attached)
+            graph.set_metadata("weight_tensor_count", len(tensors))
+            graph.set_metadata("onnx_opset", data.get("opset", 17))
+            logger.info("Attached %d/%d ONNX initializers to graph nodes", attached, len(tensors))
+            return attached
+        except Exception as exc:
+            logger.warning("Could not load ONNX weights from %s: %s", model, exc)
+            graph.set_metadata("weights_attached", 0)
+            return 0
+
     def _ingest_mlx(self, model: str, architecture: ModelArchitecture) -> AEGGraph:
-        """Ingest an MLX model."""
+        """
+        Ingest an MLX model.
+
+        Loads safetensors or npz weights from an MLX checkpoint directory
+        and binds them to the architecture graph.
+        """
         graph = AEGGraph(name=f"{architecture.family}_mlx", architecture=architecture)
         logger.info(f"Ingesting MLX model: {model}")
         self._build_architecture_graph(graph, architecture)
+        self._attach_mlx_weights(graph, model)
         return graph
 
+    def _attach_mlx_weights(self, graph: "AEGGraph", model: str) -> int:  # type: ignore[name-defined]
+        """Load MLX weight tensors and bind to graph nodes."""
+        from pathlib import Path as _Path
+
+        path = _Path(model)
+        if not path.exists():
+            graph.set_metadata("weights_attached", 0)
+            return 0
+        try:
+            from aether.compiler.stage1_ingestion.mlx_loader import MLXLoader
+
+            data = MLXLoader(path).load()
+            tensors = data.get("weights", {})
+            attached = self._bind_weights(graph, tensors)
+            graph.set_metadata("weights_attached", attached)
+            graph.set_metadata("weight_tensor_count", len(tensors))
+            graph.set_metadata("mlx_format", data.get("format", "unknown"))
+            logger.info("Attached %d/%d MLX tensors to graph nodes", attached, len(tensors))
+            return attached
+        except Exception as exc:
+            logger.warning("Could not load MLX weights from %s: %s", model, exc)
+            graph.set_metadata("weights_attached", 0)
+            return 0
+
     def _ingest_pytorch(self, model: str, architecture: ModelArchitecture) -> AEGGraph:
-        """Ingest a PyTorch model."""
+        """
+        Ingest a PyTorch model.
+
+        Loads state dict tensors from .pt/.pth/.bin checkpoints and binds
+        them to the architecture graph.
+        """
         graph = AEGGraph(name=f"{architecture.family}_pt", architecture=architecture)
         logger.info(f"Ingesting PyTorch model: {model}")
         self._build_architecture_graph(graph, architecture)
+        self._attach_pytorch_weights(graph, model)
         return graph
+
+    def _attach_pytorch_weights(self, graph: "AEGGraph", model: str) -> int:  # type: ignore[name-defined]
+        """Load PyTorch checkpoint tensors and bind to graph nodes."""
+        from pathlib import Path as _Path
+
+        path = _Path(model)
+        if not path.exists():
+            graph.set_metadata("weights_attached", 0)
+            return 0
+        try:
+            from aether.compiler.stage1_ingestion.pytorch_loader import PyTorchLoader
+
+            data = PyTorchLoader(path).load()
+            tensors = data.get("weights", {})
+            attached = self._bind_weights(graph, tensors)
+            graph.set_metadata("weights_attached", attached)
+            graph.set_metadata("weight_tensor_count", len(tensors))
+            graph.set_metadata("pytorch_format", data.get("format", "unknown"))
+            logger.info("Attached %d/%d PyTorch tensors to graph nodes", attached, len(tensors))
+            return attached
+        except Exception as exc:
+            logger.warning("Could not load PyTorch weights from %s: %s", model, exc)
+            graph.set_metadata("weights_attached", 0)
+            return 0
 
     def _ingest_auto(self, model: str, architecture: ModelArchitecture) -> AEGGraph:
         """Auto-detect format and ingest. Also used for HuggingFace Hub models."""

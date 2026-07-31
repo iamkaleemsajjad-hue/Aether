@@ -2,614 +2,243 @@
 
 > **Compile once. Run on any hardware, forever.**
 
-Aether is the **compiler for AI models** — not another inference wrapper. It takes any model format (SafeTensors, GGUF, ONNX, MLX, PyTorch) and compiles it into an **Aether Execution Graph (AEG)**, a portable, hardware-agnostic, optimized artifact. The AEG file contains everything needed to run the model on NVIDIA, AMD, Apple Silicon, Intel, or CPU — today and in the future.
-
-Aether is inspired by LLVM: just as C/C++ compiles to LLVM IR and then to any ISA, any AI model compiles to AEG-IR and then to any inference backend. The runtime selects the best available backend for your hardware (vLLM, llama.cpp, TensorRT-LLM, MLX, ONNX Runtime, or PyTorch) and applies Aether's own scheduling, caching, speculative decoding, and precision management on top.
+Aether Runtime is an open-source, hardware-portable LLM inference engine that compiles any model into a single binary **AEG** (Aether Executable Graph) artifact and runs it natively across CPU, CUDA, ROCm, Metal, and OpenVINO targets — all without re-quantizing or re-compiling per device.
 
 ---
 
-## Table of Contents
+## Architecture
 
-1. [Why Aether?](#why-aether)
-2. [What is an AEG?](#what-is-an-aeg)
-3. [Quick Start](#quick-start)
-4. [Installation](#installation)
-5. [Python SDK](#python-sdk)
-6. [CLI](#cli)
-7. [REST API](#rest-api)
-8. [OpenAI Compatibility](#openai-compatibility)
-9. [Architecture](#architecture)
-10. [Compiler Pipeline](#compiler-pipeline)
-11. [Optimizer Passes](#optimizer-passes)
-12. [Runtime Intelligence](#runtime-intelligence)
-13. [Supported Backends](#supported-backends)
-14. [Supported Hardware](#supported-hardware)
-15. [AEG Format](#aeg-format)
-16. [Contributing](#contributing)
-17. [License](#license)
-18. [Research Foundation](#research-foundation)
-19. [Roadmap](#roadmap)
-20. [Commercial](#commercial)
-21. [Support](#support)
-
----
-
-## Why Aether?
-
-Every existing AI inference tool is a wrapper around a backend that was chosen at build time:
-
-- **Ollama** wraps llama.cpp with a Docker-like UX.
-- **vLLM** wraps PyTorch with PagedAttention scheduling.
-- **SGLang** wraps vLLM with structured generation.
-- **TensorRT-LLM** wraps CUDA kernels with a Python interface.
-- **MLX** is Apple-only.
-- **ONNX Runtime** is great for cross-platform but not LLM-optimized.
-
-Wrappers inherit the constraints of their substrate. They are statically bound to hardware, cannot see the whole model, and cannot apply optimizations that cross backend boundaries. Aether does something different: it **owns the compiled model format**.
-
-### The problem Aether solves
-
-A model today exists as raw weights (`safetensors`, `GGUF`, `ONNX`, `MLX`, `pytorch.bin`). To deploy it you must:
-
-1. Install the right CUDA / ROCm / Metal / OpenVINO stack.
-2. Install a backend that supports that stack and that model.
-3. Configure tensor parallelism, quantization, and KV cache by hand.
-4. Repeat from scratch when you change hardware or cloud provider.
-
-Aether replaces this with a single compile step:
-
-```bash
-pip install aether-runtime
-aether compile Qwen/Qwen3-8B
-aether run Qwen/Qwen3-8B
+```
+Input Model                 AEG Compiler                  Aether Runtime
+─────────────  ──────────────────────────────────  ────────────────────────
+safetensors ─┐                                     ┌─ CPU (AVX-512 / NEON)
+GGUF        ─┤  Stage 1: Ingestion                 ├─ CUDA (sm70 → sm100)
+ONNX        ─┤  Stage 2: Optimization (9 passes)   ├─ ROCm (RDNA3/CDNA3)
+MLX         ─┤  Stage 3: Targeting                 ├─ Metal (M1 → M3)
+PyTorch     ─┘  ─────────────────────────────────▶ └─ OpenVINO
+                         AEG Package
+                  manifest + graph + weights
 ```
 
-The `.aeg` file is now a portable artifact. Move it to a different machine and it runs optimally there too — no reinstall, no reconfigure, no recompile (if the Aether Hub has the kernel cache).
+---
+
+## Phases Implemented
+
+### ✅ Phase 1 — Core Compiler E2E (100%)
+
+| Feature | Status | File |
+|---------|--------|------|
+| SafeTensors ingestion + weight attachment | ✅ | `stage1_ingestion/ingestion.py` |
+| **GGUF ingestion** — pure-Python binary parser, K-quant dequant | ✅ | `stage1_ingestion/gguf_loader.py` |
+| **ONNX ingestion** — ONNX→AEG-IR op lowering + weight extraction | ✅ | `stage1_ingestion/onnx_loader.py` |
+| **PyTorch ingestion** — state dict + sharded HF checkpoints | ✅ | `stage1_ingestion/pytorch_loader.py` |
+| **MLX ingestion** — safetensors / npz / native mlx.core | ✅ | `stage1_ingestion/mlx_loader.py` |
+| Architecture detection (LLaMA, Qwen, Mistral, Falcon, Gemma, GPT-2…) | ✅ | `stage1_ingestion/architecture_detector.py` |
+| AEG graph IR (`AEGGraph`, `AEGNode`, `AEGInstruction`) | ✅ | `core/aeg_ir.py` |
+| AEG package format (`AEGPackage`, `AEGManifest`, `load_aeg_package`) | ✅ | `core/aeg_format.py` |
+| Optimizer pass 1 — Operator fusion | ✅ | `stage2_optimizer/pass1_operator_fusion.py` |
+| Optimizer pass 2 — Sensitivity analysis | ✅ | `stage2_optimizer/pass2_sensitivity_analysis.py` |
+| Optimizer pass 3 — Precision assignment | ✅ | `stage2_optimizer/pass3_precision_assignment.py` |
+| Optimizer passes 4–9 — KV structuring, MoE, parallelism, reasoning, sparse, pruning | ✅ | `stage2_optimizer/optimizer.py` |
+| Calibration datasets (WikiText-2, Hellaswag, custom JSONL) | ✅ | `calibration/datasets.py` |
+| Perplexity evaluator (corpus entropy + precision penalty model) | ✅ | `calibration/perplexity.py` |
+| Weight quantization codecs (Q4_K_M, Q8_0, FP8_E4M3, INT4, INT8, BF16) | ✅ | `quantization/` |
+| AEG weight persistence (quantized weights in `.aed` directory) | ✅ | `runtime/aeg_loader.py` |
+| CPU execution engine (numpy forward pass, all LLM op types) | ✅ | `runtime/cpu_engine.py` |
+| E2E compile → run pipeline (safetensors → AEG → CPU inference) | ✅ | `tests/unit/test_e2e_compile_run_cpu.py` |
+| Hardware detection & fingerprinting | ✅ | `runtime/hardware.py` |
+
+### ✅ Phase 2 — GPU-Native + Advanced Runtime (100%)
+
+| Feature | Status | File |
+|---------|--------|------|
+| **EAGLE-3** tree-speculative decoding engine | ✅ | `runtime/eagle.py` |
+| EAGLE-3 multi-layer feature extrapolation (offline mode) | ✅ | `runtime/eagle.py` |
+| EAGLE-3 speculative sampling verify + rejection correction | ✅ | `runtime/eagle.py` |
+| **FlashAttention-2** tiled numpy reference + flash_attn dispatch | ✅ | `kernels/attention.py` |
+| Grouped Query Attention (GQA/MQA — LLaMA-3, Qwen3) | ✅ | `kernels/attention.py` |
+| Sliding Window Attention (Mistral style) | ✅ | `kernels/attention.py` |
+| Paged Attention (vLLM-style block-sparse KV cache) | ✅ | `kernels/attention.py` |
+| Attention dispatcher (auto-selects best kernel) | ✅ | `kernels/attention.py` |
+| **Dynamic precision manager** (BF16→FP8→Q4 on pressure) | ✅ | `runtime/precision_manager.py` |
+| Precision ladder with quality budget enforcement | ✅ | `runtime/precision_manager.py` |
+| **Model registry** with LRU eviction + reference counting | ✅ | `runtime/model_registry.py` |
+| Hot-reload (atomic model replacement) | ✅ | `runtime/model_registry.py` |
+| KV cache manager — tiered L1/L2/L3/L4 + prefix hashing | ✅ | `runtime/kv_cache.py` |
+| Disaggregated prefill/decode scheduler | ✅ | `runtime/scheduler.py` |
+| TreeSpeculativeEngine (high-level wrapper) | ✅ | `runtime/speculative.py` |
+| **llama.cpp backend** — in-process + subprocess/REST modes | ✅ | `backends/llamacpp_backend.py` |
+| **vLLM backend** — in-process LLM engine | ✅ | `backends/vllm_backend.py` |
+| PyTorch backend — HF AutoModel + AEG handle | ✅ | `backends/torch_backend.py` |
+| MLX backend (Apple Silicon) | ✅ | `backends/mlx_backend.py` |
+| ONNX Runtime backend | ✅ | `backends/onnx_backend.py` |
+| TensorRT-LLM backend | ✅ | `backends/trtllm_backend.py` |
+| OpenAI-compatible REST server (FastAPI) | ✅ | `server/routes.py` |
+| Server middleware (CORS, auth, rate-limit) | ✅ | `server/middleware.py` |
+| **Hub client** — real HTTP with retry/backoff + local fallback | ✅ | `hub/client.py` |
+| Hub ZIP archive upload/download | ✅ | `hub/client.py` |
+| Runtime `generate()` / `chat()` / `embed()` / `rerank()` | ✅ | `runtime/runtime.py` |
+| Inference metrics (TPS, TTFT, P95, spec accept rate, KV hit rate) | ✅ | `runtime/runtime.py` |
 
 ---
 
-## What is an AEG?
+## GGUF Dequantization Support
 
-The **Aether Execution Graph** is Aether's central invention. A `.aeg` file contains:
+The GGUF loader supports **zero-dependency** dequantization (no `gguf` pip package required):
 
-- `graph/computation_graph.aeg-ir` — a hardware-agnostic operator graph (AEG-IR) that preserves high-level transformer semantics.
-- `weights/quantized/` — mixed-precision weights with a per-layer `precision_map.json`.
-- `kernels/` — pre-compiled or backend-selected kernels for each target profile.
-- `parallelism/` — pre-computed 1/2/4/8 GPU sharding plans.
-- `manifest.json` — top-level metadata, hashes, and compilation provenance.
+| GGML Type | Status | Details |
+|-----------|--------|---------|
+| `F32`     | ✅ | Direct cast |
+| `F16`     | ✅ | numpy float16→float32 |
+| `BF16`    | ✅ | uint16 bit-shift |
+| `Q8_0`    | ✅ | 32 int8 + f16 scale per block |
+| `Q4_0`    | ✅ | 32 nibbles + f16 scale, shifted by −8 |
+| `Q4_K_M`  | ✅ | 256-element super-block, NF4 lookup |
+| `Q5_K`    | ✅ | 256-element super-block |
+| `Q6_K`    | ✅ | 256-element super-block, 6-bit quantized |
+| `Q2_K`    | ✅ | 256-element super-block, 2-bit quantized |
+| `Q3_K`    | ✅ | 256-element super-block, 3-bit quantized |
 
-AEG is versioned and stable. An AEG/1.x file compiled today will run on all future Aether versions.
+---
+
+## Optimizer Passes
+
+| Pass | Name | Status |
+|------|------|--------|
+| 1 | Operator Fusion (QKV, FFN-SwiGLU) | ✅ Full |
+| 2 | Sensitivity Analysis (calibration-driven) | ✅ Full |
+| 3 | Mixed-Precision Assignment | ✅ Full |
+| 4 | KV Cache Structuring | ✅ Full |
+| 5 | MoE Expert Routing Optimization | ✅ Full |
+| 6 | Tensor Parallelism Discovery | ✅ Full |
+| 7 | Reasoning Graph Extraction | ✅ Full |
+| 8 | Sparse Attention Pattern Detection | ✅ Full |
+| 9 | Pruning & Sparsity | ✅ Full |
 
 ---
 
 ## Quick Start
 
-```bash
-# Install Aether
-pip install aether-runtime
+```python
+from aether import Compiler, Runtime
 
-# Compile a small model from HuggingFace
-aether compile Qwen/Qwen3-0.6B
+# Compile a model once
+compiler = Compiler()
+aeg = compiler.compile("Qwen/Qwen3-0.6B")
+aeg.save("./models/qwen3-0.6b")
 
-# Run it interactively
-aether run Qwen/Qwen3-0.6B
-
-# Or start a server
-aether serve Qwen/Qwen3-0.6B --port 11434
+# Load and run on any hardware
+rt = Runtime()
+response = rt.generate(
+    "Qwen/Qwen3-0.6B",
+    "Explain the AEG format in one sentence.",
+    max_tokens=100,
+)
+print(response.text)
+print(f"TPS: {response.metrics.throughput_tps:.1f}")
 ```
 
-### Python SDK
+### Serve via OpenAI-compatible API
 
-```python
-from aether import Runtime
+```bash
+aether serve --model Qwen/Qwen3-0.6B --port 8080
+```
 
-rt = Runtime()
-response = rt.generate("Qwen/Qwen3-0.6B", "Explain quantum computing in one sentence.")
-print(response.text)
-print(f"TPS: {response.metrics.throughput_tps}")
-print(f"TTFT: {response.metrics.ttft_ms}ms")
+```bash
+curl http://localhost:8080/v1/generate \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen3-0.6B", "prompt": "Hello!", "max_tokens": 50}'
+```
+
+---
+
+## Supported Hardware Targets
+
+| Target | Backend | Status |
+|--------|---------|--------|
+| `cpu_avx512` | PyTorch / llama.cpp | ✅ |
+| `cpu_neon` | PyTorch / llama.cpp | ✅ |
+| `cuda_sm80` (A100) | vLLM / PyTorch / TRT-LLM | ✅ |
+| `cuda_sm90` (H100) | vLLM / PyTorch / TRT-LLM | ✅ |
+| `cuda_sm100` (B200) | vLLM | ✅ |
+| `rocm_rdna3` | PyTorch / ROCm | ✅ |
+| `metal_m1`/`metal_m3` | MLX / PyTorch | ✅ |
+| `openvino` | OpenVINO | ✅ |
+
+---
+
+## Project Structure
+
+```
+src/aether/
+├── compiler/
+│   ├── stage1_ingestion/     # Format loaders: safetensors, GGUF, ONNX, MLX, PyTorch
+│   ├── stage2_optimizer/     # 9 optimization passes
+│   ├── stage3_targeting/     # Hardware targeting and kernel selection
+│   └── calibration/          # Calibration datasets + perplexity evaluator
+├── core/                     # AEG graph IR, format spec, types, constants
+├── quantization/             # Q4_K_M, Q8_0, FP8, INT4/INT8 codecs
+├── runtime/
+│   ├── cpu_engine.py         # Full numpy CPU forward pass
+│   ├── eagle.py              # EAGLE-3 tree-speculative decoding
+│   ├── precision_manager.py  # Dynamic BF16→FP8→Q4 on pressure
+│   ├── model_registry.py     # LRU model registry with ref-counting
+│   ├── kv_cache.py           # Tiered KV cache (L1/L2/L3/L4)
+│   ├── scheduler.py          # Disaggregated prefill/decode
+│   └── speculative.py        # TreeSpeculativeEngine wrapper
+├── kernels/
+│   ├── attention.py          # FA-2, GQA, SlidingWindow, Paged, Dispatcher
+│   ├── gemm.py               # GEMM kernels
+│   ├── ffn.py                # FFN (SwiGLU, GEGLU)
+│   ├── norm.py               # RMSNorm, LayerNorm
+│   └── rope.py               # Rotary position embedding
+├── backends/                 # PyTorch, vLLM, llama.cpp, MLX, ONNX, TRT-LLM
+├── server/                   # FastAPI OpenAI-compatible server
+├── hub/                      # Aether Hub HTTP client
+└── utils/                    # Logging, file I/O, profiling
+```
+
+---
+
+## Running Tests
+
+```bash
+# All tests
+python -m pytest tests/ -v
+
+# Phase 1 tests only
+python -m pytest tests/unit/test_e2e_compile_run_cpu.py tests/unit/test_gguf_loader.py tests/unit/test_format_loaders.py -v
+
+# Phase 2 tests only
+python -m pytest tests/unit/test_phase2_runtime.py tests/unit/test_hub_client.py -v
 ```
 
 ---
 
 ## Installation
 
-### Base install (CPU, PyTorch fallback)
-
 ```bash
+# Core (CPU inference, compiler)
 pip install aether-runtime
-```
 
-### With your preferred backend
+# With CUDA support
+pip install aether-runtime[cuda]
 
-```bash
-# NVIDIA / high-throughput serving
+# With llama.cpp (GGUF / CPU K-quant)
+pip install aether-runtime[llamacpp]
+
+# With vLLM (NVIDIA high-throughput)
 pip install aether-runtime[vllm]
 
-# Apple Silicon
+# With MLX (Apple Silicon)
 pip install aether-runtime[mlx]
 
-# ONNX Runtime
-pip install aether-runtime[onnxruntime]
-
-# All backends (development)
-pip install aether-runtime[dev]
+# Everything
+pip install aether-runtime[all]
 ```
-
-### Optional dependencies
-
-- `vllm` — NVIDIA serving backend.
-- `llamacpp` — llama.cpp backend for CPU/GGUF.
-- `trtllm` — TensorRT-LLM backend.
-- `mlx` — Apple Silicon backend.
-- `onnxruntime` — ONNX Runtime backend.
-- `triton` — Triton kernel templates (Linux).
-- `dev` — lint, test, docs, benchmark tooling.
-
----
-
-## Python SDK
-
-### Runtime
-
-```python
-from aether import Runtime, RuntimeConfig
-
-config = RuntimeConfig(
-    optimize_for="latency",
-    speculative_decoding=True,
-    prefill_chunk_size=2048,
-    dynamic_precision=True,
-)
-rt = Runtime(config)
-
-# Text generation
-response = rt.generate(
-    model="Qwen/Qwen3-8B",
-    prompt="Write a haiku about compilers.",
-    max_tokens=64,
-    temperature=0.7,
-)
-print(response.text)
-
-# Streaming
-for chunk in rt.generate("Qwen/Qwen3-8B", "Count to 10", stream=True):
-    print(chunk.delta, end="", flush=True)
-
-# Chat
-response = rt.chat(
-    model="Qwen/Qwen3-8B",
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "What is an AEG?"},
-    ],
-)
-print(response.text)
-
-# Embeddings
-vectors = rt.embed(
-    model="nomic-ai/nomic-embed-text-v1.5",
-    input=["Hello world", "Machine learning"],
-)
-
-# Reranking
-ranked = rt.rerank(
-    model="BAAI/bge-reranker-v2-m3",
-    query="What is CUDA?",
-    documents=["CUDA is a parallel computing platform.", "Python is a programming language."],
-)
-
-# Transcription
-transcript = rt.transcribe(
-    model="openai/whisper-large-v3",
-    audio="path/to/audio.mp3",
-    language="en",
-)
-```
-
-### Compiler
-
-```python
-from aether import Compiler, CompilerConfig
-
-config = CompilerConfig(
-    quality_budget=0.02,
-    calibration_dataset="wikitext-2",
-    targets=["auto"],
-)
-compiler = Compiler(config)
-
-# Dry-run: inspect the plan before compiling
-plan = compiler.plan("Qwen/Qwen3-8B")
-print(plan.fusion_opportunities)
-print(plan.estimated_memory_gb)
-
-# Compile
-aeg = compiler.compile("Qwen/Qwen3-8B")
-print(aeg.graph_summary())
-print(aeg.precision_map())
-print(aeg.quality_report())
-print(aeg.sharding_plans())
-
-# Save / distribute
-aeg.save("./qwen3-8b.aeg")
-aeg.upload(hub="hub.aether.dev")
-```
-
----
-
-## CLI
-
-```bash
-# Compilation
-aether compile Qwen/Qwen3-8B
-aether compile Qwen/Qwen3-8B --quality-budget 0.01
-aether compile Qwen/Qwen3-8B --target cuda_sm90
-aether compile Qwen/Qwen3-8B --upload
-
-# Model management
-aether pull Qwen/Qwen3-0.6B
-aether list
-aether info Qwen/Qwen3-8B
-aether graph Qwen/Qwen3-8B
-aether rm Qwen/Qwen3-0.6B
-
-# Serving
-aether serve Qwen/Qwen3-8B --port 11434
-aether status
-aether stop
-
-# Running
-aether run Qwen/Qwen3-0.6B
-aether run Qwen/Qwen3-0.6B --stream
-
-# Benchmarking
-aether bench Qwen/Qwen3-8B
-aether bench Qwen/Qwen3-8B --compare vllm
-aether bench --all
-
-# Hardware and diagnostics
-aether hw
-aether kernels
-aether logs
-```
-
----
-
-## REST API
-
-```bash
-aether serve Qwen/Qwen3-0.6B --port 11434
-```
-
-### Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/generate` | Text completion |
-| POST | `/v1/chat` | Chat completion (OpenAI-compatible) |
-| POST | `/v1/embeddings` | Embedding generation |
-| POST | `/v1/rerank` | Document reranking |
-| POST | `/v1/transcribe` | Audio transcription |
-| POST | `/v1/compile` | Compile a model (async job) |
-| GET | `/v1/compile/{job_id}` | Compilation job status |
-| GET | `/v1/models` | List compiled models |
-| POST | `/v1/models/pull` | Download and compile model |
-| GET | `/v1/models/{name}` | Model info and metadata |
-| DELETE | `/v1/models/{name}` | Remove compiled model |
-| GET | `/v1/models/{name}/graph` | Inspect AEG-IR |
-| GET | `/v1/hardware` | Hardware fingerprint |
-| GET | `/v1/kernels` | Active kernel targets |
-| GET | `/v1/metrics` | Prometheus metrics |
-| GET | `/v1/health` | Health check |
-
----
-
-## OpenAI Compatibility
-
-Point any OpenAI SDK v1+ client at Aether:
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:11434/v1", api_key="aether")
-
-response = client.chat.completions.create(
-    model="Qwen/Qwen3-8B",
-    messages=[{"role": "user", "content": "Hello!"}],
-)
-print(response.choices[0].message.content)
-```
-
-Works with LangChain, LlamaIndex, CrewAI, AutoGen, OpenHands, and any OpenAI-compatible tool.
-
----
-
-## Architecture
-
-Aether is a five-stage compiler plus a backend-orchestrated runtime.
-
-```
-Any Model Format (safetensors / GGUF / ONNX / MLX / .pt)
-                    │
-                    ▼
-Stage 1: Model Ingestion & Graph Extraction → AEG-IR
-                    │
-                    ▼
-Stage 2: Aether Optimizer (6 graph-level passes) → optimized AEG-IR
-                    │
-                    ▼
-Stage 3: Hardware Targeting & Backend Selection → AEG artifact
-                    │
-                    ▼
-Stage 4: Self-Optimizing Runtime → tokens / embeddings
-                    │
-                    ▼
-Stage 5: Developer Interface (Python SDK / REST / CLI / OpenAI-compat)
-```
-
-### Backend plugin model
-
-Aether does not write custom kernels for every accelerator. Instead, it integrates best-in-class backends behind a stable `Backend` interface:
-
-- **vLLM** — NVIDIA high-throughput serving.
-- **llama.cpp** — cross-platform CPU/GGUF.
-- **TensorRT-LLM** — NVIDIA compiled engines.
-- **MLX** — Apple Silicon native.
-- **ONNX Runtime** — Intel / cross-platform execution providers.
-- **PyTorch** — universal fallback and graph tracing.
-
-Aether's value is in choosing the right backend, scheduling requests, managing the KV cache, applying speculative decoding, and compiling the model into a portable AEG. New backends can be added as plugins without changing the public API.
-
----
-
-## Compiler Pipeline
-
-### Stage 1: Model Ingestion
-
-Aether supports:
-
-- SafeTensors (direct loading + config.json parsing)
-- GGUF (header parsing + dequantization for tracing)
-- ONNX (protobuf graph → AEG-IR lowering)
-- MLX (module tracing → AEG-IR)
-- PyTorch `.pt` / `.bin` (`torch.export` graph capture → AEG-IR)
-
-Architecture detection inspects the graph structure, not the model name, so it works with custom models and future variants.
-
-### Stage 2: Nine Optimizer Passes
-
-1. **Operator Fusion** — fuse `RMSNorm → QKV → RoPE → GQA` into megakernels.
-2. **Sensitivity Analysis** — compute `d(perplexity)/d(precision)` per layer.
-3. **Precision Assignment** — mixed-precision quantization based on sensitivity.
-4. **KV Cache Structuring** — paged blocks, radix-tree prefix hints, tiering.
-5. **MoE Expert Routing** — hot/warm/cold expert tiering, threshold-based routing.
-6. **Automatic Parallelism Discovery** — search tensor/pipeline/expert/context parallelism.
-
-### Stage 3: Hardware Targeting
-
-Aether selects the best backend and precision plan for each target profile:
-
-- `cuda_sm70` — V100
-- `cuda_sm80` — A100
-- `cuda_sm89` — RTX 4090
-- `cuda_sm90` — H100
-- `cuda_sm100` — B200
-- `metal_m1` — Apple M1/M2
-- `metal_m3` — Apple M3/M4/M5
-- `rocm_rdna3` — AMD RX 7000
-- `rocm_cdna3` — AMD MI300X
-- `openvino_npu` — Intel Arc NPU
-- `cpu_avx512` — x86 AVX-512
-- `cpu_neon` — ARM NEON
-
-### Stage 4: Runtime
-
-The runtime loads the AEG, fingerprints the hardware, picks the backend, and runs a disaggregated prefill/decode scheduler with tree-speculative decoding and a global tiered KV cache.
-
-### Stage 5: Developer Interface
-
-Python SDK, REST API, OpenAI-compatible endpoints, and the `aether` CLI.
-
----
-
-## Optimizer Passes
-
-### Pass 1: Operator Fusion
-
-Before fusion:
-```
-rmsnorm → q_proj → k_proj → v_proj → rope_q → rope_k
-```
-After fusion:
-```
-fused_qkv_rope_norm(x, wq, wk, wv, pos)
-```
-
-### Pass 2: Sensitivity Analysis
-
-For each layer, compute the perplexity change when quantized. This is the mathematical basis for mixed precision.
-
-```python
-sensitivity[L] = (ppl_quantized - ppl_baseline) / bits_saved(L)
-```
-
-### Pass 3: Precision Assignment
-
-| Sensitivity | Typical Layers | Precision |
-|-------------|----------------|-----------|
-| > 0.9       | Embeddings, LM head | BF16 |
-| 0.7–0.9     | Q/K projections | FP8 or Q6_K |
-| 0.4–0.7     | V/O projections | Q4_K_M |
-| < 0.4       | FFN deep layers | Q3_K / IQ3_XS |
-
-### Pass 4: KV Cache Structuring
-
-- Paged blocks aligned to hardware page size.
-- Radix-tree prefix hints for shared system prompts.
-- Tiered storage: GPU HBM → CPU DRAM → NVMe SSD → Aether Hub CDN.
-
-### Pass 5: MoE Expert Routing
-
-- Activation profiling on a calibration set.
-- Hot experts (>5% activation) → GPU HBM.
-- Warm experts (0.1–5%) → CPU DRAM + prefetch.
-- Cold experts (<0.1%) → NVMe lazy load.
-- Threshold-based routing replaces rigid top-K.
-- Intra-expert sparsity kernels skip dead channels.
-
-### Pass 6: Automatic Parallelism Discovery
-
-Searches the space of tensor/pipeline/expert/context parallelism and produces separate prefill and decode plans, stored in the AEG.
-
----
-
-## Runtime Intelligence
-
-### Disaggregated Prefill/Decode
-
-Separates compute-bound prefill from memory-bandwidth-bound decode. Long prefills are chunked to maintain TTFT SLOs. KV state is transferred via shared memory or RDMA.
-
-### Tree-Speculative Decoding
-
-A draft model proposes a branching tree of candidate tokens. The target model verifies the entire tree in one forward pass using tree-masked attention. Target: 3–6x throughput on latency-sensitive workloads.
-
-### Global KV Cache Manager
-
-| Tier | Storage | Use |
-|------|---------|-----|
-| L1 | GPU HBM | Active requests |
-| L2 | CPU DRAM | Prefix cache, recently evicted |
-| L3 | NVMe SSD | Long system prompts, RAG KV |
-| L4 | Aether Hub | Globally shared system prompts |
-
-### Dynamic Precision Adjustment
-
-Under memory pressure, the runtime downgrades the lowest-sensitivity layers to a lower precision in place, then restores them when pressure eases.
-
----
-
-## Supported Backends
-
-| Backend | When Used | Notes |
-|---------|-----------|-------|
-| vLLM | NVIDIA high-throughput serving | PagedAttention, continuous batching |
-| llama.cpp | CPU/GGUF | Cross-platform, quantized models |
-| TensorRT-LLM | NVIDIA production | Compiled engines, FP8 |
-| MLX | Apple Silicon | Unified memory, native performance |
-| ONNX Runtime | Intel / cross-platform | OpenVINO EP, NPU support |
-| PyTorch | Fallback / tracing | Universal, always available |
-
----
-
-## Supported Hardware
-
-| Vendor | Hardware | Target ID |
-|--------|----------|-----------|
-| NVIDIA | V100, A100, RTX 4090, H100, B200 | cuda_sm70–sm100 |
-| Apple | M1/M2/M3/M4/M5 | metal_m1, metal_m3 |
-| AMD | RX 7000, MI300X | rocm_rdna3, rocm_cdna3 |
-| Intel | Arc NPU, x86 | openvino_npu, cpu_avx512 |
-| ARM | Qualcomm, Apple CPU | cpu_neon |
-
----
-
-## AEG Format
-
-The AEG format is documented in `docs/aeg-format.md`. It is versioned and stable:
-
-- **AEG/1.x** — readable forever by all future Aether versions.
-- **AEG/2.x** — when introduced, backward compatibility maintained for 3 years.
-
-The format is content-addressed and includes:
-
-- Computation graph (AEG-IR)
-- Quantized weights and precision map
-- Backend/kernel plans per target
-- Parallelism plans for 1/2/4/8 GPUs
-- Manifest with hashes and provenance
-
----
-
-## Contributing
-
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, coding standards, and the PR process. Key areas:
-
-- New ingestion loaders (model formats)
-- New backend plugins
-- Compiler passes
-- Optimizations and benchmarks
-- Documentation and examples
 
 ---
 
 ## License
 
-Aether Runtime is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
-
----
-
-## Research Foundation
-
-Aether's design is grounded in recent research. See [research/research_foundation.md](research/research_foundation.md) for the full paper mapping.
-
-Key works referenced include:
-
-- MLIR, IREE, StableHLO for compiler/IR design.
-- PagedAttention, SGLang RadixAttention, DistServe, Mooncake for KV cache and serving.
-- GPTQ, AWQ, AutoMixQ, AMQ for quantization.
-- SpecInfer, OPT-Tree, DeFT, JetSpec for speculative decoding.
-- MoE-Infinity, CommitMoE, FinDEP, DynaMoE for MoE optimization.
-- Alpa, Megatron-LM, Seesaw, Ring Attention for parallelism.
-
----
-
-## Roadmap
-
-Aether is developed in five phases:
-
-1. **Phase 1 — Compiler Foundation** (months 1–4): AEG format, ingestion, optimizer Pass 1, basic runtime, SDK, CLI, Hub MVP.
-2. **Phase 2 — Optimizer Depth** (months 5–9): Passes 2–4, mixed precision, KV cache, speculative decoding, disaggregated scheduler.
-3. **Phase 3 — Parallelism and Scale** (months 10–16): Pass 6, automatic parallelism, MoE compiler, multi-node disaggregation.
-4. **Phase 4 — Ecosystem** (months 17–24): MLX ingestion, OpenVINO target, model registry, more SDK bindings, WASM experimental.
-5. **Phase 5 — Compiler as Platform** (month 25+): Hardware vendor SDK, custom targets, community compiler passes, multimodal compilation.
-
-See the full roadmap in `docs/roadmap.md`.
-
----
-
-## Commercial
-
-Aether follows an open-core model:
-
-- **Open source**: compiler, AEG format, runtime, Hub, all features.
-- **Aether Cloud**: managed compilation, private AEG registry, fleet management, enterprise SSO, RBAC, audit logs.
-
-Contact `enterprise@aether.dev` for commercial inquiries.
-
----
-
-## Support
-
-- GitHub Issues: [github.com/aether-dev/aether-runtime/issues](https://github.com/aether-dev/aether-runtime/issues)
-- GitHub Discussions: [github.com/aether-dev/aether-runtime/discussions](https://github.com/aether-dev/aether-runtime/discussions)
-- Documentation: [docs.aether.dev](https://docs.aether.dev)
-- Email: `dev@aether.dev`
-
----
-
-<p align="center">
-  <strong>Aether Runtime — the compiler for AI models.</strong>
-</p>
-
-
-### PRD v3.1 Runtime Layers
-
-Aether now includes functional reference implementations and artifact contracts for the v3.1 platform layer:
-
-- Agentic workflow optimizer with meta-tool mining, context-cache policy, and cascade routing.
-- EAGLE-3 planner with multi-layer fusion, flattened tree metadata, and drift-correction flags.
-- MLA native planner with latent-KV compression ratios and target-specific kernel selection.
-- Observability contracts for eval gates, drift monitoring, OpenTelemetry-style metrics, and A/B rollout.
-- Fleet management, hot reload routing, CUDA Graph capture manifests, multimodal graph planning, and distillation manifests.
-
+Apache 2.0 — see [LICENSE](LICENSE).
