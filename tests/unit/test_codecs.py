@@ -16,6 +16,7 @@ from aether.quantization.codecs import (
     AffineIntCodec,
     FP4Codec,
     FP8Codec,
+    MXFP4Codec,
     NF4Codec,
     PassthroughCodec,
     SymmetricIntCodec,
@@ -67,10 +68,54 @@ class TestCodecRegistry:
 
     @pytest.mark.parametrize(
         ("alias", "canonical"),
-        [("NVFP4", "FP4"), ("MXFP4", "FP4"), ("E4M3", "FP8"), ("normalfloat4", "NF4")],
+        [("NVFP4", "FP4"), ("E4M3", "FP8"), ("normalfloat4", "NF4")],
     )
     def test_aliases_resolve_to_same_codec(self, alias: str, canonical: str) -> None:
         assert get_codec(alias).name == get_codec(canonical).name
+
+    def test_mxfp4_is_a_distinct_codec_not_an_fp4_alias(self) -> None:
+        """
+        MXFP4 must not collapse into FP4.
+
+        Both use E2M1 codes, but OCP MXFP4 adds an outer FP8-E4M3 microscale
+        per 32-element group on top of the per-block scale. That second scale
+        level is what makes it more accurate than single-scale FP4, so
+        resolving MXFP4 to FP4Codec would silently drop precision on Blackwell
+        / MI400 / Gaudi3 targets. PRD §18 lists them as separate formats.
+        """
+        mxfp4 = get_codec("MXFP4")
+        fp4 = get_codec("FP4")
+
+        assert isinstance(mxfp4, MXFP4Codec)
+        assert mxfp4.name == "MXFP4"
+        assert mxfp4.name != fp4.name
+        # Same nominal width, different scaling structure.
+        assert mxfp4.bits == fp4.bits == 4
+        assert mxfp4.OUTER_GROUP == 32
+
+    def test_mxfp4_outer_microscale_beats_plain_fp4_on_varied_magnitudes(self) -> None:
+        """
+        The dual-level scale must earn its keep.
+
+        Across groups whose magnitudes differ by orders of magnitude, the outer
+        microscale should reconstruct at least as accurately as single-scale
+        FP4 — that is the whole reason the format exists.
+        """
+        rng = np.random.RandomState(7)
+        # Blocks spanning wildly different dynamic ranges.
+        scales = np.array([1e-3, 1.0, 1e2, 1e3], dtype=np.float32).repeat(8)
+        blocks = (rng.randn(32, 32) * scales[:, None]).astype(np.float32)
+
+        def reconstruction_error(codec) -> float:
+            codes, scale, zero = codec.encode(blocks)
+            out = codec.decode(codes, scale, zero)
+            denom = float(np.abs(blocks).mean())
+            return float(np.abs(out - blocks).mean() / denom)
+
+        mxfp4_err = reconstruction_error(get_codec("MXFP4"))
+        fp4_err = reconstruction_error(get_codec("FP4"))
+
+        assert mxfp4_err <= fp4_err * 1.05
 
     def test_precision_is_case_insensitive(self) -> None:
         assert get_codec("q4_k_m").name == get_codec("Q4_K_M").name

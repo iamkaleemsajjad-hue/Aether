@@ -32,9 +32,27 @@ from typing import Any
 
 import numpy as np
 
+# Stable public entry point for Pass 9 within the optimizer pipeline. The
+# pipeline-facing pass lives in ``optimizer``; this module additionally hosts
+# the pruner implementations (Wanda, SparseGPT, structured, layer-drop).
+from aether.compiler.stage2_optimizer.optimizer import PruningSparsityPass
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+__all__ = [
+    "PruningSparsityPass",
+    "Pass9PruningSparsity",
+    "WandaPruner",
+    "SparseGPTPruner",
+    "StructuredPruner",
+    "LayerDropAnalyzer",
+    "LayerSparsityMask",
+    "SparsityManifest",
+    "PruningMethod",
+    "SparsityTarget",
+    "PRUNING_STRATEGIES",
+]
 
 
 # ---------------------------------------------------------------------------

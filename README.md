@@ -387,6 +387,18 @@ python -m pytest tests/unit/test_phase6_ecosystem.py -v      # Phase 6
 python -m pytest tests/unit/test_v31_elite_extensions.py -v  # v3.1 Extensions
 ```
 
+> **Run the suite serially.** `test_e2e_compile_run_cpu.py` and
+> `test_v31_features.py` both compile into the shared `~/.aether` cache; two
+> concurrent pytest processes race on it and fail spuriously.
+>
+> Tests that need HuggingFace weights skip cleanly when no network path to
+> `huggingface.co` is available.
+
+See [REMEDIATION.md](REMEDIATION.md) for the July 2026 gap-closure report —
+the compile-time plan layer (PRD §16 multi-modal graph, §34.2 RAG pipeline,
+MLA planner), the runtime `PrecisionManager`, and the MXFP4-vs-FP4 codec
+decision are documented there.
+
 | Module | Tests | Status |
 |--------|-------|--------|
 | `observability.otel` | 13 | Pass |

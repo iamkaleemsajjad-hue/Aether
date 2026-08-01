@@ -19,8 +19,10 @@ This implementation covers:
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -611,3 +613,177 @@ class MLADetector:
             return config
 
         return None
+
+    def detect_from_architecture(self, architecture: Any) -> MLAConfig | None:
+        """
+        Detect MLA from an ingested :class:`ModelArchitecture`.
+
+        Returns None when the architecture does not use MLA.
+        """
+        attn_type = str(getattr(architecture, "attention_type", "") or "").upper()
+        family = str(getattr(architecture, "family", "") or "").lower()
+        is_mla = attn_type == "MLA" or any(f in family for f in self.MLA_FAMILIES)
+        if not is_mla:
+            return None
+
+        num_heads = int(getattr(architecture, "num_attention_heads", 128) or 128)
+        num_kv_heads = int(getattr(architecture, "num_kv_heads", None) or num_heads)
+        head_dim = int(getattr(architecture, "head_dim", None) or 128)
+
+        # DeepSeek's published split: the RoPE branch is half the nope branch.
+        qk_rope = max(16, head_dim // 2)
+        return MLAConfig(
+            kv_lora_rank=512,
+            q_lora_rank=1536,
+            qk_nope_head_dim=head_dim,
+            qk_rope_head_dim=qk_rope,
+            v_head_dim=head_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            rope_theta=float(getattr(architecture, "rope_theta", 10000.0) or 10000.0),
+            rope_decoupled=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Compile-time MLA plan
+# ---------------------------------------------------------------------------
+
+#: Attention kernel per target family. FA-4 lands on Blackwell-class parts
+#: (SM100/SM120); FA-3 covers Hopper; everything else uses the portable kernel.
+_MLA_KERNELS: dict[str, str] = {
+    "fa4": "aeg.mla_flash_attention_4",
+    "fa3": "aeg.mla_flash_attention_3",
+    "portable": "aeg.mla_portable",
+}
+
+_FA4_TARGETS = ("cuda_sm100", "cuda_sm103", "cuda_sm120")
+_FA3_TARGETS = ("cuda_sm90", "cuda_sm89")
+
+
+@dataclass
+class MLACompressionPlan:
+    """
+    Compile-time MLA plan recorded at ``.aeg/mla/plan.json``.
+
+    Captures whether MLA applies, which kernel the target can run, and the
+    KV-cache compression the runtime should expect.
+    """
+
+    enabled: bool
+    target: str = ""
+    kernel: str = _MLA_KERNELS["portable"]
+    config: MLAConfig | None = None
+    weight_absorption: bool = False
+    kv_cache_dtype: str = "BF16"
+    version: str = "mla_compression/1.0"
+
+    @property
+    def compression_ratio(self) -> float:
+        """KV cache compression vs standard GQA; 1.0 when MLA is disabled."""
+        if not self.enabled or self.config is None:
+            return 1.0
+        return self.config.compression_ratio
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "version": self.version,
+            "enabled": self.enabled,
+            "target": self.target,
+            "kernel": self.kernel,
+            "weight_absorption": self.weight_absorption,
+            "kv_cache_dtype": self.kv_cache_dtype,
+            "compression_ratio": round(self.compression_ratio, 4),
+        }
+        if self.config is not None:
+            d["config"] = self.config.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "MLACompressionPlan":
+        cfg = d.get("config")
+        return cls(
+            enabled=d.get("enabled", False),
+            target=d.get("target", ""),
+            kernel=d.get("kernel", _MLA_KERNELS["portable"]),
+            config=MLAConfig.from_dict(cfg) if cfg else None,
+            weight_absorption=d.get("weight_absorption", False),
+            kv_cache_dtype=d.get("kv_cache_dtype", "BF16"),
+            version=d.get("version", "mla_compression/1.0"),
+        )
+
+    def save(self, aeg_dir: str | Path) -> Path:
+        out = Path(aeg_dir) / "mla" / "plan.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        logger.info("MLA plan saved", path=str(out), enabled=self.enabled)
+        return out
+
+
+class MLAPlanner:
+    """
+    Plans MLA compilation for a model/target pair.
+
+    Wraps :class:`MLADetector` and picks the attention kernel the target can
+    actually run, so the AEG records a plan the runtime can execute rather
+    than an aspiration.
+    """
+
+    def __init__(self, detector: MLADetector | None = None) -> None:
+        self.detector = detector or MLADetector()
+
+    @staticmethod
+    def select_kernel(target: str) -> str:
+        """Return the best MLA attention kernel available on a target."""
+        t = (target or "").lower()
+        if any(t.startswith(x) for x in _FA4_TARGETS):
+            return _MLA_KERNELS["fa4"]
+        if any(t.startswith(x) for x in _FA3_TARGETS):
+            return _MLA_KERNELS["fa3"]
+        return _MLA_KERNELS["portable"]
+
+    def plan(
+        self,
+        architecture: Any,
+        target: str = "",
+        kv_cache_dtype: str = "BF16",
+    ) -> MLACompressionPlan:
+        """
+        Build the MLA plan for an architecture on a target.
+
+        Args:
+            architecture: Ingested :class:`ModelArchitecture`.
+            target: Hardware target id, e.g. ``cuda_sm100``.
+            kv_cache_dtype: Storage dtype for the compressed latent cache.
+
+        Returns:
+            An MLACompressionPlan. ``enabled`` is False for non-MLA models,
+            in which case the portable kernel is recorded and the compression
+            ratio is 1.0.
+        """
+        config = self.detector.detect_from_architecture(architecture)
+        if config is None:
+            return MLACompressionPlan(
+                enabled=False,
+                target=target,
+                kernel=_MLA_KERNELS["portable"],
+                kv_cache_dtype=kv_cache_dtype,
+            )
+
+        plan = MLACompressionPlan(
+            enabled=True,
+            target=target,
+            kernel=self.select_kernel(target),
+            config=config,
+            # Absorption folds W_UK into W_UQ at compile time; only valid when
+            # the RoPE branch is decoupled, since the RoPE half cannot absorb.
+            weight_absorption=config.weight_absorption_possible and config.rope_decoupled,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+        logger.info(
+            "MLA plan built",
+            target=target,
+            kernel=plan.kernel,
+            compression_ratio=round(plan.compression_ratio, 2),
+        )
+        return plan

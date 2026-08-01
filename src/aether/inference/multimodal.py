@@ -45,6 +45,324 @@ class VLMArchitecture:
     CROSS_ATTN    = "cross_attn"     # Flamingo-style
 
 
+# ---------------------------------------------------------------------------
+# Multi-Modal Unified Graph plan (PRD §16)
+# ---------------------------------------------------------------------------
+
+#: AEG-IR encode opcode emitted for each supported modality (PRD §16).
+MODALITY_ENCODE_OPS: dict[str, str] = {
+    "image": "aeg.vision_encode",
+    "video": "aeg.vision_encode",
+    "audio": "aeg.audio_encode",
+    "text":  "aeg.text_encode",
+}
+
+#: Default per-modality visual/audio token budgets before compression.
+MODALITY_TOKEN_BUDGETS: dict[str, int] = {
+    "image": 1024,
+    "video": 32768,
+    "audio": 3000,
+    "text":  0,
+}
+
+
+@dataclass
+class ModalityEncoder:
+    """
+    One non-text encoder in a Multi-Modal Unified Graph (PRD §16).
+
+    Each encoder is a separately compiled AEG artifact (a ViT, a video
+    encoder, an audio tower) that the unified graph invokes before fusion.
+
+    Per PRD §16, encoders use ViT-DP (data parallel) rather than tensor
+    parallelism: an all-reduce for a sub-10B encoder costs more than the
+    parallelism saves, so each replica holds the whole encoder.
+
+    Args:
+        modality: One of ``image``, ``video``, ``audio``, ``text``.
+        model_path: Path/URI of the compiled encoder ``.aeg`` artifact.
+        token_budget: Max tokens this encoder may emit before compression.
+            Defaults to the per-modality budget in MODALITY_TOKEN_BUDGETS.
+        compression_ratio: Fraction of tokens kept by dynamic token merging.
+            PRD §16 targets 75% reduction (ratio 0.25) at <2% quality loss.
+        parallelism: Encoder sharding strategy — ``dp`` per PRD §16.
+        dynamic_resolution: Enable ``aeg.dynamic_resolution_resize``.
+    """
+
+    modality: str
+    model_path: str
+    token_budget: int = 0
+    compression_ratio: float = 0.25
+    parallelism: str = "dp"
+    dynamic_resolution: bool = True
+
+    def __post_init__(self) -> None:
+        modality = self.modality.lower().strip()
+        if not modality:
+            raise ValueError("modality must be a non-empty string")
+        self.modality = modality
+        if not 0.0 < self.compression_ratio <= 1.0:
+            raise ValueError(
+                f"compression_ratio must be in (0, 1], got {self.compression_ratio}"
+            )
+        if self.token_budget <= 0:
+            self.token_budget = MODALITY_TOKEN_BUDGETS.get(modality, 1024)
+        # Audio has no spatial resolution to resize.
+        if modality == "audio":
+            self.dynamic_resolution = False
+
+    @property
+    def encode_op(self) -> str:
+        """AEG-IR opcode used to encode this modality."""
+        return MODALITY_ENCODE_OPS.get(self.modality, "aeg.vision_encode")
+
+    @property
+    def compressed_tokens(self) -> int:
+        """Token count after dynamic token merging."""
+        return max(1, int(self.token_budget * self.compression_ratio))
+
+    def to_stage(self) -> dict[str, Any]:
+        """Render this encoder as a stage in the unified graph."""
+        stage: dict[str, Any] = {
+            "op": self.encode_op,
+            "modality": self.modality,
+            "model": self.model_path,
+            "token_budget": self.token_budget,
+            "compressed_tokens": self.compressed_tokens,
+            "compression_ratio": round(self.compression_ratio, 4),
+            "parallelism": self.parallelism,
+        }
+        if self.dynamic_resolution:
+            stage["preprocess"] = "aeg.dynamic_resolution_resize"
+        return stage
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "modality": self.modality,
+            "model_path": self.model_path,
+            "token_budget": self.token_budget,
+            "compressed_tokens": self.compressed_tokens,
+            "compression_ratio": round(self.compression_ratio, 4),
+            "parallelism": self.parallelism,
+            "dynamic_resolution": self.dynamic_resolution,
+            "encode_op": self.encode_op,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ModalityEncoder":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class MultiModalGraphPlan:
+    """
+    Unified multi-modal execution graph (PRD §16).
+
+    A VLM is compiled as one graph rather than a ViT bolted onto an LLM:
+    every encoder, the fusion step, and generation are stages of a single
+    AEG-IR program. Serialized to ``.aeg/multimodal/graph.json``.
+
+    Args:
+        llm_model: Path/URI of the compiled LLM ``.aeg`` artifact.
+        encoders: Non-text modality encoders feeding the fusion stage.
+        fusion: ``early_fuse`` (token-level, Qwen3-VL) or ``late_fusion``.
+        llm_parallelism: LLM sharding — ``tp`` per PRD §16 hybrid parallelism.
+        mm_sparse_attention: Enable MMInference grid sparse attention, which
+            exploits spatial/temporal locality in video tokens (PRD §A.9).
+        visual_token_compression: Enable dynamic token merging (Fast-VLM).
+        kv_cache_visual_tokens: Cache encoder output across turns so a
+            re-sent image is not re-encoded.
+    """
+
+    llm_model: str
+    encoders: tuple[ModalityEncoder, ...] = ()
+    fusion: str = "early_fuse"
+    llm_parallelism: str = "tp"
+    mm_sparse_attention: bool = True
+    visual_token_compression: bool = True
+    kv_cache_visual_tokens: bool = True
+    version: str = "multimodal_graph/1.0"
+
+    def __post_init__(self) -> None:
+        # Accept any iterable of encoders; normalize to a tuple.
+        self.encoders = tuple(self.encoders)
+        for enc in self.encoders:
+            if not isinstance(enc, ModalityEncoder):
+                raise TypeError(
+                    f"encoders must contain ModalityEncoder instances, got {type(enc).__name__}"
+                )
+        seen: set[str] = set()
+        for enc in self.encoders:
+            if enc.modality in seen:
+                raise ValueError(f"duplicate modality encoder: {enc.modality!r}")
+            seen.add(enc.modality)
+
+    @property
+    def modalities(self) -> tuple[str, ...]:
+        """Modalities handled by this graph, text always included."""
+        return tuple(["text", *(e.modality for e in self.encoders)])
+
+    @property
+    def total_visual_tokens(self) -> int:
+        """Total post-compression tokens contributed by all encoders."""
+        return sum(e.compressed_tokens for e in self.encoders)
+
+    def to_graph(self) -> dict[str, Any]:
+        """
+        Lower the plan to an AEG-IR stage list.
+
+        Stage order: one encode stage per modality → fusion → generation.
+        The final stage is always ``aeg.llm_generate``.
+        """
+        stages: list[dict[str, Any]] = [e.to_stage() for e in self.encoders]
+
+        fusion_op = (
+            "aeg.early_fuse" if self.fusion == "early_fuse" else "aeg.late_fuse"
+        )
+        stages.append({
+            "op": fusion_op,
+            "strategy": self.fusion,
+            "inputs": [e.modality for e in self.encoders] + ["text"],
+            "visual_tokens": self.total_visual_tokens,
+        })
+
+        stages.append({
+            "op": "aeg.llm_generate",
+            "model": self.llm_model,
+            "parallelism": self.llm_parallelism,
+            "kv_cache_visual_tokens": self.kv_cache_visual_tokens,
+        })
+
+        return {
+            "version": self.version,
+            "llm_model": self.llm_model,
+            "modalities": list(self.modalities),
+            "stages": stages,
+            "parallelism": {
+                # PRD §16 hybrid parallelism: encoders DP, LLM TP.
+                "encoders": {e.modality: e.parallelism for e in self.encoders},
+                "llm": self.llm_parallelism,
+                "strategy": "hybrid_vit_dp_llm_tp",
+            },
+            "optimizations": {
+                "mm_sparse_attention": self.mm_sparse_attention,
+                "visual_token_compression": self.visual_token_compression,
+                "kv_cache_visual_tokens": self.kv_cache_visual_tokens,
+                "dynamic_resolution": any(e.dynamic_resolution for e in self.encoders),
+            },
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "llm_model": self.llm_model,
+            "fusion": self.fusion,
+            "llm_parallelism": self.llm_parallelism,
+            "encoders": [e.to_dict() for e in self.encoders],
+            "mm_sparse_attention": self.mm_sparse_attention,
+            "visual_token_compression": self.visual_token_compression,
+            "kv_cache_visual_tokens": self.kv_cache_visual_tokens,
+            "total_visual_tokens": self.total_visual_tokens,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "MultiModalGraphPlan":
+        encoders = tuple(
+            ModalityEncoder.from_dict(e) for e in d.get("encoders", [])
+        )
+        fields = {
+            k: v for k, v in d.items()
+            if k in cls.__dataclass_fields__ and k != "encoders"
+        }
+        return cls(encoders=encoders, **fields)
+
+    def save(self, aeg_dir: str | Path) -> Path:
+        """Write the unified graph to ``.aeg/multimodal/graph.json``."""
+        out = Path(aeg_dir) / "multimodal" / "graph.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(self.to_graph(), indent=2), encoding="utf-8")
+        logger.info(
+            "Multi-modal graph saved",
+            path=str(out),
+            modalities=len(self.modalities),
+        )
+        return out
+
+    @classmethod
+    def load(cls, aeg_dir: str | Path) -> "MultiModalGraphPlan":
+        p = Path(aeg_dir) / "multimodal" / "graph.json"
+        if not p.exists():
+            raise FileNotFoundError(f"Multi-modal graph not found at {p}")
+        d = json.loads(p.read_text(encoding="utf-8"))
+        llm_model = d.get("llm_model", "")
+        encoders = tuple(
+            ModalityEncoder(
+                modality=stage["modality"],
+                model_path=stage.get("model", ""),
+                token_budget=stage.get("token_budget", 0),
+                compression_ratio=stage.get("compression_ratio", 0.25),
+                parallelism=stage.get("parallelism", "dp"),
+                dynamic_resolution="preprocess" in stage,
+            )
+            for stage in d.get("stages", [])
+            if stage.get("op") in set(MODALITY_ENCODE_OPS.values())
+            and stage.get("modality")
+        )
+        opts = d.get("optimizations", {})
+        return cls(
+            llm_model=llm_model,
+            encoders=encoders,
+            mm_sparse_attention=opts.get("mm_sparse_attention", True),
+            visual_token_compression=opts.get("visual_token_compression", True),
+            kv_cache_visual_tokens=opts.get("kv_cache_visual_tokens", True),
+        )
+
+
+#: Model-id substrings that imply a video-capable encoder.
+_VIDEO_MODEL_HINTS = ("video", "-vl", "_vl", "omni", "qwen3-vl", "internvideo")
+
+#: Model-id substrings that imply an audio-capable encoder.
+_AUDIO_MODEL_HINTS = ("audio", "omni", "whisper", "qwen2-audio", "voice")
+
+
+def default_multimodal_plan(model_id: str) -> MultiModalGraphPlan:
+    """
+    Build the default Multi-Modal Unified Graph plan for a model.
+
+    Every compiled AEG carries a multi-modal graph so a text-only model can
+    later accept an image encoder without recompiling the LLM. The encoder set
+    is inferred from the model id: an image encoder is always present, with
+    video and audio towers added when the id implies those capabilities.
+
+    Args:
+        model_id: Source model identifier, e.g. ``Qwen/Qwen3-VL-8B``.
+
+    Returns:
+        A MultiModalGraphPlan whose final stage is ``aeg.llm_generate``.
+    """
+    mid = (model_id or "").lower()
+    slug = mid.rsplit("/", maxsplit=1)[-1] or "model"
+
+    encoders: list[ModalityEncoder] = [
+        ModalityEncoder(modality="image", model_path=f"{slug}-vision.aeg"),
+    ]
+    if any(hint in mid for hint in _VIDEO_MODEL_HINTS):
+        encoders.append(
+            ModalityEncoder(modality="video", model_path=f"{slug}-video.aeg")
+        )
+    if any(hint in mid for hint in _AUDIO_MODEL_HINTS):
+        encoders.append(
+            ModalityEncoder(modality="audio", model_path=f"{slug}-audio.aeg")
+        )
+
+    return MultiModalGraphPlan(
+        llm_model=f"{slug}.aeg",
+        encoders=tuple(encoders),
+        # Early fusion is the PRD-preferred unified-graph strategy (§16).
+        fusion="early_fuse",
+    )
+
+
 @dataclass
 class VLMConfig:
     """Configuration for a Vision-Language Model."""

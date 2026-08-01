@@ -1,29 +1,62 @@
-"""Compiled inference workflow helpers."""
+"""
+Compiled inference workflow helpers.
 
-from aether.inference.rag import RAGPipeline, Document, RetrievalResult
-from aether.inference.multimodal import MultiModalGraphDispatcher, VLMConfig
+Two layers are exported:
 
-# Backward-compat stubs for old import surface
-RAGPipelinePlan = RAGPipeline
+* **Plan layer** — compile-time graph plans serialized into the ``.aeg``
+  package (:class:`RAGPipelinePlan`, :class:`MultiModalGraphPlan`).
+* **Runtime layer** — executable engines that run those graphs
+  (:class:`RAGPipeline`, :class:`MultiModalGraphDispatcher`).
+"""
 
-class RetrievalSource:
-    VECTOR = "vector"
-    BM25   = "bm25"
-    GRAPH  = "graph"
-
-ModalityEncoder = VLMConfig
-MultiModalGraphPlan = VLMConfig
-default_multimodal_plan = VLMConfig()
+from aether.inference.multimodal import (
+    ImagePreprocessor,
+    ModalConnector,
+    ModalityEncoder,
+    MultiModalGraphDispatcher,
+    MultiModalGraphPlan,
+    VisualTokenCompressor,
+    ViTEncoder,
+    VLMArchitecture,
+    VLMConfig,
+    default_multimodal_plan,
+)
+from aether.inference.rag import (
+    BM25Retriever,
+    ContextAssembler,
+    CrossEncoderReranker,
+    Document,
+    EmbeddingEncoder,
+    RAGPipeline,
+    RAGPipelinePlan,
+    RetrievalResult,
+    RetrievalSource,
+    VectorStore,
+)
 
 __all__ = [
-    "RAGPipeline",
+    # RAG — plan layer
     "RAGPipelinePlan",
     "RetrievalSource",
+    # RAG — runtime layer
+    "RAGPipeline",
     "Document",
     "RetrievalResult",
+    "EmbeddingEncoder",
+    "VectorStore",
+    "BM25Retriever",
+    "CrossEncoderReranker",
+    "ContextAssembler",
+    # Multi-modal — plan layer
+    "MultiModalGraphPlan",
+    "ModalityEncoder",
+    "default_multimodal_plan",
+    # Multi-modal — runtime layer
     "MultiModalGraphDispatcher",
     "VLMConfig",
-    "ModalityEncoder",
-    "MultiModalGraphPlan",
-    "default_multimodal_plan",
+    "VLMArchitecture",
+    "ImagePreprocessor",
+    "ViTEncoder",
+    "VisualTokenCompressor",
+    "ModalConnector",
 ]
