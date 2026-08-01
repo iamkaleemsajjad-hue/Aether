@@ -50,6 +50,7 @@ class TestPlanLayerIsNotAliased:
     """The compile-time plan types must be real, distinct implementations."""
 
     def test_modality_encoder_is_not_vlm_config(self) -> None:
+        """Verify ModalityEncoder is a distinct class from VLMConfig."""
         from aether.inference import ModalityEncoder, VLMConfig
 
         assert ModalityEncoder is not VLMConfig
@@ -57,6 +58,7 @@ class TestPlanLayerIsNotAliased:
         assert encoder.encode_op == "aeg.vision_encode"
 
     def test_multimodal_plan_is_not_vlm_config(self) -> None:
+        """Verify MultiModalGraphPlan is a distinct class from VLMConfig."""
         from aether.inference import ModalityEncoder, MultiModalGraphPlan, VLMConfig
 
         assert MultiModalGraphPlan is not VLMConfig
@@ -67,6 +69,7 @@ class TestPlanLayerIsNotAliased:
         assert plan.to_graph()["stages"][-1]["op"] == "aeg.llm_generate"
 
     def test_default_multimodal_plan_is_a_factory_not_an_instance(self) -> None:
+        """Verify default_multimodal_plan is a factory function returning a plan."""
         from aether.inference import MultiModalGraphPlan, default_multimodal_plan
 
         assert callable(default_multimodal_plan)
@@ -74,6 +77,7 @@ class TestPlanLayerIsNotAliased:
         assert isinstance(plan, MultiModalGraphPlan)
 
     def test_mla_planner_is_not_the_detector_and_can_plan(self) -> None:
+        """Verify MLAPlanner is a distinct class from MLADetector and produces a compression plan."""
         from aether.attention import MLACompressionPlan, MLADetector, MLAPlanner
         from aether.core.types import ModelArchitecture
 
@@ -94,6 +98,7 @@ class TestPlanLayerIsNotAliased:
         assert plan.to_dict()["kernel"] == "aeg.mla_flash_attention_4"
 
     def test_retrieval_source_accepts_arguments(self) -> None:
+        """Verify RetrievalSource correctly initializes with valid arguments."""
         from aether.inference import RetrievalSource
 
         source = RetrievalSource("docs", "bm25", top_k=25)
@@ -101,6 +106,7 @@ class TestPlanLayerIsNotAliased:
         assert source.top_k == 25
 
     def test_retrieval_source_rejects_unknown_kind(self) -> None:
+        """Verify RetrievalSource raises ValueError for invalid source types."""
         from aether.inference import RetrievalSource
 
         with pytest.raises(ValueError, match="Unknown retrieval kind"):
@@ -135,15 +141,11 @@ class TestRuntimeLayerStillExported:
         ],
     )
     def test_symbol_is_still_exported(self, module: str, symbol: str) -> None:
+        """Verify symbol is exported from the specified module."""
         assert hasattr(importlib.import_module(module), symbol)
 
     def test_mla_forward_alias_points_at_the_forward_path(self) -> None:
-        """
-        ``MLAForward`` aliased ``MLADetector``, which has no forward path.
-
-        It now aliases the attention class, which implements prefill and
-        decode.
-        """
+        """Verify MLAForward points to an implementation with forward_prefill and forward_decode."""
         from aether.attention import MLAForward
 
         assert hasattr(MLAForward, "forward_prefill")
@@ -170,6 +172,7 @@ class TestOptimizerPassEntryPoints:
     def test_pass_entry_point_re_exports_implementation(
         self, module: str, symbol: str
     ) -> None:
+        """Verify pass entry point re-exports the exact implementation class."""
         from aether.compiler.stage2_optimizer import optimizer
 
         mod = importlib.import_module(f"aether.compiler.stage2_optimizer.{module}")

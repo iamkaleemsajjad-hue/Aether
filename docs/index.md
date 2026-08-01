@@ -6,7 +6,7 @@ Welcome to the Aether Runtime documentation. Aether is the compiler for AI model
 
 ```{toctree}
 :maxdepth: 2
-:caption: Table of Contents
+:hidden:
 
 getting-started
 architecture
