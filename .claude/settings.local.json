@@ -75,7 +75,21 @@
       "Bash(awk '{printf \"%-58s +%s -%s\\\\n\", $3, $1, $2}')",
       "Bash(sort -t+ -k2 -rn)",
       "Bash(ps -eo pid,ppid,etime,command)",
-      "PowerShell(Get-CimInstance *)"
+      "PowerShell(Get-CimInstance *)",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\pc\\\\.antigravity\" -Recurse -Force -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 200000 } | Select-Object -First 60 FullName, Length | Format-Table -AutoSize)",
+      "PowerShell($p = @\\(\"$env:LOCALAPPDATA\\\\Programs\\\\Antigravity\",\"$env:LOCALAPPDATA\\\\Programs\\\\Antigravity IDE\",\"C:\\\\Program Files\\\\Antigravity\",\"C:\\\\Program Files\\\\Antigravity IDE\"\\); foreach\\($i in $p\\){ if\\(Test-Path $i\\){ \"FOUND: $i\" } })",
+      "Bash(grep -o -E 'gU=\\\\{[^}]{0,300}\\\\}|gUt=\\\\{[^}]{0,300}\\\\}' workbench.desktop.main.js)",
+      "Bash(grep -o -E 'gU;\\\\\\(function\\\\\\(t\\\\\\)\\\\{[^}]{0,400}\\\\}\\\\\\)\\\\\\(gU' workbench.desktop.main.js)",
+      "Bash(grep -o -E '\\(gU|gUt\\)\\\\[[^]]*\\\\]=[0-9]{1,2}\\\\\\)\\\\\\)?,?[^;]{0,120}' workbench.desktop.main.js)",
+      "Bash(grep -a -o -E '[^\"]{0,80}\\(secureModeEnabled|cascadeAutoExecutionPolicy|cascadeAllowedCommands|cascadeDeniedCommands|enableTerminalSandbox|sandboxAllowNetwork|enableShellIntegration\\)[^\"]{0,140}')",
+      "Bash(grep -a -o -E '.{0,60}\\(secureModeEnabled|cascadeAutoExecutionPolicy|cascadeAllowedCommands|cascadeDeniedCommands|enableTerminalSandbox\\).{0,160}' state.vscdb)",
+      "Bash(perl -0777 -ne 'while\\(/Terminal Command Auto Execution/g\\){ print substr\\($_, pos\\($_\\)-200, 1400\\), \"\\\\n=====\\\\n\"; }' workbench.desktop.main.js)",
+      "Bash(perl -0777 -ne 'while\\(/cachedOverrideSentinelKey:sw\\\\.TERMINAL_AUTO_EXECUTION_POLICY/g\\){ print substr\\($_, pos\\($_\\)-500, 900\\), \"\\\\n=====\\\\n\"; }' workbench.desktop.main.js)",
+      "Bash(perl -0777 -ne 'while\\(/Secure Mode/g\\){ print substr\\($_, pos\\($_\\)-150, 700\\), \"\\\\n=====\\\\n\"; }' workbench.desktop.main.js)",
+      "Bash(grep -o -a -E '\"[^\"]{0,120}\\(denied|Denied|not allowed|blocked by|Blocked|deny list|Deny list|denylist\\)[^\"]{0,120}\"' workbench.desktop.main.js)",
+      "Bash(grep -r -a -o -E '.{0,50}\\(secureModeEnabled|cascadeAutoExecutionPolicy|terminalAutoExecutionPolicy|cascadeDeniedCommands|enableTerminalSandbox\\).{0,120}' \"Local Storage\" User/globalStorage/state.vscdb)",
+      "Bash(perl -0777 -ne 'while\\(/defaultValue:KA\\\\.terminalDeniedCommands/g\\){ print substr\\($_, pos\\($_\\)-700, 900\\), \"\\\\n=====\\\\n\"; }' workbench.desktop.main.js)",
+      "Bash(perl -0777 -ne 'while\\(/ENABLE_TERMINAL_SANDBOX,\\\\{/g\\){ print substr\\($_, pos\\($_\\)-30, 700\\), \"\\\\n=====\\\\n\"; }' workbench.desktop.main.js)"
     ]
   }
 }
