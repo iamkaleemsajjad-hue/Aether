@@ -36,3 +36,7 @@ html_title = "Aether Runtime"
 
 autodoc_typehints = "description"
 autodoc_member_order = "bysource"
+
+intersphinx_mapping = {}
+suppress_warnings = ["myst.header", "intersphinx.external"]
+
