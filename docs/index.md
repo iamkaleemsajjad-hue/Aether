@@ -4,6 +4,20 @@ Welcome to the Aether Runtime documentation. Aether is the compiler for AI model
 
 ## Getting Started
 
+```{toctree}
+:maxdepth: 2
+:caption: Table of Contents
+
+getting-started
+architecture
+aeg-format
+optimizer-passes
+runtime
+api-reference
+research
+roadmap
+```
+
 - [Quick start guide](getting-started.md)
 - [Architecture overview](architecture.md)
 - [AEG format specification](aeg-format.md)

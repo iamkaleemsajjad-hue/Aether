@@ -195,6 +195,10 @@ class Runtime:
         """Find the AEG package path for a model, downloading/compile if needed."""
         from aether.utils.file_io import aether_cache_dir
 
+        path_candidate = Path(model_id)
+        if path_candidate.exists() and (path_candidate / "manifest.json").exists():
+            return str(path_candidate.resolve())
+
         cache_root = aether_cache_dir(self.config.model_cache_dir)
         aeg_path = cache_root / "models" / model_id.replace("/", "_")
         if aeg_path.exists():

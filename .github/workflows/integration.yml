@@ -68,6 +68,6 @@ jobs:
       - name: Compile and run a tiny model
         run: |
           python -m aether compile Qwen/Qwen3-0.6B --output ./qwen3-0.6b.aeg
-          python -m aether run Qwen/Qwen3-0.6B --max-tokens 16 --prompt "Hello, my name is" --non-interactive
+          python -m aether run ./qwen3-0.6b.aeg --max-tokens 16 --prompt "Hello, my name is" --non-interactive
         env:
           AETHER_CACHE_DIR: ${{ runner.temp }}/aether-cache

@@ -149,7 +149,7 @@ class LlamaCppBackend(Backend):
         ]
 
         logger.info("llama.cpp: starting server process: %s", " ".join(cmd))
-        proc = subprocess.Popen(
+        proc = subprocess.Popen(  # nosec B603 B607
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
