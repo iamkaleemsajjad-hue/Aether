@@ -194,7 +194,7 @@ def _verify_toolchain(toolchain: CompilerToolchain) -> bool:
         source.write_text(probe, encoding="utf-8")
         output = Path(tmp) / f"probe{toolchain.library_suffix}"
         try:
-            result = subprocess.run(  # noqa: S603 - argv built from a fixed candidate list
+            result = subprocess.run(  # noqa: S603  # nosec B603 - argv built from a fixed candidate list
                 toolchain.build_command(source, output),
                 capture_output=True,
                 timeout=60,
@@ -548,7 +548,7 @@ class NativeCPUKernels:
             staged = Path(tmp) / output.name
             command = self.toolchain.build_command(source, staged)
             try:
-                result = subprocess.run(  # noqa: S603 - argv from detected toolchain
+                result = subprocess.run(  # noqa: S603  # nosec B603 - argv from detected toolchain
                     command, capture_output=True, timeout=180, cwd=tmp, check=False, text=True
                 )
             except (OSError, subprocess.SubprocessError) as exc:
