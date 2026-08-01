@@ -323,3 +323,331 @@ class DynamicPrecisionManager:
             f"pressure={self._memory_pressure:.2f}, "
             f"ppl_delta={self.estimated_ppl_delta():.4f})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Multi-model precision manager
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ModelPrecisionState:
+    """Runtime precision state for one loaded model."""
+
+    model_id: str
+    #: Precision map as compiled into the AEG package.
+    target_map: dict[str, str]
+    #: Precision map currently in force; diverges from target under pressure.
+    active_map: dict[str, str]
+    memory_pressure: float = 0.0
+    last_adjust_at: float = 0.0
+    downgrades: int = 0
+    upgrades: int = 0
+
+    @property
+    def is_degraded(self) -> bool:
+        """True when any layer is running below its compiled precision."""
+        return self.active_map != self.target_map
+
+    def estimated_memory_ratio(self) -> float:
+        """Mean memory footprint of the active map relative to BF16."""
+        if not self.active_map:
+            return 1.0
+        costs = [_PRECISION_COST.get(p, 1.0) for p in self.active_map.values()]
+        return sum(costs) / len(costs)
+
+    def estimated_ppl_delta(self) -> float:
+        """Mean perplexity penalty implied by the active map."""
+        if not self.active_map:
+            return 0.0
+        penalties = [
+            _PRECISION_PPL_PENALTY.get(p, 0.0) for p in self.active_map.values()
+        ]
+        return sum(penalties) / len(penalties)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model_id": self.model_id,
+            "memory_pressure": round(self.memory_pressure, 4),
+            "is_degraded": self.is_degraded,
+            "downgrades": self.downgrades,
+            "upgrades": self.upgrades,
+            "active_map": dict(self.active_map),
+            "target_map": dict(self.target_map),
+            "estimated_memory_ratio": round(self.estimated_memory_ratio(), 4),
+            "estimated_ppl_delta": round(self.estimated_ppl_delta(), 6),
+        }
+
+
+class PrecisionManager:
+    """
+    Precision manager for the multi-model runtime.
+
+    Where :class:`DynamicPrecisionManager` tracks layers of a single model,
+    this manages every model resident in the runtime and gates changes behind
+    a cooldown. The cooldown matters: precision changes invalidate compiled
+    kernels and CUDA graphs, so reacting to every pressure spike would thrash
+    the kernel cache and cost more than the memory saved.
+
+    Usage:
+        mgr = PrecisionManager(cooldown_seconds=30.0)
+        mgr.register("qwen3-8b", {"layer_0": "BF16", ...})
+        mgr.update_memory_pressure("qwen3-8b", 0.94)
+        result = mgr.adjust("qwen3-8b")
+    """
+
+    def __init__(
+        self,
+        cooldown_seconds: float = 30.0,
+        downgrade_threshold: float = _DOWNGRADE_PRESSURE_THRESHOLD,
+        upgrade_threshold: float = _UPGRADE_PRESSURE_THRESHOLD,
+        max_ppl_delta: float = 0.05,
+    ) -> None:
+        self.cooldown_seconds = max(0.0, cooldown_seconds)
+        self.downgrade_threshold = downgrade_threshold
+        self.upgrade_threshold = upgrade_threshold
+        self.max_ppl_delta = max_ppl_delta
+        self._lock = threading.RLock()
+        self._states: dict[str, ModelPrecisionState] = {}
+
+    # ------------------------------------------------------------------
+    # Registration
+    # ------------------------------------------------------------------
+
+    def register(
+        self, model_id: str, precision_map: dict[str, str]
+    ) -> ModelPrecisionState:
+        """
+        Register a model's compiled precision map.
+
+        Returns the tracked state. Re-registering resets the model to its
+        compiled precision.
+        """
+        with self._lock:
+            state = ModelPrecisionState(
+                model_id=model_id,
+                target_map=dict(precision_map),
+                active_map=dict(precision_map),
+                # Start the cooldown clock at registration: a model's memory
+                # footprint is still settling right after load, so the first
+                # pressure reading is not yet a reason to change precision.
+                last_adjust_at=time.monotonic(),
+            )
+            self._states[model_id] = state
+            logger.info(
+                "Precision manager registered model",
+                model_id=model_id,
+                layers=len(precision_map),
+            )
+            return state
+
+    def unregister(self, model_id: str) -> bool:
+        """Drop a model's precision state. Returns True if it was present."""
+        with self._lock:
+            return self._states.pop(model_id, None) is not None
+
+    def get_state(self, model_id: str) -> ModelPrecisionState | None:
+        """Return the tracked state for a model, or None if unregistered."""
+        with self._lock:
+            return self._states.get(model_id)
+
+    def get_active_precision(self, model_id: str, layer_id: str) -> str:
+        """Active precision for one layer, falling back to BF16."""
+        with self._lock:
+            state = self._states.get(model_id)
+            if state is None:
+                return "BF16"
+            return state.active_map.get(layer_id, "BF16")
+
+    # ------------------------------------------------------------------
+    # Pressure tracking and adjustment
+    # ------------------------------------------------------------------
+
+    def update_memory_pressure(self, model_id: str, pressure: float) -> float:
+        """
+        Record current memory pressure for a model.
+
+        Args:
+            pressure: Fraction of device memory consumed, clamped to [0, 1].
+
+        Returns:
+            The clamped pressure that was recorded.
+        """
+        with self._lock:
+            state = self._states.get(model_id)
+            if state is None:
+                raise KeyError(f"Model {model_id!r} is not registered")
+            state.memory_pressure = max(0.0, min(1.0, pressure))
+            return state.memory_pressure
+
+    def adjust(self, model_id: str) -> dict[str, Any]:
+        """
+        Apply a precision adjustment if pressure warrants and cooldown allows.
+
+        Returns a dict whose ``action`` is one of:
+
+        * ``cooldown``  — a change happened too recently; nothing done.
+        * ``downgrade`` — every eligible layer stepped down one rung.
+        * ``downgrade_selective`` — some layers stepped down; others were held
+          back by the quality budget or the bottom of the ladder.
+        * ``upgrade``   — layers moved back toward compiled precision.
+        * ``none``      — pressure is in the neutral band, or nothing to do.
+        """
+        with self._lock:
+            state = self._states.get(model_id)
+            if state is None:
+                raise KeyError(f"Model {model_id!r} is not registered")
+
+            now = time.monotonic()
+            if self.cooldown_seconds > 0.0 and state.last_adjust_at > 0.0:
+                elapsed = now - state.last_adjust_at
+                if elapsed < self.cooldown_seconds:
+                    return {
+                        "action": "cooldown",
+                        "model_id": model_id,
+                        "seconds_remaining": round(self.cooldown_seconds - elapsed, 3),
+                    }
+
+            if state.memory_pressure >= self.downgrade_threshold:
+                result = self._downgrade(state)
+            elif state.memory_pressure <= self.upgrade_threshold:
+                result = self._upgrade(state)
+            else:
+                return {"action": "none", "model_id": model_id, "reason": "neutral_band"}
+
+            if result["action"] != "none":
+                state.last_adjust_at = now
+            return result
+
+    def _downgrade(self, state: ModelPrecisionState) -> dict[str, Any]:
+        """Step eligible layers one rung down the precision ladder."""
+        changed: dict[str, tuple[str, str]] = {}
+        blocked = 0
+
+        # Least-sensitive first is not knowable here, so walk deterministically
+        # and stop individual layers that would breach the quality budget.
+        for layer_id in sorted(state.active_map):
+            current = state.active_map[layer_id]
+            if layer_id in {"embedding", "lm_head"}:
+                blocked += 1
+                continue
+            if current not in _PRECISION_LADDER:
+                blocked += 1
+                continue
+            idx = _PRECISION_LADDER.index(current)
+            if idx >= len(_PRECISION_LADDER) - 1:
+                blocked += 1
+                continue
+            nxt = _PRECISION_LADDER[idx + 1]
+            if _PRECISION_PPL_PENALTY.get(nxt, 0.0) > self.max_ppl_delta:
+                blocked += 1
+                continue
+            state.active_map[layer_id] = nxt
+            changed[layer_id] = (current, nxt)
+
+        if not changed:
+            return {
+                "action": "none",
+                "model_id": state.model_id,
+                "reason": "no_downgrade_candidates",
+            }
+
+        state.downgrades += len(changed)
+        action = "downgrade" if blocked == 0 else "downgrade_selective"
+        logger.info(
+            "Precision downgrade",
+            model_id=state.model_id,
+            layers_changed=len(changed),
+            layers_held=blocked,
+            pressure=round(state.memory_pressure, 3),
+        )
+        return {
+            "action": action,
+            "model_id": state.model_id,
+            "changed": {k: {"from": v[0], "to": v[1]} for k, v in changed.items()},
+            "layers_changed": len(changed),
+            "layers_held": blocked,
+            "estimated_memory_ratio": round(state.estimated_memory_ratio(), 4),
+        }
+
+    def _upgrade(self, state: ModelPrecisionState) -> dict[str, Any]:
+        """Step degraded layers one rung back toward compiled precision."""
+        changed: dict[str, tuple[str, str]] = {}
+
+        for layer_id in sorted(state.active_map):
+            current = state.active_map[layer_id]
+            target = state.target_map.get(layer_id, current)
+            if current == target:
+                continue
+            if current not in _PRECISION_LADDER or target not in _PRECISION_LADDER:
+                continue
+            cur_idx = _PRECISION_LADDER.index(current)
+            tgt_idx = _PRECISION_LADDER.index(target)
+            if cur_idx <= tgt_idx:
+                continue
+            nxt = _PRECISION_LADDER[cur_idx - 1]
+            state.active_map[layer_id] = nxt
+            changed[layer_id] = (current, nxt)
+
+        if not changed:
+            return {
+                "action": "none",
+                "model_id": state.model_id,
+                "reason": "already_at_target",
+            }
+
+        state.upgrades += len(changed)
+        logger.info(
+            "Precision upgrade",
+            model_id=state.model_id,
+            layers_changed=len(changed),
+            pressure=round(state.memory_pressure, 3),
+        )
+        return {
+            "action": "upgrade",
+            "model_id": state.model_id,
+            "changed": {k: {"from": v[0], "to": v[1]} for k, v in changed.items()},
+            "layers_changed": len(changed),
+            "estimated_memory_ratio": round(state.estimated_memory_ratio(), 4),
+        }
+
+    def reset(
+        self, model_id: str, precision_map: dict[str, str] | None = None
+    ) -> ModelPrecisionState:
+        """
+        Reset a model to its compiled precision, or to a new map.
+
+        Passing ``precision_map`` replaces both the target and active maps —
+        use this after a hot-reload changes the compiled precision.
+        """
+        with self._lock:
+            state = self._states.get(model_id)
+            if state is None:
+                if precision_map is None:
+                    raise KeyError(f"Model {model_id!r} is not registered")
+                return self.register(model_id, precision_map)
+
+            if precision_map is not None:
+                state.target_map = dict(precision_map)
+            state.active_map = dict(state.target_map)
+            state.last_adjust_at = 0.0
+            logger.info("Precision manager reset model", model_id=model_id)
+            return state
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "models": len(self._states),
+                "cooldown_seconds": self.cooldown_seconds,
+                "downgrade_threshold": self.downgrade_threshold,
+                "upgrade_threshold": self.upgrade_threshold,
+                "degraded_models": sum(
+                    1 for s in self._states.values() if s.is_degraded
+                ),
+                "states": {mid: s.to_dict() for mid, s in self._states.items()},
+            }
+
+    def __repr__(self) -> str:
+        return (
+            f"PrecisionManager(models={len(self._states)}, "
+            f"cooldown={self.cooldown_seconds}s)"
+        )

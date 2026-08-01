@@ -316,6 +316,95 @@ class TestLoRAEngine:
         engine.save_to_aeg(tmp_path)
         assert (tmp_path / "adapters" / "manifest.json").exists()
 
+    def test_both_construction_forms_are_tagged_with_their_layout(self):
+        """The two LoRAAdapter forms store transposed A/B; each must know which."""
+        from aether.adapters.lora import LoRAAdapter, LoRAConfig
+
+        delta = LoRAAdapter(
+            adapter_id="d",
+            delta_a=np.ones((4, 2), np.float32),   # (in, rank)
+            delta_b=np.ones((2, 3), np.float32),   # (rank, out)
+        )
+        assert delta.layout == LoRAAdapter.LAYOUT_DELTA
+
+        bgmv = LoRAAdapter(
+            config=LoRAConfig(adapter_id="b", rank=2, alpha=2.0),
+            weights={"q_proj": (np.ones((2, 4), np.float32),   # (rank, in)
+                                np.ones((3, 2), np.float32))},  # (out, rank)
+        )
+        assert bgmv.layout == LoRAAdapter.LAYOUT_BGMV
+
+    def test_single_delta_adapter_rejected_by_bgmv_kernel(self):
+        """
+        Serving a single-delta adapter through BGMV must raise, not guess.
+
+        The layouts are transposes of each other. For square matrices the
+        multiply succeeds and returns a silently wrong result, so this has to
+        be an explicit type check rather than a shape check.
+        """
+        from aether.adapters.lora import LoRAAdapter, LoRAHotSwapEngine
+
+        square = LoRAAdapter(
+            adapter_id="sq",
+            delta_a=np.ones((2, 2), np.float32),
+            delta_b=np.ones((2, 2), np.float32),
+        )
+        engine = LoRAHotSwapEngine(max_slots=1)
+        engine.register(square)
+
+        x = np.ones((1, 2), np.float32)
+        base = np.eye(2, dtype=np.float32)
+        with pytest.raises(ValueError, match="single-delta layout"):
+            engine.serve_batch(x, base, ["sq"], module_name="default")
+
+    def test_bgmv_adapter_rejected_by_forward(self):
+        """The reverse mismatch must also raise rather than compute."""
+        from aether.adapters.lora import LoRAAdapter, LoRAConfig, LoRAHotSwapEngine
+
+        bgmv = LoRAAdapter(
+            config=LoRAConfig(adapter_id="bg", rank=2, alpha=2.0),
+            weights={"q_proj": (np.ones((2, 2), np.float32),
+                                np.ones((2, 2), np.float32))},
+        )
+        engine = LoRAHotSwapEngine(np.eye(2, dtype=np.float32))
+        engine.register(bgmv)
+
+        with pytest.raises(ValueError, match="BGMV layout"):
+            engine.forward(np.ones((1, 2), np.float32), ["bg"], module="q_proj")
+
+    def test_forward_and_serve_batch_agree_on_equivalent_adapters(self):
+        """
+        The two paths are different conventions for the same math.
+
+        Given adapters that are transposes of one another, forward() and
+        serve_batch() must produce the same output — otherwise one of them
+        has its scaling or orientation wrong.
+        """
+        from aether.adapters.lora import LoRAAdapter, LoRAConfig, LoRAHotSwapEngine
+
+        rng = np.random.default_rng(3)
+        in_f, out_f, rank = 4, 3, 2
+        A_delta = rng.normal(size=(in_f, rank)).astype(np.float32)
+        B_delta = rng.normal(size=(rank, out_f)).astype(np.float32)
+        base = rng.normal(size=(in_f, out_f)).astype(np.float32)
+        x = rng.normal(size=(1, in_f)).astype(np.float32)
+
+        delta = LoRAAdapter(adapter_id="d", delta_a=A_delta, delta_b=B_delta, alpha=float(rank))
+        e1 = LoRAHotSwapEngine(base)
+        e1.register(delta)
+        out_forward = e1.forward(x, ["d"])
+
+        # Same adapter expressed in BGMV layout; serve_batch takes W as (out, in).
+        bgmv = LoRAAdapter(
+            config=LoRAConfig(adapter_id="d", rank=rank, alpha=float(rank)),
+            weights={"default": (A_delta.T.copy(), B_delta.T.copy())},
+        )
+        e2 = LoRAHotSwapEngine(max_slots=1)
+        e2.register(bgmv)
+        out_bgmv = e2.serve_batch(x, base.T.copy(), ["d"], module_name="default")
+
+        np.testing.assert_allclose(out_forward, out_bgmv, rtol=1e-5, atol=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # SSM / Hybrid State Tests

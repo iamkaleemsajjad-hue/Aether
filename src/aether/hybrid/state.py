@@ -181,6 +181,14 @@ class StateSnapshot:
     """
     Snapshot of both transformer KV state and SSM recurrent state.
     Used for speculative decoding rollback when draft tokens are rejected.
+
+    Two storage modes are supported:
+
+    * **Layer mode** — ``kv_state``/``ssm_state`` hold per-layer tensors, keyed
+      by layer index. This is what the runtime execution engines use.
+    * **Payload mode** — ``kv_payload``/``ssm_payload`` hold an opaque
+      serializable object covering the whole request. Used by session-level
+      callers that checkpoint an already-assembled cache structure.
     """
     snapshot_id: str
     request_id: str
@@ -193,6 +201,15 @@ class StateSnapshot:
     # SSM recurrent states: layer_idx → MambaState or RWKVState
     ssm_state: dict[int, Any] = field(default_factory=dict)
 
+    # Opaque whole-request payloads (payload mode). None when unused.
+    kv_payload: Any = None
+    ssm_payload: Any = None
+
+    @property
+    def is_payload_mode(self) -> bool:
+        """True when this snapshot checkpoints opaque request-level payloads."""
+        return self.kv_payload is not None or self.ssm_payload is not None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "snapshot_id": self.snapshot_id,
@@ -200,6 +217,7 @@ class StateSnapshot:
             "step": self.step,
             "kv_layers": list(self.kv_state.keys()),
             "ssm_layers": list(self.ssm_state.keys()),
+            "payload_mode": self.is_payload_mode,
             "created_at": self.created_at,
         }
 
@@ -220,6 +238,18 @@ class SSMStatePool:
     def __init__(self) -> None:
         self._mamba_states: dict[str, dict[int, MambaState]] = {}   # req → {layer → state}
         self._rwkv_states:  dict[str, dict[int, RWKVState]] = {}
+        # Opaque request-level payloads for callers that manage their own
+        # state representation instead of per-layer Mamba/RWKV structs.
+        self._payloads: dict[str, Any] = {}
+
+    def set_payload(self, request_id: str, payload: Any) -> None:
+        """Store an opaque request-level SSM payload (deep-copied)."""
+        self._payloads[request_id] = copy.deepcopy(payload)
+
+    def get_payload(self, request_id: str) -> Any:
+        """Return the opaque request-level payload, or None if unset."""
+        payload = self._payloads.get(request_id)
+        return copy.deepcopy(payload) if payload is not None else None
 
     def init_mamba(
         self,
@@ -280,8 +310,16 @@ class SSMStatePool:
             self._rwkv_states[request_id] = {}
         self._rwkv_states[request_id][layer_idx] = state.copy()
 
-    def get(self, request_id: str) -> dict[str, Any]:
-        """Get all SSM states for a request (for snapshotting)."""
+    def get(self, request_id: str) -> Any:
+        """
+        Get the SSM state for a request (for snapshotting).
+
+        Returns the opaque payload when one was stored via
+        :meth:`set_payload`; otherwise a ``{layer_idx: state}`` dict.
+        """
+        payload = self._payloads.get(request_id)
+        if payload is not None:
+            return copy.deepcopy(payload)
         result: dict[int, Any] = {}
         for lid, state in self._mamba_states.get(request_id, {}).items():
             result[lid] = state.copy()
@@ -302,11 +340,13 @@ class SSMStatePool:
     def free(self, request_id: str) -> None:
         self._mamba_states.pop(request_id, None)
         self._rwkv_states.pop(request_id, None)
+        self._payloads.pop(request_id, None)
 
     def stats(self) -> dict[str, Any]:
         return {
             "active_mamba_requests": len(self._mamba_states),
             "active_rwkv_requests": len(self._rwkv_states),
+            "active_payload_requests": len(self._payloads),
             "total_mamba_layers": sum(len(v) for v in self._mamba_states.values()),
             "total_rwkv_layers": sum(len(v) for v in self._rwkv_states.values()),
         }
@@ -329,6 +369,20 @@ class StateSnapshotStore:
         self.max_per_request = max_snapshots_per_request
         self._snapshots: dict[str, list[StateSnapshot]] = {}   # req → [snaps]
 
+    def _next_id(self, request_id: str, step: int) -> str:
+        """Build a collision-free snapshot id for a request/step."""
+        base = f"{request_id}:step{step}"
+        existing = {s.snapshot_id for s in self._snapshots.get(request_id, [])}
+        # Two snapshots in the same millisecond must not share an id, or
+        # rollback would resolve to the wrong checkpoint.
+        candidate = f"{base}:{int(time.time() * 1000) % 100000}"
+        if candidate not in existing:
+            return candidate
+        suffix = 1
+        while f"{candidate}-{suffix}" in existing:
+            suffix += 1
+        return f"{candidate}-{suffix}"
+
     def save(
         self,
         request_id: str,
@@ -336,8 +390,8 @@ class StateSnapshotStore:
         kv_state: dict[int, tuple[np.ndarray, np.ndarray]],
         ssm_state: dict[int, Any],
     ) -> StateSnapshot:
-        """Save a full state snapshot for rollback."""
-        snap_id = f"{request_id}:step{step}:{int(time.time()*1000) % 100000}"
+        """Save a full per-layer state snapshot for rollback."""
+        snap_id = self._next_id(request_id, step)
 
         # Deep copy KV state
         kv_copy = {lid: (k.copy(), v.copy()) for lid, (k, v) in kv_state.items()}
@@ -359,7 +413,33 @@ class StateSnapshotStore:
             kv_state=kv_copy,
             ssm_state=ssm_copy,
         )
+        return self._store(snapshot)
 
+    def save_payload(
+        self,
+        request_id: str,
+        step: int,
+        kv_payload: Any,
+        ssm_payload: Any,
+    ) -> StateSnapshot:
+        """
+        Save an opaque whole-request payload snapshot.
+
+        Payloads are deep-copied so later mutation of the live pool cannot
+        reach back into the checkpoint.
+        """
+        snapshot = StateSnapshot(
+            snapshot_id=self._next_id(request_id, step),
+            request_id=request_id,
+            step=step,
+            kv_payload=copy.deepcopy(kv_payload),
+            ssm_payload=copy.deepcopy(ssm_payload),
+        )
+        return self._store(snapshot)
+
+    def _store(self, snapshot: StateSnapshot) -> StateSnapshot:
+        """Append a snapshot to its request ring buffer, evicting the oldest."""
+        request_id = snapshot.request_id
         if request_id not in self._snapshots:
             self._snapshots[request_id] = []
         snaps = self._snapshots[request_id]
@@ -369,7 +449,9 @@ class StateSnapshotStore:
         if len(snaps) > self.max_per_request:
             snaps.pop(0)
 
-        logger.debug("Snapshot saved: %s (step=%d)", snap_id, step)
+        logger.debug(
+            "Snapshot saved: %s (step=%d)", snapshot.snapshot_id, snapshot.step
+        )
         return snapshot
 
     def load(self, snapshot_id: str) -> StateSnapshot | None:
@@ -415,7 +497,7 @@ class HybridMemoryPool:
     """
 
     def __init__(self) -> None:
-        self.kv_pool: dict[str, dict[int, tuple[np.ndarray, np.ndarray]]] = {}
+        self.kv_pool: dict[str, Any] = {}
         self.ssm_pool = SSMStatePool()
         self.snapshots = StateSnapshotStore()
 
@@ -426,19 +508,65 @@ class HybridMemoryPool:
     def set_kv(
         self,
         request_id: str,
-        layer_idx: int,
-        k: np.ndarray,  # (seq, num_kv_heads, head_dim)
-        v: np.ndarray,  # (seq, num_kv_heads, head_dim)
+        layer_idx: int | Any = None,
+        k: np.ndarray | None = None,
+        v: np.ndarray | None = None,
     ) -> None:
-        if request_id not in self.kv_pool:
-            self.kv_pool[request_id] = {}
-        self.kv_pool[request_id][layer_idx] = (k.copy(), v.copy())
+        """
+        Store KV state for a request.
+
+        Two call forms are supported:
+
+        * ``set_kv(request_id, layer_idx, k, v)`` — layer mode. Stores the
+          ``(K, V)`` tensor pair for one transformer layer.
+        * ``set_kv(request_id, payload)`` — payload mode. Stores an opaque
+          request-level cache object.
+        """
+        if k is None and v is None:
+            # Payload mode: the second positional is the payload itself.
+            self.kv_pool[request_id] = copy.deepcopy(layer_idx)
+            return
+
+        if k is None or v is None:
+            raise ValueError(
+                "set_kv layer mode requires both k and v tensors; "
+                "use set_kv(request_id, payload) for payload mode"
+            )
+
+        entry = self.kv_pool.get(request_id)
+        if not isinstance(entry, dict):
+            entry = {}
+            self.kv_pool[request_id] = entry
+        entry[layer_idx] = (k.copy(), v.copy())
+
+    def set_ssm(self, request_id: str, payload: Any) -> None:
+        """
+        Store an opaque request-level SSM payload.
+
+        For per-layer Mamba/RWKV state use ``pool.ssm_pool.set_mamba(...)``
+        or ``pool.ssm_pool.set_rwkv(...)`` instead.
+        """
+        self.ssm_pool.set_payload(request_id, payload)
+
+    def get_ssm(self, request_id: str) -> Any:
+        """Return the request-level SSM payload, or None if unset."""
+        return self.ssm_pool.get_payload(request_id)
 
     def get_kv(
-        self, request_id: str, layer_idx: int
-    ) -> tuple[np.ndarray, np.ndarray] | None:
+        self, request_id: str, layer_idx: int | None = None
+    ) -> Any:
+        """
+        Retrieve KV state.
+
+        With ``layer_idx`` returns the ``(K, V)`` pair for that layer; without
+        it returns the whole request entry (payload or per-layer dict).
+        """
         req = self.kv_pool.get(request_id)
         if req is None:
+            return None
+        if layer_idx is None:
+            return req
+        if not isinstance(req, dict):
             return None
         entry = req.get(layer_idx)
         if entry is None:
@@ -469,15 +597,31 @@ class HybridMemoryPool:
     # Speculative decoding: snapshot and rollback
     # ------------------------------------------------------------------ #
 
-    def snapshot(self, request_id: str, step: int) -> StateSnapshot:
+    def snapshot(self, request_id: str, step: int | None = None) -> StateSnapshot:
         """
-        Save full state snapshot (KV + SSM) for speculative decoding.
+        Save a full state snapshot (KV + SSM) for speculative decoding.
 
-        Call before generating speculative draft tokens.
+        Call before generating speculative draft tokens. Dispatches to payload
+        or layer mode based on how the request's state was stored. When
+        ``step`` is omitted it is inferred from the snapshot count so far.
         """
-        kv_state = self.kv_pool.get(request_id, {})
-        ssm_state = self.ssm_pool.get(request_id)
-        return self.snapshots.save(request_id, step, kv_state, ssm_state)
+        if step is None:
+            step = len(self.snapshots._snapshots.get(request_id, []))
+
+        kv_entry = self.kv_pool.get(request_id)
+        ssm_payload = self.ssm_pool.get_payload(request_id)
+
+        # Payload mode: either side was stored as an opaque request payload.
+        if ssm_payload is not None or (
+            kv_entry is not None and not isinstance(kv_entry, dict)
+        ):
+            return self.snapshots.save_payload(
+                request_id, step, kv_entry, ssm_payload
+            )
+
+        return self.snapshots.save(
+            request_id, step, kv_entry or {}, self.ssm_pool.get(request_id)
+        )
 
     def rollback(self, request_id: str, snapshot_id: str) -> bool:
         """
@@ -490,14 +634,21 @@ class HybridMemoryPool:
             logger.warning("Rollback failed: snapshot %s not found", snapshot_id)
             return False
 
-        # Restore KV pool
-        self.kv_pool[request_id] = {
-            lid: (k.copy(), v.copy())
-            for lid, (k, v) in snapshot.kv_state.items()
-        }
-
-        # Restore SSM pool
-        self.ssm_pool.restore(request_id, snapshot.ssm_state)
+        if snapshot.is_payload_mode:
+            if snapshot.kv_payload is not None:
+                self.kv_pool[request_id] = copy.deepcopy(snapshot.kv_payload)
+            if snapshot.ssm_payload is not None:
+                self.ssm_pool.set_payload(
+                    request_id, copy.deepcopy(snapshot.ssm_payload)
+                )
+        else:
+            # Restore KV pool
+            self.kv_pool[request_id] = {
+                lid: (k.copy(), v.copy())
+                for lid, (k, v) in snapshot.kv_state.items()
+            }
+            # Restore SSM pool
+            self.ssm_pool.restore(request_id, snapshot.ssm_state)
 
         logger.debug(
             "Rollback: request=%s, snapshot=%s (step %d)",
@@ -523,13 +674,25 @@ class HybridMemoryPool:
         self.snapshots.free(request_id)
 
     def stats(self) -> dict[str, Any]:
-        kv_mem = sum(
-            k.nbytes + v.nbytes
-            for req in self.kv_pool.values()
-            for k, v in req.values()
-        )
+        # Only per-layer entries have measurable tensor bytes; opaque payloads
+        # are counted separately since their size is caller-defined.
+        kv_mem = 0
+        payload_requests = 0
+        for req in self.kv_pool.values():
+            if not isinstance(req, dict):
+                payload_requests += 1
+                continue
+            for entry in req.values():
+                if isinstance(entry, tuple) and len(entry) == 2:
+                    k, v = entry
+                    if hasattr(k, "nbytes") and hasattr(v, "nbytes"):
+                        kv_mem += k.nbytes + v.nbytes
+                else:
+                    payload_requests += 1
+                    break
         return {
             "active_requests": len(self.kv_pool),
+            "kv_payload_requests": payload_requests,
             "kv_memory_mb": round(kv_mem / 1e6, 2),
             "ssm": self.ssm_pool.stats(),
             "snapshots": self.snapshots.stats(),

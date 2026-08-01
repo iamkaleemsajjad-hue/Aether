@@ -1,23 +1,38 @@
-"""Attention-specific compiler planners."""
+"""
+Attention-specific compiler planners and runtime kernels.
+
+Multi-Head Latent Attention (MLA) is exported as two layers:
+
+* **Plan layer** — :class:`MLAPlanner` produces an :class:`MLACompressionPlan`
+  recorded at ``.aeg/mla/plan.json`` during compilation.
+* **Runtime layer** — :class:`MLAAttention`, :class:`MLACompressedKVCache`, and
+  :class:`MLAWeightAbsorber` execute that plan.
+"""
 
 from aether.attention.mla import (
-    MLAConfig,
-    MLAWeightAbsorber,
+    MLAAttention,
     MLACompressedKVCache,
+    MLACompressionPlan,
+    MLAConfig,
     MLADetector,
+    MLAPlanner,
+    MLAWeightAbsorber,
 )
 
-# Backward-compat aliases expected by stage2 optimizer and other consumers
-MLACompressionPlan = MLAConfig    # plan ≡ config at this level
-MLAPlanner = MLADetector          # planner ≡ detector
-MLAForward = MLADetector          # legacy alias — points to detector
+#: Legacy alias. Points at the class implementing the MLA forward path
+#: (``forward_prefill`` / ``forward_decode``); it previously aliased
+#: ``MLADetector``, which has no forward path.
+MLAForward = MLAAttention
 
 __all__ = [
+    # Plan layer
+    "MLAPlanner",
+    "MLACompressionPlan",
+    "MLADetector",
     "MLAConfig",
+    # Runtime layer
+    "MLAAttention",
     "MLAWeightAbsorber",
     "MLACompressedKVCache",
-    "MLADetector",
     "MLAForward",
-    "MLACompressionPlan",
-    "MLAPlanner",
 ]

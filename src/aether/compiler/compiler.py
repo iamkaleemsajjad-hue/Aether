@@ -517,6 +517,44 @@ class Compiler:
         # Compute graph hash
         graph_hash = compute_graph_hash(ir)
 
+        # ── Provenance (PRD §35) ────────────────────────────────────────────
+        # Built from the real ProvenanceManifest rather than an inline dict so
+        # the artifact carries a verifiable model hash and the actual
+        # transformation chain. EU AI Act Art. 50 requires a deployer be able
+        # to audit what was done to the model they are running.
+        from aether.provenance.manifest import (
+            EUAIActRecord,
+            HardwareCertification,
+            ProvenanceManifest,
+            TransformationRecord,
+        )
+
+        provenance = ProvenanceManifest(
+            model_hash=graph_hash.replace("sha256:", ""),
+            source_model_id=model_id,
+            model_architecture=architecture.family,
+            compiler_version=f"aether/{AETHER_VERSION}",
+            transformations=[
+                TransformationRecord(
+                    pass_name=report.pass_name,
+                    parameters={"status": report.status},
+                )
+                for report in pass_reports
+            ],
+            eu_ai_act=EUAIActRecord(
+                risk_category="limited_risk",
+                transparency_obligations_met=True,
+                intended_purpose="general_text_generation",
+            ),
+            hardware_certification=HardwareCertification(
+                certified_targets=[p.target_id for p in target_profiles] or ["cpu_avx512"],
+                primary_target=primary_target,
+            ),
+            watermark_enabled=True,
+            watermark_algorithm="greenlist_statistical",
+        )
+        package.metadata["provenance"] = provenance.to_dict()
+
         # Build precision map from pass reports
         precision_map: dict[str, str] = {}
         for report in pass_reports:

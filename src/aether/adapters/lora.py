@@ -82,10 +82,122 @@ class LoRAConfig:
 
 @dataclass
 class LoRAAdapter:
-    """A compiled LoRA adapter with A and B matrices."""
-    config: LoRAConfig
+    """
+    A compiled LoRA adapter.
+
+    Two construction forms are supported:
+
+    * **Multi-module form** — pass a :class:`LoRAConfig` and a ``weights``
+      dict mapping module name to an ``(A, B)`` pair. Used when an adapter
+      spans several projections (``q_proj``, ``v_proj``, ...).
+    * **Single-delta form** — pass ``adapter_id`` plus ``delta_a``/``delta_b``
+      directly. Convenient for a one-matrix adapter; the config is derived
+      and rank is inferred from ``delta_a``.
+
+    .. warning::
+       The two forms store **transposed** matrices, matching the convention
+       each caller expects:
+
+       ============= ==================== =====================
+       Form          ``A``                ``B``
+       ============= ==================== =====================
+       multi-module  ``(rank, in)``       ``(out, rank)``
+       single-delta  ``(in, rank)``       ``(rank, out)``
+       ============= ==================== =====================
+
+       Use :meth:`apply` for single-delta adapters and :class:`BGMVKernel`
+       for multi-module ones. :attr:`layout` records which convention an
+       instance uses, and the BGMV path rejects a mismatch rather than
+       producing a silently wrong result.
+
+    In both cases the effective update is ``scaling × B @ A`` where
+    ``scaling = alpha / rank``.
+    """
+
+    #: Matrix layout for the multi-module/BGMV convention: A=(rank, in), B=(out, rank).
+    LAYOUT_BGMV = "bgmv"
+    #: Matrix layout for the single-delta convention: A=(in, rank), B=(rank, out).
+    LAYOUT_DELTA = "delta"
+
+    config: LoRAConfig | None = None
     # Per-module weight matrices: module_name → (A, B)
     weights: dict[str, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+
+    # Single-delta form
+    adapter_id: str = ""
+    delta_a: np.ndarray | None = None
+    delta_b: np.ndarray | None = None
+    alpha: float | None = None
+    rank: int | None = None
+    #: Module the single-delta form binds to.
+    module: str = "default"
+    #: Which matrix convention :attr:`weights` uses. Set automatically.
+    layout: str = LAYOUT_BGMV
+
+    def __post_init__(self) -> None:
+        has_delta = self.delta_a is not None and self.delta_b is not None
+
+        if self.config is None:
+            if not self.adapter_id:
+                raise ValueError(
+                    "LoRAAdapter requires either a LoRAConfig or an adapter_id"
+                )
+            # Infer rank from delta_a's inner dimension: A is (in_features, rank)
+            # in the single-delta convention, so rank is its trailing axis.
+            inferred_rank = self.rank
+            if inferred_rank is None:
+                inferred_rank = (
+                    int(self.delta_a.shape[-1]) if has_delta else 64
+                )
+            # Default alpha to rank so scaling is 1.0 — an adapter supplied as
+            # an explicit delta should apply at face value unless told otherwise.
+            inferred_alpha = (
+                self.alpha if self.alpha is not None else float(inferred_rank)
+            )
+            self.config = LoRAConfig(
+                adapter_id=self.adapter_id,
+                rank=max(1, inferred_rank),
+                alpha=inferred_alpha,
+                target_modules=[self.module],
+            )
+        else:
+            # Keep the convenience fields in sync with the supplied config.
+            if not self.adapter_id:
+                self.adapter_id = self.config.adapter_id
+            if self.alpha is None:
+                self.alpha = self.config.alpha
+            if self.rank is None:
+                self.rank = self.config.rank
+
+        if has_delta and self.module not in self.weights:
+            self.weights[self.module] = (self.delta_a, self.delta_b)
+            # delta_a/delta_b are supplied in the (in, rank)/(rank, out) layout.
+            self.layout = self.LAYOUT_DELTA
+
+    @property
+    def scaling(self) -> float:
+        """LoRA scaling factor α/r."""
+        return self.config.scaling
+
+    def apply(self, x: np.ndarray, module: str | None = None) -> np.ndarray:
+        """
+        Compute the LoRA delta contribution for an input batch.
+
+        Uses the single-delta convention ``(x @ A) @ B × scaling`` where
+        ``A`` is ``(in_features, rank)`` and ``B`` is ``(rank, out_features)``.
+
+        Args:
+            x: ``(batch, in_features)`` input activations.
+            module: Module to apply; defaults to this adapter's module.
+
+        Returns:
+            ``(batch, out_features)`` delta to add to the base output.
+        """
+        key = module or self.module
+        if key not in self.weights:
+            raise KeyError(f"Adapter {self.config.adapter_id!r} has no module {key!r}")
+        A, B = self.weights[key]
+        return ((x.astype(np.float32) @ A) @ B) * self.scaling
 
     def get_delta(self, module: str) -> np.ndarray | None:
         """Compute W_delta = (alpha/r) × B × A for a module."""
@@ -304,6 +416,17 @@ class BGMVKernel:
             adapter = self.pool.get(adapter_id)
             if adapter is None or module_name not in adapter.weights:
                 continue
+            if adapter.layout != LoRAAdapter.LAYOUT_BGMV:
+                # Its A/B are transposed relative to what this kernel expects;
+                # multiplying anyway would either raise deep inside numpy or,
+                # for square matrices, return a silently wrong result.
+                raise ValueError(
+                    f"Adapter {adapter_id!r} uses the single-delta layout "
+                    f"(A=(in, rank), B=(rank, out)) and cannot be served by the "
+                    f"BGMV kernel, which expects A=(rank, in), B=(out, rank). "
+                    f"Use LoRAHotSwapEngine(base_weight).forward(...) for this "
+                    f"adapter, or rebuild it with LoRAAdapter(config=..., weights=...)."
+                )
             A, B = adapter.weights[module_name]
             scale = adapter.config.scaling
             x_i = x_batch[i].astype(np.float32)
@@ -388,13 +511,34 @@ class LoRAHotSwapEngine:
     """
     Full LoRA runtime engine: pool management + BGMV inference + AEG persistence.
 
-    Usage:
+    Can be constructed two ways:
+
+        # Bound to a base weight — enables forward(x, adapter_ids)
+        engine = LoRAHotSwapEngine(base_weight)
+
+        # Pool-only — pass the base weight per call to serve_batch()
         engine = LoRAHotSwapEngine(max_slots=8)
-        engine.load_adapter(adapter)
-        output = engine.serve(request_prompt, adapter_id="legal_v2", base_weights=W)
+
+    Usage:
+        engine.register(adapter)
+        output = engine.forward(x_batch, [None, "legal_v2"])
     """
 
-    def __init__(self, max_slots: int = 8) -> None:
+    def __init__(
+        self,
+        base_weight: np.ndarray | int | None = None,
+        max_slots: int = 8,
+    ) -> None:
+        # Allow LoRAHotSwapEngine(4) to mean max_slots=4.
+        if isinstance(base_weight, (int, np.integer)) and not isinstance(
+            base_weight, np.ndarray
+        ):
+            max_slots = int(base_weight)
+            base_weight = None
+
+        self.base_weight: np.ndarray | None = (
+            base_weight.astype(np.float32) if base_weight is not None else None
+        )
         self.pool = LoRAAdapterPool(max_slots=max_slots)
         self.bgmv = BGMVKernel(self.pool)
         self._compiler = LoRACompiler(mode="multi_slot")
@@ -404,8 +548,80 @@ class LoRAHotSwapEngine:
         """Load a LoRA adapter into the runtime pool."""
         return self.pool.load(adapter)
 
+    def register(self, adapter: LoRAAdapter) -> int:
+        """Register an adapter into a slot. Alias of :meth:`load_adapter`."""
+        return self.pool.load(adapter)
+
     def unload_adapter(self, adapter_id: str) -> None:
         self.pool.unload(adapter_id)
+
+    def forward(
+        self,
+        x_batch: np.ndarray,
+        adapter_ids: list[str | None],
+        module: str | None = None,
+    ) -> np.ndarray:
+        """
+        Per-request LoRA forward against the bound base weight.
+
+        Each batch row is routed through its own adapter (or none), so a
+        single call can serve requests using different adapters.
+
+        Args:
+            x_batch: ``(batch, in_features)`` activations.
+            adapter_ids: Per-row adapter id, or None for base-only.
+            module: Module name to apply; defaults to each adapter's own.
+
+        Returns:
+            ``(batch, out_features)`` output.
+        """
+        if self.base_weight is None:
+            raise ValueError(
+                "forward() requires a base weight. Construct with "
+                "LoRAHotSwapEngine(base_weight) or use serve_batch()."
+            )
+        if len(adapter_ids) != x_batch.shape[0]:
+            raise ValueError(
+                f"adapter_ids length {len(adapter_ids)} != batch size {x_batch.shape[0]}"
+            )
+
+        x = x_batch.astype(np.float32)
+        result = x @ self.base_weight
+        self._request_count += len(adapter_ids)
+
+        for i, adapter_id in enumerate(adapter_ids):
+            if adapter_id is None:
+                continue
+            adapter = self.pool.get(adapter_id)
+            if adapter is None:
+                logger.warning("forward: unknown adapter %r — serving base only", adapter_id)
+                continue
+            key = module or adapter.module
+            if key not in adapter.weights:
+                continue
+            if adapter.layout != LoRAAdapter.LAYOUT_DELTA:
+                raise ValueError(
+                    f"Adapter {adapter_id!r} uses the multi-module BGMV layout "
+                    f"(A=(rank, in), B=(out, rank)) and cannot be served by "
+                    f"forward(), which expects A=(in, rank), B=(rank, out). "
+                    f"Use serve_batch(x, base_weight, adapter_ids, module) instead."
+                )
+            result[i] = result[i] + adapter.apply(x[i : i + 1], key)[0]
+
+        return result.astype(np.float32)
+
+    def manifest(self) -> dict[str, Any]:
+        """Return the adapter-pool manifest written into the AEG package."""
+        return {
+            "version": "lora/1.0",
+            "max_slots": self.pool.max_slots,
+            "slots": len(self.pool.list_adapters()),
+            "adapters": self.pool.list_adapters(),
+            "bgmv_enabled": True,
+            "base_weight_shape": (
+                list(self.base_weight.shape) if self.base_weight is not None else None
+            ),
+        }
 
     def serve_batch(
         self,

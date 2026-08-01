@@ -29,9 +29,26 @@ from typing import Any
 
 import numpy as np
 
+# Stable public entry point for Pass 7 within the optimizer pipeline. The
+# pipeline-facing pass lives in ``optimizer``; this module additionally hosts
+# the CoT graph compiler and its runtime budget controller.
+from aether.compiler.stage2_optimizer.optimizer import ReasoningGraphPass
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+__all__ = [
+    "ReasoningGraphPass",
+    "Pass7ReasoningGraph",
+    "ReasoningGraph",
+    "ReasoningBudget",
+    "ReasoningBudgetController",
+    "ReasoningStep",
+    "CoTConfig",
+    "is_reasoning_model",
+    "REASONING_MODEL_FAMILIES",
+    "REASONING_CONFIG_KEYS",
+]
 
 
 # ---------------------------------------------------------------------------

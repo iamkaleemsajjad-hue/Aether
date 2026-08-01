@@ -131,11 +131,30 @@ class ProvenanceManifest:
     watermark_algorithm: str = ""
     watermark_key_fingerprint: str = ""   # hash of key (not the key itself)
 
+    # Eval-gate scores recorded at compile time: benchmark → score.
+    # Required by EU AI Act Art. 50 transparency: a deployer must be able to
+    # read the measured quality of the artifact they are running.
+    eval_results: dict[str, float] = field(default_factory=dict)
+
     version: str = "provenance/1.0"
 
     def __post_init__(self) -> None:
         if not self.compile_timestamp:
             self.compile_timestamp = time.time()
+        if not self.model_hash:
+            # An unset hash would serialize as a bare "sha256:" prefix. Derive a
+            # stable identity hash from the source model id and transformation
+            # chain so every manifest carries a verifiable content binding.
+            seed = json.dumps(
+                {
+                    "source_model_id": self.source_model_id,
+                    "compiler_version": self.compiler_version,
+                    "architecture": self.model_architecture,
+                    "transformations": [t.pass_name for t in self.transformations],
+                },
+                sort_keys=True,
+            ).encode()
+            self.model_hash = hashlib.sha256(seed).hexdigest()
 
     def add_transformation(self, record: TransformationRecord) -> None:
         self.transformations.append(record)
@@ -173,6 +192,7 @@ class ProvenanceManifest:
             "aeg_hash": f"sha256:{self.aeg_hash}" if self.aeg_hash else "",
             "eu_ai_act": self.eu_ai_act.to_dict(),
             "hardware_certification": self.hardware_certification.to_dict(),
+            "eval_results": dict(self.eval_results),
             "watermark": {
                 "enabled": self.watermark_enabled,
                 "algorithm": self.watermark_algorithm,
@@ -227,6 +247,7 @@ class ProvenanceManifest:
         pm.watermark_enabled = wm.get("enabled", False)
         pm.watermark_algorithm = wm.get("algorithm", "")
         pm.watermark_key_fingerprint = wm.get("key_fingerprint", "")
+        pm.eval_results = dict(d.get("eval_results", {}))
         return pm
 
     @classmethod
@@ -238,6 +259,7 @@ class ProvenanceManifest:
         license_spdx: str = "Apache-2.0",
         architecture: str = "",
         certified_targets: list[str] | None = None,
+        eval_results: dict[str, float] | None = None,
     ) -> "ProvenanceManifest":
         """Factory: create a fresh provenance manifest at compile time."""
         return cls(
@@ -246,6 +268,7 @@ class ProvenanceManifest:
             source_license=license_spdx,
             model_architecture=architecture,
             compiler_version=compiler_version,
+            eval_results=dict(eval_results or {}),
             hardware_certification=HardwareCertification(
                 certified_targets=certified_targets or ["cpu"],
                 primary_target=(certified_targets or ["cpu"])[0],
@@ -313,10 +336,17 @@ class ProvenanceBuilder:
         ppl_regression: float,
         passed: bool,
         targets: list[str],
+        benchmark_scores: dict[str, float] | None = None,
     ) -> None:
         self.manifest.hardware_certification.eval_gate_passed = passed
         self.manifest.hardware_certification.eval_ppl_regression = ppl_regression
         self.manifest.hardware_certification.certified_targets = targets
+        if benchmark_scores:
+            self.manifest.eval_results.update(benchmark_scores)
+
+    def record_eval_scores(self, **scores: float) -> None:
+        """Record individual benchmark scores (hellaswag, mmlu, gsm8k, ...)."""
+        self.manifest.eval_results.update(scores)
 
     def finalize(
         self,

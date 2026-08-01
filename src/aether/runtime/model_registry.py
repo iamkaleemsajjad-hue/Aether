@@ -104,11 +104,91 @@ class ModelRegistry:
     - Hot-reload: replace a model entry atomically
     """
 
-    def __init__(self, max_loaded_models: int = 4) -> None:
+    def __init__(
+        self,
+        max_loaded_models: int = 4,
+        cache_dir: str | Path | None = None,
+    ) -> None:
+        from aether.utils.file_io import aether_cache_dir
+
         self.max_loaded_models = max_loaded_models
         self._entries: dict[str, ModelEntry] = {}
         self._lock = threading.RLock()
-        logger.info("Model registry initialized", max_loaded_models=max_loaded_models)
+
+        # On-disk side of the registry: compiled AEG packages live under
+        # <cache>/models/. Resolved eagerly so models_dir always exists.
+        self.cache_dir: Path = aether_cache_dir(cache_dir)
+        self.models_dir: Path = self.cache_dir / "models"
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(
+            "Model registry initialized",
+            max_loaded_models=max_loaded_models,
+            models_dir=str(self.models_dir),
+        )
+
+    # ------------------------------------------------------------------
+    # On-disk AEG cache
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _slug(model_id: str) -> str:
+        """Filesystem-safe name for a model id ('org/model' → 'org__model')."""
+        return model_id.replace("/", "__").replace("\\", "__").strip()
+
+    def cached_path(self, model_id: str) -> Path:
+        """Return the canonical on-disk AEG path for a model id."""
+        return self.models_dir / f"{self._slug(model_id)}.aeg"
+
+    def _cache_candidates(self, model_id: str) -> list[Path]:
+        """
+        All paths a compiled package for this model may occupy.
+
+        The compiler historically wrote ``<models>/<model_id>.aeg`` verbatim,
+        which nests a directory for namespaced ids, so both layouts are probed.
+        """
+        return [
+            self.cached_path(model_id),
+            self.models_dir / f"{model_id}.aeg",
+        ]
+
+    def is_cached(self, model_id: str) -> bool:
+        """Return True if a compiled AEG package for this model is on disk."""
+        return any(p.exists() for p in self._cache_candidates(model_id))
+
+    def list_cached(self) -> list[str]:
+        """Return sorted model ids that have a compiled package on disk."""
+        if not self.models_dir.exists():
+            return []
+        found = {
+            p.name[: -len(".aeg")].replace("__", "/")
+            for p in self.models_dir.glob("*.aeg")
+        }
+        return sorted(found)
+
+    def remove(self, model_id: str) -> bool:
+        """
+        Delete a model's cached AEG package from disk.
+
+        Also unloads it from memory so a stale handle cannot outlive the
+        package it was loaded from. Returns False when nothing was cached.
+        """
+        import shutil
+
+        removed = False
+        for path in self._cache_candidates(model_id):
+            if not path.exists():
+                continue
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            removed = True
+
+        if removed:
+            self.unload(model_id)
+            logger.info("Model registry: removed cached package", model_id=model_id)
+        return removed
 
     # ------------------------------------------------------------------
     # Registration
