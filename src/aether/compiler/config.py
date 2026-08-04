@@ -13,7 +13,6 @@ from typing import Any
 
 from aether.core.constants import (
     DEFAULT_CACHE_DIR,
-    DEFAULT_CACHE_DIR,
     DEFAULT_CALIBRATION_DATASET,
     DEFAULT_CALIBRATION_TOKENS,
     DEFAULT_FUSION_PASS,
@@ -27,6 +26,21 @@ from aether.core.constants import (
     DEFAULT_REASONING_GRAPH_PASS,
     DEFAULT_SENSITIVITY_PASS,
     DEFAULT_SPARSE_ATTENTION_PASS,
+    # PRD v4.0 pass defaults
+    DEFAULT_MTP_HEAD_PASS,
+    DEFAULT_GRAMMAR_CONSTRAINT_PASS,
+    DEFAULT_MODEL_MERGING_PASS,
+    DEFAULT_TTT_PASS,
+    DEFAULT_SEMANTIC_KV_PASS,
+    DEFAULT_CROSS_LAYER_KV_PASS,
+    DEFAULT_GREEN_ENERGY_PASS,
+    DEFAULT_TEE_PASS,
+    # PRD v5.0 pass defaults
+    DEFAULT_MDLM_DRAFTER_PASS,
+    DEFAULT_SUB2BIT_PASS,
+    DEFAULT_VIDEO_COMPRESSION_PASS,
+    DEFAULT_ADVANCED_PEFT_PASS,
+    DEFAULT_RLVR_VERIFIER_PASS,
 )
 from aether.core.exceptions import CompilerConfigError
 from aether.core.types import HardwareTarget
@@ -81,6 +95,195 @@ class CompilerConfig:
 
     enable_pruning: bool = DEFAULT_PRUNING_PASS
     """Enable pruning and sparsity planning pass (Pass 9)."""
+
+    # ── PRD v4.0 compiler passes (10–17) ──────────────────────────────────────
+
+    enable_mtp_head: bool = DEFAULT_MTP_HEAD_PASS
+    """Pass 10: Compile native Multi-Token Prediction heads from the model graph.
+
+    Detects DeepSeek-V3/FastMTP/L-MTP style MTP heads and compiles them into
+    AEG speculation/mtp_heads.bin.  Enables 1.8–2.5× throughput with no
+    external draft model required.
+    """
+
+    enable_grammar_constraint: bool = DEFAULT_GRAMMAR_CONSTRAINT_PASS
+    """Pass 11: Pre-compile grammar/JSON Schema/regex constraints into FSM token masks.
+
+    Requires `grammar_schema` to be set.  Produces .aeg/grammar/fsm.bin with
+    pre-built per-state token bitmasks.  Enables <50µs structured output at
+    decode time via the grammar FSM runtime engine (R3).
+    """
+
+    grammar_schema: str | None = None
+    """EBNF / JSON Schema / regex string for Pass 11 grammar constraint compilation."""
+
+    grammar_backend: str = "xgrammar"
+    """Grammar compiler backend: xgrammar | llguidance | outlines."""
+
+    enable_model_merging: bool = DEFAULT_MODEL_MERGING_PASS
+    """Pass 12: Merge task vectors from multiple fine-tunes into a single AEG.
+
+    Supports Task Arithmetic, DARE, TIES-Merging, and FREE-Merging (evolutionary
+    optimization of merge coefficients).  Enables multi-task inference at
+    single-model cost.
+    """
+
+    model_merging_sources: list[str] = field(default_factory=list)
+    """List of fine-tuned model paths or AEG paths to merge with the base model."""
+
+    model_merging_method: str = "task_arithmetic"
+    """Merging method: task_arithmetic | dare | ties | free | evolutionary."""
+
+    model_merging_coefficients: list[float] = field(default_factory=list)
+    """Per-source scaling coefficient for task vectors (default: uniform 1/N)."""
+
+    enable_ttt: bool = DEFAULT_TTT_PASS
+    """Pass 13: Inject TTT fast-weight slots for test-time training.
+
+    Injects µ/σ fast-weight LayerNorm slots into every transformer layer.
+    Enables domain adaptation during inference without full recompilation.
+    Based on In-Place TTT (arXiv 2026) and VDS-TTT (NeurIPS 2026).
+    """
+
+    ttt_rank: int = 16
+    """LoRA rank for TTT fast-weight matrices.  Higher = more adaptive capacity."""
+
+    ttt_learning_rate: float = 1e-4
+    """Online gradient step size for TTT fast-weight updates at inference time."""
+
+    enable_semantic_kv: bool = DEFAULT_SEMANTIC_KV_PASS
+    """Pass 14: Compress KV cache by semantic similarity clustering.
+
+    ChunkKV: cosine-distance clustering of KV blocks.
+    SentenceKV: sentence-boundary aware retention.
+    Achieves 40–70% KV reduction while preserving semantic meaning.
+    """
+
+    semantic_kv_compression_ratio: float = 0.5
+    """Target KV retention ratio for Pass 14 (0.3 = retain 30% of KV pairs)."""
+
+    semantic_kv_strategy: str = "chunk"
+    """KV compression strategy: chunk | sentence | hybrid."""
+
+    enable_cross_layer_kv: bool = DEFAULT_CROSS_LAYER_KV_PASS
+    """Pass 15: Share KV pointers across layers to reduce per-layer KV memory.
+
+    xKV: SVD-based cross-layer KV sharing.
+    CommonKV: layers sharing >threshold KV redundancy share a pointer.
+    Middle-outward assignment (Wu/Tu 2025): layers share from center outward.
+    Achieves 30–50% per-layer KV memory reduction.
+    """
+
+    cross_layer_kv_share_threshold: float = 0.85
+    """Cosine similarity threshold above which two layers share KV pointers."""
+
+    enable_green_energy: bool = DEFAULT_GREEN_ENERGY_PASS
+    """Pass 16: Embed green energy profile and DVFS hints into AEG metadata.
+
+    MELODI: energy-aware operator scheduling.
+    DVFS: Dynamic Voltage and Frequency Scaling breakpoint embedding.
+    CodeCarbon: carbon intensity metadata per target region.
+    Achieves up to 48% energy reduction on idle-burst workloads.
+    """
+
+    green_carbon_region: str = "us-west"
+    """Target grid region for Pass 16 carbon intensity data."""
+
+    green_target_tdp_watts: float | None = None
+    """Target TDP cap in watts for DVFS breakpoint computation (None = hardware max)."""
+
+    enable_tee: bool = DEFAULT_TEE_PASS
+    """Pass 17: Wrap emitted kernels with TEE (Trusted Execution Environment) guards.
+
+    Intel TDX: Trust Domain Extension enclave enter/exit per kernel.
+    AMD SEV-SNP: Secure Encrypted Virtualization wrapping.
+    NVIDIA H100/B200 CC mode: encrypted weight loading + activation encryption.
+    Overhead < 10% on H100/B200 Confidential Computing mode.
+    """
+
+    tee_backend: str = "nvidia_cc"
+    """TEE enclave backend: nvidia_cc | intel_tdx | amd_sev_snp."""
+
+    tee_attest_endpoint: str | None = None
+    """Remote attestation service endpoint URL (None = self-signed)."""
+
+    # ── PRD v5.0 compiler passes (18–22) ──────────────────────────────────────
+
+    enable_mdlm_drafter: bool = DEFAULT_MDLM_DRAFTER_PASS
+    """Pass 18: Compile a lightweight MDLM diffusion drafter alongside the model.
+
+    Masked Diffusion LM: cosine denoising schedule, T=6 default steps, K=8
+    parallel draft tokens per step.  DiffuSpec / SpecDiff ACL 2026: 2.8–4.1×
+    over autoregressive on long-context tasks.
+    """
+
+    mdlm_drafter_steps: int = 6
+    """Number of MDLM denoising steps per draft block (T parameter)."""
+
+    mdlm_draft_block_size: int = 8
+    """Number of draft tokens proposed per diffusion forward pass (K parameter)."""
+
+    enable_sub2bit: bool = DEFAULT_SUB2BIT_PASS
+    """Pass 19: Quantize model weights to sub-2-bit ternary or binary format.
+
+    BitNet b1.58: ternary {-1,0,+1} packed as 2 bits, addition-only inference.
+    BTC-LLM: binary codebook (0.8–1.11 bits), gather-based inference.
+    NanoQuant: trellis codebook (sub-1-bit), highest compression.
+    10× memory reduction and up to 5× throughput on ternary-native hardware.
+    """
+
+    sub2bit_method: str = "bitnet"
+    """Sub-2-bit method: bitnet | btc_llm | nanoquant."""
+
+    sub2bit_quality_gate_ppl: float = 0.1
+    """Max perplexity increase allowed by Pass 19 quality gate (10%)."""
+
+    enable_video_compression: bool = DEFAULT_VIDEO_COMPRESSION_PASS
+    """Pass 20: Compress video tokens for Vision-Language Models (VLMs).
+
+    STC (CVPR 2026): plug-and-play, 98% visual token reduction.
+    STORM: Mamba temporal projector for streaming video.
+    StreamingTOM: bounded KV for infinite video, 15.7× KV compression.
+    InfoTok: ELBO information-theoretic token budget allocation.
+    Only activates when model architecture includes a vision encoder.
+    """
+
+    video_compression_ratio: float = 0.75
+    """Target video token retention ratio for Pass 20 (0.25 = keep 25% of frames)."""
+
+    video_compression_backend: str = "stc"
+    """Video compression method: stc | storm | streamingtom | infotok | mage_vl."""
+
+    enable_advanced_peft: bool = DEFAULT_ADVANCED_PEFT_PASS
+    """Pass 21: Compile advanced PEFT adapter weights into AEG.
+
+    LoRA+: asymmetric learning rate (λ=16) baked into AEG adapter scaling.
+    LoRAMoE: fuse LoRA experts into Pass 5 MoE dispatch graph.
+    MoLF: gradient-guided LoRA / FullFT navigation schedule.
+    LoRAFusion: single-kernel dispatch for multi-adapter batches.
+    """
+
+    peft_adapter_paths: list[str] = field(default_factory=list)
+    """Paths to LoRA / PEFT adapter checkpoints to compile into the AEG."""
+
+    peft_lora_plus_lambda: float = 16.0
+    """LoRA+ asymmetric LR ratio λ (B matrix LR = λ × A matrix LR)."""
+
+    enable_rlvr_verifier: bool = DEFAULT_RLVR_VERIFIER_PASS
+    """Pass 22: Inject RLVR verifier head for reinforcement learning from verification.
+
+    GRPO: group relative policy optimization (K=8 solutions/prompt).
+    RLVR: deterministic binary verifier (sympy for math, pytest for code).
+    K2V: sub-task decomposition DAG for dense reward shaping.
+    RLSVR: multi-agent self-play for open-ended RLHF.
+    Stores verifier weights in .aeg/training/.
+    """
+
+    rlvr_verifier_type: str = "sympy"
+    """RLVR verifier type: sympy | pytest | llm_judge | human."""
+
+    rlvr_group_size: int = 8
+    """GRPO group size K — number of candidate solutions sampled per prompt."""
 
     reasoning_budget_tokens: int = 512
     """Default token budget for compiled reasoning graph nodes."""

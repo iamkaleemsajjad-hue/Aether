@@ -15,31 +15,26 @@ from aether.compiler.report import PassReport
 from aether.core.exceptions import CompilerPassError
 from aether.utils.logging import get_logger
 
+# PRD v4.0 + v5.0 pass imports
+from aether.compiler.stage2_optimizer.pass10_mtp_head import MTPHeadCompilationPass
+from aether.compiler.stage2_optimizer.pass11_grammar_constraint import GrammarConstraintCompilerPass
+from aether.compiler.stage2_optimizer.pass12_model_merging import ModelMergingPass
+from aether.compiler.stage2_optimizer.pass13_ttt_fast_weight import TTTFastWeightInjectionPass
+from aether.compiler.stage2_optimizer.pass14_semantic_kv_compression import SemanticKVCompressionPass
+from aether.compiler.stage2_optimizer.pass15_cross_layer_kv import CrossLayerKVSharingPass
+from aether.compiler.stage2_optimizer.pass16_green_energy import GreenEnergyCompilationPass
+from aether.compiler.stage2_optimizer.pass17_tee_wrapping import TEEKernelWrappingPass
+from aether.compiler.stage2_optimizer.pass18_mdlm_drafter import MDLMDrafterCompilationPass
+from aether.compiler.stage2_optimizer.pass19_sub2bit_quant import Sub2BitQuantizationPass
+from aether.compiler.stage2_optimizer.pass20_video_compression import VideoTokenCompressionPass
+from aether.compiler.stage2_optimizer.pass21_advanced_peft import AdvancedPEFTCompilationPass
+from aether.compiler.stage2_optimizer.pass22_rlvr_verifier import RLVRVerifierHeadInjectionPass
+
 logger = get_logger(__name__)
 
-
-class BasePass:
-    """Base class for all optimizer passes.
-
-    Each pass must implement `run()` which takes a computation graph (an AEGGraph
-    or AEGIRModule) and returns an (optimized_graph, report) tuple.
-    """
-
-    name: str = "base"
-    description: str = "Base optimizer pass."
-
-    def run(self, graph: Any, architecture: Any, config: CompilerConfig) -> tuple[Any, PassReport]:
-        """Execute the pass.
-
-        Args:
-            graph: Input computation graph or AEG-IR module.
-            architecture: Model architecture metadata.
-            config: Compiler configuration.
-
-        Returns:
-            Tuple of (optimized_graph, PassReport).
-        """
-        raise NotImplementedError
+# BasePass lives in base_pass.py to avoid circular imports.
+# (passes import BasePass, optimizer imports passes — circular if both in optimizer.py)
+from aether.compiler.stage2_optimizer.base_pass import BasePass  # noqa: E402  re-export
 
 
 class OperatorFusionPass(BasePass):
@@ -757,15 +752,40 @@ class PruningSparsityPass(BasePass):
 
 
 class OptimizerPipeline:
-    """Orchestrates the six Aether optimizer passes.
+    """Orchestrates all 22 Aether optimizer passes (PRD v3.1 passes 1–9 + PRD v4.0–v5.0 passes 10–22).
 
     Passes are run in sequential order since each depends on the output of
-    the previous pass. The pipeline can be configured to skip specific passes.
+    the previous pass.  The pipeline can be configured to skip specific passes.
+
+    Pass ordering (PRD v2 canonical order):
+      1  OperatorFusionPass            — kernel fusion, megakernels
+      2  SensitivityAnalysisPass       — layer sensitivity profiling
+      3  PrecisionAssignmentPass       — mixed precision mapping
+      4  KVCacheStructuringPass        — paged/sparse KV layout
+      5  MoERoutingPass                — MoE expert dispatch graph
+      6  ParallelismDiscoveryPass      — TP/PP/EP/CP graph partitioning
+      7  ReasoningGraphPass            — reasoning chain subgraph
+      8  SparseAttentionPass           — sparse attention patterns
+      9  PruningSparsityPass           — weight pruning / 2:4 sparsity
+      10 MTPHeadCompilationPass        — native MTP speculation heads
+      11 GrammarConstraintCompilerPass — FSA grammar pre-compilation
+      12 ModelMergingPass              — task vector fusion
+      13 TTTFastWeightInjectionPass    — TTT fast-weight slots
+      14 SemanticKVCompressionPass     — ChunkKV / SentenceKV / PyramidKV
+      15 CrossLayerKVSharingPass       — xKV / CommonKV / middle-outward
+      16 GreenEnergyCompilationPass    — DVFS / carbon / MELODI
+      17 TEEKernelWrappingPass         — TEE enclave guards
+      18 MDLMDrafterCompilationPass    — MDLM diffusion drafter
+      19 Sub2BitQuantizationPass       — BitNet/BTC-LLM/NanoQuant
+      20 VideoTokenCompressionPass     — STC / STORM / StreamingTOM
+      21 AdvancedPEFTCompilationPass   — LoRA+ / LoRAMoE / LoRAFusion
+      22 RLVRVerifierHeadInjectionPass — GRPO / RLVR training hooks
     """
 
     def __init__(self, config: CompilerConfig | None = None) -> None:
         self.config = config or CompilerConfig()
         self._passes: list[BasePass] = [
+            # PRD v3.1 passes 1–9
             OperatorFusionPass(),
             SensitivityAnalysisPass(),
             PrecisionAssignmentPass(),
@@ -775,8 +795,24 @@ class OptimizerPipeline:
             ReasoningGraphPass(),
             SparseAttentionPass(),
             PruningSparsityPass(),
+            # PRD v4.0 passes 10–17
+            MTPHeadCompilationPass(),
+            GrammarConstraintCompilerPass(),
+            ModelMergingPass(),
+            TTTFastWeightInjectionPass(),
+            SemanticKVCompressionPass(),
+            CrossLayerKVSharingPass(),
+            GreenEnergyCompilationPass(),
+            TEEKernelWrappingPass(),
+            # PRD v5.0 passes 18–22
+            MDLMDrafterCompilationPass(),
+            Sub2BitQuantizationPass(),
+            VideoTokenCompressionPass(),
+            AdvancedPEFTCompilationPass(),
+            RLVRVerifierHeadInjectionPass(),
         ]
         self._pass_enabled = {
+            # PRD v3.1
             "operator_fusion": True,
             "sensitivity_analysis": True,
             "precision_assignment": True,
@@ -786,6 +822,21 @@ class OptimizerPipeline:
             "reasoning_graph": True,
             "sparse_attention": True,
             "pruning_sparsity": True,
+            # PRD v4.0
+            "mtp_head_compilation": True,
+            "grammar_constraint_compilation": False,  # opt-in
+            "model_merging": False,  # opt-in
+            "ttt_fast_weight_injection": False,  # opt-in
+            "semantic_kv_compression": True,
+            "cross_layer_kv_sharing": True,
+            "green_energy_compilation": False,  # opt-in
+            "tee_kernel_wrapping": False,  # opt-in
+            # PRD v5.0
+            "mdlm_drafter_compilation": False,  # opt-in
+            "sub2bit_quantization": False,  # opt-in
+            "video_token_compression": True,  # auto-skips non-VLM
+            "advanced_peft_compilation": True,
+            "rlvr_verifier_head_injection": False,  # opt-in
         }
 
     @property
@@ -824,7 +875,8 @@ class OptimizerPipeline:
         pass_reports: list[PassReport] = []
         current_graph = graph
 
-        # Update enabled status from config
+        # Sync enabled flags from config for all 22 passes.
+        # PRD v3.1
         self._pass_enabled["operator_fusion"] = self.config.enable_fusion
         self._pass_enabled["sensitivity_analysis"] = self.config.enable_sensitivity
         self._pass_enabled["precision_assignment"] = self.config.enable_precision_assignment
@@ -834,6 +886,21 @@ class OptimizerPipeline:
         self._pass_enabled["reasoning_graph"] = self.config.enable_reasoning_graph
         self._pass_enabled["sparse_attention"] = self.config.enable_sparse_attention
         self._pass_enabled["pruning_sparsity"] = self.config.enable_pruning
+        # PRD v4.0
+        self._pass_enabled["mtp_head_compilation"] = self.config.enable_mtp_head
+        self._pass_enabled["grammar_constraint_compilation"] = self.config.enable_grammar_constraint
+        self._pass_enabled["model_merging"] = self.config.enable_model_merging
+        self._pass_enabled["ttt_fast_weight_injection"] = self.config.enable_ttt
+        self._pass_enabled["semantic_kv_compression"] = self.config.enable_semantic_kv
+        self._pass_enabled["cross_layer_kv_sharing"] = self.config.enable_cross_layer_kv
+        self._pass_enabled["green_energy_compilation"] = self.config.enable_green_energy
+        self._pass_enabled["tee_kernel_wrapping"] = self.config.enable_tee
+        # PRD v5.0
+        self._pass_enabled["mdlm_drafter_compilation"] = self.config.enable_mdlm_drafter
+        self._pass_enabled["sub2bit_quantization"] = self.config.enable_sub2bit
+        self._pass_enabled["video_token_compression"] = self.config.enable_video_compression
+        self._pass_enabled["advanced_peft_compilation"] = self.config.enable_advanced_peft
+        self._pass_enabled["rlvr_verifier_head_injection"] = self.config.enable_rlvr_verifier
 
         for pass_instance in self._passes:
             if not self._pass_enabled.get(pass_instance.name, True):
