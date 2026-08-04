@@ -55,25 +55,40 @@ AEG_PRECISION_MAP_FILENAME: str = "precision_map.json"
 # ── Hardware target identifiers ────────────────────────────────────────────────
 
 SUPPORTED_TARGETS: dict[str, str] = {
-    # NVIDIA
+    # ── v3.1 NVIDIA ────────────────────────────────────────────────────────────
     "cuda_sm70": "NVIDIA V100 (Volta)",
     "cuda_sm80": "NVIDIA A100 (Ampere)",
     "cuda_sm89": "NVIDIA RTX 4090 (Ada)",
     "cuda_sm90": "NVIDIA H100 (Hopper)",
     "cuda_sm100": "NVIDIA B200 (Blackwell)",
-    "cuda_sm120": "NVIDIA Rubin (future)",
-    # Apple
+    "cuda_sm120": "NVIDIA Rubin R100 (sm_120)",
+    # ── v3.1 Apple ────────────────────────────────────────────────────────────
     "metal_m1": "Apple M1/M2",
     "metal_m3": "Apple M3/M4/M5",
-    # AMD
-    "rocm_rdna3": "AMD RX 7000 Series",
-    "rocm_cdna3": "AMD MI300X",
-    # Intel
-    "openvino_npu": "Intel Arc NPU",
-    "qualcomm_qnn": "Qualcomm Snapdragon NPU",
-    # CPU
+    # ── v3.1 AMD ──────────────────────────────────────────────────────────────
+    "rocm_rdna3": "AMD RX 7000 Series (RDNA3)",
+    "rocm_cdna3": "AMD MI300X (CDNA3)",
+    # ── v3.1 Intel / Qualcomm / CPU ───────────────────────────────────────────
+    "openvino_npu": "Intel Arc NPU (OpenVINO)",
+    "qualcomm_qnn": "Qualcomm Snapdragon NPU (QNN)",
     "cpu_avx512": "x86_64 (AVX-512)",
     "cpu_neon": "ARM (NEON SIMD)",
+    # ── v4.0 new targets ──────────────────────────────────────────────────────
+    "cuda_sm130": "NVIDIA Rubin Ultra (sm_130, dual-core ~100 PFLOPS FP4)",
+    "cuda_sm100_tee": "NVIDIA B200 Confidential Computing (CC mode)",
+    "riscv_mips_s8200": "MIPS S8200 NPU (RISC-V agentic, sub-10W)",
+    "riscv_sifive_x160": "SiFive Intelligence X160 (scalar+vector+matrix)",
+    "riscv_xuantie_c930": "Alibaba XuanTie C930 (RISC-V + integrated NPU)",
+    "fpga_xilinx_vu9p": "Xilinx VU9P FPGA (decode-only, 10x cheaper/token)",
+    "amd_mi350x": "AMD MI350X (CDNA4, HBM3e, successor to MI300X)",
+    "qualcomm_cloud_ai100": "Qualcomm Cloud AI 100 Ultra (data center NPU)",
+    # ── v5.0 new targets ──────────────────────────────────────────────────────
+    "cuda_sm100_gb300": "NVIDIA GB300 Blackwell Ultra (1.5x B200 FP4, HBM3e+)",
+    "rocm_cdna5_mi455x": "AMD MI455X (CDNA5, 432 GB HBM4, 23.3 TB/s, MXFP6)",
+    "cpu_avx512_ternary": "x86_64 AVX2 Ternary (BitNet b1.58, ADD-only)",
+    "cpu_neon_ternary": "ARM NEON Ternary (BitNet b1.58, mobile/Apple M-series)",
+    "fpga_ternary": "FPGA BTC-LLM Ternary (0.8-1.58 bit, purpose-built circuits)",
+    "riscv_cervell": "Semidynamics Cervell (unified scalar/vector/tensor RISC-V NPU)",
 }
 """Mapping of target IDs to human-readable hardware descriptions."""
 
@@ -81,6 +96,7 @@ SUPPORTED_TARGET_IDS: frozenset[str] = frozenset(SUPPORTED_TARGETS.keys())
 """Set of all valid target IDs for validation."""
 
 BACKEND_BY_TARGET: dict[str, list[str]] = {
+    # v3.1
     "cuda_sm70": ["pytorch", "tensorrt-llm"],
     "cuda_sm80": ["vllm", "pytorch", "tensorrt-llm"],
     "cuda_sm89": ["vllm", "pytorch", "tensorrt-llm"],
@@ -95,6 +111,22 @@ BACKEND_BY_TARGET: dict[str, list[str]] = {
     "qualcomm_qnn": ["onnxruntime", "pytorch"],
     "cpu_avx512": ["llama.cpp", "onnxruntime", "pytorch"],
     "cpu_neon": ["llama.cpp", "onnxruntime", "pytorch"],
+    # v4.0
+    "cuda_sm130": ["vllm", "pytorch", "tensorrt-llm"],
+    "cuda_sm100_tee": ["pytorch"],   # TEE requires dedicated backend
+    "riscv_mips_s8200": ["onnxruntime"],
+    "riscv_sifive_x160": ["onnxruntime"],
+    "riscv_xuantie_c930": ["onnxruntime", "pytorch"],
+    "fpga_xilinx_vu9p": ["onnxruntime"],
+    "amd_mi350x": ["vllm", "pytorch"],
+    "qualcomm_cloud_ai100": ["onnxruntime", "pytorch"],
+    # v5.0
+    "cuda_sm100_gb300": ["vllm", "pytorch", "tensorrt-llm"],
+    "rocm_cdna5_mi455x": ["vllm", "pytorch"],
+    "cpu_avx512_ternary": ["bitnet.cpp", "llama.cpp"],
+    "cpu_neon_ternary": ["bitnet.cpp", "llama.cpp"],
+    "fpga_ternary": ["bitnet.cpp"],
+    "riscv_cervell": ["onnxruntime"],
 }
 """Priority-ordered backend candidates for each target."""
 
@@ -271,6 +303,101 @@ DEFAULT_SPARSE_ATTENTION_PASS: bool = True
 DEFAULT_PRUNING_PASS: bool = True
 """Whether pruning and sparsity mask planning is enabled by default."""
 
+# ── PRD v4.0 compiler pass defaults ───────────────────────────────────────────
+
+DEFAULT_MTP_HEAD_PASS: bool = True
+"""Pass 10: Enable native MTP head compilation by default."""
+
+DEFAULT_GRAMMAR_CONSTRAINT_PASS: bool = False
+"""Pass 11: Grammar constraint FSM pre-compilation — opt-in (schema required)."""
+
+DEFAULT_MODEL_MERGING_PASS: bool = False
+"""Pass 12: Model merging / task vector fusion — opt-in."""
+
+DEFAULT_TTT_PASS: bool = False
+"""Pass 13: TTT fast-weight injection — opt-in (requires fast-weight slots)."""
+
+DEFAULT_SEMANTIC_KV_PASS: bool = True
+"""Pass 14: Semantic KV compression — enabled by default."""
+
+DEFAULT_CROSS_LAYER_KV_PASS: bool = True
+"""Pass 15: Cross-layer KV sharing — enabled by default."""
+
+DEFAULT_GREEN_ENERGY_PASS: bool = False
+"""Pass 16: Green energy-aware compilation — opt-in (requires carbon API)."""
+
+DEFAULT_TEE_PASS: bool = False
+"""Pass 17: TEE enclave emission — opt-in (requires TEE hardware)."""
+
+# ── PRD v5.0 compiler pass defaults ───────────────────────────────────────────
+
+DEFAULT_MDLM_DRAFTER_PASS: bool = False
+"""Pass 18: MDLM diffusion drafter compilation — opt-in."""
+
+DEFAULT_SUB2BIT_PASS: bool = False
+"""Pass 19: Sub-2-bit ternary quantization — opt-in (requires BitNet checkpoint)."""
+
+DEFAULT_VIDEO_COMPRESSION_PASS: bool = True
+"""Pass 20: Video token compression — auto-detected for VLMs."""
+
+DEFAULT_ADVANCED_PEFT_PASS: bool = True
+"""Pass 21: Advanced PEFT compilation (LoRA+, LoRAMoE, MoLF) — enabled."""
+
+DEFAULT_RLVR_VERIFIER_PASS: bool = False
+"""Pass 22: RLVR verifier head injection — opt-in (training workflow only)."""
+
+# ── PRD v4.0 runtime defaults ─────────────────────────────────────────────────
+
+DEFAULT_P_EAGLE_ENGINE: bool = True
+"""R1: Enable P-EAGLE hardware-parallel speculative decoding."""
+
+DEFAULT_MULTI_AGENT_KV: bool = False
+"""R2: Multi-agent KV coordination — opt-in (requires session registry)."""
+
+DEFAULT_GRAMMAR_FSM_ENGINE: bool = False
+"""R3: Structured output grammar FSM engine — opt-in (requires pre-compiled FSM)."""
+
+DEFAULT_SLO_SCHEDULER: bool = True
+"""R4: SLO-aware adaptive scheduler — enabled by default."""
+
+DEFAULT_TTT_ENGINE: bool = False
+"""R5: TTT fast-weight engine — opt-in (requires compiled TTT slots)."""
+
+DEFAULT_MCP_INTEGRATION: bool = False
+"""R6: MCP native integration layer — opt-in (requires MCP server config)."""
+
+DEFAULT_GREEN_POWER_MANAGER: bool = False
+"""R7: Green inference power manager — opt-in."""
+
+DEFAULT_TEE_RUNTIME: bool = False
+"""R8: Confidential inference TEE runtime — opt-in (requires CC-mode hardware)."""
+
+# ── PRD v5.0 runtime defaults ─────────────────────────────────────────────────
+
+DEFAULT_DIFFUSION_SPEC_ENGINE: bool = False
+"""R9: Diffusion speculative decoding engine — opt-in."""
+
+DEFAULT_KV_TRANSFER_ENGINE: str = "nixl"
+"""R10: KV network transfer engine: nixl|uccl|rdma|nvlink|cxl."""
+
+DEFAULT_NIKA_POLICY: bool = True
+"""R10: NIKA adaptive transfer-vs-recompute policy — enabled by default."""
+
+DEFAULT_SEMANTIC_CACHE: bool = False
+"""R11: Semantic request cache — opt-in."""
+
+DEFAULT_SEMANTIC_CACHE_THRESHOLD: float = 0.92
+"""R11: Cosine similarity threshold for semantic cache hit (0.0-1.0)."""
+
+DEFAULT_SEMANTIC_CACHE_SIZE: int = 100_000
+"""R11: Maximum HNSW index entries for semantic cache."""
+
+DEFAULT_CXL_KV_POOL: bool = False
+"""R12: CXL rack-scale KV pool — opt-in (requires CXL 3.0 hardware)."""
+
+DEFAULT_CXL_POOL_SIZE_GB: int = 512
+"""R12: Default CXL pool size in GB."""
+
 # ── Runtime defaults ───────────────────────────────────────────────────────────
 
 DEFAULT_OPTIMIZE_FOR: str = "latency"
@@ -327,40 +454,54 @@ PRECISION_SIZES_BYTES: dict[str, float] = {
     "FP8": 1.0,
     "Q8_0": 1.0,
     "Q6_K": 0.75,
+    "MXFP6": 0.75,     # 6 bits / 8 = 0.75 bytes (PRD v5.0 AMD MI455X)
     "Q4_K_M": 0.5,
     "Q4_0": 0.5,
     "Q3_K": 0.375,
     "Q3_K_S": 0.375,
     "IQ3_XS": 0.375,
+    "IQ2_XXS": 0.25,
     "Q2_K": 0.25,
+    "Q2_K_S": 0.25,
     "INT4": 0.5,
     "FP4": 0.5,
     "NVFP4": 0.5,
     "MXFP4": 0.5,
     "INT8": 1.0,
     "INT16": 2.0,
+    # Sub-2-bit (PRD v5.0 Pass 19)
+    "TERNARY": 0.25,   # 2 bits packed storage per ternary weight (4 per byte)
+    "BINARY": 0.125,   # ~1 bit effective; stored as codebook index
+    "NANOQ": 0.125,    # sub-1-bit trellis; stored as codebook index
 }
 """Memory size in bytes per element for each precision format."""
 
-PRECISION_BITS: dict[str, int] = {
+PRECISION_BITS: dict[str, float] = {
     "BF16": 16,
     "FP16": 16,
     "FP32": 32,
     "FP8": 8,
     "Q8_0": 8,
+    "MXFP6": 6,        # AMD MI455X CDNA5 native format (PRD v5.0)
     "Q6_K": 6,
     "Q4_K_M": 4,
     "Q4_0": 4,
     "Q3_K": 3,
     "Q3_K_S": 3,
     "IQ3_XS": 3,
+    "IQ2_XXS": 2,
     "Q2_K": 2,
+    "Q2_K_S": 2,
     "INT4": 4,
     "FP4": 4,
     "NVFP4": 4,
     "MXFP4": 4,
     "INT8": 8,
     "INT16": 16,
+    # Sub-2-bit (PRD v5.0 Pass 19)
+    "TERNARY": 1.58,   # log2(3) — information content of one ternary symbol
+    "BINARY": 1.0,     # 1 bit per weight (binary codebook)
+    "NANOQ": 0.9,      # approximate; codebook size dependent
 }
 """Effective bit width of each precision format."""
 

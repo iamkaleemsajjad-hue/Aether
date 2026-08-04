@@ -130,3 +130,251 @@ jobs:
         run: pip install -e .[test]
       - name: Validate v3.1 runtime layers
         run: pytest tests/unit/test_v31_runtime_layers.py --no-cov
+
+
+  # ── PRD v4.0 + v5.0 CI jobs ─────────────────────────────────────────────────
+
+  v40-pass-contract:
+    name: PRD v4.0+v5.0 — Optimizer Pass Contract (Passes 10–22)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: Run PRD v4.0+v5.0 optimizer pass tests
+        run: |
+          pytest tests/test_passes_v2.py -v \
+            --tb=short \
+            --junitxml=test-results-passes-v2.xml
+      - name: Upload pass test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-passes-v2
+          path: test-results-passes-v2.xml
+
+  v40-runtime-layer-contract:
+    name: PRD v4.0+v5.0 — Runtime Layer Contract (R1–R12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: Run PRD v4.0+v5.0 runtime layer tests
+        run: |
+          pytest tests/test_runtime_v2.py -v \
+            --tb=short \
+            --junitxml=test-results-runtime-v2.xml
+      - name: Upload runtime test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-runtime-v2
+          path: test-results-runtime-v2.xml
+
+  v40-pipeline-smoke:
+    name: PRD v4.0+v5.0 — Full Pipeline Smoke Test (22 passes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: Verify 22 passes registered in OptimizerPipeline
+        run: |
+          python -c "
+          from aether.compiler.stage2_optimizer.optimizer import OptimizerPipeline
+          p = OptimizerPipeline()
+          assert p.pass_count == 22, f'Expected 22 passes, got {p.pass_count}'
+          print(f'OK: OptimizerPipeline has {p.pass_count} passes registered.')
+          "
+      - name: Verify R1–R12 importable from aether.runtime
+        run: |
+          python -c "
+          from aether.runtime import (
+            PEAGLEEngine, MultiAgentKVCoordinator, GrammarFSMEngine,
+            SLOScheduler, TTTFastWeightEngine, MCPIntegrationLayer,
+            GreenPowerManager, TEERuntimeManager, Sub2BitKVWeightCache,
+            VideoFrameKVManager, SemanticKVCache, RLVRTrainingHarness,
+          )
+          print('OK: All 12 PRD v4.0+v5.0 runtime layers importable.')
+          "
+      - name: Run full pipeline with all-default config
+        run: |
+          pytest tests/test_passes_v2.py::TestOptimizerPipelineIntegration \
+            -v --tb=short --no-cov
+
+  v40-algorithm-correctness:
+    name: PRD v4.0+v5.0 — Algorithm Correctness (Pure-Math Tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: Run algorithm-specific tests
+        run: |
+          pytest \
+            tests/test_passes_v2.py::TestPass14SemanticKV::test_cosine_similarity_unit_vectors \
+            tests/test_passes_v2.py::TestPass14SemanticKV::test_chunk_kv_compress_reduces \
+            tests/test_passes_v2.py::TestPass14SemanticKV::test_sentence_kv_compress \
+            tests/test_passes_v2.py::TestPass18MDLM::test_cosine_schedule_bounds \
+            tests/test_passes_v2.py::TestPass18MDLM::test_cosine_schedule_monotone \
+            tests/test_passes_v2.py::TestPass19Sub2Bit::test_bitnet_ternary_values \
+            tests/test_passes_v2.py::TestPass21PEFT::test_lora_plus_scaling \
+            tests/test_runtime_v2.py::TestR1PEAGLEEngine::test_softmax_single \
+            tests/test_runtime_v2.py::TestR1PEAGLEEngine::test_throughput_multiplier_positive \
+            tests/test_runtime_v2.py::TestR9Sub2BitKVCache::test_ternary_roundtrip \
+            tests/test_runtime_v2.py::TestR12RLVRHarness::test_grpo_advantages_sum_near_zero \
+            tests/test_runtime_v2.py::TestR12RLVRHarness::test_pass_at_k_all_correct \
+            tests/test_runtime_v2.py::TestR12RLVRHarness::test_pass_at_k_none_correct \
+            -v --tb=short
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint and typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[lint,test]"
+
+      - name: Run ruff linter
+        run: ruff check src tests examples benchmarks scripts
+
+      - name: Run ruff format check
+        run: ruff format --check src tests examples benchmarks scripts
+
+      - name: Run mypy typecheck
+        run: mypy src/aether
+
+  unit-tests:
+    name: Unit tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Run unit tests
+        run: pytest tests/unit -m "not slow" --junitxml=test-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.os }}-${{ matrix.python-version }}
+          path: test-results.xml
+
+  docs-build:
+    name: Build documentation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[docs]"
+
+      - name: Build docs
+        run: sphinx-build -W -b html docs docs/_build/html
+
+      - name: Upload docs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-html
+          path: docs/_build/html
+
+
+  v31-artifact-contract:
+    name: AEG v3.1 artifact contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Verify v3.1 package artifacts
+        run: pytest tests/unit/test_v31_features.py::test_compiled_package_contains_v31_artifacts --no-cov
+
+
+  v31-runtime-layer-contract:
+    name: PRD v3.1 Runtime Layer Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: pip install -e .[test]
+      - name: Validate v3.1 runtime layers
+        run: pytest tests/unit/test_v31_runtime_layers.py --no-cov

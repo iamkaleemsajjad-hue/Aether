@@ -432,3 +432,167 @@ When changing agentic, observability, fleet, distillation, CUDA graph, MLA, EAGL
 - Keep generated package contracts backward-compatible with `AEGPackage.load()`.
 - Avoid network-dependent tests; use local synthetic traces, architectures, and telemetry snapshots.
 - Update `docs/aeg-format.md` when a new artifact path is added to `manifest.artifacts`.
+
+
+---
+
+## Authoring PRD v4.0 + v5.0 Optimizer Passes (Passes 10–22)
+
+Each new optimizer pass follows the pattern established by passes 10–22.
+
+### Pass File Structure
+
+Create `src/aether/compiler/stage2_optimizer/pass{N}_{name}.py`:
+
+```python
+"""
+Pass N — Short Title.
+
+Module-level docstring with:
+  - Algorithm description referencing specific research papers.
+  - AEG artifacts written (paths under .aeg/).
+  - Performance targets from benchmarks.
+
+Research basis: cite arXiv IDs or paper titles.
+"""
+
+from __future__ import annotations
+from aether.utils.logging import get_logger
+logger = get_logger(__name__)
+
+class MyNewPass:
+    """Single-sentence summary.
+
+    Longer description with key algorithm details.
+    """
+
+    PASS_NAME = "my_new_pass"          # Must be unique across all passes.
+    PASS_VERSION = "1.0"
+
+    def run(self, graph, arch: dict, config) -> tuple[Any, PassReport]:
+        """Required signature — all passes must implement this."""
+        if not getattr(config, "enable_my_pass", False):
+            return graph, PassReport(pass_name=self.PASS_NAME, status="skipped", ...)
+
+        try:
+            # Implementation here.
+            ...
+            return graph, PassReport(pass_name=self.PASS_NAME, status="ok", ...)
+        except Exception as exc:
+            return graph, PassReport(pass_name=self.PASS_NAME, status="failed", ...)
+```
+
+### Required Elements for Every New Pass
+
+1. **Config flag**: Add `enable_my_pass: bool = False` to `CompilerConfig` (opt-in by default).
+2. **Skip path**: Return `status="skipped"` when `enable_my_pass=False`.
+3. **AEG artifact**: Write JSON/binary output to `{output_dir}/<category>/<artifact>.json`.
+4. **Opcode emission**: Add `aeg.my_opcode` metadata to the graph.
+5. **PassReport**: Always return a `PassReport` — never raise exceptions from `run()`.
+6. **Registration**: Register in `OptimizerPipeline.__init__()` with the correct ordering.
+7. **Tests**: Add tests to `tests/test_passes_v2.py`:
+   - Smoke test (runs without exception).
+   - Skip-when-disabled test.
+   - Core algorithm correctness test (pure-Python, no GPU).
+   - AEG artifact written test.
+
+### AEG Artifact Conventions
+
+| Category | Path pattern | Used by |
+|----------|-------------|---------|
+| Speculation | `.aeg/speculation/` | R1 P-EAGLE |
+| Grammar | `.aeg/grammar/` | R3 FSM |
+| Graph plans | `.aeg/graph/` | R2, R10 |
+| Diffusion | `.aeg/diffusion/` | — |
+| Quantization | `.aeg/quantization/` | R9 |
+| Adapters | `.aeg/adapters/` | — |
+| Metadata | `.aeg/metadata/` | R7 |
+| Security | `.aeg/security/` | R8 |
+| Training | `.aeg/training/` | R12 |
+| TTT | `.aeg/ttt/` | R5 |
+
+All artifact JSON files should contain at minimum:
+```json
+{
+  "pass_name": "my_new_pass",
+  "pass_version": "1.0",
+  "generated_at": "ISO-8601 timestamp",
+  ...
+}
+```
+
+---
+
+## Authoring PRD v4.0 + v5.0 Runtime Layers (R1–R12 Pattern)
+
+### Runtime Layer File Structure
+
+Create `src/aether/runtime/r{N}_{name}.py`:
+
+```python
+"""
+R{N} — Short Title.
+
+Module-level docstring covering:
+  - What the layer does.
+  - Which AEG artifact it loads (if any).
+  - Performance targets.
+  - Research basis.
+"""
+
+from __future__ import annotations
+from aether.utils.logging import get_logger
+logger = get_logger(__name__)
+
+class MyRuntimeLayer:
+    def __init__(self, config_path: str | None = None) -> None:
+        self._config: dict = {}
+        self._stats = _MyLayerStats()
+        if config_path:
+            self._load_config(config_path)
+
+    def _load_config(self, path: str) -> None:
+        """Load AEG artifact config. Fail gracefully if not found."""
+        ...
+
+    # Public API methods go here.
+
+    @property
+    def stats(self) -> "_MyLayerStats":
+        return self._stats
+
+    def summary(self) -> dict:
+        return {... }  # JSON-serializable dict.
+
+
+class _MyLayerStats:
+    """Internal stats (use __slots__ for memory efficiency)."""
+    __slots__ = ("field_a", "field_b")
+
+    def __init__(self) -> None:
+        self.field_a = 0
+        self.field_b = 0.0
+```
+
+### Required Elements for Every New Runtime Layer
+
+1. **AEG config loading**: Load from the AEG artifact if path is provided; fail gracefully.
+2. **Thread safety**: Use `threading.RLock()` for any shared mutable state.
+3. **Stats object**: `_Stats` class with `__slots__` tracking key metrics.
+4. **`summary()` method**: Returns a JSON-serializable dict for telemetry.
+5. **Export**: Add to `src/aether/runtime/__init__.py` `__all__`.
+6. **Tests**: Add to `tests/test_runtime_v2.py`:
+   - Config loading test.
+   - Core algorithm test (pure-Python inputs, no GPU).
+   - Edge case tests (empty inputs, missing config, etc.).
+   - `summary()` key presence test.
+
+### Algorithm Standards
+
+All algorithm implementations must:
+
+- Be **self-contained**: no mandatory external dependencies. Optional dependencies
+  (e.g., `hnswlib`, `sympy`) are welcome but must degrade gracefully.
+- Have **pure-Python correctness tests**: the algorithm must be testable without GPU.
+- Reference the **research paper** in module docstring with arXiv ID or full citation.
+- Match the **mathematical specification** in the PRD (not just approximate it).

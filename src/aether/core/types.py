@@ -27,6 +27,10 @@ class DType(enum.Enum):
     FP16 = "fp16"
     FP32 = "fp32"
     FP8 = "fp8"
+    FP4 = "fp4"
+    """4-bit floating point (NVFP4 / MXFP4 family)."""
+    MXFP6 = "mxfp6"
+    """6-bit floating point — AMD MI455X CDNA5 format (between FP8 and FP4)."""
     INT4 = "int4"
     INT8 = "int8"
     INT16 = "int16"
@@ -36,14 +40,28 @@ class DType(enum.Enum):
     UINT16 = "uint16"
     BOOL = "bool"
     FLOAT = "float32"
+    # Sub-2-bit formats — BitNet b1.58 / BTC-LLM / NanoQuant (PRD v5.0 Pass 19)
+    TERNARY = "ternary"
+    """1.58-bit ternary weights {-1, 0, +1} — BitNet b1.58 format.  Stored packed
+    as 2 bits per weight: 00=-1, 01=0, 10=+1.  Requires addition-only kernels."""
+    BINARY = "binary"
+    """~0.8-1.11-bit binary codebook format — BTC-LLM / NanoQuant.  Weights stored
+    as indices into a learned binary codebook."""
 
     def byte_size(self) -> int:
-        """Return the number of bytes per element of this dtype."""
+        """Return the number of bytes per element of this dtype.
+
+        For sub-2-bit types (TERNARY, BINARY) this returns the packed storage
+        byte size.  Actual effective bits per weight are fractional; callers
+        that need fractional precision should use `bits_per_element()` instead.
+        """
         mapping = {
             DType.BF16: 2,
             DType.FP16: 2,
             DType.FP32: 4,
             DType.FP8: 1,
+            DType.FP4: 1,      # two FP4 values packed per byte
+            DType.MXFP6: 1,    # ceiling; actual: 0.75 bytes per element
             DType.INT4: 1,
             DType.INT8: 1,
             DType.INT16: 2,
@@ -53,12 +71,14 @@ class DType(enum.Enum):
             DType.UINT16: 2,
             DType.BOOL: 1,
             DType.FLOAT: 4,
+            DType.TERNARY: 1,  # 4 ternary values packed per byte (2 bits each)
+            DType.BINARY: 1,   # codebook index; size depends on codebook
         }
         return mapping[self]
 
     def is_floating_point(self) -> bool:
         """Return True if this dtype is a floating-point type."""
-        return self in (DType.BF16, DType.FP16, DType.FP32, DType.FP8, DType.FLOAT)
+        return self in (DType.BF16, DType.FP16, DType.FP32, DType.FP8, DType.FP4, DType.MXFP6, DType.FLOAT)
 
     def is_integer(self) -> bool:
         """Return True if this dtype is an integer type."""
@@ -66,11 +86,38 @@ class DType(enum.Enum):
 
     def is_quantized(self) -> bool:
         """Return True if this dtype represents a quantized format."""
-        return self == DType.INT4 or self == DType.INT8
+        return self in (DType.INT4, DType.INT8, DType.TERNARY, DType.BINARY)
 
-    def bits_per_element(self) -> int:
-        """Return the number of bits per element for this dtype."""
-        return self.byte_size() * 8
+    def is_sub2bit(self) -> bool:
+        """Return True if this dtype is a sub-2-bit quantized format (PRD v5.0)."""
+        return self in (DType.TERNARY, DType.BINARY)
+
+    def bits_per_element(self) -> float:
+        """Return the effective number of bits per element for this dtype.
+
+        For sub-2-bit types this returns the true fractional bit count rather
+        than the packed storage size returned by `byte_size()`.
+        """
+        mapping: dict[DType, float] = {
+            DType.BF16: 16.0,
+            DType.FP16: 16.0,
+            DType.FP32: 32.0,
+            DType.FP8: 8.0,
+            DType.FP4: 4.0,
+            DType.MXFP6: 6.0,
+            DType.INT4: 4.0,
+            DType.INT8: 8.0,
+            DType.INT16: 16.0,
+            DType.INT32: 32.0,
+            DType.INT64: 64.0,
+            DType.UINT8: 8.0,
+            DType.UINT16: 16.0,
+            DType.BOOL: 1.0,
+            DType.FLOAT: 32.0,
+            DType.TERNARY: 1.58,  # log2(3) — information content of ternary symbol
+            DType.BINARY: 1.0,    # 1 bit per codebook-selected weight
+        }
+        return mapping[self]
 
     def __str__(self) -> str:
         return self.value
@@ -89,6 +136,9 @@ class DType(enum.Enum):
             "float": DType.FP32,
             "fp8": DType.FP8,
             "float8": DType.FP8,
+            "fp4": DType.FP4,
+            "float4": DType.FP4,
+            "mxfp6": DType.MXFP6,
             "int4": DType.INT4,
             "int8": DType.INT8,
             "int16": DType.INT16,
@@ -97,10 +147,15 @@ class DType(enum.Enum):
             "uint8": DType.UINT8,
             "uint16": DType.UINT16,
             "bool": DType.BOOL,
+            "ternary": DType.TERNARY,
+            "bitnet": DType.TERNARY,
+            "int158": DType.TERNARY,
+            "binary": DType.BINARY,
+            "btc": DType.BINARY,
         }
         result = mapping.get(normalized)
         if result is None:
-            msg = f"Unknown dtype: {value}"
+            msg = f"Unknown dtype: {value!r}. Valid values: {sorted(mapping)}"
             raise ValueError(msg)
         return result
 
@@ -121,6 +176,8 @@ class Precision(enum.Enum):
     FP4 = "FP4"
     NVFP4 = "NVFP4"
     MXFP4 = "MXFP4"
+    MXFP6 = "MXFP6"
+    """6-bit floating point — AMD MI455X CDNA5 (PRD v5.0 Pass 3/19)."""
     Q8_0 = "Q8_0"
     Q6_K = "Q6_K"
     Q4_K_M = "Q4_K_M"
@@ -130,33 +187,50 @@ class Precision(enum.Enum):
     IQ3_XS = "IQ3_XS"
     Q2_K = "Q2_K"
     Q2_K_S = "Q2_K_S"
+    IQ2_XXS = "IQ2_XXS"
     INT4 = "INT4"
     INT8 = "INT8"
+    # Sub-2-bit formats (PRD v5.0 Pass 19)
+    TERNARY = "TERNARY"
+    """BitNet b1.58 ternary {-1, 0, +1} — 1.58 bits per weight."""
+    BINARY = "BINARY"
+    """BTC-LLM binary codebook — 0.8-1.11 bits per weight."""
+    NANOQ = "NANOQ"
+    """NanoQuant trellis codebook — sub-1-bit per weight."""
 
     @property
-    def bit_width(self) -> int:
-        """Return the effective bit width of this precision format."""
-        mapping = {
-            Precision.BF16: 16,
-            Precision.FP16: 16,
-            Precision.FP32: 32,
-            Precision.FP8: 8,
-            Precision.FP8_E4M3: 8,
-            Precision.FP8_E5M2: 8,
-            Precision.FP4: 4,
-            Precision.NVFP4: 4,
-            Precision.MXFP4: 4,
-            Precision.Q8_0: 8,
-            Precision.Q6_K: 6,
-            Precision.Q4_K_M: 4,
-            Precision.Q4_0: 4,
-            Precision.Q3_K: 3,
-            Precision.Q3_K_S: 3,
-            Precision.IQ3_XS: 3,
-            Precision.Q2_K: 2,
-            Precision.Q2_K_S: 2,
-            Precision.INT4: 4,
-            Precision.INT8: 8,
+    def bit_width(self) -> float:
+        """Return the effective bit width of this precision format.
+
+        For sub-2-bit formats (TERNARY, BINARY, NANOQ) this is a fractional
+        value representing the information-theoretic bit cost per weight.
+        """
+        mapping: dict[Precision, float] = {
+            Precision.BF16: 16.0,
+            Precision.FP16: 16.0,
+            Precision.FP32: 32.0,
+            Precision.FP8: 8.0,
+            Precision.FP8_E4M3: 8.0,
+            Precision.FP8_E5M2: 8.0,
+            Precision.FP4: 4.0,
+            Precision.NVFP4: 4.0,
+            Precision.MXFP4: 4.0,
+            Precision.MXFP6: 6.0,
+            Precision.Q8_0: 8.0,
+            Precision.Q6_K: 6.0,
+            Precision.Q4_K_M: 4.0,
+            Precision.Q4_0: 4.0,
+            Precision.Q3_K: 3.0,
+            Precision.Q3_K_S: 3.0,
+            Precision.IQ3_XS: 3.0,
+            Precision.Q2_K: 2.0,
+            Precision.Q2_K_S: 2.0,
+            Precision.IQ2_XXS: 2.0,
+            Precision.INT4: 4.0,
+            Precision.INT8: 8.0,
+            Precision.TERNARY: 1.58,   # log2(3)
+            Precision.BINARY: 1.0,
+            Precision.NANOQ: 0.9,      # approximate; depends on codebook size
         }
         return mapping[self]
 
@@ -167,11 +241,23 @@ class Precision(enum.Enum):
 
     def is_quantized(self) -> bool:
         """Return True if this is a quantized precision format."""
-        return self.value.startswith("Q") or self.value.startswith("I")
+        return (
+            self.value.startswith("Q")
+            or self.value.startswith("I")
+            or self in (Precision.TERNARY, Precision.BINARY, Precision.NANOQ)
+        )
+
+    def is_sub2bit(self) -> bool:
+        """Return True if this is a sub-2-bit precision (PRD v5.0 Pass 19)."""
+        return self in (Precision.TERNARY, Precision.BINARY, Precision.NANOQ)
 
     def is_floating_point(self) -> bool:
         """Return True if this is a floating-point precision."""
-        return self in (Precision.BF16, Precision.FP16, Precision.FP32, Precision.FP8, Precision.FP8_E4M3, Precision.FP8_E5M2)
+        return self in (
+            Precision.BF16, Precision.FP16, Precision.FP32,
+            Precision.FP8, Precision.FP8_E4M3, Precision.FP8_E5M2,
+            Precision.FP4, Precision.NVFP4, Precision.MXFP4, Precision.MXFP6,
+        )
 
     def to_dtype(self) -> DType:
         """Convert this precision to an approximate AEG-IR DType."""
@@ -282,8 +368,13 @@ class MemoryLayout(enum.Enum):
 
 
 class HardwareTarget(enum.Enum):
-    """Identifiers for supported hardware targets."""
+    """Identifiers for supported hardware targets.
 
+    Values follow the naming scheme: ``{backend}_{architecture}``.
+    Targets added for PRD v4.0 are marked (v4.0); PRD v5.0 targets (v5.0).
+    """
+
+    # ── v3.1 targets (already implemented) ────────────────────────────────────
     CUDA_SM70 = "cuda_sm70"
     CUDA_SM80 = "cuda_sm80"
     CUDA_SM89 = "cuda_sm89"
@@ -299,65 +390,179 @@ class HardwareTarget(enum.Enum):
     CPU_AVX512 = "cpu_avx512"
     CPU_NEON = "cpu_neon"
 
+    # ── v4.0 new hardware targets ──────────────────────────────────────────────
+    CUDA_SM130 = "cuda_sm130"
+    """NVIDIA Rubin Ultra 2027 — dual Rubin cores, ~100 PFLOPS FP4 (future)."""
+    CUDA_SM100_TEE = "cuda_sm100_tee"
+    """NVIDIA B200 Confidential Computing mode — encrypted weights + activations."""
+    RISCV_MIPS_S8200 = "riscv_mips_s8200"
+    """MIPS S8200 agentic NPU — RISC-V, sub-10W, battery-powered edge."""
+    RISCV_SIFIVE_X160 = "riscv_sifive_x160"
+    """SiFive Intelligence X160 — unified scalar+vector+matrix RISC-V ISA."""
+    RISCV_XUANTIE_C930 = "riscv_xuantie_c930"
+    """Alibaba XuanTie C930 — high-perf RISC-V + integrated NPU, robotics."""
+    FPGA_XILINX_VU9P = "fpga_xilinx_vu9p"
+    """Xilinx VU9P FPGA — decode-only target, 10x lower cost-per-token vs GPU."""
+    AMD_MI350X = "amd_mi350x"
+    """AMD MI350X CDNA4 — HBM3e, successor to MI300X."""
+    QUALCOMM_CLOUD_AI100 = "qualcomm_cloud_ai100"
+    """Qualcomm Cloud AI 100 Ultra — data center NPU."""
+
+    # ── v5.0 new hardware targets ──────────────────────────────────────────────
+    CUDA_SM100_GB300 = "cuda_sm100_gb300"
+    """NVIDIA GB300 Blackwell Ultra — 1.5x B200 FP4 throughput, HBM3e+."""
+    ROCM_CDNA5_MI455X = "rocm_cdna5_mi455x"
+    """AMD MI455X CDNA5 — 432 GB HBM4, 23.3 TB/s, MXFP6 precision format."""
+    CPU_AVX512_TERNARY = "cpu_avx512_ternary"
+    """x86 AVX2 addition-only ternary kernels — BitNet b1.58, no multiply."""
+    CPU_NEON_TERNARY = "cpu_neon_ternary"
+    """ARM NEON addition-only ternary kernels — mobile, Apple M-series."""
+    FPGA_TERNARY = "fpga_ternary"
+    """Generic FPGA BTC-LLM purpose-built addition circuits, 0.8-1.58 bit."""
+    RISCV_CERVELL = "riscv_cervell"
+    """Semidynamics Cervell — unified scalar/vector/tensor RISC-V NPU."""
+
     @property
     def vendor(self) -> str:
         """Return the vendor name for this target."""
-        return {
+        _vendors: dict[HardwareTarget, str] = {
             HardwareTarget.CUDA_SM70: "NVIDIA",
             HardwareTarget.CUDA_SM80: "NVIDIA",
             HardwareTarget.CUDA_SM89: "NVIDIA",
             HardwareTarget.CUDA_SM90: "NVIDIA",
             HardwareTarget.CUDA_SM100: "NVIDIA",
             HardwareTarget.CUDA_SM120: "NVIDIA",
+            HardwareTarget.CUDA_SM130: "NVIDIA",
+            HardwareTarget.CUDA_SM100_TEE: "NVIDIA",
+            HardwareTarget.CUDA_SM100_GB300: "NVIDIA",
             HardwareTarget.METAL_M1: "Apple",
             HardwareTarget.METAL_M3: "Apple",
             HardwareTarget.ROCM_RDNA3: "AMD",
             HardwareTarget.ROCM_CDNA3: "AMD",
+            HardwareTarget.AMD_MI350X: "AMD",
+            HardwareTarget.ROCM_CDNA5_MI455X: "AMD",
             HardwareTarget.OPENVINO_NPU: "Intel",
             HardwareTarget.QUALCOMM_QNN: "Qualcomm",
+            HardwareTarget.QUALCOMM_CLOUD_AI100: "Qualcomm",
             HardwareTarget.CPU_AVX512: "CPU",
             HardwareTarget.CPU_NEON: "CPU",
-        }[self]
+            HardwareTarget.CPU_AVX512_TERNARY: "CPU",
+            HardwareTarget.CPU_NEON_TERNARY: "CPU",
+            HardwareTarget.RISCV_MIPS_S8200: "MIPS",
+            HardwareTarget.RISCV_SIFIVE_X160: "SiFive",
+            HardwareTarget.RISCV_XUANTIE_C930: "Alibaba",
+            HardwareTarget.RISCV_CERVELL: "Semidynamics",
+            HardwareTarget.FPGA_XILINX_VU9P: "Xilinx",
+            HardwareTarget.FPGA_TERNARY: "FPGA",
+        }
+        return _vendors[self]
 
     @property
     def display_name(self) -> str:
         """Return a human-readable display name for this target."""
-        return {
+        _names: dict[HardwareTarget, str] = {
             HardwareTarget.CUDA_SM70: "NVIDIA V100 (Volta)",
             HardwareTarget.CUDA_SM80: "NVIDIA A100 (Ampere)",
             HardwareTarget.CUDA_SM89: "NVIDIA RTX 4090 (Ada)",
             HardwareTarget.CUDA_SM90: "NVIDIA H100 (Hopper)",
             HardwareTarget.CUDA_SM100: "NVIDIA B200 (Blackwell)",
-            HardwareTarget.CUDA_SM120: "NVIDIA Rubin (future)",
+            HardwareTarget.CUDA_SM120: "NVIDIA Rubin R100 (sm_120)",
+            HardwareTarget.CUDA_SM130: "NVIDIA Rubin Ultra (sm_130)",
+            HardwareTarget.CUDA_SM100_TEE: "NVIDIA B200 Confidential Computing",
+            HardwareTarget.CUDA_SM100_GB300: "NVIDIA GB300 Blackwell Ultra",
             HardwareTarget.METAL_M1: "Apple M1/M2",
             HardwareTarget.METAL_M3: "Apple M3/M4/M5",
-            HardwareTarget.ROCM_RDNA3: "AMD RX 7000 Series",
-            HardwareTarget.ROCM_CDNA3: "AMD MI300X",
-            HardwareTarget.OPENVINO_NPU: "Intel Arc NPU",
-            HardwareTarget.QUALCOMM_QNN: "Qualcomm Snapdragon NPU",
+            HardwareTarget.ROCM_RDNA3: "AMD RX 7000 Series (RDNA3)",
+            HardwareTarget.ROCM_CDNA3: "AMD MI300X (CDNA3)",
+            HardwareTarget.AMD_MI350X: "AMD MI350X (CDNA4)",
+            HardwareTarget.ROCM_CDNA5_MI455X: "AMD MI455X (CDNA5, 432 GB HBM4)",
+            HardwareTarget.OPENVINO_NPU: "Intel Arc NPU (OpenVINO)",
+            HardwareTarget.QUALCOMM_QNN: "Qualcomm Snapdragon NPU (QNN)",
+            HardwareTarget.QUALCOMM_CLOUD_AI100: "Qualcomm Cloud AI 100 Ultra",
             HardwareTarget.CPU_AVX512: "x86_64 (AVX-512)",
             HardwareTarget.CPU_NEON: "ARM (NEON SIMD)",
-        }[self]
+            HardwareTarget.CPU_AVX512_TERNARY: "x86_64 AVX2 Ternary (BitNet b1.58)",
+            HardwareTarget.CPU_NEON_TERNARY: "ARM NEON Ternary (BitNet b1.58)",
+            HardwareTarget.RISCV_MIPS_S8200: "MIPS S8200 NPU (RISC-V, sub-10W)",
+            HardwareTarget.RISCV_SIFIVE_X160: "SiFive Intelligence X160",
+            HardwareTarget.RISCV_XUANTIE_C930: "Alibaba XuanTie C930 RISC-V NPU",
+            HardwareTarget.RISCV_CERVELL: "Semidynamics Cervell RISC-V NPU",
+            HardwareTarget.FPGA_XILINX_VU9P: "Xilinx VU9P FPGA (decode-only)",
+            HardwareTarget.FPGA_TERNARY: "FPGA BTC-LLM Ternary (sub-2-bit)",
+        }
+        return _names[self]
 
     @property
     def backend_candidates(self) -> list[str]:
         """Return priority-ordered candidate backend names for this target."""
-        return {
+        _candidates: dict[HardwareTarget, list[str]] = {
             HardwareTarget.CUDA_SM70: ["pytorch", "tensorrt-llm"],
             HardwareTarget.CUDA_SM80: ["vllm", "pytorch", "tensorrt-llm"],
             HardwareTarget.CUDA_SM89: ["vllm", "pytorch", "tensorrt-llm"],
             HardwareTarget.CUDA_SM90: ["vllm", "pytorch", "tensorrt-llm"],
             HardwareTarget.CUDA_SM100: ["vllm", "pytorch", "tensorrt-llm"],
             HardwareTarget.CUDA_SM120: ["vllm", "pytorch", "tensorrt-llm"],
+            HardwareTarget.CUDA_SM130: ["vllm", "pytorch", "tensorrt-llm"],
+            HardwareTarget.CUDA_SM100_TEE: ["pytorch"],  # TEE requires bespoke backend
+            HardwareTarget.CUDA_SM100_GB300: ["vllm", "pytorch", "tensorrt-llm"],
             HardwareTarget.METAL_M1: ["mlx", "llama.cpp", "pytorch"],
             HardwareTarget.METAL_M3: ["mlx", "llama.cpp", "pytorch"],
             HardwareTarget.ROCM_RDNA3: ["pytorch", "llama.cpp"],
             HardwareTarget.ROCM_CDNA3: ["vllm", "pytorch"],
+            HardwareTarget.AMD_MI350X: ["vllm", "pytorch"],
+            HardwareTarget.ROCM_CDNA5_MI455X: ["vllm", "pytorch"],
             HardwareTarget.OPENVINO_NPU: ["onnxruntime", "pytorch"],
             HardwareTarget.QUALCOMM_QNN: ["onnxruntime", "pytorch"],
+            HardwareTarget.QUALCOMM_CLOUD_AI100: ["onnxruntime", "pytorch"],
             HardwareTarget.CPU_AVX512: ["llama.cpp", "onnxruntime", "pytorch"],
             HardwareTarget.CPU_NEON: ["llama.cpp", "onnxruntime", "pytorch"],
-        }[self]
+            HardwareTarget.CPU_AVX512_TERNARY: ["bitnet.cpp", "llama.cpp"],
+            HardwareTarget.CPU_NEON_TERNARY: ["bitnet.cpp", "llama.cpp"],
+            HardwareTarget.RISCV_MIPS_S8200: ["onnxruntime"],
+            HardwareTarget.RISCV_SIFIVE_X160: ["onnxruntime"],
+            HardwareTarget.RISCV_XUANTIE_C930: ["onnxruntime", "pytorch"],
+            HardwareTarget.RISCV_CERVELL: ["onnxruntime"],
+            HardwareTarget.FPGA_XILINX_VU9P: ["onnxruntime"],
+            HardwareTarget.FPGA_TERNARY: ["bitnet.cpp"],
+        }
+        return _candidates[self]
+
+    @property
+    def supports_ternary(self) -> bool:
+        """Return True if this target supports BitNet b1.58 ternary kernels."""
+        return self in (
+            HardwareTarget.CPU_AVX512_TERNARY,
+            HardwareTarget.CPU_NEON_TERNARY,
+            HardwareTarget.FPGA_TERNARY,
+        )
+
+    @property
+    def supports_mxfp6(self) -> bool:
+        """Return True if this target natively supports MXFP6 precision."""
+        return self == HardwareTarget.ROCM_CDNA5_MI455X
+
+    @property
+    def is_confidential_compute(self) -> bool:
+        """Return True if this target is a Confidential Computing (TEE) target."""
+        return self == HardwareTarget.CUDA_SM100_TEE
+
+    @property
+    def is_riscv(self) -> bool:
+        """Return True if this is a RISC-V based target."""
+        return self in (
+            HardwareTarget.RISCV_MIPS_S8200,
+            HardwareTarget.RISCV_SIFIVE_X160,
+            HardwareTarget.RISCV_XUANTIE_C930,
+            HardwareTarget.RISCV_CERVELL,
+        )
+
+    @property
+    def is_fpga(self) -> bool:
+        """Return True if this is an FPGA target."""
+        return self in (
+            HardwareTarget.FPGA_XILINX_VU9P,
+            HardwareTarget.FPGA_TERNARY,
+        )
 
     def __str__(self) -> str:
         return self.value
