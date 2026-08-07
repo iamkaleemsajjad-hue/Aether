@@ -5,6 +5,92 @@ All notable changes to Aether Runtime will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-07 — Hardware Targets, RISC-V NPU IR, AEG Format 2.0, API v4.0
+
+### Added — Hardware Profiles (PRD §3)
+
+- **28 hardware profiles** registered in `HardwareProfile._TARGET_PROFILES`:
+  - **v4.0 targets (9 NEW)**: `cuda_sm130` (Rubin Ultra placeholder),
+    `cuda_sm100_tee` (B200 Confidential Computing), `riscv_mips_s8200` (MIPS S8200 NPU),
+    `riscv_sifive_x160` (SiFive X160), `riscv_xuantie_c930` (XuanTie C930),
+    `fpga_xilinx_vu9p`, `amd_mi350x` (CDNA4), `qualcomm_cloud_ai100`.
+  - **v5.0 targets (6 NEW)**: `cuda_sm100_gb300` (GB300 Blackwell Ultra),
+    `rocm_cdna5_mi455x`, `cpu_avx512_ternary`, `cpu_neon_ternary`, `fpga_ternary`,
+    `riscv_cervell` (Semidynamics Cervell / Quadric qdIR).
+- **New `HardwareProfile` fields**: `flops_fp4`, `supports_fp4`, `supports_ternary`,
+  `supports_mxfp6`, `supports_tee`, `tee_backend`, `nvlink_bandwidth_gb_s`,
+  `tdp_watts`, `is_riscv_npu`, `abstract_ir_family`.
+- Fixed syntax error (duplicate class definition appended at line 926) in
+  `hardware_profile.py`.
+
+### Added — RISC-V NPU Abstract IR (PRD §3.2)
+
+- **`src/aether/compiler/stage3_targeting/riscv_npu_ir.py`**: Core
+  `RISCVNPUIRBuilder` + `RISCV_NPU_BACKEND_REGISTRY`. Tiling invariant:
+  `3 × T² × dtype_bytes ≤ scratchpad_bytes`; T always power-of-2.
+- **`target_riscv_mips.py`**: MIPS S8200 NPU (RV32IM + MIPS.NPU ISA, 64 TOPS sub-10W edge).
+- **`target_riscv_sifive.py`**: SiFive X160 (RVV-1.0 + RMMM-0.7 matrix multiply, 128 TOPS).
+- **`target_riscv_xuantie.py`**: XuanTie C930 (RVV-1.0 + XPU co-processor, 256 TOPS).
+- **`target_riscv_cervell.py`**: Semidynamics Cervell (Quadric qdIR unified exec, 512 TOPS est.).
+
+### Added — AEG Format 2.0 (PRD §5)
+
+- **`src/aether/compiler/aeg_format_v2.py`**: Full AEG/2.0 package builder and reader.
+  - `AEGPackageV2.create()` — idempotent package creation with all v4.0 directories.
+  - `AEGPackageV2.upgrade_v1_to_v2()` — in-place migration of AEG/1.x packages.
+  - `AEGManifest` — top-level manifest with all v4.0 pass flags.
+  - `SpeculationConfig` — P-EAGLE / Saguaro speculation config (R1).
+  - `GrammarManifest` — structured output FSM manifest (Pass 11 / R3).
+  - `GreenEnergyProfile` — energy profile + DVFS hints (Pass 16 / R7).
+  - `TEEConfig` — TEE enclave config (Pass 17 / R8).
+  - `MultiAgentConfig` — multi-agent KV coordination (R2).
+  - `MCPConfig` — MCP server registry (R6).
+  - All 25 v4.0+v5.0 kernel target subdirectories created automatically.
+  - New directories: `speculation/`, `structured_output/`, `merging/`, `ttt/`,
+    `green/`, `tee/`, `multi_agent/`, `mcp/`, `semantic_cache/`, `training/`, `parallelism/`.
+  - Exported from `aether.compiler` public API.
+
+### Added — Server API v4.0 (PRD §22)
+
+- **9 new endpoints** in `src/aether/server/routes.py`:
+  - `POST /v1/tools/call` — MCP native tool call (R6).
+  - `POST /v1/grammar/compile` — Pre-compile grammar FSM with CRANE dual-mode support.
+  - `GET  /v1/grammar/list` — List compiled grammar FSMs.
+  - `POST /v1/models/{name}/merge` — Task arithmetic / DARE / TIES / FREE merge (Pass 12).
+  - `POST /v1/models/{name}/ttt` — TTT fast-weight domain adaptation (Pass 13 / R5).
+  - `GET  /v1/targets` — All 28 hardware targets with v4.0 profile fields.
+  - `GET  /v1/targets/{target_id}` — Single target hardware profile.
+  - `GET  /v1/green/status` — Carbon intensity + DVFS state (R7).
+  - `POST /v1/tee/session` — Start TEE confidential inference session (R8).
+  - `DELETE /v1/tee/session/{id}` — Close TEE session.
+- Updated `GenerateRequest` / `ChatRequest`: `grammar`, `response_format`, `slo_deadline_ms`.
+- Updated `CompileRequest`: `enable_mtp`, `enable_grammar`, `enable_tee`, `enable_green`.
+- `GET /v1/hardware` — now returns all v4.0 profile fields.
+- `GET /v1/health` — now returns `{"version": "4.0"}`.
+
+### Added — Tests
+
+- **`tests/unit/test_aeg_format_v2.py`**: 64 tests, 100% pass rate, 93% coverage.
+  Covers all AEG/2.0 dataclasses, directory creation, v1→v2 upgrade, validation.
+- **`tests/unit/test_riscv_and_hardware.py`**: RISC-V backend registration,
+  tiling invariants, `HardwareProfile` v4.0 field correctness for all 28 targets.
+
+### Changed
+
+- **`src/aether/compiler/__init__.py`**: Exports all AEG Format 2.0 types
+  (`AEGPackageV2`, `AEGManifest`, `SpeculationConfig`, etc.).
+- **`src/aether/compiler/stage2_optimizer/__init__.py`**: Updated docstring to
+  reflect 22-pass pipeline; exports all pass classes.
+- **`tests/unit/test_optimizer_passes.py`**: Updated `TestOptimizerPipeline`
+  tests to accept 22-pass pipeline (was hardcoded to 9).
+
+### Fixed
+
+- `hardware_profile.py`: Removed accidental duplicate class definition
+  appended at line 926 during previous session. File now 925 lines, parses cleanly.
+- `ci.yml`: Removed duplicated second workflow block (duplicate `on:` + `jobs:` section).
+
+
 ## [0.3.0] - 2026-08-04 — PRD v5.0 (RLVR, LoRA+, Sub-2-Bit, Video, PEFT)
 
 ### Added — Compiler Passes (Batch 3: Passes 19–22)

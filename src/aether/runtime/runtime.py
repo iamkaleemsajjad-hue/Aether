@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import threading
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
@@ -136,6 +137,27 @@ class Runtime:
         self._loaded_backends: dict[str, Backend] = {}
         self._aeg_packages: dict[str, AEGPackage] = {}
         self._lock = threading.RLock()
+
+        # v4.0 runtime layer handles — initialized lazily on first model load
+        # or when explicitly enabled via RuntimeConfig.
+        self.grammar_engine: Any | None = None
+        """R3 Grammar FSM Engine (Pass 11). Set by _init_v4_layers()."""
+
+        self.ttt_engine: Any | None = None
+        """R5 TTT Fast-Weight Engine (Pass 13). Set by _init_v4_layers()."""
+
+        self.tee_manager: Any | None = None
+        """R8 TEE Runtime Manager (Pass 17). Set by _init_v4_layers()."""
+
+        self.green_power_manager: Any | None = None
+        """R7 Green Power Manager (Pass 16). Set by _init_v4_layers()."""
+
+        self.mcp_layer: Any | None = None
+        """R6 MCP Integration Layer. Set by _init_v4_layers()."""
+
+        # Async compilation job registry: {job_id: {status, model, ...}}
+        self._compile_jobs: dict[str, dict[str, Any]] = {}
+
         logger.info(
             "Aether runtime initialized",
             target=self.fingerprint.target_id,
@@ -414,6 +436,236 @@ class Runtime:
             "throughput_tps": tps,
             "ttft_ms": result.metrics.get("ttft_ms", 0.0),
         }
+
+    # ── v4.0 Runtime Extensions ────────────────────────────────────────────────
+
+    def _init_v4_layers(self, aeg_path: str | None = None) -> None:
+        """Initialize v4.0 runtime layers from AEG package config.
+
+        Called lazily on first model load. Each layer is imported and
+        constructed only if its config flag is enabled in the AEG package
+        and/or RuntimeConfig.
+
+        Layers that fail to initialize log a warning and remain None —
+        the runtime continues to function without them.
+        """
+        if aeg_path is None:
+            return
+        try:
+            from aether.compiler.aeg_format_v2 import AEGPackageV2
+            pkg = AEGPackageV2(aeg_path)
+            manifest = pkg.read_manifest()
+
+            # R3 Grammar FSM Engine
+            if manifest.has_grammar_fsm and self.grammar_engine is None:
+                try:
+                    from aether.runtime.r3_grammar_fsm import GrammarFSMEngine
+                    self.grammar_engine = GrammarFSMEngine(aeg_path=aeg_path)
+                    logger.info("R3 Grammar FSM Engine initialized")
+                except Exception as exc:
+                    logger.warning("R3 Grammar FSM Engine init failed", error=str(exc))
+
+            # R5 TTT Fast-Weight Engine
+            if manifest.has_ttt_fast_weights and self.ttt_engine is None:
+                try:
+                    from aether.runtime.r5_ttt_engine import TTTFastWeightEngine
+                    self.ttt_engine = TTTFastWeightEngine(aeg_path=aeg_path)
+                    logger.info("R5 TTT Fast-Weight Engine initialized")
+                except Exception as exc:
+                    logger.warning("R5 TTT Engine init failed", error=str(exc))
+
+            # R7 Green Power Manager
+            if manifest.has_green_profile and self.green_power_manager is None:
+                try:
+                    from aether.runtime.r7_green_power_manager import GreenPowerManager
+                    self.green_power_manager = GreenPowerManager(aeg_path=aeg_path)
+                    logger.info("R7 Green Power Manager initialized")
+                except Exception as exc:
+                    logger.warning("R7 Green Power Manager init failed", error=str(exc))
+
+            # R8 TEE Runtime Manager
+            if manifest.has_tee_enclave and self.tee_manager is None:
+                try:
+                    from aether.runtime.r8_tee_manager import TEERuntimeManager
+                    tee_cfg = pkg.read_tee_config()
+                    self.tee_manager = TEERuntimeManager(
+                        aeg_path=aeg_path,
+                        backend=tee_cfg.tee_backend if tee_cfg else "auto",
+                    )
+                    logger.info("R8 TEE Runtime Manager initialized")
+                except Exception as exc:
+                    logger.warning("R8 TEE Manager init failed", error=str(exc))
+
+            # R6 MCP Integration Layer
+            if manifest.has_mcp_config and self.mcp_layer is None:
+                try:
+                    from aether.runtime.r6_mcp_integration import MCPIntegrationLayer
+                    mcp_cfg = pkg.read_mcp_config()
+                    self.mcp_layer = MCPIntegrationLayer(
+                        aeg_path=aeg_path,
+                        server_registry=mcp_cfg.server_registry if mcp_cfg else [],
+                    )
+                    logger.info("R6 MCP Integration Layer initialized")
+                except Exception as exc:
+                    logger.warning("R6 MCP Layer init failed", error=str(exc))
+
+        except Exception as exc:
+            logger.warning("v4.0 layer init skipped", error=str(exc))
+
+    def compile_async(
+        self,
+        model_id: str,
+        job_id: str | None = None,
+        target: str = "auto",
+        quantization: str | None = None,
+        quality_budget: float = 0.98,
+        enable_mtp: bool = False,
+        enable_grammar: bool = False,
+        enable_tee: bool = False,
+        enable_green: bool = False,
+    ) -> str:
+        """Start an async compilation job.
+
+        Enqueues a background thread that compiles the model with the given
+        configuration. Returns the job_id immediately.
+
+        Args:
+            model_id: Source model identifier or path.
+            job_id: Optional job ID (auto-generated if None).
+            target: Hardware target ID ('auto' = detect from fingerprint).
+            quantization: Quantization scheme or None for auto.
+            quality_budget: Quality preservation budget (0.0–1.0).
+            enable_mtp: Enable Pass 10 MTP head compilation.
+            enable_grammar: Enable Pass 11 grammar FSM pre-compilation.
+            enable_tee: Enable Pass 17 TEE kernel wrapping.
+            enable_green: Enable Pass 16 green energy profiling.
+
+        Returns:
+            Job ID string.
+        """
+        if job_id is None:
+            job_id = str(uuid.uuid4())
+
+        self._compile_jobs[job_id] = {
+            "status": "queued",
+            "model": model_id,
+            "target": target,
+            "queued_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "completed_at": None,
+            "error": None,
+        }
+
+        def _run_compile() -> None:
+            try:
+                self._compile_jobs[job_id]["status"] = "running"  # type: ignore[index]
+                self._compile_jobs[job_id]["started_at"] = (  # type: ignore[index]
+                    datetime.datetime.now(datetime.timezone.utc).isoformat()
+                )
+                from aether.compiler import Compiler, CompilerConfig
+                resolved_target = target if target != "auto" else self.fingerprint.target_id
+                # Build kwargs with only known CompilerConfig fields
+                cfg_kwargs: dict[str, Any] = {
+                    "targets": [resolved_target],
+                    "quality_budget": quality_budget,
+                    "enable_mtp_head": enable_mtp,
+                    "enable_grammar_constraint": enable_grammar,
+                    "enable_tee": enable_tee,
+                    "enable_green_energy": enable_green,
+                }
+                # Map quantization shorthand to kv_cache_dtype if provided
+                if quantization is not None:
+                    cfg_kwargs["kv_cache_dtype"] = quantization
+                cfg = CompilerConfig(**cfg_kwargs)
+                compiler = Compiler(cfg)
+                result = compiler.compile(model_id)
+                self._compile_jobs[job_id]["status"] = "succeeded"  # type: ignore[index]
+                self._compile_jobs[job_id]["output_path"] = str(result.output_path)  # type: ignore[index]
+            except Exception as exc:
+                self._compile_jobs[job_id]["status"] = "failed"  # type: ignore[index]
+                self._compile_jobs[job_id]["error"] = str(exc)  # type: ignore[index]
+                logger.error("Async compilation failed", job_id=job_id, error=str(exc))
+            finally:
+                self._compile_jobs[job_id]["completed_at"] = (  # type: ignore[index]
+                    datetime.datetime.now(datetime.timezone.utc).isoformat()
+                )
+
+        thread = threading.Thread(target=_run_compile, daemon=True, name=f"compile-{job_id[:8]}")
+        thread.start()
+        logger.info("Compilation job queued", job_id=job_id, model=model_id, target=target)
+        return job_id
+
+    def get_compile_status(self, job_id: str) -> dict[str, Any]:
+        """Get the status of an async compilation job.
+
+        Args:
+            job_id: Job ID returned by compile_async().
+
+        Returns:
+            Status dict with keys: job_id, status, model, target, queued_at,
+            started_at (if started), completed_at (if done), error (if failed),
+            output_path (if succeeded).
+
+        Raises:
+            KeyError: If job_id is not found.
+        """
+        if job_id not in self._compile_jobs:
+            msg = f"Compilation job '{job_id}' not found."
+            raise KeyError(msg)
+        return {"job_id": job_id, **self._compile_jobs[job_id]}
+
+    def merge(
+        self,
+        model_id: str,
+        task_vectors: list[dict[str, Any]],
+        method: str = "task_arithmetic",
+        density: float = 1.0,
+    ) -> dict[str, Any]:
+        """Apply model merging task vectors using Pass 12 logic.
+
+        Merges a base model with one or more task-specific delta-weight
+        vectors (task_arithmetic / dare_ties / free_merging / evolutionary).
+
+        Args:
+            model_id: Base model AEG path or identifier.
+            task_vectors: List of task vector configs. Each entry:
+                {name: str, coefficient: float, path: str}
+            method: Merge strategy: task_arithmetic | dare_ties |
+                    free_merging | heterogeneous | evolutionary.
+            density: Pruning density for DARE/TIES (0.0-1.0, default 1.0).
+
+        Returns:
+            Dict with merge result metadata.
+
+        Research basis:
+            Task Arithmetic (ICLR 2023), TIES-Merging (NeurIPS 2023),
+            DARE-TIES (arXiv 2024), FREE-Merging (arXiv 2026).
+        """
+        try:
+            from aether.compiler.stage2_optimizer.optimizer import ModelMergingPass
+            pass_instance = ModelMergingPass()
+            result = pass_instance.apply_task_vectors(
+                model_id=model_id,
+                task_vectors=task_vectors,
+                method=method,
+                density=density,
+            )
+            return result
+        except (ImportError, AttributeError):
+            # Graceful fallback: record the merge config without executing
+            return {
+                "model": model_id,
+                "method": method,
+                "task_count": len(task_vectors),
+                "density": density,
+                "status": "recorded",
+                "note": (
+                    "Pass 12 ModelMergingPass.apply_task_vectors() not available. "
+                    "Re-compile model with enable_model_merging=True."
+                ),
+            }
+        except Exception as exc:
+            logger.error("Model merge failed", model=model_id, error=str(exc))
+            raise
 
     def __repr__(self) -> str:
         return (

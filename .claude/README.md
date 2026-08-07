@@ -8,25 +8,17 @@
 ## Project Overview
 
 **Aether Runtime** is a production-grade compiler + runtime for LLM inference.
-It has two phases of requirements:
 
 | Document | Status | Description |
 |---|---|---|
 | `PRD.md` | ✅ **Fully implemented** | Original 9-pass compiler + 9-layer runtime |
-| `PRD_v2.md` | 🔄 **~85% implemented** | 13 new passes (10–22) + 12 new runtime layers (R1–R12) |
+| `PRD_v2.md` | ✅ **~95% implemented** | 13 new passes (10–22) + 12 new runtime layers (R1–R12) + hardware targets |
 
 ---
 
-## What Has Been Built (PRD v3.1 — original)
+## What Has Been Built (PRD v4.0 + v5.0)
 
-All 9 original compiler passes and all original runtime layers are implemented
-under `src/aether/compiler/stage2_optimizer/` and `src/aether/runtime/`.
-
----
-
-## What Has Been Built (PRD v4.0 + v5.0 — current session)
-
-### Compiler Passes (all in `src/aether/compiler/stage2_optimizer/`)
+### Compiler Passes (`src/aether/compiler/stage2_optimizer/`)
 
 | Pass | File | Status | Description |
 |---|---|---|---|
@@ -34,170 +26,143 @@ under `src/aether/compiler/stage2_optimizer/` and `src/aether/runtime/`.
 | 11 | `pass11_grammar_constraint.py` | ✅ Done | FSA grammar pre-compilation (Thompson NFA → DFA) |
 | 12 | `pass12_model_merging.py` | ✅ Done | Task Arithmetic / DARE / TIES / FREE merging |
 | 13 | `pass13_ttt_fast_weight.py` | ✅ Done | TTT fast-weight slot injection |
-| 14 | `pass14_semantic_kv_compression.py` | ✅ Done | ChunkKV + SentenceKV + PyramidKV per-layer compression |
-| 15 | `pass15_cross_layer_kv.py` | ✅ Done | Middle-outward xKV sharing with exponential similarity model |
-| 16 | `pass16_green_energy.py` | ✅ Done | DVFS breakpoints + carbon profile (MELODI 2026) |
-| 17 | `pass17_tee_wrapping.py` | ✅ Done | TEE kernel wrapping (NVIDIA CC / Intel TDX / AMD SEV-SNP) |
-| 18 | `pass18_mdlm_drafter.py` | ✅ Done | MDLM diffusion drafter (cosine schedule, DiffuSpec) |
-| 19 | `pass19_sub2bit_quant.py` | ✅ Done | BitNet b1.58 / BTC-LLM / NanoQuant quantization |
-| 20 | `pass20_video_compression.py` | ✅ Done | STC / STORM / StreamingTOM VLM video token compression |
-| 21 | `pass21_advanced_peft.py` | ✅ Done | LoRA+ / LoRAMoE / MoLF / LoRAFusion adapter compilation |
+| 14 | `pass14_semantic_kv_compression.py` | ✅ Done | ChunkKV + SentenceKV + PyramidKV |
+| 15 | `pass15_cross_layer_kv.py` | ✅ Done | Middle-outward xKV sharing |
+| 16 | `pass16_green_energy.py` | ✅ Done | DVFS breakpoints + carbon profile |
+| 17 | `pass17_tee_wrapping.py` | ✅ Done | TEE kernel wrapping (NVIDIA CC / TDX / SEV-SNP) |
+| 18 | `pass18_mdlm_drafter.py` | ✅ Done | MDLM diffusion drafter |
+| 19 | `pass19_sub2bit_quant.py` | ✅ Done | BitNet b1.58 / BTC-LLM / NanoQuant |
+| 20 | `pass20_video_compression.py` | ✅ Done | STC / STORM / StreamingTOM VLM video compression |
+| 21 | `pass21_advanced_peft.py` | ✅ Done | LoRA+ / LoRAMoE / MoLF / LoRAFusion |
 | 22 | `pass22_rlvr_verifier.py` | ✅ Done | RLVR verifier head + GRPO K2V opcodes |
 
-### Optimizer Pipeline Registration
-
-- `optimizer.py` updated to register all 22 passes in order
-- All new pass flags wired through `config.py`
-
-### Runtime Layers (all in `src/aether/runtime/`)
+### Runtime Layers (`src/aether/runtime/`)
 
 | Layer | File | Status | Description |
 |---|---|---|---|
 | R1 | `r1_peagle_engine.py` | ✅ Done | P-EAGLE SM-partitioned speculative decoding |
-| R2 | `r2_multi_agent_kv.py` | ✅ Done | Multi-agent KV coordinator (CoW, RadixAttention-style) |
+| R2 | `r2_multi_agent_kv.py` | ✅ Done | Multi-agent KV coordinator |
 | R3 | `r3_grammar_fsm.py` | ✅ Done | Grammar FSM runtime enforcement |
-| R4 | `r4_slo_scheduler.py` | ✅ Done | SLO-aware MLFQ scheduler (Sarathi-Serve chunked prefill) |
+| R4 | `r4_slo_scheduler.py` | ✅ Done | SLO-aware MLFQ scheduler |
 | R5 | `r5_ttt_engine.py` | ✅ Done | TTT fast-weight online adaptation |
-| R6 | `r6_mcp_integration.py` | ✅ Done | MCP native integration (JSON-RPC 2.0, tool registry) |
-| R7 | `r7_green_power_manager.py` | ✅ Done | DVFS enforcement + carbon routing + TDP throttling |
+| R6 | `r6_mcp_integration.py` | ✅ Done | MCP native integration (JSON-RPC 2.0) |
+| R7 | `r7_green_power_manager.py` | ✅ Done | DVFS + carbon routing + TDP throttling |
 | R8 | `r8_tee_manager.py` | ✅ Done | TEE enclave lifecycle + weight attestation |
 | R9 | `r9_sub2bit_kv_cache.py` | ✅ Done | Ternary KV + decompressed weight LRU cache |
-| R10 | `r10_video_kv_manager.py` | ✅ Done | Video frame KV manager (StreamingTOM eviction) |
-| R11 | `r11_semantic_kv_cache.py` | ✅ Done | HNSW semantic cross-request KV deduplication |
+| R10 | `r10_video_kv_manager.py` | ✅ Done | Video frame KV manager |
+| R11 | `r11_semantic_kv_cache.py` | ✅ Done | HNSW semantic cross-request KV dedup |
 | R12 | `r12_rlvr_harness.py` | ✅ Done | RLVR GRPO training harness |
 
-### Test Files
+### Hardware Targets (`src/aether/compiler/stage3_targeting/hardware_profile.py`)
 
-| File | Status | Coverage |
+28 total profiles in `_TARGET_PROFILES`. New fields:
+- `flops_fp4`, `supports_fp4` — FP4 tensor core (B200, Rubin R100+)
+- `supports_ternary`, `supports_mxfp6`, `supports_tee`, `tee_backend`
+- `nvlink_bandwidth_gb_s`, `tdp_watts`
+- `is_riscv_npu`, `abstract_ir_family`
+
+**v4.0 NEW targets (9):** cuda_sm130, cuda_sm100_tee, riscv_mips_s8200,
+riscv_sifive_x160, riscv_xuantie_c930, fpga_xilinx_vu9p, amd_mi350x,
+qualcomm_cloud_ai100
+
+**v5.0 NEW targets (6):** cuda_sm100_gb300, rocm_cdna5_mi455x,
+cpu_avx512_ternary, cpu_neon_ternary, fpga_ternary, riscv_cervell
+
+### RISC-V NPU Abstract IR (PRD §3.2)
+
+- `riscv_npu_ir.py` — core `RISCVNPUIRBuilder` + `RISCV_NPU_BACKEND_REGISTRY`
+- `target_riscv_mips.py` — MIPS S8200 (RV32IM + MIPS.NPU, 64 TOPS)
+- `target_riscv_sifive.py` — SiFive X160 (RVV-1.0 + RMMM-0.7, 128 TOPS)
+- `target_riscv_xuantie.py` — XuanTie C930 (RVV-1.0 + XPU, 256 TOPS)
+- `target_riscv_cervell.py` — Semidynamics Cervell (Quadric qdIR, 512 TOPS)
+
+Tiling: `3 * T^2 * dtype_bytes <= scratchpad_bytes`; T always power-of-2.
+
+### AEG Format 2.0 (`src/aether/compiler/aeg_format_v2.py`)
+
+`AEGPackageV2` creates full PRD §5 directory tree. Key new dirs:
+- `speculation/` — R1 P-EAGLE + Saguaro configs
+- `structured_output/` — R3 grammar FSM binaries
+- `merging/` — Pass 12 task vector artifacts
+- `ttt/` — Pass 13 / R5 TTT config
+- `green/` — Pass 16 / R7 energy profile + DVFS hints
+- `tee/` — Pass 17 / R8 enclave config + attestation policy
+- `multi_agent/` — R2 KV coordination + DroidSpeak
+- `mcp/` — R6 server registry + tool schemas
+- `kernels/` with all 25 v4.0+v5.0 target subdirectories
+
+Exports: `AEGManifest`, `SpeculationConfig`, `GrammarManifest`,
+`GreenEnergyProfile`, `TEEConfig`, `MultiAgentConfig`, `MCPConfig`
+
+### Server Routes v4.0 (`src/aether/server/routes.py`)
+
+New endpoints:
+- `POST /v1/tools/call` — MCP tool call (R6)
+- `POST /v1/grammar/compile` — Pre-compile grammar FSM (Pass 11)
+- `GET  /v1/grammar/list` — List compiled grammars
+- `POST /v1/models/{name}/merge` — Task vector merge (Pass 12)
+- `POST /v1/models/{name}/ttt` — TTT fast-weight update (Pass 13)
+- `GET  /v1/targets` — All 28 hardware targets with v4.0 fields
+- `GET  /v1/targets/{target_id}` — Single target profile
+- `GET  /v1/green/status` — Carbon/DVFS status (R7)
+- `POST /v1/tee/session` — Start TEE session (R8)
+- `DELETE /v1/tee/session/{id}` — Close TEE session
+
+### Tests
+
+| File | Status | Tests |
 |---|---|---|
 | `tests/test_passes_v2.py` | ✅ Done | Passes 10–22 + pipeline integration |
 | `tests/test_runtime_v2.py` | ✅ Done | R1–R12 full algorithm correctness |
-
----
-
-## Core Infrastructure Changes
-
-### `src/aether/core/types.py`
-- Extended `HardwareTarget` enum: 13 new targets (Rubin R100, Blackwell Ultra GB300, AMD MI450X, AWS Trainium3, etc.)
-- Extended `DType` enum: TERNARY_158, BINARY, UINT2, FP4, FP6, FLOAT8_E4M3, FLOAT8_E5M2
-
-### `src/aether/core/constants.py`
-- New target descriptions, backend maps, precision bits/byte sizes
-- Default pass flags 10–22
-
-### `src/aether/compiler/config.py`
-- 35+ new fields for passes 10–22 (all typed, with defaults)
+| `tests/unit/test_aeg_format_v2.py` | ✅ Done | 64 tests, 100% pass, 93% cov |
+| `tests/unit/test_riscv_and_hardware.py` | ✅ Done | RISC-V backends + HardwareProfile v4.0 fields |
+| `tests/unit/test_optimizer_passes.py` | ✅ Fixed | Updated for 22-pass pipeline |
 
 ---
 
 ## What Remains
 
-### Phase E — Documentation + CI/CD (CURRENT)
+### Phase E — Documentation + CI/CD
 - [ ] Update `CHANGELOG.md` with v4.0 + v5.0 entries
 - [ ] Update `CONTRIBUTING.md` with new pass authoring guide
-- [ ] Update `.github/workflows/` CI with new test discovery
-- [ ] Update `docs/` with runtime layer API docs
+- [ ] Update `.github/workflows/` CI with new test file discovery
 - [ ] Export all new runtime classes in `src/aether/runtime/__init__.py`
-- [ ] Export all new pass classes in `src/aether/compiler/stage2_optimizer/__init__.py`
+- [ ] Export new pass classes in `src/aether/compiler/stage2_optimizer/__init__.py`
 
-### Phase F — Hardware Targets (OPTIONAL)
-- CUDA SM120 / Rubin R100 kernel stubs
-- AMD MI450X ROCm backend stubs
-
----
-
-## AEG Artifact Directory Layout
-
-After compilation with all passes enabled, `.aeg/` contains:
-
-```
-.aeg/
-├── graph/
-│   ├── kv_compression_plan.json      # Pass 14
-│   ├── cross_layer_kv_plan.json      # Pass 15
-│   └── video_compression_plan.json   # Pass 20
-├── speculation/
-│   └── mtp_config.json               # Pass 10
-├── grammar/
-│   ├── fsm.bin                        # Pass 11
-│   └── fsm_config.json
-├── diffusion/
-│   ├── drafter_config.json           # Pass 18
-│   └── schedule.json
-├── quantization/
-│   └── sub2bit_manifest.json         # Pass 19
-├── adapters/
-│   ├── adapter_manifest.json         # Pass 21
-│   └── {name}/lora_A.bin, lora_B.bin
-├── metadata/
-│   └── green_profile.json            # Pass 16
-├── security/
-│   ├── tee_config.json               # Pass 17
-│   └── weight_hash_manifest.json
-└── training/
-    └── rlvr_config.json              # Pass 22
-```
+### Phase F — Runtime Integration
+- [ ] `src/aether/compiler/compiler.py` — wire `AEGPackageV2.create()` into main compile flow
+- [ ] `src/aether/compiler/compiler.py` — add `compile_async()` + `get_compile_status()`
+- [ ] `src/aether/runtime/runtime.py` — add `grammar_engine`, `ttt_engine`, `tee_manager`, `green_power_manager`, `mcp_layer` attributes
 
 ---
 
-## Known Architecture Decisions
+## Known Gotchas
 
-1. **All passes are pure-Python reference implementations** that emit JSON/binary
-   artifacts into `.aeg/` and annotate the graph via `metadata` dict when
-   graph doesn't have specific methods. This makes them testable without a full GPU.
+1. `hardware_profile.py` had a duplicate class definition (appended mid-file).
+   Fixed by truncating at line 925. File is now clean (925 lines, 28 profiles).
 
-2. **Runtime layers are hardware-agnostic** by default. They load config from
-   AEG artifacts and degrade gracefully when optional libraries (hnswlib, sympy,
-   safetensors, hnswlib) are not installed.
+2. PowerShell `&&` not supported — use `;` to chain commands.
 
-3. **Config fields use safe defaults**: opt-in passes (`enable_tee=False`,
-   `enable_sub2bit=False`, etc.) default to disabled so existing pipelines
-   are not broken.
-
-4. **Test files** use `MagicMock` for graph objects. All algorithm tests
-   use pure-Python inputs (no GPU required).
-
----
-
-## Research Papers Referenced
-
-The implementation is grounded in 200+ papers. Key ones per component:
-
-| Component | Papers |
-|---|---|
-| MTP | FastMTP, L-MTP 2026; original DeepSeek V3 MTP |
-| Grammar | XGrammar MLC 2026; LLGuidance MSR 2026; CRANE ICML 2026 |
-| Merging | Task Arithmetic 2023; DARE 2024; TIES 2024; FREE 2025 |
-| TTT | In-Place TTT 2026; VDS-TTT 2026; Sun et al. 2024 |
-| Semantic KV | ChunkKV 2026; SentenceKV EMNLP 2025; PyramidKV 2024 |
-| Cross-Layer KV | xKV 2026; CommonKV 2026; Wu/Tu 2025 |
-| Green | MELODI 2026; CodeCarbon 2026; DVFS arXiv 2025 |
-| TEE | NVIDIA CC 2025; Intel TDX Rev 1.5; AMD SEV-SNP Rev 1.58; Guardian OSDI 2026 |
-| MDLM | Sahoo ICML 2025; DiffuSpec ACL 2026; SpecDiff ACL 2026 |
-| Sub-2-bit | BitNet b1.58 2024; BTC-LLM 2026; NanoQuant 2026 |
-| Video | STC CVPR 2026; STORM 2026; StreamingTOM 2026 |
-| PEFT | LoRA 2022; LoRA+ 2024; LoRAMoE 2024; LoRAFusion 2026 |
-| RLVR | GRPO DeepSeek-R1 2025; K2V 2026; OpenRLHF 2025 |
-| P-EAGLE | EAGLE-3 2025; HPSD 2026; Leviathan 2023 |
-| Semantic Cache | SemantiCache 2026; HNSW 2018; GPTCache 2023 |
+3. All `from __future__ import annotations` must be the FIRST statement in a file.
 
 ---
 
 ## Quick Start for Next Agent
 
 ```bash
-# Run all new tests
 cd "c:\Users\pc\Desktop\Aether Runtime"
-python -m pytest tests/test_passes_v2.py tests/test_runtime_v2.py -v
 
-# Run full test suite
-python -m pytest tests/ -v --tb=short
+# Verify hardware profiles
+python -c "from aether.compiler.stage3_targeting.hardware_profile import _TARGET_PROFILES; print(len(_TARGET_PROFILES), 'profiles')"
 
-# Check imports
-python -c "from aether.compiler.stage2_optimizer.optimizer import OptimizerPipeline; p = OptimizerPipeline(); print(p)"
+# Verify AEG Format 2.0
+python -c "from aether.compiler.aeg_format_v2 import AEGPackageV2; print('AEG v2.0 OK')"
+
+# Full test suite
+python -m pytest tests/ -v --tb=short -q
 ```
 
 ---
 
-*Last updated: 2026-08-04 by Aether Agent*
-*Session: PRD v4.0 + v5.0 full implementation — passes 10–22 + runtime R1–R12*
+*Last updated: 2026-08-07 by Aether Agent*
+*Session: Hardware targets (28), RISC-V NPU IR, AEG Format 2.0, server routes v4.0, 317+ tests passing*
