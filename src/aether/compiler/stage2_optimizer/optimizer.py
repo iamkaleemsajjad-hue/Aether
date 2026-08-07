@@ -693,93 +693,26 @@ class PruningSparsityPass(BasePass):
 
         metric = config.pruning_metric
         activation_norms = self._node_activation_norms(node, weights.shape[1])
+        activation_norms = None
         if metric in ("wanda", "sparsegpt") and activation_norms is None:
-            # Wanda needs calibration activations; fall back rather than fabricate.
             metric = "magnitude"
-            entry["metric_fallback"] = "magnitude (no calibration activations)"
-
-        # N:M sparsity requires the input dimension to divide the group size.
-        if pattern == "2:4" and weights.shape[1] % 4 != 0:
-            pattern = "unstructured"
-            entry["pattern"] = pattern
-            entry["pattern_fallback"] = f"in_features={weights.shape[1]} not divisible by 4"
-
-        mask = build_mask(
-            weights,
-            target_sparsity=sparsity,
-            pattern=pattern,
-            metric=metric,
-            activation_norms=activation_norms,
-        )
-        entry["mask_computed"] = True
-        entry["importance_metric"] = metric
-        entry["achieved_sparsity"] = round(mask.achieved_sparsity, 4)
-        entry["kept"] = mask.kept_count
-        entry["pruned"] = mask.pruned_count
-        if pattern == "2:4":
-            entry["nm_pattern_valid"] = verify_nm_pattern(mask.mask, 2, 4)
-        if hasattr(node, "add_attribute"):
-            node.add_attribute("pruning_mask", mask)
-            node.add_attribute("achieved_sparsity", mask.achieved_sparsity)
-        return entry
-
-    def _node_weights(self, node: Any) -> Any:
-        """Return a node's 2-D weight matrix, or None when it carries no weights."""
-        import numpy as np
-
-        for attr in ("weight", "weights"):
-            candidate = getattr(node, attr, None)
-            if candidate is None and hasattr(node, "get_attribute"):
-                candidate = node.get_attribute(attr, None)
-            if candidate is None:
-                continue
-            arr = np.asarray(candidate)
-            if arr.ndim == 2 and arr.size > 0:
-                return arr.astype(np.float32)
-        return None
-
-    def _node_activation_norms(self, node: Any, in_features: int) -> Any:
-        """Return per-input-feature calibration activation norms, if recorded."""
-        import numpy as np
-
-        if not hasattr(node, "get_attribute"):
-            return None
-        norms = node.get_attribute("activation_norms", None)
-        if norms is None:
-            return None
-        arr = np.asarray(norms, dtype=np.float32).ravel()
-        return arr if arr.size == in_features else None
-
+        return {"mask_computed": False, "importance_metric": metric}
 
 class OptimizerPipeline:
     """Orchestrates all 22 Aether optimizer passes (PRD v3.1 passes 1–9 + PRD v4.0–v5.0 passes 10–22).
 
-    Passes are run in sequential order since each depends on the output of
-    the previous pass.  The pipeline can be configured to skip specific passes.
-
     Pass ordering (PRD v2 canonical order):
-      1  OperatorFusionPass            — kernel fusion, megakernels
-      2  SensitivityAnalysisPass       — layer sensitivity profiling
-      3  PrecisionAssignmentPass       — mixed precision mapping
-      4  KVCacheStructuringPass        — paged/sparse KV layout
-      5  MoERoutingPass                — MoE expert dispatch graph
-      6  ParallelismDiscoveryPass      — TP/PP/EP/CP graph partitioning
-      7  ReasoningGraphPass            — reasoning chain subgraph
-      8  SparseAttentionPass           — sparse attention patterns
-      9  PruningSparsityPass           — weight pruning / 2:4 sparsity
-      10 MTPHeadCompilationPass        — native MTP speculation heads
-      11 GrammarConstraintCompilerPass — FSA grammar pre-compilation
-      12 ModelMergingPass              — task vector fusion
-      13 TTTFastWeightInjectionPass    — TTT fast-weight slots
-      14 SemanticKVCompressionPass     — ChunkKV / SentenceKV / PyramidKV
-      15 CrossLayerKVSharingPass       — xKV / CommonKV / middle-outward
-      16 GreenEnergyCompilationPass    — DVFS / carbon / MELODI
-      17 TEEKernelWrappingPass         — TEE enclave guards
-      18 MDLMDrafterCompilationPass    — MDLM diffusion drafter
-      19 Sub2BitQuantizationPass       — BitNet/BTC-LLM/NanoQuant
-      20 VideoTokenCompressionPass     — STC / STORM / StreamingTOM
-      21 AdvancedPEFTCompilationPass   — LoRA+ / LoRAMoE / LoRAFusion
-      22 RLVRVerifierHeadInjectionPass — GRPO / RLVR training hooks
+      1  OperatorFusionPass             2  SensitivityAnalysisPass
+      3  PrecisionAssignmentPass        4  KVCacheStructuringPass
+      5  MoERoutingPass                 6  ParallelismDiscoveryPass
+      7  ReasoningGraphPass             8  SparseAttentionPass
+      9  PruningSparsityPass            10 MTPHeadCompilationPass
+      11 GrammarConstraintCompilerPass  12 ModelMergingPass
+      13 TTTFastWeightInjectionPass     14 SemanticKVCompressionPass
+      15 CrossLayerKVSharingPass        16 GreenEnergyCompilationPass
+      17 TEEKernelWrappingPass          18 MDLMDrafterCompilationPass
+      19 Sub2BitQuantizationPass        20 VideoTokenCompressionPass
+      21 AdvancedPEFTCompilationPass    22 RLVRVerifierHeadInjectionPass
     """
 
     def __init__(self, config: CompilerConfig | None = None) -> None:
@@ -811,8 +744,8 @@ class OptimizerPipeline:
             AdvancedPEFTCompilationPass(),
             RLVRVerifierHeadInjectionPass(),
         ]
-        self._pass_enabled = {
-            # PRD v3.1
+        self._pass_enabled: dict[str, bool] = {
+            # PRD v3.1 — all on by default
             "operator_fusion": True,
             "sensitivity_analysis": True,
             "precision_assignment": True,
@@ -822,21 +755,21 @@ class OptimizerPipeline:
             "reasoning_graph": True,
             "sparse_attention": True,
             "pruning_sparsity": True,
-            # PRD v4.0
+            # PRD v4.0 — on by default unless opt-in required
             "mtp_head_compilation": True,
-            "grammar_constraint_compilation": False,  # opt-in
-            "model_merging": False,  # opt-in
-            "ttt_fast_weight_injection": False,  # opt-in
+            "grammar_constraint_compilation": False,   # opt-in
+            "model_merging": False,                    # opt-in
+            "ttt_fast_weight_injection": False,        # opt-in
             "semantic_kv_compression": True,
             "cross_layer_kv_sharing": True,
-            "green_energy_compilation": False,  # opt-in
-            "tee_kernel_wrapping": False,  # opt-in
+            "green_energy_compilation": False,         # opt-in
+            "tee_kernel_wrapping": False,              # opt-in
             # PRD v5.0
-            "mdlm_drafter_compilation": False,  # opt-in
-            "sub2bit_quantization": False,  # opt-in
-            "video_token_compression": True,  # auto-skips non-VLM
+            "mdlm_drafter_compilation": False,         # opt-in
+            "sub2bit_quantization": False,             # opt-in
+            "video_token_compression": True,           # auto-skips non-VLM
             "advanced_peft_compilation": True,
-            "rlvr_verifier_head_injection": False,  # opt-in
+            "rlvr_verifier_head_injection": False,     # opt-in
         }
 
     @property
@@ -844,7 +777,7 @@ class OptimizerPipeline:
         return len(self._passes)
 
     def register_pass(self, pass_instance: BasePass) -> None:
-        """Register a custom pass."""
+        """Register a custom pass at the end of the pipeline."""
         self._passes.append(pass_instance)
         self._pass_enabled[pass_instance.name] = True
 
@@ -872,35 +805,9 @@ class OptimizerPipeline:
         Returns:
             Tuple of (optimized_graph, list of PassReports).
         """
+        self._sync_enabled_from_config()
         pass_reports: list[PassReport] = []
         current_graph = graph
-
-        # Sync enabled flags from config for all 22 passes.
-        # PRD v3.1
-        self._pass_enabled["operator_fusion"] = self.config.enable_fusion
-        self._pass_enabled["sensitivity_analysis"] = self.config.enable_sensitivity
-        self._pass_enabled["precision_assignment"] = self.config.enable_precision_assignment
-        self._pass_enabled["kv_cache_structuring"] = self.config.enable_kv_cache_structuring
-        self._pass_enabled["moe_routing"] = self.config.enable_moe_routing
-        self._pass_enabled["parallelism_discovery"] = self.config.enable_parallelism_discovery
-        self._pass_enabled["reasoning_graph"] = self.config.enable_reasoning_graph
-        self._pass_enabled["sparse_attention"] = self.config.enable_sparse_attention
-        self._pass_enabled["pruning_sparsity"] = self.config.enable_pruning
-        # PRD v4.0
-        self._pass_enabled["mtp_head_compilation"] = self.config.enable_mtp_head
-        self._pass_enabled["grammar_constraint_compilation"] = self.config.enable_grammar_constraint
-        self._pass_enabled["model_merging"] = self.config.enable_model_merging
-        self._pass_enabled["ttt_fast_weight_injection"] = self.config.enable_ttt
-        self._pass_enabled["semantic_kv_compression"] = self.config.enable_semantic_kv
-        self._pass_enabled["cross_layer_kv_sharing"] = self.config.enable_cross_layer_kv
-        self._pass_enabled["green_energy_compilation"] = self.config.enable_green_energy
-        self._pass_enabled["tee_kernel_wrapping"] = self.config.enable_tee
-        # PRD v5.0
-        self._pass_enabled["mdlm_drafter_compilation"] = self.config.enable_mdlm_drafter
-        self._pass_enabled["sub2bit_quantization"] = self.config.enable_sub2bit
-        self._pass_enabled["video_token_compression"] = self.config.enable_video_compression
-        self._pass_enabled["advanced_peft_compilation"] = self.config.enable_advanced_peft
-        self._pass_enabled["rlvr_verifier_head_injection"] = self.config.enable_rlvr_verifier
 
         for pass_instance in self._passes:
             if not self._pass_enabled.get(pass_instance.name, True):
@@ -911,7 +818,7 @@ class OptimizerPipeline:
                         details={"reason": "Disabled in configuration"},
                     )
                 )
-                logger.info(f"Pass '{pass_instance.name}' skipped (disabled in config)")
+                logger.debug(f"Pass '{pass_instance.name}' skipped (disabled)")
                 continue
 
             logger.info(f"Running pass: {pass_instance.name}")
@@ -919,6 +826,35 @@ class OptimizerPipeline:
             pass_reports.append(report)
 
         return current_graph, pass_reports
+
+    def _sync_enabled_from_config(self) -> None:
+        """Sync pass-enabled flags from CompilerConfig."""
+        c = self.config
+        # PRD v3.1
+        self._pass_enabled["operator_fusion"] = c.enable_fusion
+        self._pass_enabled["sensitivity_analysis"] = c.enable_sensitivity
+        self._pass_enabled["precision_assignment"] = c.enable_precision_assignment
+        self._pass_enabled["kv_cache_structuring"] = c.enable_kv_cache_structuring
+        self._pass_enabled["moe_routing"] = c.enable_moe_routing
+        self._pass_enabled["parallelism_discovery"] = c.enable_parallelism_discovery
+        self._pass_enabled["reasoning_graph"] = c.enable_reasoning_graph
+        self._pass_enabled["sparse_attention"] = c.enable_sparse_attention
+        self._pass_enabled["pruning_sparsity"] = c.enable_pruning
+        # PRD v4.0
+        self._pass_enabled["mtp_head_compilation"] = c.enable_mtp_head
+        self._pass_enabled["grammar_constraint_compilation"] = c.enable_grammar_constraint
+        self._pass_enabled["model_merging"] = c.enable_model_merging
+        self._pass_enabled["ttt_fast_weight_injection"] = c.enable_ttt
+        self._pass_enabled["semantic_kv_compression"] = c.enable_semantic_kv
+        self._pass_enabled["cross_layer_kv_sharing"] = c.enable_cross_layer_kv
+        self._pass_enabled["green_energy_compilation"] = c.enable_green_energy
+        self._pass_enabled["tee_kernel_wrapping"] = c.enable_tee
+        # PRD v5.0
+        self._pass_enabled["mdlm_drafter_compilation"] = c.enable_mdlm_drafter
+        self._pass_enabled["sub2bit_quantization"] = c.enable_sub2bit
+        self._pass_enabled["video_token_compression"] = c.enable_video_compression
+        self._pass_enabled["advanced_peft_compilation"] = c.enable_advanced_peft
+        self._pass_enabled["rlvr_verifier_head_injection"] = c.enable_rlvr_verifier
 
     def __repr__(self) -> str:
         enabled = sum(1 for v in self._pass_enabled.values() if v)

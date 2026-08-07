@@ -240,6 +240,104 @@ class MultiAgentKVCoordinator:
                 self._shared_blocks[block_id].kv_data = kv_data
                 self._shared_blocks[block_id].last_access_ts = time.time()
 
+    def hash_prefix(self, prefix_text: str) -> str:
+        """Compute a stable hash for a text prefix string.
+
+        Used by Runtime.multi_agent_session() to identify shared system prompts
+        without tokenizing. SHA-256 of the normalized UTF-8 prefix.
+
+        Args:
+            prefix_text: System prompt or shared context text.
+
+        Returns:
+            Hex string content-address of the prefix.
+        """
+        return hashlib.sha256(prefix_text.strip().encode("utf-8")).hexdigest()
+
+    def create_agent_session(
+        self,
+        session_id: str,
+        prefix_hash: str | None = None,
+        prefix_kv: Any = None,
+        pin_shared: bool = False,
+    ) -> AgentKVSession:
+        """Create an agent session optionally sharing a pre-hashed prefix block.
+
+        Unlike register_session() which takes raw token IDs, this accepts an
+        already-computed prefix_hash (from hash_prefix()) — useful when the caller
+        has hashed the text without tokenizing.
+
+        Args:
+            session_id: Unique agent session ID.
+            prefix_hash: Pre-computed content hash of the shared prefix.
+            prefix_kv: KV data for the prefix (stored in shared block if new).
+            pin_shared: If True, pin the shared block so it cannot be evicted.
+
+        Returns:
+            AgentKVSession descriptor.
+        """
+        with self._lock:
+            if prefix_hash is not None:
+                if prefix_hash in self._shared_blocks:
+                    block = self._shared_blocks[prefix_hash]
+                    block.ref_count += 1
+                    block.last_access_ts = time.time()
+                    self._stats.cache_hits += 1
+                    logger.debug(
+                        "R2: Agent session %r attaches to shared block %s (ref=%d).",
+                        session_id[:8], prefix_hash[:8], block.ref_count,
+                    )
+                else:
+                    block = SharedKVBlock(
+                        block_id=prefix_hash,
+                        ref_count=1,
+                        kv_data=prefix_kv,
+                        seq_len=0,
+                        last_access_ts=time.time(),
+                        is_pinned=pin_shared,
+                    )
+                    self._shared_blocks[prefix_hash] = block
+                    self._stats.blocks_created += 1
+                    if len(self._shared_blocks) > self.max_shared_blocks:
+                        self._evict_one()
+
+                session = AgentKVSession(
+                    session_id=session_id,
+                    shared_block_id=prefix_hash,
+                    private_kv=None,
+                    agent_token_offset=block.seq_len,
+                )
+            else:
+                session = AgentKVSession(
+                    session_id=session_id,
+                    shared_block_id=None,
+                    private_kv=None,
+                    agent_token_offset=0,
+                )
+
+            self._sessions[session_id] = session
+            self._stats.sessions_created += 1
+            return session
+
+    def pin_block(self, block_id: str, pinned: bool = True) -> bool:
+        """Pin or unpin a shared block from eviction.
+
+        Pinned blocks are never evicted regardless of ref_count.
+        Used for long-lived shared system prompts.
+
+        Args:
+            block_id: Block ID to pin (from hash_prefix()).
+            pinned: True to pin, False to unpin.
+
+        Returns:
+            True if block was found, False otherwise.
+        """
+        with self._lock:
+            if block_id in self._shared_blocks:
+                self._shared_blocks[block_id].is_pinned = pinned
+                return True
+            return False
+
     def _evict_one(self) -> None:
         """Evict one shared block according to the eviction policy."""
         if self.eviction_policy == "lru":
@@ -271,6 +369,7 @@ class MultiAgentKVCoordinator:
                     self._stats.cache_hits / max(1, self._stats.sessions_created)
                 ),
                 "blocks_evicted": self._stats.blocks_evicted,
+                "research_basis": "SGLang RadixAttention 2024 + MemServe 2025",
             }
 
 
