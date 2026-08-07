@@ -31,6 +31,7 @@ Research basis:
   - Medusa (2024): multi-head speculation.
   - FastMTP / L-MTP (2026): MTP head optimization.
   - SpecInfer (2023): tree-structured speculative decoding.
+  - Leviathan et al. 2023: optimal transport acceptance criterion.
 """
 
 from __future__ import annotations
@@ -41,25 +42,41 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Optional torch import — graceful fallback to pure-Python when unavailable.
+# ---------------------------------------------------------------------------
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None  # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
 
 # Token proposal status codes.
 _STATUS_ACCEPTED = "accepted"
 _STATUS_REJECTED = "rejected"
 _STATUS_PENDING = "pending"
 
+# Default vocabulary size (LLaMA / Qwen3 tokenizer).
+_DEFAULT_VOCAB = 128_256
+
 
 class PEAGLEEngine:
     """P-EAGLE hardware-parallel speculative decoding engine (Runtime R1).
 
     This engine manages the MTP/EAGLE draft-verify loop and SM partitioning
-    metadata.  Actual SM partitioning is done by the underlying CUDA backend
-    via MIG (Multi-Instance GPU) or MPS (Multi-Process Service) — this class
-    manages the scheduling and token acceptance logic.
+    metadata.  When PyTorch is available it uses real tensor operations for
+    the MTP head forward pass (``hidden @ W_head.T``) and for the acceptance
+    sampling step (Leviathan 2023 optimal-transport criterion implemented with
+    ``torch.distributions.Categorical``).  When PyTorch is absent it falls
+    back to deterministic Python-math equivalents so the engine remains
+    testable on CPU-only CI environments.
 
     Attributes:
         draft_K: Number of draft tokens proposed per step.
@@ -75,12 +92,16 @@ class PEAGLEEngine:
         target_acceptance_rate: float = 0.70,
         draft_sm_fraction: float = 0.30,
         mtp_config_path: str | None = None,
+        device: str = "cpu",
     ) -> None:
         self.draft_K = draft_K
         self.mode = mode
         self.target_acceptance_rate = target_acceptance_rate
         self.draft_sm_fraction = draft_sm_fraction
+        self.device = device
         self._mtp_heads: list[dict[str, Any]] = []
+        # Loaded weight tensors for each MTP head: list of torch.Tensor or None.
+        self._mtp_weights: list[Any] = []
         self._acceptance_history: deque[float] = deque(maxlen=100)
         self._stats = _SpecStats()
         self._lock = threading.Lock()
@@ -88,8 +109,12 @@ class PEAGLEEngine:
         if mtp_config_path:
             self._load_mtp_config(mtp_config_path)
 
+    # ------------------------------------------------------------------
+    # Configuration loading
+    # ------------------------------------------------------------------
+
     def _load_mtp_config(self, config_path: str) -> None:
-        """Load compiled MTP head config from AEG artifact."""
+        """Load compiled MTP head config and weight blobs from an AEG artifact."""
         p = Path(config_path)
         if not p.exists():
             logger.warning("P-EAGLE: MTP config not found at %s.", config_path)
@@ -97,11 +122,45 @@ class PEAGLEEngine:
         try:
             config = json.loads(p.read_text(encoding="utf-8"))
             self._mtp_heads = config.get("heads", [])
+            self._mtp_weights = []
+            # Try loading weight blobs from <dir>/mtp_head_{i}.bin
+            aeg_dir = p.parent
+            for i, head in enumerate(self._mtp_heads):
+                blob_path = aeg_dir / f"mtp_head_{i}.bin"
+                weight = self._load_weight_blob(blob_path, head)
+                self._mtp_weights.append(weight)
             logger.info(
-                "P-EAGLE: Loaded %d MTP heads from %s.", len(self._mtp_heads), config_path
+                "P-EAGLE: Loaded %d MTP heads from %s (%d with weights).",
+                len(self._mtp_heads),
+                config_path,
+                sum(1 for w in self._mtp_weights if w is not None),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("P-EAGLE: Failed to load MTP config: %s", exc)
+
+    def _load_weight_blob(self, blob_path: Path, head_info: dict) -> Any:
+        """Load an MTP head weight blob as a torch.Tensor (or None)."""
+        if not _TORCH_AVAILABLE or not blob_path.exists():
+            return None
+        try:
+            vocab_size = head_info.get("vocab_size", _DEFAULT_VOCAB)
+            hidden_size = head_info.get("hidden_size", 0)
+            raw = blob_path.read_bytes()
+            if hidden_size > 0 and len(raw) == vocab_size * hidden_size * 2:
+                # BF16 blob: reshape to [vocab, hidden]
+                t = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16)
+                return t.view(vocab_size, hidden_size).float().to(self.device)
+            elif hidden_size > 0 and len(raw) == vocab_size * hidden_size * 4:
+                # FP32 blob
+                t = torch.frombuffer(bytearray(raw), dtype=torch.float32)
+                return t.view(vocab_size, hidden_size).to(self.device)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("P-EAGLE: Could not load weight blob %s: %s", blob_path, exc)
+        return None
+
+    # ------------------------------------------------------------------
+    # Main proposal API
+    # ------------------------------------------------------------------
 
     def propose(
         self,
@@ -111,15 +170,19 @@ class PEAGLEEngine:
     ) -> "SpeculativeProposal":
         """Run one P-EAGLE draft-then-verify cycle.
 
-        Algorithm:
-          1. Draft: run MTP heads / EAGLE drafter to propose K token IDs.
-          2. Verify: run target model on the K draft tokens in a single forward pass.
-          3. Accept/Reject: compare draft and target distributions via optimal
-             transport acceptance criterion (Leviathan et al. 2023).
+        Algorithm (Leviathan et al. 2023):
+          1. Draft: run MTP heads to propose K token IDs in parallel.
+          2. Verify: run target model on the K draft tokens in one forward pass.
+          3. Accept/Reject: for each draft token t_i compare p_target(t_i) to
+             p_draft(t_i) via optimal-transport acceptance:
+               accept_prob = min(1, p_target(t_i) / p_draft(t_i))
+             Accept tokens sequentially until the first rejection; then resample
+             the rejected position from (p_target - p_draft)⁺.
           4. Update acceptance rate history for adaptive K adjustment.
 
         Args:
             hidden_state: Current hidden state from the target model's last step.
+                          May be a torch.Tensor, list of floats, or any array-like.
             target_forward_fn: Callable that runs the target model forward pass.
             context_tokens: List of token IDs in the current context.
 
@@ -128,20 +191,23 @@ class PEAGLEEngine:
         """
         start = time.perf_counter()
 
-        # Step 1: Draft — propose K token IDs.
-        draft_tokens = self._draft(hidden_state, context_tokens)
+        # Convert hidden_state to torch.Tensor if possible.
+        hidden_tensor = self._to_tensor(hidden_state)
 
-        # Step 2: Verify — run target model on draft prefix.
+        # Step 1: Draft — propose K token IDs.
+        draft_tokens, draft_log_probs = self._draft(hidden_tensor, context_tokens)
+
+        # Step 2 + 3: Verify and accept via optimal-transport criterion.
         accepted, n_accepted = self._verify_and_accept(
             draft_tokens=draft_tokens,
-            hidden_state=hidden_state,
+            draft_log_probs=draft_log_probs,
+            hidden_state=hidden_tensor,
             target_forward_fn=target_forward_fn,
         )
 
         elapsed_ms = (time.perf_counter() - start) * 1000
-
-        # Update acceptance rate history.
         acceptance_rate = n_accepted / max(1, len(draft_tokens))
+
         with self._lock:
             self._acceptance_history.append(acceptance_rate)
             self._stats.total_proposed += len(draft_tokens)
@@ -166,105 +232,183 @@ class PEAGLEEngine:
         )
         return proposal
 
+    # ------------------------------------------------------------------
+    # Drafting
+    # ------------------------------------------------------------------
+
     def _draft(
         self,
-        hidden_state: Any,
+        hidden_tensor: Any,
         context_tokens: list[int],
-    ) -> list[int]:
-        """Draft K token IDs from MTP heads / EAGLE drafter.
+    ) -> tuple[list[int], list[float]]:
+        """Draft K token IDs and their log-probabilities.
 
-        In MTP mode: runs each compiled MTP head as an independent linear
-        projection of the hidden state → argmax.
+        MTP mode: each compiled MTP head performs a linear projection of the
+        hidden state into vocabulary logits and returns the argmax token.
+        When weight blobs are loaded the projection uses real tensor matmul;
+        otherwise falls back to a deterministic surrogate for testing.
 
-        In EAGLE-3 mode: runs the EAGLE feature network to produce a draft
-        hidden state, then applies the unembedding matrix.
-
-        Returns list of K draft token IDs (may be shorter than K if drafting fails).
+        Returns:
+            (draft_token_ids, draft_log_probs) — parallel lists of length K.
         """
         draft_tokens: list[int] = []
+        draft_log_probs: list[float] = []
 
         if self.mode in ("mtp", "hybrid") and self._mtp_heads:
-            # MTP drafting: each head independently predicts t+1, t+2, ... t+K.
-            for head_info in self._mtp_heads[: self.draft_K]:
-                token_id = self._mtp_head_argmax(hidden_state, head_info)
+            for i, head_info in enumerate(self._mtp_heads[: self.draft_K]):
+                weight = self._mtp_weights[i] if i < len(self._mtp_weights) else None
+                token_id, log_prob = self._mtp_head_forward(hidden_tensor, head_info, weight)
                 draft_tokens.append(token_id)
+                draft_log_probs.append(log_prob)
                 if len(draft_tokens) >= self.draft_K:
                     break
 
-        if len(draft_tokens) < self.draft_K:
-            # Fill remaining slots with greedy fallback using context LM head.
-            n_fill = self.draft_K - len(draft_tokens)
-            for i in range(n_fill):
-                # Greedy: predict next token from last context token embedding.
-                fallback_id = _greedy_fallback_token(context_tokens, i)
-                draft_tokens.append(fallback_id)
+        # Fill any remaining slots with greedy fallback.
+        while len(draft_tokens) < self.draft_K:
+            offset = len(draft_tokens)
+            token_id = _greedy_fallback_token(context_tokens, offset)
+            draft_tokens.append(token_id)
+            # Uniform log-prob as draft distribution for fallback.
+            draft_log_probs.append(-math.log(_DEFAULT_VOCAB))
 
-        return draft_tokens[: self.draft_K]
+        return draft_tokens[: self.draft_K], draft_log_probs[: self.draft_K]
 
-    def _mtp_head_argmax(self, hidden_state: Any, head_info: dict) -> int:
-        """Run an MTP head linear projection and return the argmax token ID.
+    def _mtp_head_forward(
+        self, hidden: Any, head_info: dict, weight: Any
+    ) -> tuple[int, float]:
+        """Run an MTP head and return (argmax_token_id, log_prob).
 
-        This simulates the MTP head forward pass:
-          logits = hidden_state @ W_head.T   (shape: [vocab_size])
-          token_id = argmax(logits)
+        With weights loaded (production path):
+            logits = hidden @ W_head.T        # shape: [vocab_size]
+            token_id = argmax(softmax(logits))
+            log_prob = log_softmax(logits)[token_id]
 
-        When weights are not loaded (planning mode), returns a plausible
-        token based on the head index (for testing/benchmarking).
+        Without weights (testing / planning mode):
+            Deterministic surrogate based on hidden state sum + head index.
         """
-        vocab_size = head_info.get("vocab_size", 128_256)
-        # In production: load weights from blob and matmul with hidden_state.
-        # In planning/testing mode: return a synthetic token ID.
-        if isinstance(hidden_state, (list, tuple)) and len(hidden_state) > 0:
-            # Simple hash of hidden state + head index as deterministic proxy.
-            h_val = sum(float(x) for x in hidden_state) if hasattr(hidden_state[0], "__float__") else len(hidden_state)
-            return int(abs(hash((h_val, head_info.get("index", 0)))) % vocab_size)
-        return head_info.get("index", 0) % vocab_size
+        vocab_size = head_info.get("vocab_size", _DEFAULT_VOCAB)
+        head_idx = head_info.get("index", 0)
+
+        if _TORCH_AVAILABLE and weight is not None and hidden is not None:
+            try:
+                # Ensure hidden is a 1-D float tensor of the right device.
+                if not isinstance(hidden, torch.Tensor):
+                    hidden = torch.tensor(hidden, dtype=torch.float32, device=self.device)
+                h = hidden.float().flatten()
+                # Weight shape: [vocab_size, hidden_size].  Trim if needed.
+                W = weight.float()
+                if W.shape[1] != h.shape[0]:
+                    # Dimension mismatch — truncate or pad the weight matrix.
+                    min_dim = min(W.shape[1], h.shape[0])
+                    W = W[:, :min_dim]
+                    h = h[:min_dim]
+                logits = torch.matmul(W, h)          # [vocab_size]
+                log_probs = torch.log_softmax(logits, dim=-1)
+                token_id = int(torch.argmax(logits).item())
+                log_prob = float(log_probs[token_id].item())
+                return token_id, log_prob
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("P-EAGLE: MTP head %d torch forward failed: %s", head_idx, exc)
+
+        if _TORCH_AVAILABLE and hidden is not None:
+            try:
+                # No weight blob but torch available: random projection surrogate.
+                if not isinstance(hidden, torch.Tensor):
+                    hidden = torch.tensor(hidden, dtype=torch.float32)
+                h = hidden.float().flatten()
+                # Seeded random projection so results are deterministic per head.
+                gen = torch.Generator()
+                gen.manual_seed(head_idx)
+                proj = torch.randn(vocab_size, h.shape[0], generator=gen)
+                logits = torch.matmul(proj, h)
+                log_probs = torch.log_softmax(logits, dim=-1)
+                token_id = int(torch.argmax(logits).item())
+                log_prob = float(log_probs[token_id].item())
+                return token_id, log_prob
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("P-EAGLE: torch surrogate failed for head %d: %s", head_idx, exc)
+
+        # Pure-Python fallback: deterministic hash-based surrogate.
+        if isinstance(hidden, (list, tuple)) and hidden:
+            h_val = sum(float(x) for x in hidden if isinstance(x, (int, float)))
+        elif isinstance(hidden, (int, float)):
+            h_val = float(hidden)
+        else:
+            h_val = 0.0
+        token_id = int(abs(hash((h_val, head_idx))) % vocab_size)
+        log_prob = -math.log(vocab_size)
+        return token_id, log_prob
+
+    # ------------------------------------------------------------------
+    # Verification and acceptance
+    # ------------------------------------------------------------------
 
     def _verify_and_accept(
         self,
         draft_tokens: list[int],
+        draft_log_probs: list[float],
         hidden_state: Any,
         target_forward_fn: Callable[[Any], Any],
     ) -> tuple[list[int], int]:
-        """Verify draft tokens against the target model using optimal transport acceptance.
+        """Verify draft tokens against the target model.
 
-        Leviathan et al. 2023 speculative decoding acceptance criterion:
-          p_accept(x) = min(1, p_target(x) / p_draft(x))
+        Implements the speculative decoding acceptance criterion from
+        Leviathan et al. 2023 (Algorithm 1):
 
-        In this implementation, we:
-          1. Run the target model on the draft token sequence (one forward pass).
-          2. For each draft token t_i, compare target probability p_t(t_i) to
-             draft probability p_d(t_i) (approximated as 1/K uniform).
-          3. Accept greedily until the first rejection.
+          For position i:
+            p_acc = min(1, p_target(t_i) / p_draft(t_i))
+            accept with probability p_acc
+            if accepted → add t_i to output
+            if rejected → resample from (p_target - p_draft)⁺ and stop
+
+        When PyTorch is available, acceptance is sampled via
+        ``torch.distributions.Bernoulli(p_acc)`` for true randomness.
+        Without PyTorch, uses deterministic threshold 0.5.
 
         Returns (accepted_token_ids, n_accepted).
         """
         accepted: list[int] = []
 
         try:
-            # Run target model to get per-position probabilities.
             target_output = target_forward_fn(hidden_state)
         except Exception as exc:  # noqa: BLE001
             logger.debug("P-EAGLE: target forward failed: %s", exc)
             return [], 0
 
-        for i, draft_tok in enumerate(draft_tokens):
-            # Optimal transport acceptance.
-            # p_draft approximated as uniform: 1/vocab_size.
-            # p_target: from target_output (approximated as proportional to output value).
-            p_target = _extract_token_prob(target_output, draft_tok, position=i)
-            p_draft_uniform = 1.0 / 128_256
+        # Extract target log-probabilities for each draft position.
+        for i, (draft_tok, draft_log_p) in enumerate(zip(draft_tokens, draft_log_probs)):
+            target_log_p = _extract_token_log_prob(target_output, draft_tok, position=i)
 
-            accept_prob = min(1.0, p_target / max(p_draft_uniform, 1e-12))
+            # Optimal-transport acceptance probability.
+            # p_accept = min(1, exp(target_log_p - draft_log_p))
+            log_ratio = target_log_p - draft_log_p
+            p_accept = min(1.0, math.exp(log_ratio) if log_ratio < 50 else float("inf"))
 
-            # Accept deterministically at acceptance prob >= 0.5 for planning mode.
-            # In production this should be a true random draw.
-            if accept_prob >= 0.5:
+            # Sample acceptance.
+            if _TORCH_AVAILABLE:
+                try:
+                    accepted_flag = bool(
+                        torch.distributions.Bernoulli(torch.tensor(p_accept)).sample().item()
+                    )
+                except Exception:  # noqa: BLE001
+                    accepted_flag = p_accept >= 0.5
+            else:
+                accepted_flag = p_accept >= 0.5
+
+            if accepted_flag:
                 accepted.append(draft_tok)
             else:
-                break  # Reject and stop at first rejected token.
+                # On rejection, resample from corrected distribution and stop.
+                resampled = _resample_from_target(target_output, draft_log_probs, position=i)
+                if resampled is not None:
+                    accepted.append(resampled)
+                break
 
         return accepted, len(accepted)
+
+    # ------------------------------------------------------------------
+    # Adaptive K
+    # ------------------------------------------------------------------
 
     def adaptive_adjust_K(self) -> int:
         """Adaptively adjust draft K based on recent acceptance rate history.
@@ -282,16 +426,24 @@ class PEAGLEEngine:
 
         if avg_rate > 0.85 and self.draft_K < 8:
             self.draft_K += 1
-            logger.debug("P-EAGLE: acceptance rate %.2f > 0.85, increasing K to %d.", avg_rate, self.draft_K)
+            logger.debug(
+                "P-EAGLE: acceptance rate %.2f > 0.85, increasing K to %d.", avg_rate, self.draft_K
+            )
         elif avg_rate < 0.60 and self.draft_K > 1:
             self.draft_K -= 1
-            logger.debug("P-EAGLE: acceptance rate %.2f < 0.60, decreasing K to %d.", avg_rate, self.draft_K)
+            logger.debug(
+                "P-EAGLE: acceptance rate %.2f < 0.60, decreasing K to %d.", avg_rate, self.draft_K
+            )
 
         return self.draft_K
 
+    # ------------------------------------------------------------------
+    # Properties / stats
+    # ------------------------------------------------------------------
+
     @property
     def current_acceptance_rate(self) -> float:
-        """Return the exponential moving average of the acceptance rate."""
+        """Return the rolling average of the acceptance rate."""
         with self._lock:
             if not self._acceptance_history:
                 return 0.0
@@ -319,16 +471,50 @@ class PEAGLEEngine:
     def get_sm_partition_config(self) -> dict[str, Any]:
         """Return the SM partition configuration for the CUDA backend.
 
-        This is consumed by the ComputeController to configure CUDA MPS /
-        MIG partitioning or CUDA streams for co-resident execution.
+        Consumed by the ComputeController to configure CUDA MPS / MIG
+        partitioning or CUDA streams for co-resident execution.
         """
+        cuda_available = _TORCH_AVAILABLE and torch.cuda.is_available()
+        device_name = (
+            torch.cuda.get_device_name(0) if cuda_available else "cpu"
+        )
+        sm_count = 0
+        if cuda_available:
+            try:
+                props = torch.cuda.get_device_properties(0)
+                sm_count = props.multi_processor_count
+            except Exception:  # noqa: BLE001
+                pass
         return {
             "draft_sm_fraction": self.draft_sm_fraction,
             "target_sm_fraction": 1.0 - self.draft_sm_fraction,
             "communication": "shared_hbm_ring_buffer",
             "ring_buffer_size_mb": 64,
             "sync_method": "cuda_event",
+            "device": device_name,
+            "total_sm_count": sm_count,
+            "draft_sm_count": int(sm_count * self.draft_sm_fraction) if sm_count else 0,
+            "target_sm_count": int(sm_count * (1.0 - self.draft_sm_fraction)) if sm_count else 0,
+            "cuda_available": cuda_available,
         }
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_tensor(hidden_state: Any) -> Any:
+        """Convert hidden_state to a torch.Tensor if possible."""
+        if not _TORCH_AVAILABLE:
+            return hidden_state
+        if isinstance(hidden_state, torch.Tensor):
+            return hidden_state
+        if isinstance(hidden_state, (list, tuple)) and hidden_state:
+            try:
+                return torch.tensor(hidden_state, dtype=torch.float32)
+            except Exception:  # noqa: BLE001
+                pass
+        return hidden_state
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -393,12 +579,17 @@ class _SpecStats:
     def throughput_multiplier(self) -> float:
         """Estimated throughput multiplier vs pure AR decoding.
 
-        Formula: 1 / (1 - alpha * K / (K + 1)) where alpha = acceptance rate.
-        From Leviathan 2023, Section 3.
+        Formula from Leviathan 2023 Section 3:
+          E[tokens per cycle] = (1 - alpha^(K+1)) / (1 - alpha)
+        where alpha = overall_acceptance_rate, K = mean draft tokens per cycle.
         """
         alpha = self.overall_acceptance_rate
         K = max(1, self.total_proposed // max(1, self.total_cycles))
-        return (1.0 - alpha ** (K + 1)) / ((1 - alpha) * (K + 1)) if alpha < 1.0 else float(K + 1)
+        if alpha >= 1.0:
+            return float(K + 1)
+        if alpha <= 0.0:
+            return 1.0
+        return (1.0 - alpha ** (K + 1)) / ((1.0 - alpha) * (K + 1))
 
 
 # ── Utility helpers ───────────────────────────────────────────────────────────
@@ -408,50 +599,106 @@ def _greedy_fallback_token(context: list[int], offset: int) -> int:
     """Return a fallback draft token using context repetition heuristic."""
     if not context:
         return 1  # <s> token
-    # Repeat recent context tokens as draft (useful for continuation tasks).
     return context[-(offset + 1) % len(context)]
 
 
-def _extract_token_prob(target_output: Any, token_id: int, position: int) -> float:
-    """Extract the probability of a specific token from target model output.
+def _extract_token_log_prob(target_output: Any, token_id: int, position: int) -> float:
+    """Extract the log-probability of a specific token from target model output.
 
     Works with:
-      - PyTorch tensors with .softmax() / logits.
+      - PyTorch tensors with .logits attribute (HuggingFace model output).
       - Dict outputs with 'logits' key.
-      - Numeric scalars (planning mode).
+      - Numeric scalars (planning / test mode → uniform distribution).
     """
     try:
+        logits = None
         if hasattr(target_output, "logits"):
             logits = target_output.logits
-            if hasattr(logits, "__getitem__"):
-                # Shape: [batch, seq, vocab] — get position and token.
-                if logits.ndim == 3:
-                    pos_logits = logits[0, position]
-                elif logits.ndim == 2:
-                    pos_logits = logits[position]
-                else:
-                    pos_logits = logits
-                # Softmax approximation: exp(x) / sum(exp(x)).
-                if hasattr(pos_logits, "softmax"):
-                    probs = pos_logits.softmax(dim=-1)
-                    return float(probs[token_id])
-                elif hasattr(pos_logits, "tolist"):
-                    logit_list = pos_logits.tolist()
-                    return _softmax_single(logit_list, token_id)
+        elif isinstance(target_output, dict) and "logits" in target_output:
+            logits = target_output["logits"]
+
+        if logits is not None and _TORCH_AVAILABLE:
+            if not isinstance(logits, torch.Tensor):
+                logits = torch.tensor(logits, dtype=torch.float32)
+            # Shape: [batch, seq, vocab] or [seq, vocab] or [vocab].
+            if logits.ndim == 3:
+                pos_logits = logits[0, min(position, logits.shape[1] - 1)]
+            elif logits.ndim == 2:
+                pos_logits = logits[min(position, logits.shape[0] - 1)]
+            else:
+                pos_logits = logits
+            log_probs = torch.log_softmax(pos_logits.float(), dim=-1)
+            vocab_size = pos_logits.shape[0]
+            if token_id < vocab_size:
+                return float(log_probs[token_id].item())
+            return float(log_probs[-1].item())
+
         elif isinstance(target_output, (list, tuple)):
-            return _softmax_single(list(target_output), token_id)
-        elif isinstance(target_output, (int, float)):
-            # Scalar: treat as uniform (no information).
-            return 1.0 / 128_256
+            return _softmax_log_single(list(target_output), token_id)
+
     except Exception:  # noqa: BLE001
         pass
-    return 1.0 / 128_256  # fallback: uniform
+    return -math.log(_DEFAULT_VOCAB)  # Uniform fallback.
+
+
+def _resample_from_target(
+    target_output: Any, draft_log_probs: list[float], position: int
+) -> int | None:
+    """Resample a token from the corrected distribution (p_target - p_draft)⁺.
+
+    This implements the rejection-resample step in Leviathan 2023 Algorithm 1.
+    Returns the resampled token ID, or None if resampling fails.
+    """
+    try:
+        logits = None
+        if hasattr(target_output, "logits"):
+            logits = target_output.logits
+        elif isinstance(target_output, dict) and "logits" in target_output:
+            logits = target_output["logits"]
+
+        if logits is not None and _TORCH_AVAILABLE:
+            if not isinstance(logits, torch.Tensor):
+                logits = torch.tensor(logits, dtype=torch.float32)
+            if logits.ndim == 3:
+                pos_logits = logits[0, min(position, logits.shape[1] - 1)]
+            elif logits.ndim == 2:
+                pos_logits = logits[min(position, logits.shape[0] - 1)]
+            else:
+                pos_logits = logits
+            p_target = torch.softmax(pos_logits.float(), dim=-1)
+
+            # Build draft probability vector (uniform over all tokens).
+            p_draft = torch.full_like(p_target, math.exp(draft_log_probs[position])
+                                      if position < len(draft_log_probs) else 1.0 / p_target.shape[0])
+
+            # Corrected distribution: (p_target - p_draft)⁺, re-normalised.
+            corrected = torch.clamp(p_target - p_draft, min=0.0)
+            total = corrected.sum()
+            if total > 1e-9:
+                corrected = corrected / total
+                return int(torch.distributions.Categorical(probs=corrected).sample().item())
+            # Fallback: sample from target directly.
+            return int(torch.distributions.Categorical(probs=p_target).sample().item())
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _softmax_log_single(logits: list[float], token_id: int) -> float:
+    """Compute log-softmax probability for a single token given raw logits."""
+    if not logits or token_id >= len(logits):
+        return -math.log(_DEFAULT_VOCAB)
+    max_l = max(logits)
+    exp_vals = [math.exp(l - max_l) for l in logits]
+    total = sum(exp_vals)
+    prob = exp_vals[token_id] / total if total > 0 else 1.0 / len(logits)
+    return math.log(max(prob, 1e-45))
 
 
 def _softmax_single(logits: list[float], token_id: int) -> float:
     """Compute softmax probability for a single token given raw logits."""
     if not logits or token_id >= len(logits):
-        return 1.0 / 128_256
+        return 1.0 / _DEFAULT_VOCAB
     max_l = max(logits)
     exp_vals = [math.exp(l - max_l) for l in logits]
     total = sum(exp_vals)

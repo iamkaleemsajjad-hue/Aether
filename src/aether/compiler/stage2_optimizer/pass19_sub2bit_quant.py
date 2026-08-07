@@ -143,8 +143,8 @@ class Sub2BitQuantizationPass(BasePass):
             compression_ratio = 2.0 / bytes_per_elem
 
             elapsed = time.perf_counter() - start
-            report.status = "ok"
-            report.elapsed_s = elapsed
+            report.status = "applied"
+            report.duration_ms = elapsed * 1000
             report.details = {
                 "method": method,
                 "bits_per_weight": bits_per_weight,
@@ -396,3 +396,5 @@ def _write_sub2bit_manifest(
         json.dumps(manifest, indent=2), encoding="utf-8"
     )
     logger.debug("Wrote sub-2-bit manifest: %s", quant_dir / "sub2bit_manifest.json")
+
+

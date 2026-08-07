@@ -158,8 +158,8 @@ class VideoTokenCompressionPass(BasePass):
                 )
 
             elapsed = time.perf_counter() - start
-            report.status = "ok"
-            report.elapsed_s = elapsed
+            report.status = "applied"
+            report.duration_ms = elapsed * 1000
             report.details = {
                 "backend": backend,
                 "retention_ratio": retention_ratio,
@@ -199,11 +199,11 @@ def _is_vlm_architecture(architecture: Any, graph: Any) -> bool:
     elif hasattr(architecture, "__dict__"):
         arch_str = str(architecture.__dict__).lower()
 
-    # Check graph node names.
+    # Check graph node names — use .nodes.values() to avoid topological_order().
     graph_str = ""
-    if hasattr(graph, "__iter__"):
+    if hasattr(graph, "nodes"):
         try:
-            for node in graph:
+            for node in graph.nodes.values():
                 graph_str += str(getattr(node, "name", "")).lower() + " "
         except Exception:  # noqa: BLE001
             pass
@@ -273,3 +273,5 @@ def _write_video_plan(
         json.dumps(plan, indent=2), encoding="utf-8"
     )
     logger.debug("Wrote video compression plan.")
+
+

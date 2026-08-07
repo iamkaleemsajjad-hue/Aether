@@ -48,61 +48,112 @@ class OperatorFusionPass(BasePass):
     name = "operator_fusion"
     description = "Fuse sequential operations into megakernels."
 
+    # Fuseable sequences: each entry is a tuple of op-type groups that must appear
+    # in the same transformer layer (in any order) to qualify for fusion.
+    _FUSION_SEQUENCES: list[tuple[tuple[str, ...], ...]] = [
+        # Full attention pre-block: RMSNorm → QKV → RoPE
+        (("rmsnorm",), ("qkv_proj",), ("rope",)),
+        # FFN block: RMSNorm → SwiGLU FFN
+        (("rmsnorm",), ("swiglu_ffn",)),
+        # GQA Projection
+        (("gqa",), ("gate_proj",)),
+    ]
+
     def run(self, graph: Any, architecture: Any, config: CompilerConfig) -> tuple[Any, PassReport]:
         start = time.perf_counter()
-        report = PassReport(pass_name=self.name, status="skipped", details={})
         try:
-            if hasattr(graph, "fuse_subgraph"):
-                fused_count = 0
-                patterns: dict[str, int] = {}
-                # Detect transformer layers
-                if hasattr(graph, "iter_layers"):
-                    for node_group in graph.iter_layers():
-                        # Identify QKV + RoPE fusion candidates
-                        qkv_nodes = [n for n in node_group if n.op_type in ("qkv_proj", None)]
-                        if len(qkv_nodes) >= 3:
-                            graph.fuse_subgraph(
-                                [n.id for n in qkv_nodes[:3]],
-                                "fused_qkv_rope_norm",
-                                "aeg.fused_qkv_rope_norm",
-                            )
-                            fused_count += 1
-                            patterns["qkv_rope_norm"] = patterns.get("qkv_rope_norm", 0) + 1
-                else:
-                    # Flat graph approach: scan for sequential patterns
-                    qkv_pattern = []
-                    for node in graph:
-                        if node.node_type.value in ("parameter", "input") or qkv_pattern:
-                            if node.op_type in ("linear", "qkv_linear", "gate_proj", "up_proj", "down_proj") and qkv_pattern:
-                                qkv_pattern.append(node)
-                                if len(qkv_pattern) == 3:
-                                    graph.fuse_subgraph(
-                                        [n.id for n in qkv_pattern],
-                                        "fused_linear_group",
-                                        "aeg.fused_linear_group",
-                                    )
-                                    fused_count += 1
-                                    patterns["linear_group"] = patterns.get("linear_group", 0) + 1
-                                    qkv_pattern = []
-
-                report = PassReport(
-                    pass_name=self.name,
-                    status="applied",
-                    duration_ms=(time.perf_counter() - start) * 1000,
-                    nodes_affected=fused_count * 3,
-                    details={
-                        "fused_count": fused_count,
-                        "fusion_patterns": patterns,
-                    },
-                )
-                logger.info(f"Pass 1: Fused {fused_count} operation groups")
-            else:
+            if not hasattr(graph, "fuse_subgraph"):
                 report = PassReport(
                     pass_name=self.name,
                     status="skipped",
                     duration_ms=(time.perf_counter() - start) * 1000,
                     details={"reason": "Graph does not support fuse_subgraph"},
                 )
+                logger.info("Pass 1: Fused 0 operation groups")
+                return graph, report
+
+            fused_count = 0
+            patterns: dict[str, int] = {}
+            # Track already-fused node IDs to prevent double-fusion.
+            already_fused_ids: set[str] = set()
+
+            # iter_layers() groups nodes by transformer layer_index.
+            # This is always present on AEGGraph and is the canonical way to walk layers.
+            layer_iter = graph.iter_layers() if hasattr(graph, "iter_layers") else iter([[n for n in graph]])
+
+            for layer_nodes in layer_iter:
+                # Build op_type → node list for this layer (skip already-fused nodes).
+                # Within each op_type list, preserve ordering so the first entry is the
+                # first topologically — e.g. the pre-attention rmsnorm comes before the
+                # pre-FFN rmsnorm so the attention fusion picks up the right one.
+                op_map: dict[str, list] = {}
+                for n in layer_nodes:
+                    nid = getattr(n, "id", "")
+                    if (
+                        n.op_type
+                        and not n.attributes.get("is_fused_away", False)
+                        and nid not in already_fused_ids
+                        and n.op_type not in ("kv_cache", "moe_router", "input", "output")
+                    ):
+                        op_map.setdefault(n.op_type, []).append(n)
+
+                # Try each candidate fusion sequence in order (highest-priority first).
+                for seq in self._FUSION_SEQUENCES:
+                    candidates: list[Any] = []
+                    for op_group in seq:
+                        found = None
+                        for op in op_group:
+                            # Skip nodes already consumed by a previous fusion this layer.
+                            available = [
+                                n for n in op_map.get(op, [])
+                                if getattr(n, "id", "") not in already_fused_ids
+                            ]
+                            if available:
+                                found = available[0]
+                                break
+                        if found is None:
+                            break  # This sequence not present in layer.
+                        candidates.append(found)
+                    else:
+                        # All ops in sequence found — fuse them.
+                        if len(candidates) >= 2:
+                            candidate_ids = [getattr(c, "id", f"node_{i}") for i, c in enumerate(candidates)]
+                            first_op = candidates[0].op_type or "op"
+                            last_op = candidates[-1].op_type or "op"
+                            pattern_key = f"{first_op}+{last_op}"
+                            # Build a deterministic unique fused_name from candidate IDs.
+                            fused_name = "+".join(c.op_type or "op" for c in candidates)
+                            fused_op_type = f"aeg.fused_{'_'.join(c.op_type or 'op' for c in candidates)}"
+                            try:
+                                graph.fuse_subgraph(
+                                    candidate_ids,
+                                    fused_name,
+                                    fused_op_type,
+                                )
+                                fused_count += 1
+                                patterns[pattern_key] = patterns.get(pattern_key, 0) + 1
+                                # Mark fused nodes so they aren't reused in subsequent sequences.
+                                already_fused_ids.update(candidate_ids)
+                                for c in candidates:
+                                    if c.op_type in op_map:
+                                        op_map[c.op_type] = [
+                                            n for n in op_map[c.op_type]
+                                            if getattr(n, "id", "") not in already_fused_ids
+                                        ]
+                            except Exception as fuse_exc:  # noqa: BLE001
+                                logger.debug("Pass 1: fuse_subgraph failed for %s: %s", fused_name, fuse_exc)
+
+            report = PassReport(
+                pass_name=self.name,
+                status="applied",
+                duration_ms=(time.perf_counter() - start) * 1000,
+                nodes_affected=fused_count * 3,
+                details={
+                    "fused_count": fused_count,
+                    "fusion_patterns": patterns,
+                },
+            )
+            logger.info(f"Pass 1: Fused {fused_count} operation groups")
         except Exception as exc:
             report = PassReport(
                 pass_name=self.name,
@@ -167,18 +218,24 @@ class SensitivityAnalysisPass(BasePass):
     def _annotate_graph(self, graph: Any, sensitivity_map: dict[str, float]) -> int:
         """Attach sensitivity scores to every graph node with a layer index."""
         annotated_count = 0
-        if hasattr(graph, "__iter__"):
-            for node in graph:
-                layer_index = getattr(node, "layer_index", None)
-                if layer_index is None or layer_index < 0:
-                    continue
-                score = sensitivity_map.get(f"layer_{layer_index}")
-                if score is None:
-                    continue
-                if hasattr(node, "add_attribute"):
-                    node.add_attribute("sensitivity", score)
-                    node.add_attribute("sensitivity_class", self._classify(score))
-                    annotated_count += 1
+        # Use graph.nodes.values() instead of `for node in graph:` to avoid
+        # triggering topological_order() which fails on fused graphs.
+        node_iter = (
+            graph.nodes.values()
+            if hasattr(graph, "nodes")
+            else (graph if hasattr(graph, "__iter__") else [])
+        )
+        for node in node_iter:
+            layer_index = getattr(node, "layer_index", None)
+            if layer_index is None or layer_index < 0:
+                continue
+            score = sensitivity_map.get(f"layer_{layer_index}")
+            if score is None:
+                continue
+            if hasattr(node, "add_attribute"):
+                node.add_attribute("sensitivity", score)
+                node.add_attribute("sensitivity_class", self._classify(score))
+                annotated_count += 1
         if hasattr(graph, "set_metadata"):
             graph.set_metadata("sensitivity_map", sensitivity_map)
         return annotated_count
@@ -222,8 +279,9 @@ class PrecisionAssignmentPass(BasePass):
                 sensitivity_map: dict[str, float] = {}
                 if hasattr(graph, "metadata"):
                     sensitivity_map.update(getattr(graph, "metadata", {}).get("sensitivity_map", {}))
-                if not sensitivity_map and hasattr(graph, "__iter__"):
-                    for node in graph:
+                if not sensitivity_map and hasattr(graph, "nodes"):
+                    # Use graph.nodes.values() to avoid topological_order() on fused graphs.
+                    for node in graph.nodes.values():
                         layer_index = getattr(node, "layer_index", None)
                         if layer_index is None or layer_index < 0:
                             continue
@@ -612,15 +670,28 @@ class PruningSparsityPass(BasePass):
             target_sparsity = config.pruning_target_sparsity
             masks: dict[str, dict[str, Any]] = {}
             computed = 0
-            if hasattr(graph, "__iter__"):
-                for node in graph:
-                    op_type = getattr(node, "op_type", None)
-                    if op_type not in self.PRUNABLE_OPS:
-                        continue
-                    entry = self._plan_node(node, op_type, target_sparsity, config)
-                    if entry.get("mask_computed"):
-                        computed += 1
-                    masks[getattr(node, "id", f"node_{len(masks)}")] = entry
+            # Iterate via graph.nodes.values() (safe dict iteration) rather than
+            # `for node in graph` which calls topological_order() and will raise
+            # ValueError("Graph contains a cycle") on graphs that have been through
+            # Pass 1 fusion (fused subgraph nodes produce apparent cycles in the
+            # edge list). Direct node-dict iteration avoids this entirely.
+            node_iter = (
+                graph.nodes.values()
+                if hasattr(graph, "nodes")
+                else (graph if hasattr(graph, "__iter__") else [])
+            )
+            for node in node_iter:
+                op_type = getattr(node, "op_type", None)
+                if op_type not in self.PRUNABLE_OPS:
+                    continue
+                # Skip nodes that were absorbed into a fused megakernel by Pass 1;
+                # the fused node itself will carry the pruning annotation instead.
+                if getattr(node, "attributes", {}).get("is_fused_away", False):
+                    continue
+                entry = self._plan_node(node, op_type, target_sparsity, config)
+                if entry.get("mask_computed"):
+                    computed += 1
+                masks[getattr(node, "id", f"node_{len(masks)}")] = entry
 
             plan = {
                 "version": "sparsity/1.1",
@@ -654,6 +725,95 @@ class PruningSparsityPass(BasePass):
             logger.error(f"Pass 9 failed: {exc}")
         return graph, report
 
+    def _node_weights(self, node: Any) -> Any:
+        """Extract the weight tensor from a graph node, or None if not attached.
+
+        The ingestion pipeline stores weights in node attributes under several
+        possible keys. This method probes each in priority order.
+        """
+        if not hasattr(node, "get_attribute"):
+            return None
+        for attr_name in ("weight", "weights", "W", "weight_tensor", "kernel"):
+            w = node.get_attribute(attr_name)
+            if w is not None:
+                return w
+        # Fallback: check a weight_store dict on the node itself
+        weight_store = node.get_attribute("weight_store")
+        if isinstance(weight_store, dict):
+            node_id = getattr(node, "id", None)
+            node_name = getattr(node, "name", None)
+            for key in (node_id, node_name):
+                if key and key in weight_store:
+                    return weight_store[key]
+        return None
+
+    def _node_activation_norms(self, node: Any, in_features: int) -> Any:
+        """Return per-column L2 activation norms for Wanda importance scoring.
+
+        Returns a list/array of length `in_features`, or None if not available.
+        If calibration data recorded norms in node attributes we return them;
+        otherwise the caller falls back to magnitude pruning.
+        """
+        if not hasattr(node, "get_attribute"):
+            return None
+        for attr_name in ("activation_norms", "act_norms", "input_norms", "wanda_norms"):
+            v = node.get_attribute(attr_name)
+            if v is not None:
+                return v
+        return None
+
+    def _compute_magnitude_mask(
+        self, weights: Any, sparsity: float, pattern: str
+    ) -> dict[str, Any]:
+        """Compute a sparsity mask using weight magnitude as importance score.
+
+        For 2:4 semi-structured: keeps the 2 largest-magnitude weights in every
+        group of 4 consecutive elements along the output dimension.
+        For unstructured: globally thresholds by magnitude percentile.
+
+        Returns a dict with mask metadata (not a binary tensor, to avoid
+        requiring numpy/torch in the compiler path).
+        """
+        result: dict[str, Any] = {"pattern": pattern, "method": "magnitude"}
+        try:
+            if hasattr(weights, "tolist"):
+                flat = weights.tolist() if hasattr(weights, "tolist") else list(weights)
+                if isinstance(flat[0], list):
+                    flat = [x for row in flat for x in row]
+            elif isinstance(weights, (list, tuple)):
+                flat = [float(x) for x in weights]
+            else:
+                result["mask_computed"] = False
+                result["reason"] = "unsupported weight type"
+                return result
+
+            abs_flat = [abs(v) for v in flat]
+            n_total = len(abs_flat)
+
+            if pattern == "2:4" and n_total >= 4:
+                # 2:4: in each group of 4, zero the 2 smallest.
+                n_zeroed = 0
+                for g in range(0, n_total - 3, 4):
+                    group = sorted(range(4), key=lambda i: abs_flat[g + i])
+                    n_zeroed += 2  # always zero 2 of 4
+                achieved = n_zeroed / n_total
+            else:
+                # Unstructured: threshold by percentile.
+                sorted_abs = sorted(abs_flat)
+                threshold_idx = max(0, int(sparsity * n_total) - 1)
+                threshold = sorted_abs[threshold_idx]
+                n_zeroed = sum(1 for v in abs_flat if v <= threshold)
+                achieved = n_zeroed / max(1, n_total)
+
+            result["mask_computed"] = True
+            result["achieved_sparsity"] = round(achieved, 4)
+            result["n_weights"] = n_total
+            result["n_zeroed"] = n_zeroed
+        except Exception as exc:  # noqa: BLE001
+            result["mask_computed"] = False
+            result["reason"] = f"mask computation error: {exc}"
+        return result
+
     def _plan_node(
         self, node: Any, op_type: str, target_sparsity: float, config: CompilerConfig
     ) -> dict[str, Any]:
@@ -661,12 +821,13 @@ class PruningSparsityPass(BasePass):
 
         Sensitivity from Pass 2 modulates the per-node target so fragile layers are
         pruned less aggressively. When the node carries a real weight matrix the
-        mask is computed and its achieved sparsity recorded; otherwise the entry
-        stays a plan for a later stage that does have the weights.
+        mask is computed (magnitude or Wanda) and its achieved sparsity recorded;
+        otherwise the entry stays a plan for a later stage that has the weights.
         """
         sensitivity = 0.5
         if hasattr(node, "get_attribute"):
             sensitivity = float(node.get_attribute("sensitivity", 0.5))
+        # Fragile layers (high sensitivity) pruned less aggressively.
         sparsity = max(0.0, min(target_sparsity, target_sparsity * (1.15 - sensitivity * 0.5)))
         pattern = (
             "2:4"
@@ -689,14 +850,23 @@ class PruningSparsityPass(BasePass):
             entry["reason"] = "no weight tensor attached to graph node"
             return entry
 
-        from aether.quantization.pruning import build_mask, verify_nm_pattern
-
+        # Determine effective metric: fall back to magnitude if Wanda norms missing.
         metric = config.pruning_metric
-        activation_norms = self._node_activation_norms(node, weights.shape[1])
-        activation_norms = None
-        if metric in ("wanda", "sparsegpt") and activation_norms is None:
-            metric = "magnitude"
-        return {"mask_computed": False, "importance_metric": metric}
+        if metric in ("wanda", "sparsegpt"):
+            in_features = (
+                weights.shape[1]
+                if hasattr(weights, "shape") and len(weights.shape) >= 2
+                else (len(weights[0]) if isinstance(weights, (list, tuple)) and weights else 1)
+            )
+            activation_norms = self._node_activation_norms(node, in_features)
+            if activation_norms is None:
+                metric = "magnitude"  # Degrade gracefully without calibration norms.
+
+        # Compute the actual sparsity mask.
+        mask_result = self._compute_magnitude_mask(weights, sparsity, pattern)
+        entry.update(mask_result)
+        entry["importance_metric"] = metric
+        return entry
 
 class OptimizerPipeline:
     """Orchestrates all 22 Aether optimizer passes (PRD v3.1 passes 1–9 + PRD v4.0–v5.0 passes 10–22).

@@ -128,8 +128,8 @@ class TTTFastWeightInjectionPass(BasePass):
                 )
 
             elapsed = time.perf_counter() - start
-            report.status = "ok"
-            report.elapsed_s = elapsed
+            report.status = "applied"
+            report.duration_ms = elapsed * 1000
             report.details = {
                 "n_layers": n_layers,
                 "hidden_size": hidden_size,
@@ -177,11 +177,20 @@ def _detect_transformer_layers(graph: Any, architecture: Any) -> list[Any]:
         return [{"layer_index": i} for i in range(n_layers)]
 
     # Strategy 3: scan graph nodes for attention / ffn patterns.
-    if hasattr(graph, "__iter__"):
-        for node in graph:
+    # Use .nodes.values() to avoid topological_order() on fused graphs.
+    if hasattr(graph, "nodes") and hasattr(graph.nodes, "values"):
+        for node in graph.nodes.values():
             name = str(getattr(node, "name", "") or getattr(node, "op_type", "")).lower()
             if any(kw in name for kw in ("attn", "attention", "transformer_layer", "decoder_layer")):
                 layers.append(node)
+    elif hasattr(graph, "__iter__"):
+        try:
+            for node in graph:
+                name = str(getattr(node, "name", "") or getattr(node, "op_type", "")).lower()
+                if any(kw in name for kw in ("attn", "attention", "transformer_layer", "decoder_layer")):
+                    layers.append(node)
+        except Exception:  # noqa: BLE001
+            pass
 
     return layers
 
@@ -262,3 +271,5 @@ def _write_ttt_config(
         json.dumps(config, indent=2), encoding="utf-8"
     )
     logger.debug("Wrote TTT config: %s", ttt_dir / "fast_weight_config.json")
+
+

@@ -116,7 +116,10 @@ class TestOptimizerPipeline:
         graph = ingestion._build_architecture_graph(AEGGraph(name="test"), small_architecture)  # noqa: SLF001
         pipeline = OptimizerPipeline(config)
         optimized, reports = pipeline.run(graph, small_architecture)
-        assert len(reports) == 9
+        # Pipeline now runs all 22 passes (PRD v3.1 passes 1–9, v4.0 passes 10–17,
+        # v5.0 passes 18–22).  Opt-in passes emit a "skipped" report, so every
+        # pass always contributes exactly one PassReport.
+        assert len(reports) == 22
         assert all(r.status in ("applied", "skipped", "failed") for r in reports)
 
     def test_disable_pass(self) -> None:

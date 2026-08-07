@@ -150,8 +150,8 @@ class SemanticKVCompressionPass(BasePass):
                 )
 
             elapsed = time.perf_counter() - start
-            report.status = "ok"
-            report.elapsed_s = elapsed
+            report.status = "applied"
+            report.duration_ms = elapsed * 1000
             report.details = {
                 "n_layers": n_layers,
                 "strategy": strategy,
@@ -400,3 +400,5 @@ def _infer_n_kv_heads(architecture: Any) -> int:
     elif hasattr(architecture, "num_key_value_heads"):
         return int(architecture.num_key_value_heads)
     return 8  # GQA default
+
+

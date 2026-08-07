@@ -151,8 +151,8 @@ class GrammarConstraintCompilerPass(BasePass):
             _annotate_graph(graph, fsa, grammar_type, schema_hash)
 
             elapsed = time.perf_counter() - start
-            report.status = "ok"
-            report.elapsed_s = elapsed
+            report.status = "applied"
+            report.duration_ms = elapsed * 1000
             report.details = {
                 "grammar_type": grammar_type,
                 "grammar_backend": backend,
@@ -938,3 +938,5 @@ def _annotate_graph(
         graph.add_annotation("grammar_constraint", annotation)
     elif hasattr(graph, "metadata"):
         graph.metadata["grammar_constraint"] = annotation
+
+

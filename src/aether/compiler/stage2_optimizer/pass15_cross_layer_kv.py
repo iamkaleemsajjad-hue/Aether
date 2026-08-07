@@ -121,8 +121,8 @@ class CrossLayerKVSharingPass(BasePass):
                 )
 
             elapsed = time.perf_counter() - start
-            report.status = "ok"
-            report.elapsed_s = elapsed
+            report.status = "applied"
+            report.duration_ms = elapsed * 1000
             report.details = {
                 "n_layers": n_layers,
                 "n_sharing_groups": len(groups),
@@ -247,3 +247,5 @@ def _count_layers(architecture: Any, graph: Any) -> int:
     if hasattr(graph, "n_layers"):
         return int(graph.n_layers)
     return 32
+
+

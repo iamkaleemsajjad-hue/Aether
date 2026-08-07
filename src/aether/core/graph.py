@@ -507,13 +507,27 @@ class AEGGraph:
     def topological_order(self) -> list[str]:
         """Return node IDs in topological order (data dependencies only).
 
+        Nodes that have been fused into a megakernel (``is_fused_away=True``)
+        are excluded from the ordering — they are retained in the node dict for
+        inspection but are logically replaced by the enclosing fused node.
+
         Returns:
             A list of node IDs sorted such that all predecessors appear before
             their successors.
         """
-        in_degree: dict[str, int] = {nid: 0 for nid in self._nodes}
+        # Exclude nodes that were subsumed into a fused operation.
+        live_nodes = {
+            nid: node
+            for nid, node in self._nodes.items()
+            if not node.attributes.get("is_fused_away", False)
+        }
+
+        in_degree: dict[str, int] = {nid: 0 for nid in live_nodes}
         for edge in self._edges:
-            if edge.edge_type == AEGGraphEdgeType.DATA:
+            if edge.edge_type != AEGGraphEdgeType.DATA:
+                continue
+            # Only count edges where both endpoints are live nodes.
+            if edge.source in live_nodes and edge.target in live_nodes:
                 in_degree[edge.target] += 1
 
         queue = [nid for nid, deg in in_degree.items() if deg == 0]
@@ -522,12 +536,12 @@ class AEGGraph:
             current = queue.pop(0)
             order.append(current)
             for edge in self.get_output_edges(current):
-                if edge.edge_type == AEGGraphEdgeType.DATA:
+                if edge.edge_type == AEGGraphEdgeType.DATA and edge.target in in_degree:
                     in_degree[edge.target] -= 1
                     if in_degree[edge.target] == 0:
                         queue.append(edge.target)
 
-        if len(order) != len(self._nodes):
+        if len(order) != len(live_nodes):
             msg = "Graph contains a cycle; cannot produce topological order"
             raise ValueError(msg)
         return order
