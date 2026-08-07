@@ -107,6 +107,38 @@ class RuntimeConfig:
     extra: dict[str, Any] = field(default_factory=dict)
     """Additional runtime-specific parameters."""
 
+    # ── v5.0 Runtime Config ─────────────────────────────────────────────────
+
+    vocab_size: int = 128000
+    """Vocabulary size of the model (for R9 DiffusionSpecEngine)."""
+
+    semantic_cache_threshold: float = 0.92
+    """Cosine similarity threshold for R11 semantic cache hits (0.0-1.0).
+    Lower = more aggressive caching (may return slightly different responses).
+    Higher = more conservative (only very close prompts hit cache).
+    Default 0.92 balances hit rate vs accuracy."""
+
+    cxl_pool_size_gb: float = 0.0
+    """CXL rack-scale KV pool size in GB (R12). Set to 0 to disable.
+    Requires CXL 3.0 hardware or emulated mode (file-backed mmap).
+    Typical values: 128.0 (small rack), 512.0 (full rack)."""
+
+    enable_diffusion_spec: bool = True
+    """Enable R9 diffusion speculative decoding when MDLM draft head is available.
+    Provides 2.8-4.1x wall-clock speedup vs sequential AR decoding."""
+
+    enable_semantic_cache: bool = True
+    """Enable R11 semantic request cache. Eliminates 30-50% of redundant LLM calls
+    by finding semantically similar prior responses."""
+
+    diffusion_spec_K: int = 8
+    """Initial draft block size K for R9 DiffusionSpecEngine.
+    Adaptively adjusted during inference based on acceptance rate."""
+
+    diffusion_spec_T: int = 4
+    """Initial denoising steps T for R9 DiffusionSpecEngine.
+    Adaptively adjusted based on per-block uncertainty."""
+
     def __post_init__(self) -> None:
         self.validate()
 
