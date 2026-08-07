@@ -61,7 +61,9 @@ jobs:
           pip install -e ".[test]"
 
       - name: Run unit tests
-        run: pytest tests/unit -m "not slow" --junitxml=test-results.xml
+        run: |
+          pytest tests/unit tests/test_passes_v2.py tests/test_runtime_v2.py \
+            -m "not slow" --junitxml=test-results.xml
 
       - name: Upload test results
         uses: actions/upload-artifact@v4
@@ -248,133 +250,182 @@ jobs:
             tests/test_runtime_v2.py::TestR12RLVRHarness::test_pass_at_k_none_correct \
             -v --tb=short
 
-on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main, develop]
-  workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # ── v4.0 AEG Format 2.0 and RISC-V NPU IR ─────────────────────────────────
 
-jobs:
-  lint:
-    name: Lint and typecheck
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[lint,test]"
-
-      - name: Run ruff linter
-        run: ruff check src tests examples benchmarks scripts
-
-      - name: Run ruff format check
-        run: ruff format --check src tests examples benchmarks scripts
-
-      - name: Run mypy typecheck
-        run: mypy src/aether
-
-  unit-tests:
-    name: Unit tests (${{ matrix.os }}, py${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test]"
-
-      - name: Run unit tests
-        run: pytest tests/unit -m "not slow" --junitxml=test-results.xml
-
-      - name: Upload test results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-results-${{ matrix.os }}-${{ matrix.python-version }}
-          path: test-results.xml
-
-  docs-build:
-    name: Build documentation
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[docs]"
-
-      - name: Build docs
-        run: sphinx-build -W -b html docs docs/_build/html
-
-      - name: Upload docs artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: docs-html
-          path: docs/_build/html
-
-
-  v31-artifact-contract:
-    name: AEG v3.1 artifact contract
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test]"
-
-      - name: Verify v3.1 package artifacts
-        run: pytest tests/unit/test_v31_features.py::test_compiled_package_contains_v31_artifacts --no-cov
-
-
-  v31-runtime-layer-contract:
-    name: PRD v3.1 Runtime Layer Contracts
+  v40-aeg-format-v2:
+    name: PRD v4.0 — AEG Format 2.0 Package Contract
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "[test]"
+      - name: Run AEG Format 2.0 tests
+        run: |
+          pytest tests/unit/test_aeg_format_v2.py \
+            -v --tb=short \
+            --junitxml=test-results-aeg-format-v2.xml
+      - name: Verify AEG/2.0 import from aether.compiler
+        run: |
+          python -c "
+          from aether.compiler import (
+              AEGPackageV2, AEGManifest, SpeculationConfig,
+              GrammarManifest, GreenEnergyProfile, TEEConfig,
+              MultiAgentConfig, MCPConfig, AEG_FORMAT_VERSION_V2,
+          )
+          assert AEG_FORMAT_VERSION_V2 == 'AEG/2.0'
+          print('OK: AEG Format 2.0 types importable from aether.compiler')
+          "
+      - name: Smoke test AEGPackageV2.create()
+        run: |
+          python -c "
+          import tempfile, os
+          from pathlib import Path
+          from aether.compiler.aeg_format_v2 import AEGPackageV2, AEGManifest
+          with tempfile.TemporaryDirectory() as td:
+              pkg = AEGPackageV2(Path(td) / 'smoke.aeg')
+              pkg.create()
+              errors = pkg.validate()
+              assert errors == [], f'Validation errors: {errors}'
+              assert pkg.is_v2()
+              s = pkg.summary()
+              assert s['format_version'] == 'AEG/2.0'
+              print('OK: AEGPackageV2 smoke test passed.')
+          "
+      - name: Upload AEG test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-aeg-format-v2
+          path: test-results-aeg-format-v2.xml
+
+  v40-riscv-npu-backends:
+    name: PRD v4.0 — RISC-V NPU Abstract IR and Backend Contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "[test]"
+      - name: Run RISC-V backend and hardware profile tests
+        run: |
+          pytest tests/unit/test_riscv_and_hardware.py \
+            -v --tb=short \
+            --junitxml=test-results-riscv.xml
+      - name: Verify all 28 hardware profiles load
+        run: |
+          python -c "
+          from aether.compiler.stage3_targeting.hardware_profile import (
+              HardwareProfile, _TARGET_PROFILES
+          )
+          assert len(_TARGET_PROFILES) >= 28, f'Expected >= 28 profiles, got {len(_TARGET_PROFILES)}'
+          for tid in ['cuda_sm120', 'cuda_sm100_tee', 'riscv_mips_s8200',
+                      'riscv_sifive_x160', 'riscv_xuantie_c930', 'riscv_cervell']:
+              p = HardwareProfile.from_target_id(tid)
+              assert p is not None, f'Missing profile: {tid}'
+          print(f'OK: {len(_TARGET_PROFILES)} hardware profiles registered.')
+          "
+      - name: Verify RISC-V backend registry
+        run: |
+          python -c "
+          from aether.compiler.stage3_targeting.riscv_npu_ir import RISCV_NPU_BACKEND_REGISTRY
+          import aether.compiler.stage3_targeting.target_riscv_mips
+          import aether.compiler.stage3_targeting.target_riscv_sifive
+          import aether.compiler.stage3_targeting.target_riscv_xuantie
+          import aether.compiler.stage3_targeting.target_riscv_cervell
+          families = RISCV_NPU_BACKEND_REGISTRY.registered_families
+          for f in ['mips_npu', 'sifive_x', 'xuantie_c', 'cervell']:
+              assert f in families, f'Missing backend family: {f}'
+          print(f'OK: {len(families)} RISC-V NPU backends registered: {families}')
+          "
+      - name: Upload RISC-V test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-riscv
+          path: test-results-riscv.xml
+
+  v40-hardware-profile-v2-fields:
+    name: PRD v4.0 — Hardware Profile v4.0 Field Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Install test dependencies
         run: pip install -e .[test]
-      - name: Validate v3.1 runtime layers
-        run: pytest tests/unit/test_v31_runtime_layers.py --no-cov
+      - name: Verify v4.0 HardwareProfile fields
+        run: |
+          python -c "
+          from aether.compiler.stage3_targeting.hardware_profile import HardwareProfile
+          import dataclasses
+          field_names = {f.name for f in dataclasses.fields(HardwareProfile)}
+          required_v4_fields = {
+              'supports_fp4', 'flops_fp4', 'supports_ternary', 'supports_mxfp6',
+              'supports_tee', 'tee_backend', 'nvlink_bandwidth_gb_s', 'tdp_watts',
+              'is_riscv_npu', 'abstract_ir_family',
+          }
+          missing = required_v4_fields - field_names
+          assert not missing, f'Missing v4.0 HardwareProfile fields: {missing}'
+          # Verify key v4.0 profiles have correct field values
+          sm120 = HardwareProfile.from_target_id('cuda_sm120')
+          assert sm120.supports_fp4 is True, 'cuda_sm120 must support FP4'
+          assert sm120.nvlink_bandwidth_gb_s >= 3600, 'Rubin R100 NVLink must be >= 3600 GB/s'
+          tee = HardwareProfile.from_target_id('cuda_sm100_tee')
+          assert tee.supports_tee is True, 'cuda_sm100_tee must support TEE'
+          mips = HardwareProfile.from_target_id('riscv_mips_s8200')
+          assert mips.is_riscv_npu is True, 'MIPS S8200 must be RISC-V NPU'
+          print('OK: All v4.0 HardwareProfile fields verified.')
+          "
+
+  v40-runtime-v4-extensions:
+    name: PRD v4.0 — Runtime Extension Methods (compile_async, merge, _init_v4_layers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "[test]"
+      - name: Run Runtime v4.0 extension tests
+        run: |
+          pytest tests/unit/test_runtime_v4_extensions.py \
+            -v --tb=short \
+            --junitxml=test-results-runtime-v4-ext.xml
+      - name: Verify Runtime v4.0 attribute contract
+        run: |
+          python -c "
+          from aether.runtime.runtime import Runtime
+          from aether.runtime.config import RuntimeConfig
+          rt = Runtime(RuntimeConfig())
+          assert rt.grammar_engine is None
+          assert rt.ttt_engine is None
+          assert rt.tee_manager is None
+          assert rt.green_power_manager is None
+          assert rt.mcp_layer is None
+          jid = rt.compile_async('test-model', job_id='ci-smoke')
+          s = rt.get_compile_status('ci-smoke')
+          assert s['job_id'] == 'ci-smoke'
+          result = rt.merge('model', task_vectors=[])
+          assert isinstance(result, dict)
+          print('OK: Runtime v4.0 extension API contract verified.')
+          "
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-runtime-v4-ext
+          path: test-results-runtime-v4-ext.xml

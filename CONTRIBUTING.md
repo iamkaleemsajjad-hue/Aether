@@ -596,3 +596,131 @@ All algorithm implementations must:
 - Have **pure-Python correctness tests**: the algorithm must be testable without GPU.
 - Reference the **research paper** in module docstring with arXiv ID or full citation.
 - Match the **mathematical specification** in the PRD (not just approximate it).
+
+---
+
+## Writing a New Compiler Pass (v4.0+ Guide)
+
+All compiler passes (Passes 10-22 and beyond) follow the same structure.
+
+### Step 1: Create the pass re-export file
+
+Create `src/aether/compiler/stage2_optimizer/passN_name.py`:
+
+- First non-docstring line: `from __future__ import annotations`
+- Docstring must cite the research paper (full citation or arXiv ID)
+- Re-export the pass class from `optimizer.py` using `__all__`
+
+### Step 2: Implement the pass class in optimizer.py
+
+Add to `src/aether/compiler/stage2_optimizer/optimizer.py`:
+
+```python
+class MyNewPass(BasePass):
+    name = "my_new_pass"
+    description = "Longer description for reports."
+
+    def run(self, graph, architecture, config):
+        if not config.enable_my_new_pass:
+            return graph, self._skipped()
+        try:
+            graph.metadata["my_pass_result"] = {}
+            return graph, self._applied({"key": "value"})
+        except Exception as exc:
+            return graph, self._failed(str(exc))
+```
+
+### Step 3: Add a CompilerConfig gate (opt-in)
+
+Add to `src/aether/compiler/config.py`:
+
+```python
+enable_my_new_pass: bool = False  # opt-in, default disabled
+```
+
+### Step 4: Register in OptimizerPipeline.__init__()
+
+```python
+self._passes.append(MyNewPass())
+self._pass_enabled["my_new_pass"] = config.enable_my_new_pass
+```
+
+### Step 5: AEG Format 2.0 artifacts (if pass emits files)
+
+```python
+from aether.compiler.aeg_format_v2 import AEGPackageV2
+pkg = AEGPackageV2(config.output_path)
+dir_ = pkg.root / "my_pass"
+dir_.mkdir(exist_ok=True)
+(dir_ / "config.json").write_text(json.dumps(result), encoding="utf-8")
+```
+
+Add `has_my_pass: bool = False` field to `AEGManifest` in `aeg_format_v2.py`.
+
+### Step 6: Write tests
+
+```python
+class TestPassNMyNewPass:
+    def test_skipped_when_disabled(self, graph, architecture):
+        _, report = MyNewPass().run(graph, architecture, CompilerConfig(enable_my_new_pass=False))
+        assert report.status == "skipped"
+
+    def test_applied_when_enabled(self, graph, architecture):
+        _, report = MyNewPass().run(graph, architecture, CompilerConfig(enable_my_new_pass=True))
+        assert report.status == "applied"
+
+    def test_core_algorithm(self):
+        # Pure-Python, no GPU required
+        assert my_fn(inputs) == expected
+```
+
+### Mandatory Checklist for New Passes
+
+- [ ] `from __future__ import annotations` is first non-docstring line
+- [ ] Docstring cites the research paper with arXiv ID or full citation
+- [ ] Gated behind `CompilerConfig.enable_X: bool = False` (opt-in)
+- [ ] `graph.metadata` annotated with results for downstream passes
+- [ ] `_skipped()` returned when gate is off; `_failed(msg)` on errors (never raise)
+- [ ] At least one pure-Python correctness test (no GPU required)
+- [ ] Exported from `src/aether/compiler/stage2_optimizer/__init__.py`
+- [ ] CHANGELOG.md entry added
+- [ ] AEG Format 2.0 manifest flag added if pass emits artifacts
+- [ ] CI job added in `.github/workflows/ci.yml`
+
+---
+
+## AEG Format 2.0 Directory Contract
+
+Always use `AEGPackageV2` — never create directories manually:
+
+```python
+from aether.compiler.aeg_format_v2 import AEGPackageV2, AEGManifest
+pkg = AEGPackageV2("/path/to/model.aeg")
+pkg.create()                   # idempotent
+pkg.upgrade_v1_to_v2()         # migrate AEG/1.x to AEG/2.0
+manifest = pkg.read_manifest()
+```
+
+Key `AEGManifest` boolean flags (`has_X: bool`) must match the physical files
+present in the package. `AEGPackageV2.validate()` checks consistency.
+
+---
+
+## RISC-V NPU Backend Development
+
+To add a new RISC-V NPU vendor backend:
+
+1. Create `src/aether/compiler/stage3_targeting/target_riscv_{vendor}.py`.
+2. Implement `AetherRISCVNPUBackend` protocol:
+   - `family: str` (e.g. `mips_npu`)
+   - `supported_tiling_dims: list[str]`
+   - `lower(program) -> list[str]` — emit abstract ISA instructions
+   - `emit_asm(program) -> str` — emit final assembly/qdIR
+   - `register()` — call `RISCV_NPU_BACKEND_REGISTRY.register(self)`
+3. Add hardware profile in `hardware_profile.py` with `is_riscv_npu=True`.
+4. Add kernel directory entry in `aeg_format_v2._V4_KERNEL_TARGETS`.
+
+Tiling invariant (ALL backends must satisfy):
+```
+3 * T * T * dtype_bytes <= scratchpad_bytes,  T must be power of 2
+```
