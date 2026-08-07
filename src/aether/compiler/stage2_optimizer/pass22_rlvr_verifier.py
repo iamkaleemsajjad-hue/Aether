@@ -129,8 +129,8 @@ class RLVRVerifierHeadInjectionPass(BasePass):
                 )
 
             elapsed = time.perf_counter() - start
-            report.status = "ok"
-            report.elapsed_s = elapsed
+            report.status = "applied"
+            report.duration_ms = elapsed * 1000
             report.details = {
                 "verifier_type": verifier_type,
                 "grpo_K": K,
@@ -716,3 +716,5 @@ def _grpo_train_step(
 
 # Dynamically attach the method to the pass class
 RLVRVerifierHeadInjectionPass.grpo_train_step = _grpo_train_step
+
+

@@ -160,8 +160,8 @@ class GreenEnergyCompilationPass(BasePass):
                 )
 
             elapsed = time.perf_counter() - start
-            report.status = "ok"
-            report.elapsed_s = elapsed
+            report.status = "applied"
+            report.duration_ms = elapsed * 1000
             report.details = {
                 "carbon_region": region,
                 "carbon_intensity_gco2_kwh": carbon_gco2_per_kwh,
@@ -409,3 +409,5 @@ def _is_memory_bound(op: Any) -> bool:
     # Activation / normalization / embedding are always memory-bound.
     memory_keywords = {"norm", "embed", "gather", "softmax", "relu", "gelu", "silu", "kv"}
     return any(kw in op_type for kw in memory_keywords)
+
+

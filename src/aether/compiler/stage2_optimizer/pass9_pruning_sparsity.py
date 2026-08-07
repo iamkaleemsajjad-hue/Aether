@@ -716,3 +716,5 @@ class Pass9PruningSparsity:
         graph.metadata["sparsity_target"]   = manifest.target
         graph.metadata["global_sparsity"]   = manifest.global_sparsity
         graph.metadata["throughput_multiplier"] = manifest.estimated_throughput_multiplier
+
+

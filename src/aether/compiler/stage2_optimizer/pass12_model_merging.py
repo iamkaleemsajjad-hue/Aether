@@ -175,8 +175,8 @@ class ModelMergingPass(BasePass):
                 )
 
             elapsed = time.perf_counter() - start
-            report.status = "ok"
-            report.elapsed_s = elapsed
+            report.status = "applied"
+            report.duration_ms = elapsed * 1000
             report.details = {
                 "method": method,
                 "n_sources": len(source_weights_list),
@@ -538,3 +538,5 @@ def _write_merge_manifest(
         json.dumps(manifest, indent=2), encoding="utf-8"
     )
     logger.debug("Wrote merge manifest: %s", merging_dir / "merge_manifest.json")
+
+

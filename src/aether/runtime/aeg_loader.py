@@ -54,7 +54,12 @@ def package_is_runnable(package: Any) -> bool:
     try:
         if not package.has_weights:
             return False
-        names = set(package.weight_store().entries)
+        store = package.weight_store()
+        # has_weights only checks that the blob file exists; we also need at
+        # least one indexed tensor entry to confirm weights were actually written.
+        names = set(store.entries)
+        if not names:
+            return False
     except (AEGFormatError, OSError):
         return False
     return any(name.endswith("embedding") or "embed" in name for name in names)
@@ -242,8 +247,21 @@ def _norm_vector(tensor: np.ndarray | None, size: int) -> np.ndarray:
 
 
 def _matrix_or_identity(tensor: np.ndarray | None, rows: int, cols: int) -> np.ndarray:
-    """Return a ``(rows, cols)`` matrix, defaulting to identity."""
+    """Return a ``(rows, cols)`` matrix, defaulting to identity.
+
+    Raises AEGLoadError instead of crashing with MemoryError when the default
+    matrix would be unreasonably large (> 128 MiB), which indicates the tensor
+    was expected from the weight blob but is missing.
+    """
     if tensor is None or tensor.ndim != 2:
+        size_bytes = rows * cols * 4  # float32
+        if size_bytes > 128 * 1024 * 1024:  # 128 MiB guard
+            msg = (
+                f"Missing weight tensor ({rows}×{cols} = {size_bytes // (1024*1024)} MiB); "
+                f"the package was compiled from a model without local weights and cannot be "
+                f"loaded on this machine.  Run 'aether pull <model>' first."
+            )
+            raise AEGLoadError(msg)
         return np.eye(rows, cols, dtype=np.float32)
     return np.ascontiguousarray(tensor, dtype=np.float32)
 
@@ -253,8 +271,20 @@ def _matrix_or_zeros(tensor: np.ndarray | None, rows: int, cols: int) -> np.ndar
 
     Zeros are the safe default for FFN projections: they make the block a no-op
     through the residual path instead of injecting arbitrary values.
+
+    Raises AEGLoadError instead of crashing with MemoryError when the default
+    matrix would be unreasonably large (> 128 MiB), which indicates the tensor
+    was expected from the weight blob but is missing.
     """
     if tensor is None or tensor.ndim != 2:
+        size_bytes = rows * cols * 4  # float32
+        if size_bytes > 128 * 1024 * 1024:  # 128 MiB guard
+            msg = (
+                f"Missing weight tensor ({rows}×{cols} = {size_bytes // (1024*1024)} MiB); "
+                f"the package was compiled from a model without local weights and cannot be "
+                f"loaded on this machine.  Run 'aether pull <model>' first."
+            )
+            raise AEGLoadError(msg)
         return np.zeros((rows, cols), dtype=np.float32)
     return np.ascontiguousarray(tensor, dtype=np.float32)
 

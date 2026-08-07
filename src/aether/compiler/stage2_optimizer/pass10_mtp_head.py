@@ -165,8 +165,8 @@ class MTPHeadCompilationPass(BasePass):
                 )
 
             elapsed = time.perf_counter() - start
-            report.status = "ok"
-            report.elapsed_s = elapsed
+            report.status = "applied"
+            report.duration_ms = elapsed * 1000
             report.details = {
                 "mtp_head_count": len(heads),
                 "mtp_predict_opcodes_emitted": n_opcodes,
@@ -229,12 +229,18 @@ class MTPHeadDetector:
             explicit_count = 3
 
         # --- Strategy 2: Graph weight pattern scan ---
-        if hasattr(graph, "__iter__"):
-            nodes_iter = iter(graph)
+        # Use graph.nodes.values() directly (safe dict iteration) rather than
+        # iter(graph) which calls topological_order() and crashes on fused graphs.
+        if hasattr(graph, "nodes") and hasattr(graph.nodes, "values"):
+            nodes_iter = iter(graph.nodes.values())
         elif hasattr(graph, "iter_nodes"):
             nodes_iter = graph.iter_nodes()
-        elif hasattr(graph, "nodes"):
-            nodes_iter = iter(graph.nodes)
+        elif hasattr(graph, "__iter__"):
+            # Last resort — may raise ValueError on fused graphs; catch it downstream.
+            try:
+                nodes_iter = iter(graph)
+            except Exception:  # noqa: BLE001
+                nodes_iter = iter([])
         else:
             nodes_iter = iter([])
 
@@ -533,3 +539,5 @@ def _estimate_throughput_gain(n_heads: int) -> float:
         return 1.0
     # Empirical curve: gain = 1.0 + 0.55 * log2(1 + n_heads)
     return round(1.0 + 0.55 * math.log2(1 + n_heads), 2)
+
+

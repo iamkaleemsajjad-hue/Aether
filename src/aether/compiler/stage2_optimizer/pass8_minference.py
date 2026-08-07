@@ -559,3 +559,5 @@ class Pass8MInference:
         if pattern is None or pattern.pattern_type == SparsePattern.DENSE:
             return None
         return SparseAttentionKernel(pattern)
+
+

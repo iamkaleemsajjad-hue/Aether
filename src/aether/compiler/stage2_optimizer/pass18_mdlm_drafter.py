@@ -116,8 +116,8 @@ class MDLMDrafterCompilationPass(BasePass):
                 )
 
             elapsed = time.perf_counter() - start
-            report.status = "ok"
-            report.elapsed_s = elapsed
+            report.status = "applied"
+            report.duration_ms = elapsed * 1000
             report.details = {
                 "T_steps": T,
                 "K_block_size": K,
@@ -232,3 +232,5 @@ def _infer_hidden_size(arch: Any) -> int:
     elif hasattr(arch, "hidden_size"):
         return int(arch.hidden_size)
     return 4096
+
+

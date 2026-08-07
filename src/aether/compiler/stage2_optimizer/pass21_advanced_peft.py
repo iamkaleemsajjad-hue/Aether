@@ -152,8 +152,8 @@ class AdvancedPEFTCompilationPass(BasePass):
                 )
 
             elapsed = time.perf_counter() - start
-            report.status = "ok"
-            report.elapsed_s = elapsed
+            report.status = "applied"
+            report.duration_ms = elapsed * 1000
             report.details = {
                 "n_adapters": len(compiled_adapters),
                 "lora_plus_lambda": lambda_scale,
@@ -491,3 +491,5 @@ def _infer_hidden_size(architecture: Any) -> int:
     elif hasattr(architecture, "hidden_size"):
         return int(architecture.hidden_size)
     return 4096
+
+

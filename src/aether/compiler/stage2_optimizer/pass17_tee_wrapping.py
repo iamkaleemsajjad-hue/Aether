@@ -129,8 +129,8 @@ class TEEKernelWrappingPass(BasePass):
                 )
 
             elapsed = time.perf_counter() - start
-            report.status = "ok"
-            report.elapsed_s = elapsed
+            report.status = "applied"
+            report.duration_ms = elapsed * 1000
             report.details = {
                 "tee_backend": backend,
                 "attest_endpoint": attest_endpoint,
@@ -393,3 +393,5 @@ def _get_op_type(op: Any) -> str:
         if val:
             return str(val)
     return "unknown"
+
+
