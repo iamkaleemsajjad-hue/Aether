@@ -33,8 +33,6 @@ v4.0 NEW endpoints (PRD §22 Extended Developer API v4.0):
   DELETE /v1/tee/session/{id} — close a TEE session
 """
 
-from __future__ import annotations
-
 import time
 import uuid
 from typing import Any
