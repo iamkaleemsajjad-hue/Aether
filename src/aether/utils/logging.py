@@ -37,6 +37,22 @@ def configure_logging(
         )
         return
 
+    level_number = getattr(logging, level.upper(), logging.INFO)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level_number)
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not any(
+            isinstance(handler, logging.FileHandler)
+            and Path(getattr(handler, "baseFilename", "")).resolve() == log_path.resolve()
+            for handler in root_logger.handlers
+        ):
+            root_logger.addHandler(logging.FileHandler(log_path, encoding="utf-8"))
+
+    # ``filter_by_level`` is a stdlib processor and requires a stdlib logger.
+    # PrintLoggerFactory returns a PrintLogger without ``disabled``, which
+    # previously crashed every CLI path using this processor.
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
@@ -48,17 +64,11 @@ def configure_logging(
             structlog.processors.format_exc_info,
             structlog.processors.JSONRenderer() if json_format else structlog.dev.ConsoleRenderer(),
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(
-            getattr(logging, level.upper(), logging.INFO)
-        ),
+        wrapper_class=structlog.stdlib.BoundLogger,
         context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
+        logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,
     )
-    if log_file:
-        structlog.configure(
-            logger_factory=structlog.PrintLoggerFactory(file=Path(log_file).open("a", encoding="utf-8"))
-        )
 
 
 def get_logger(name: str, **kwargs: Any) -> Any:

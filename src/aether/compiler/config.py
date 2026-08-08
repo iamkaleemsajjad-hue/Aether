@@ -8,7 +8,8 @@ quality reporting.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 from aether.core.constants import (
@@ -430,90 +431,24 @@ class CompilerConfig:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize configuration to a dictionary."""
+        # Keep serialization aligned with the dataclass declaration. The old
+        # hand-written list silently dropped every v4/v5 option (MTP, grammar,
+        # TTT, TEE, MDLM, sub-2-bit, PEFT, and RLVR) during ``clone()``.
         return {
-            "quality_budget": self.quality_budget,
-            "calibration_dataset": self.calibration_dataset,
-            "calibration_tokens": self.calibration_tokens,
-            "targets": self.targets,
-            "optimization_level": self.optimization_level,
-            "enable_fusion": self.enable_fusion,
-            "enable_sensitivity": self.enable_sensitivity,
-            "enable_precision_assignment": self.enable_precision_assignment,
-            "enable_kv_cache_structuring": self.enable_kv_cache_structuring,
-            "enable_moe_routing": self.enable_moe_routing,
-            "enable_parallelism_discovery": self.enable_parallelism_discovery,
-            "enable_reasoning_graph": self.enable_reasoning_graph,
-            "enable_sparse_attention": self.enable_sparse_attention,
-            "enable_pruning": self.enable_pruning,
-            "reasoning_budget_tokens": self.reasoning_budget_tokens,
-            "sparse_attention_context_threshold": self.sparse_attention_context_threshold,
-            "pruning_target_sparsity": self.pruning_target_sparsity,
-            "pruning_metric": self.pruning_metric,
-            "upload_kernels": self.upload_kernels,
-            "cache_dir": self.cache_dir,
-            "hub_url": self.hub_url,
-            "max_calibration_samples": self.max_calibration_samples,
-            "min_layer_samples": self.min_layer_samples,
-            "precision_assignment_mode": self.precision_assignment_mode,
-            "manual_precision_map": self.manual_precision_map,
-            "sensitivity_bits_candidates": self.sensitivity_bits_candidates,
-            "kv_cache_dtype": self.kv_cache_dtype,
-            "kv_cache_cpu_gb": self.kv_cache_cpu_gb,
-            "kv_cache_nvme_gb": self.kv_cache_nvme_gb,
-            "max_prefill_chunk_size": self.max_prefill_chunk_size,
-            "moe_hot_threshold": self.moe_hot_threshold,
-            "moe_warm_threshold": self.moe_warm_threshold,
-            "parallelism_degrees": self.parallelism_degrees,
-            "skip_download": self.skip_download,
-            "output_format": self.output_format,
-            "overwrite": self.overwrite,
-            "dry_run": self.dry_run,
-            "verbose": self.verbose,
+            item.name: deepcopy(getattr(self, item.name))
+            for item in fields(self)
         }
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> CompilerConfig:
         """Deserialize configuration from a dictionary."""
-        return CompilerConfig(
-            quality_budget=data.get("quality_budget", DEFAULT_QUALITY_BUDGET),
-            calibration_dataset=data.get("calibration_dataset", DEFAULT_CALIBRATION_DATASET),
-            calibration_tokens=data.get("calibration_tokens", DEFAULT_CALIBRATION_TOKENS),
-            targets=list(data.get("targets", ["auto"])),
-            optimization_level=data.get("optimization_level", DEFAULT_OPTIMIZATION_LEVEL),
-            enable_fusion=data.get("enable_fusion", DEFAULT_FUSION_PASS),
-            enable_sensitivity=data.get("enable_sensitivity", DEFAULT_SENSITIVITY_PASS),
-            enable_precision_assignment=data.get("enable_precision_assignment", DEFAULT_PRECISION_PASS),
-            enable_kv_cache_structuring=data.get("enable_kv_cache_structuring", DEFAULT_KV_CACHE_PASS),
-            enable_moe_routing=data.get("enable_moe_routing", DEFAULT_MOE_ROUTING_PASS),
-            enable_parallelism_discovery=data.get("enable_parallelism_discovery", DEFAULT_PARALLELISM_PASS),
-            enable_reasoning_graph=data.get("enable_reasoning_graph", DEFAULT_REASONING_GRAPH_PASS),
-            enable_sparse_attention=data.get("enable_sparse_attention", DEFAULT_SPARSE_ATTENTION_PASS),
-            enable_pruning=data.get("enable_pruning", DEFAULT_PRUNING_PASS),
-            reasoning_budget_tokens=data.get("reasoning_budget_tokens", 512),
-            sparse_attention_context_threshold=data.get("sparse_attention_context_threshold", 32768),
-            pruning_target_sparsity=data.get("pruning_target_sparsity", 0.5),
-            pruning_metric=data.get("pruning_metric", "wanda"),
-            upload_kernels=data.get("upload_kernels", False),
-            cache_dir=data.get("cache_dir", DEFAULT_CACHE_DIR),
-            hub_url=data.get("hub_url"),
-            max_calibration_samples=data.get("max_calibration_samples", 2048),
-            min_layer_samples=data.get("min_layer_samples", 128),
-            precision_assignment_mode=data.get("precision_assignment_mode", "sensitivity"),
-            manual_precision_map=dict(data.get("manual_precision_map", {})),
-            sensitivity_bits_candidates=list(data.get("sensitivity_bits_candidates", [4, 6, 8, 16])),
-            kv_cache_dtype=data.get("kv_cache_dtype", "fp8"),
-            kv_cache_cpu_gb=data.get("kv_cache_cpu_gb", 32),
-            kv_cache_nvme_gb=data.get("kv_cache_nvme_gb", 200),
-            max_prefill_chunk_size=data.get("max_prefill_chunk_size", 2048),
-            moe_hot_threshold=data.get("moe_hot_threshold", 0.05),
-            moe_warm_threshold=data.get("moe_warm_threshold", 0.001),
-            parallelism_degrees=list(data.get("parallelism_degrees", [1, 2, 4, 8])),
-            skip_download=data.get("skip_download", False),
-            output_format=data.get("output_format", "aeg"),
-            overwrite=data.get("overwrite", False),
-            dry_run=data.get("dry_run", False),
-            verbose=data.get("verbose", False),
-        )
+        valid_fields = {item.name for item in fields(CompilerConfig)}
+        values = {
+            key: deepcopy(value)
+            for key, value in data.items()
+            if key in valid_fields
+        }
+        return CompilerConfig(**values)
 
     @staticmethod
     def from_env() -> CompilerConfig:

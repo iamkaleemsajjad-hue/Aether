@@ -203,14 +203,9 @@ class GraphWeightQuantizer:
             if arr.ndim >= 1 and arr.size > 0:
                 return arr
 
-        # Fallback: synthesise a tiny random weight for the test / demo path
-        # when no real model was loaded.  This keeps the compiler pipeline
-        # runnable without a downloaded checkpoint while still exercising real
-        # quantization math.
-        shape = self._infer_weight_shape(node)
-        if shape is not None:
-            rng = np.random.default_rng(abs(hash(getattr(node, "id", ""))) % (2**31))
-            return rng.standard_normal(shape).astype(np.float32) * 0.02
+        # Never manufacture model parameters. A graph without attached
+        # checkpoint tensors is useful for planning, but it must not become a
+        # runnable AEG artifact containing random weights.
         return None
 
     def _infer_weight_shape(self, node: Any) -> tuple[int, ...] | None:

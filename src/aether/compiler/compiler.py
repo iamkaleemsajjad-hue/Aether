@@ -582,6 +582,13 @@ class Compiler:
                     default_precision="Q4_K_M",
                     block_size=32,
                 )
+                if quant_stats.tensors_written == 0:
+                    raise CompilationError(
+                        "No model weights were attached during ingestion; refusing to create a runnable AEG. "
+                        "Provide a local checkpoint or enable a supported model download path.",
+                        model_id=model_id,
+                        stage="stage1_ingestion",
+                    )
                 logger.info(
                     "Quantized %d weight tensors (%d bytes) for %s",
                     quant_stats.tensors_written,
@@ -589,7 +596,11 @@ class Compiler:
                     model_id,
                 )
         except Exception as exc:  # noqa: BLE001 — weight quant is best-effort
-            logger.warning("Weight quantization failed (graph-only package): %s", exc)
+            raise CompilationError(
+                f"Weight quantization failed; refusing to create a graph-only runnable package: {exc}",
+                model_id=model_id,
+                stage="stage4_packaging",
+            ) from exc
 
         # Sharding plans
         from aether.core.aeg_format import create_default_sharding_plans
