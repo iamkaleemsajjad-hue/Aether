@@ -139,6 +139,12 @@ def _build_aeg_graph(arch: ModelArchitecture, weights: ModelWeights) -> AEGGraph
         if w is not None:
             node.add_attribute("weight", w)
             node.add_attribute("weight_shape", list(w.shape))
+        # The architecture graph represents SwiGLU gate/up as one logical
+        # node. Preserve the second real checkpoint tensor for the strict AEG
+        # loader; substituting the gate tensor would make the fixture invalid.
+        if node_id.endswith("_gate_proj"):
+            layer_index = int(node_id.split("_")[1])
+            node.add_attribute("up_weight", weights.layers[layer_index].up_proj)
 
     return graph
 
@@ -605,6 +611,32 @@ class TestCPUEngineDirectly:
         engine = self._engine()
         tokens = engine.generate(np.array([1], dtype=np.int64), max_tokens=10, temperature=0.0)
         assert len(tokens) == 10
+
+    def test_generate_applies_grammar_fsm_token_mask(self) -> None:
+        engine = self._engine()
+
+        class Session:
+            def __init__(self) -> None:
+                self.advanced: list[int] = []
+
+            def get_token_mask(self) -> bytearray:
+                mask = bytearray((VOCAB + 7) // 8)
+                mask[7 // 8] |= 1 << (7 % 8)
+                return mask
+
+            def advance(self, token_id: int) -> int:
+                self.advanced.append(token_id)
+                return 0 if token_id == 7 else -1
+
+        session = Session()
+        tokens = engine.generate(
+            np.array([1], dtype=np.int64),
+            max_tokens=4,
+            temperature=0.0,
+            grammar_session=session,
+        )
+        assert tokens == [7, 7, 7, 7]
+        assert session.advanced == tokens
 
     def test_generate_stops_at_eos(self) -> None:
         """EOS must stop generation even if max_tokens budget remains."""

@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -172,6 +173,13 @@ class EmbeddingBackend:
 
     def _try_load_sentence_transformers(self) -> None:
         """Attempt to load sentence-transformers backend."""
+        # Importing SentenceTransformer can trigger a model download and, on
+        # some platforms, matplotlib cache initialization.  Runtime startup
+        # must be offline-safe, so the network-backed embedder is explicit.
+        # Set AETHER_ENABLE_SENTENCE_TRANSFORMERS=1 only when the model is
+        # already available or a deployment intentionally permits downloads.
+        if os.environ.get("AETHER_ENABLE_SENTENCE_TRANSFORMERS", "0").lower() not in {"1", "true", "yes"}:
+            return
         try:
             from sentence_transformers import SentenceTransformer
             self._model = SentenceTransformer(self.model_name)
@@ -669,8 +677,8 @@ class SemanticRequestCache:
         if abs(t_stored - t_requested) > 0.05:
             return False
         # Max tokens: cached response must have been long enough
-        stored_max = int(stored.get("max_new_tokens", 2048))
-        req_max = int(requested.get("max_new_tokens", 2048))
+        stored_max = int(stored.get("max_new_tokens", stored.get("max_tokens", 2048)))
+        req_max = int(requested.get("max_new_tokens", requested.get("max_tokens", 2048)))
         if stored_max < req_max:
             return False
         return True
@@ -799,6 +807,7 @@ class HNSWIndex:
         self,
         query: list[float],
         k: int = 1,
+        threshold: float = 0.0,
     ) -> list[tuple[str, float]]:
         """Find the k nearest neighbours to the query vector.
 
@@ -815,7 +824,7 @@ class HNSWIndex:
 
             q_norm = self._norm(query)
             results = self._greedy_search(q_norm, k=max(k, self.ef_search))
-            return results[:k]
+            return [(key, score) for key, score in results if score >= threshold][:k]
 
     def _greedy_search(
         self,

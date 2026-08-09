@@ -138,6 +138,23 @@ class TestPyTorchLoader:
         assert len(data["weights"]) >= 1
         Path(tmp_path).unlink(missing_ok=True)
 
+    @pytest.mark.skipif(
+        not __import__("importlib").util.find_spec("torch"),
+        reason="torch not installed",
+    )
+    def test_sharded_loader_fails_closed_on_corrupt_shard(self, tmp_path):
+        """A partially readable checkpoint must never compile silently."""
+        import torch
+
+        torch.save({"embed.weight": torch.ones(4, 4)}, tmp_path / "pytorch_model-00001-of-00002.bin")
+        (tmp_path / "pytorch_model-00002-of-00002.bin").write_bytes(b"not a torch checkpoint")
+
+        from aether.compiler.stage1_ingestion.pytorch_loader import PyTorchLoader
+        from aether.core.exceptions import IngestionError
+
+        with pytest.raises(IngestionError, match="Failed to load PyTorch shard"):
+            PyTorchLoader(tmp_path).load()
+
     def test_flatten_state_dict(self):
         """_flatten_state_dict correctly flattens nested dicts of numpy arrays."""
         from aether.compiler.stage1_ingestion.pytorch_loader import _flatten_state_dict

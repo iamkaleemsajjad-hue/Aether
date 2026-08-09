@@ -21,6 +21,7 @@ decode is O(1) in past length rather than re-running the full prefill each step.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -129,6 +130,9 @@ class KVCache:
     num_layers: int
     keys: list[np.ndarray | None] = field(default_factory=list)
     values: list[np.ndarray | None] = field(default_factory=list)
+    #: Logits for the final cached position.  This allows a session to append
+    #: an empty suffix without recomputing the entire prefix.
+    last_logits: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not self.keys:
@@ -155,6 +159,7 @@ class KVCache:
         """Drop all cached state."""
         self.keys = [None] * self.num_layers
         self.values = [None] * self.num_layers
+        self.last_logits = None
 
 
 class CPUExecutionEngine:
@@ -316,6 +321,7 @@ class CPUExecutionEngine:
 
         hidden = self.kernels.rmsnorm(hidden, self.weights.final_norm, self.weights.norm_eps)
         logits = self._linear(hidden, self.weights.lm_head)
+        cache.last_logits = np.asarray(logits[-1], dtype=np.float32).copy()
         return logits, cache
 
     def generate(
@@ -326,6 +332,7 @@ class CPUExecutionEngine:
         top_k: int = 0,
         eos_token_id: int | None = None,
         seed: int | None = None,
+        grammar_session: Any | None = None,
     ) -> list[int]:
         """Autoregressively generate token ids.
 
@@ -340,17 +347,115 @@ class CPUExecutionEngine:
         Returns:
             The generated token ids, excluding the prompt.
         """
-        rng = np.random.default_rng(seed)
-        logits, cache = self.forward(prompt_ids)
+        generated, _cache = self.generate_with_cache(
+            prompt_ids,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            eos_token_id=eos_token_id,
+            seed=seed,
+            grammar_session=grammar_session,
+        )
+        return generated
+
+    def generate_with_cache(
+        self,
+        prompt_ids: np.ndarray,
+        max_tokens: int = 16,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        eos_token_id: int | None = None,
+        seed: int | None = None,
+        grammar_session: Any | None = None,
+        cache: KVCache | None = None,
+    ) -> tuple[list[int], KVCache]:
+        """Generate tokens while accepting and returning an incremental KV cache.
+
+        ``prompt_ids`` is interpreted as the next uncached suffix when
+        ``cache`` is supplied.  The caller is responsible for proving that the
+        suffix follows the sequence represented by that cache.  This explicit
+        contract prevents accidental reuse across unrelated requests.
+        """
         generated: list[int] = []
+        final_cache: list[KVCache | None] = [cache]
+
+        def remember(updated: KVCache) -> None:
+            final_cache[0] = updated
+
+        generated.extend(
+            self.generate_iter(
+                prompt_ids,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                eos_token_id=eos_token_id,
+                seed=seed,
+                grammar_session=grammar_session,
+                cache=cache,
+                cache_callback=remember,
+            )
+        )
+        if final_cache[0] is None:
+            raise RuntimeError("generation completed without producing a KV cache")
+        return generated, final_cache[0]
+
+    def generate_iter(
+        self,
+        prompt_ids: np.ndarray,
+        max_tokens: int = 16,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        eos_token_id: int | None = None,
+        seed: int | None = None,
+        grammar_session: Any | None = None,
+        cache: KVCache | None = None,
+        cache_callback: Any | None = None,
+    ) -> Any:
+        """Yield generated token IDs as they are produced.
+
+        This is the streaming counterpart to :meth:`generate_with_cache`.  It
+        executes one decoder step before yielding each token, so callers can
+        transport actual incremental output instead of slicing a completed
+        response.  ``cache_callback`` receives the final cache after normal
+        completion and is intentionally not called when generation raises.
+        """
+        ids = np.ascontiguousarray(prompt_ids, dtype=np.int64).reshape(-1)
+        rng = np.random.default_rng(seed)
+        if cache is None:
+            if ids.size == 0:
+                raise ValueError("generate_iter() requires prompt tokens for a new cache")
+            logits, cache = self.forward(ids)
+        elif ids.size:
+            logits, cache = self.forward(ids, cache)
+        elif cache.last_logits is not None:
+            logits = cache.last_logits.reshape(1, -1)
+        else:
+            raise ValueError("provided KV cache has no logits for an empty prompt suffix")
 
         for _ in range(max(0, max_tokens)):
-            next_token = self._sample(logits[-1], temperature, top_k, rng)
-            generated.append(next_token)
+            next_logits = np.asarray(logits[-1], dtype=np.float32).copy()
+            if grammar_session is not None:
+                mask = grammar_session.get_token_mask()
+                if len(mask) * 8 < next_logits.size:
+                    raise ValueError("Grammar FSM vocabulary is smaller than model vocabulary")
+                allowed = np.fromiter(
+                    ((mask[i // 8] & (1 << (i % 8))) != 0 for i in range(next_logits.size)),
+                    dtype=bool,
+                    count=next_logits.size,
+                )
+                if not np.any(allowed):
+                    raise ValueError("Grammar FSM has no valid next token")
+                next_logits[~allowed] = -np.inf
+            next_token = self._sample(next_logits, temperature, top_k, rng)
+            if grammar_session is not None and grammar_session.advance(next_token) < 0:
+                raise ValueError("The CPU engine produced a token rejected by the grammar FSM")
+            yield next_token
             if eos_token_id is not None and next_token == eos_token_id:
                 break
             logits, cache = self.forward(np.array([next_token], dtype=np.int64), cache)
-        return generated
+
+        if cache_callback is not None:
+            cache_callback(cache)
 
     def _sample(
         self, logits: np.ndarray, temperature: float, top_k: int, rng: np.random.Generator

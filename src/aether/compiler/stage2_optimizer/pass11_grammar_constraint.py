@@ -906,6 +906,10 @@ def _write_fsa_blobs(
         "n_accepting_states": n_accepting,
         "mask_bytes_per_state": mask_bytes_per_state,
         "estimated_mask_lookup_us": fsa.estimated_mask_lookup_us,
+        # The built-in compiler operates on character-code approximations and
+        # does not have access to the source tokenizer.  Runtime must not treat
+        # its masks as production-safe token constraints.
+        "tokenizer_aware": False,
         "blob_file": "fsm.bin",
     }
     (grammar_dir / "fsm_config.json").write_text(

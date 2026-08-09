@@ -19,6 +19,7 @@ Provides commands:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -35,6 +36,7 @@ from aether.compiler.stage3_targeting.hardware_profile import HardwareProfile
 from aether.compiler.stage3_targeting.target_registry import TargetRegistry
 from aether.core.aeg_format import load_aeg_package
 from aether.core.constants import AETHER_VERSION, DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT
+from aether.hub.client import HubClient
 from aether.utils.file_io import aether_cache_dir, delete_model
 from aether.utils.logging import configure_logging
 
@@ -62,6 +64,14 @@ def cli(ctx: click.Context, verbose: bool, cache_dir: str | None) -> None:
 @click.option("--output", "-o", type=click.Path(), help="Output path for the AEG artifact.")
 @click.option("--dry-run", is_flag=True, help="Plan compilation without producing an AEG.")
 @click.option("--overwrite", is_flag=True, help="Overwrite existing AEG package.")
+@click.option("--mtp", "enable_mtp", is_flag=True, help="Compile native MTP heads.")
+@click.option("--sub2bit", is_flag=True, help="Enable verified sub-2-bit quantization.")
+@click.option("--mdlm-drafter", is_flag=True, help="Compile an MDLM speculative drafter.")
+@click.option("--video-compression", is_flag=True, help="Enable VLM/video token compression.")
+@click.option("--grammar-schema", type=click.Path(exists=True), help="Grammar schema for constrained decoding.")
+@click.option("--ttt", "enable_ttt", is_flag=True, help="Inject TTT fast-weight slots.")
+@click.option("--green", "enable_green", is_flag=True, help="Embed green energy profile.")
+@click.option("--tee", "enable_tee", is_flag=True, help="Emit TEE wrapper metadata.")
 @click.pass_context
 def compile(
     ctx: click.Context,
@@ -73,6 +83,14 @@ def compile(
     output: str | None,
     dry_run: bool,
     overwrite: bool,
+    enable_mtp: bool,
+    sub2bit: bool,
+    mdlm_drafter: bool,
+    video_compression: bool,
+    grammar_schema: str | None,
+    enable_ttt: bool,
+    enable_green: bool,
+    enable_tee: bool,
 ) -> None:
     """Compile a model into an AEG artifact."""
     targets = list(target) if target else ["auto"]
@@ -85,7 +103,17 @@ def compile(
         overwrite=overwrite,
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
         verbose=ctx.obj.get("verbose", False),
+        enable_mtp_compilation=enable_mtp,
+        enable_sub2bit=sub2bit,
+        enable_mdlm_drafter=mdlm_drafter,
+        enable_video_compression=video_compression,
+        enable_ttt=enable_ttt,
+        enable_green_profile=enable_green,
+        enable_tee=enable_tee,
     )
+    if grammar_schema:
+        config.enable_grammar_constraint = True
+        config.grammar_schema = Path(grammar_schema).read_text(encoding="utf-8")
     compiler = Compiler(config)
 
     if dry_run:
@@ -166,9 +194,10 @@ def run(
 @click.argument("model", required=False)
 @click.option("--port", default=DEFAULT_SERVER_PORT, help="Server port.")
 @click.option("--host", default=DEFAULT_SERVER_HOST, help="Server host.")
+@click.option("--grpc-port", default=None, type=int, help="Also expose authenticated gRPC on this port.")
 @click.pass_context
-def serve(ctx: click.Context, model: str | None, port: int, host: str) -> None:
-    """Start the Aether REST server."""
+def serve(ctx: click.Context, model: str | None, port: int, host: str, grpc_port: int | None) -> None:
+    """Start the Aether REST server, optionally alongside gRPC."""
     try:
         from aether.server.app import create_app
         import uvicorn
@@ -182,8 +211,35 @@ def serve(ctx: click.Context, model: str | None, port: int, host: str) -> None:
         server_host=host,
     )
     app = create_app(config)
+    if model:
+        try:
+            # A model argument is a startup contract, not decorative CLI
+            # metadata: validate and load it before accepting requests.
+            app.state.aether_runtime._load_model(model)  # noqa: SLF001
+        except Exception as exc:  # noqa: BLE001
+            raise click.ClickException(f"unable to load model {model!r}: {exc}") from exc
+    grpc_server = None
+    if grpc_port is not None:
+        try:
+            from aether.server.grpc_service import start_grpc_server
+
+            grpc_server = start_grpc_server(
+                app.state.aether_runtime,
+                host=host,
+                port=grpc_port,
+                auth_token=os.environ.get("AETHER_GRPC_API_KEY"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Unable to start gRPC: {exc}[/red]")
+            sys.exit(1)
     console.print(f"[bold green]Starting Aether server at http://{host}:{port}[/bold green]")
-    uvicorn.run(app, host=host, port=port)
+    if grpc_server is not None:
+        console.print(f"[bold green]gRPC listening at {host}:{grpc_server.aether_port}[/bold green]")
+    try:
+        uvicorn.run(app, host=host, port=port)
+    finally:
+        if grpc_server is not None:
+            grpc_server.stop(0)
 
 
 @cli.command()
@@ -204,7 +260,10 @@ def bench(ctx: click.Context, model: str, compare: str | None, max_tokens: int) 
     console.print(table)
 
     if compare:
-        console.print(f"[dim]Comparison against {compare} is not yet implemented in this version.[/dim]")
+        raise click.ClickException(
+            f"benchmark comparison backend {compare!r} is unavailable; "
+            "only the active Aether backend was measured"
+        )
 
 
 @cli.command()
@@ -264,7 +323,7 @@ def rm(ctx: click.Context, model: str) -> None:
     console.print(f"[bold green]Removed {model}[/bold green]")
 
 
-@cli.command()
+@cli.command("hardware")
 def hw() -> None:
     """Show hardware fingerprint."""
     from aether.runtime.hardware import HardwareDetector
@@ -341,8 +400,8 @@ def grammar(ctx: click.Context, model: str, schema: str | None, mode: str, dry_r
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
         enable_grammar_constraint=True,
     )
-    config.grammar_schema_path = str(schema_path)
-    config.grammar_format = mode
+    config.grammar_schema = schema_path.read_text(encoding="utf-8")
+    config.grammar_backend = mode
     if dry_run:
         console.print(f"[bold]Grammar constraint plan for {model}[/bold]")
         console.print(f"  Schema:  {schema_path}")
@@ -390,9 +449,9 @@ def merge(ctx: click.Context, models: tuple[str, ...], method: str, output: str 
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
         enable_model_merging=True,
     )
-    config.merge_method = method
-    config.merge_model_ids = list(models)
-    config.merge_weights = merge_weights or [1.0 / len(models)] * len(models)
+    config.merge_strategy = method
+    config.merge_task_models = list(models)
+    config.merge_coefficients = merge_weights or [1.0 / len(models)] * len(models)
 
     with console.status(f"[bold green]Merging {len(models)} models via {method.upper()}..."):
         compiler = Compiler(config)
@@ -401,7 +460,7 @@ def merge(ctx: click.Context, models: tuple[str, ...], method: str, output: str 
     table = Table(title="Merge Summary")
     table.add_column("Model", style="cyan")
     table.add_column("Weight", style="magenta")
-    for m, w in zip(models, config.merge_weights):
+    for m, w in zip(models, config.model_merging_coefficients):
         table.add_row(m, f"{w:.3f}")
     table.add_row("[bold]Method[/bold]", method.upper())
     console.print(table)
@@ -432,10 +491,8 @@ def ttt_config(ctx: click.Context, model: str, adapter_rank: int, ttl: int, laye
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
         enable_ttt=True,
     )
-    config.ttt_adapter_rank = adapter_rank
-    config.ttt_context_ttl = ttl
-    if target_layers is not None:
-        config.ttt_target_layers = target_layers
+    config.ttt_rank = adapter_rank
+    config.ttt_layers = target_layers or []
 
     with console.status(f"[bold green]Injecting TTT fast-weight adapters into {model}..."):
         compiler = Compiler(config)
@@ -477,8 +534,8 @@ def kv_compress(ctx: click.Context, model: str, method: str, retention: float, c
         enable_semantic_kv=method in ("semantic", "both"),
         enable_cross_layer_kv=method in ("cross-layer", "both"),
     )
-    config.semantic_kv_retention = retention
-    config.cross_layer_kv_groups = cross_layer_groups
+    config.kv_compression_ratio = retention
+    config.cross_layer_kv_share_threshold = max(0.0, min(1.0, 1.0 - retention))
 
     with console.status(f"[bold green]Compiling KV compression into {model} (method={method})..."):
         compiler = Compiler(config)
@@ -670,6 +727,198 @@ def version() -> None:
     console.print(f"Aether Runtime {AETHER_VERSION}")
 
 
+@cli.command("eval")
+@click.argument("model")
+@click.option("--domain", default="general", help="Evaluation domain.")
+@click.option("--examples", type=click.IntRange(1), default=100, help="Number of examples.")
+@click.option("--threshold", type=click.FloatRange(0.0, 1.0), default=0.98)
+@click.pass_context
+def evaluate(ctx: click.Context, model: str, domain: str, examples: int, threshold: float) -> None:
+    """Run the runtime quality gate and fail if the configured threshold is missed."""
+    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
+    report = rt.eval_gate(model, domain=domain, num_examples=examples, quality_threshold=threshold)
+    console.print(RichJSON(json.dumps(report, indent=2, default=str)))
+    if not report.get("passed", False):
+        raise click.ClickException("evaluation gate failed")
+
+
+@cli.command("safety")
+@click.argument("model")
+@click.pass_context
+def safety(ctx: click.Context, model: str) -> None:
+    """Inspect persisted safety/provenance controls for an AEG artifact."""
+    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
+    path = rt._resolve_aeg_path(model)  # noqa: SLF001
+    if path is None:
+        raise click.ClickException(f"model {model!r} was not found")
+    package = load_aeg_package(path)
+    root = Path(path)
+    files = sorted(str(p.relative_to(root)) for p in (root / "safety").rglob("*") if p.is_file()) if (root / "safety").exists() else []
+    report = {"model_id": model, "integrity_verified": True, "safety_files": files, "provenance": package.manifest.provenance.to_dict() if package.manifest and package.manifest.provenance else {}}
+    console.print(RichJSON(json.dumps(report, indent=2, default=str)))
+
+
+@cli.command("trace")
+@click.argument("model", required=False)
+@click.option("--prompt", default="", help="Optional prompt to trace a real request.")
+@click.pass_context
+def trace(ctx: click.Context, model: str | None, prompt: str) -> None:
+    """Export measured runtime spans as OTLP-compatible JSON."""
+    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
+    if model and prompt:
+        rt.generate(model, prompt, max_tokens=1, temperature=0.0)
+    console.print(RichJSON(json.dumps(rt.tracer.export_otlp_json(), indent=2, default=str)))
+
+
+@cli.command("reasoning")
+@click.argument("model")
+@click.pass_context
+def reasoning(ctx: click.Context, model: str) -> None:
+    """Inspect the persisted reasoning graph for an AEG artifact."""
+    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
+    path = rt._resolve_aeg_path(model)  # noqa: SLF001
+    if path is None:
+        raise click.ClickException(f"model {model!r} was not found")
+    root = Path(path)
+    candidates = [root / "reasoning" / "reasoning_graph.json", root / "reasoning_graph.json"]
+    data = next((json.loads(p.read_text(encoding="utf-8")) for p in candidates if p.is_file()), {})
+    console.print(RichJSON(json.dumps(data, indent=2, default=str)))
+
+
+@cli.command("mla-stats")
+@click.argument("model")
+@click.pass_context
+def mla_stats(ctx: click.Context, model: str) -> None:
+    """Show MLA/attention metadata persisted in the AEG manifest."""
+    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
+    info_data = rt.info(model)
+    architecture = info_data.get("architecture", {})
+    result = {"model_id": model, "mla_detected": bool(architecture.get("mla_enabled") or architecture.get("mla")), "architecture": architecture}
+    console.print(RichJSON(json.dumps(result, indent=2, default=str)))
+
+
+@cli.command("kv-share")
+@click.argument("model")
+@click.option("--output", "output_path", type=click.Path(), help="Output AEG path.")
+@click.pass_context
+def kv_share(ctx: click.Context, model: str, output_path: str | None) -> None:
+    """Compile with cross-layer KV sharing enabled (Pass 15)."""
+    config = CompilerConfig(cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(), enable_cross_layer_kv=True)
+    result = Compiler(config).compile(model, output_path=output_path)
+    console.print(f"[bold green]Cross-layer KV AEG saved to[/bold green] {result.root}")
+
+
+@cli.command("multi-agent")
+@click.option("--agents", type=click.IntRange(1), default=4)
+@click.option("--shared-prefix", default="")
+@click.pass_context
+def multi_agent(ctx: click.Context, agents: int, shared_prefix: str) -> None:
+    """Create a real multi-agent KV coordinator session."""
+    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
+    console.print(RichJSON(json.dumps(rt.multi_agent_session(agents, shared_prefix), indent=2, default=str)))
+
+
+@cli.command("slo-status")
+@click.pass_context
+def slo_status(ctx: click.Context) -> None:
+    """Show the live scheduler queue and configured SLO mode."""
+    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
+    report = {"scheduler": rt.config.scheduler, "queue": rt.scheduler.queue_snapshot(), "max_batch_size": rt.scheduler.max_batch_size}
+    console.print(RichJSON(json.dumps(report, indent=2, default=str)))
+
+
+@cli.group("hub")
+def hub() -> None:
+    """Authenticate and exchange AEG artifacts with Aether Hub."""
+
+
+def _hub_client() -> HubClient:
+    token_path = aether_cache_dir() / "hub_token"
+    token = token_path.read_text(encoding="utf-8").strip() if token_path.is_file() else None
+    return HubClient(auth_token=token)
+
+
+@hub.command("login")
+@click.option("--token", prompt=True, hide_input=True)
+def hub_login(token: str) -> None:
+    result = _hub_client().login(token)
+    token_path = aether_cache_dir() / "hub_token"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(token, encoding="utf-8")
+    console.print(RichJSON(json.dumps(result, indent=2)))
+
+
+@hub.command("search")
+@click.argument("query")
+def hub_search(query: str) -> None:
+    console.print(RichJSON(json.dumps([m.to_dict() for m in _hub_client().search(query)], indent=2)))
+
+
+@hub.command("push")
+@click.argument("model_id")
+@click.argument("package", type=click.Path(exists=True))
+def hub_push(model_id: str, package: str) -> None:
+    manifest = _hub_client().upload(model_id, package)
+    console.print(RichJSON(json.dumps(manifest.to_dict(), indent=2)))
+
+
+@hub.command("pull")
+@click.argument("model_id")
+@click.argument("output", type=click.Path())
+def hub_pull(model_id: str, output: str) -> None:
+    path = _hub_client().download(model_id, output)
+    console.print(str(path))
+
+
+@cli.group("train")
+def train() -> None:
+    """Training and RLVR commands."""
+
+
+@train.command("grpo")
+@click.argument("model")
+@click.argument("prompts", nargs=-1, required=True)
+@click.option("--group-size", type=click.IntRange(2), default=8)
+@click.pass_context
+def train_grpo(ctx: click.Context, model: str, prompts: tuple[str, ...], group_size: int) -> None:
+    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
+    report = rt.grpo_train_step(model, list(prompts), group_size=group_size)
+    console.print(RichJSON(json.dumps(report, indent=2, default=str)))
+    if report.get("status") == "failed":
+        raise click.ClickException(report.get("error", "GRPO step failed"))
+
+
+@cli.group("kernel")
+def kernel() -> None:
+    """Target kernel planning commands."""
+
+
+@kernel.command("generate")
+@click.argument("target")
+@click.argument("op_name")
+@click.option("--output", type=click.Path())
+def kernel_generate(target: str, op_name: str, output: str | None) -> None:
+    from aether.compiler.stage3_targeting.kernel_emitter import KernelEmitter
+    plan = KernelEmitter(target).emit(op_name, [], [])
+    payload = json.dumps(plan.to_dict(), indent=2)
+    if output:
+        Path(output).write_text(payload, encoding="utf-8")
+    console.print(RichJSON(payload))
+
+
+@cli.group("kv")
+def kv() -> None:
+    """KV infrastructure commands."""
+
+
+@kv.command("transfer-stats")
+@click.argument("model", required=False)
+@click.pass_context
+def kv_transfer_stats(ctx: click.Context, model: str | None) -> None:
+    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
+    console.print(RichJSON(json.dumps(rt.kv_transfer_stats(), indent=2, default=str)))
+
+
 @cli.command()
 @click.argument("model")
 @click.pass_context
@@ -686,6 +935,10 @@ def status(ctx: click.Context, model: str) -> None:
 def main() -> None:
     """CLI entry point for `aether` command."""
     cli(obj={})
+
+
+# Preserve the short v3 command while exposing the PRD spelling.
+cli.add_command(hw, name="hw")
 
 
 if __name__ == "__main__":

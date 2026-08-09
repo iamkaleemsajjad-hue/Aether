@@ -17,6 +17,7 @@ special cases.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any
 
 import numpy as np
@@ -163,7 +164,20 @@ def _dequantized_by_key(package: Any) -> dict[tuple[int | None, str | None], np.
     store = package.weight_store()
     result: dict[tuple[int | None, str | None], np.ndarray] = {}
     for name in store.entries:
-        key = IngestionPipeline._normalise_weight_name(name)
+        # The ingestion normalizer intentionally groups checkpoint q/k/v names
+        # under ``qkv``.  The persisted AEG store has already split those
+        # projections, so preserve their exact component names here.
+        match = re.match(r"^layer_(\d+)_(q_proj|k_proj|v_proj|o_proj|attention_norm|ffn_norm|gate_proj|up_proj|down_proj)$", name)
+        if match:
+            key = (int(match.group(1)), match.group(2))
+        elif name == "embedding":
+            key = (None, "embedding")
+        elif name == "lm_head":
+            key = (None, "lm_head")
+        elif name == "final_norm":
+            key = (None, "final_norm")
+        else:
+            key = IngestionPipeline._normalise_weight_name(name)
         if key[1] is None:
             continue
         # First writer wins, matching the ingestion side's fused-tensor handling.
@@ -193,30 +207,53 @@ def _build_layer(
 ) -> LayerWeights:
     """Assemble one :class:`LayerWeights` from the tensor index.
 
-    Missing projections are substituted with identity or zero matrices of the
-    right shape rather than failing: a partially-populated package should still
-    execute so callers can inspect real logits from the layers that do exist.
+    A package is executable only when every projection required by the declared
+    architecture is present.  Identity/zero substitutions would produce logits
+    that look valid while no longer representing the source model, so malformed
+    or partial artifacts fail closed.
     """
     head_dim = hidden_size // num_heads
     kv_dim = num_kv_heads * head_dim
     intermediate = _infer_intermediate(tensors, index, hidden_size)
 
-    q_proj = tensors.get((index, "qkv"))
-    if q_proj is None:
-        q_proj = np.eye(hidden_size, dtype=np.float32)
-    k_proj = _slice_or_default(tensors.get((index, "qkv")), kv_dim, hidden_size)
-    v_proj = _slice_or_default(tensors.get((index, "qkv")), kv_dim, hidden_size)
+    q_proj = tensors.get((index, "q_proj"))
+    k_proj = tensors.get((index, "k_proj"))
+    v_proj = tensors.get((index, "v_proj"))
+    fused = tensors.get((index, "qkv"))
+    if q_proj is None and fused is not None and fused.ndim == 2:
+        q_rows = num_heads * (hidden_size // num_heads)
+        expected_rows = q_rows + 2 * kv_dim
+        if fused.shape[0] == expected_rows:
+            q_proj = fused[:q_rows]
+            k_proj = fused[q_rows : q_rows + kv_dim]
+            v_proj = fused[q_rows + kv_dim :]
+    required = {
+        "q_proj": q_proj,
+        "k_proj": k_proj,
+        "v_proj": v_proj,
+        "o_proj": tensors.get((index, "o_proj")),
+        "attention_norm": tensors.get((index, "attention_norm")),
+        "ffn_norm": tensors.get((index, "ffn_norm")),
+        "gate_proj": tensors.get((index, "gate_proj")),
+        "up_proj": tensors.get((index, "up_proj")),
+        "down_proj": tensors.get((index, "down_proj"))
+        if tensors.get((index, "down_proj")) is not None
+        else tensors.get((index, "ffn")),
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise AEGLoadError(f"AEG package is missing required layer {index} tensors: {', '.join(missing)}")
 
     return LayerWeights(
-        attention_norm=_norm_vector(tensors.get((index, "rmsnorm")), hidden_size),
-        q_proj=np.ascontiguousarray(q_proj, dtype=np.float32),
-        k_proj=k_proj,
-        v_proj=v_proj,
-        o_proj=_matrix_or_identity(tensors.get((index, "out_proj")), hidden_size, hidden_size),
-        ffn_norm=_norm_vector(tensors.get((index, "ffn_norm")), hidden_size),
-        gate_proj=_matrix_or_zeros(tensors.get((index, "gate_proj")), intermediate, hidden_size),
-        up_proj=_matrix_or_zeros(tensors.get((index, "up_proj")), intermediate, hidden_size),
-        down_proj=_matrix_or_zeros(tensors.get((index, "ffn")), hidden_size, intermediate),
+        attention_norm=_norm_vector(required["attention_norm"], hidden_size),
+        q_proj=np.ascontiguousarray(required["q_proj"], dtype=np.float32),
+        k_proj=np.ascontiguousarray(required["k_proj"], dtype=np.float32),
+        v_proj=np.ascontiguousarray(required["v_proj"], dtype=np.float32),
+        o_proj=np.ascontiguousarray(required["o_proj"], dtype=np.float32),
+        ffn_norm=_norm_vector(required["ffn_norm"], hidden_size),
+        gate_proj=np.ascontiguousarray(required["gate_proj"], dtype=np.float32),
+        up_proj=np.ascontiguousarray(required["up_proj"], dtype=np.float32),
+        down_proj=np.ascontiguousarray(required["down_proj"], dtype=np.float32),
     )
 
 

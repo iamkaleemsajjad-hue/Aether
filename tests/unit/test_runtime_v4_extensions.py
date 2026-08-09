@@ -3,7 +3,7 @@
 Covers:
   - v4.0 layer attribute initialisation (grammar_engine, ttt_engine, etc.)
   - compile_async() + get_compile_status() lifecycle contract
-  - merge() graceful fallback when Pass 12 is not available
+  - merge() fails closed when a real AEG/source is not available
   - _init_v4_layers() no-crash contract
 
 All tests run without GPU.
@@ -150,36 +150,17 @@ class TestGetCompileStatus:
 
 
 class TestMerge:
-    def test_merge_returns_dict(self, rt: Runtime) -> None:
-        result = rt.merge(
-            "fictional/model",
-            task_vectors=[{"name": "tv1", "coefficient": 0.8, "path": "/tmp/tv1"}],
-        )
-        assert isinstance(result, dict)
+    def test_merge_requires_real_sources(self, rt: Runtime) -> None:
+        with pytest.raises(ValueError, match="at least one task vector"):
+            rt.merge("fictional/model", task_vectors=[])
 
-    def test_merge_fallback_has_model_field(self, rt: Runtime) -> None:
-        result = rt.merge("my/base-model", task_vectors=[])
-        assert result.get("model") == "my/base-model"
+    def test_merge_missing_base_fails(self, rt: Runtime) -> None:
+        with pytest.raises(Exception, match="base AEG"):
+            rt.merge("fictional/model", task_vectors=[{"path": "/missing"}])
 
-    def test_merge_fallback_has_method_field(self, rt: Runtime) -> None:
-        result = rt.merge("x", task_vectors=[], method="dare_ties")
-        assert result.get("method") == "dare_ties"
-
-    def test_merge_task_count(self, rt: Runtime) -> None:
-        tvs = [
-            {"name": "a", "coefficient": 0.5, "path": "/a"},
-            {"name": "b", "coefficient": 0.3, "path": "/b"},
-        ]
-        result = rt.merge("x", task_vectors=tvs)
-        assert result.get("task_count") == 2
-
-    def test_merge_density_propagated(self, rt: Runtime) -> None:
-        result = rt.merge("x", task_vectors=[], density=0.5)
-        assert result.get("density") == 0.5
-
-    def test_merge_default_method_is_task_arithmetic(self, rt: Runtime) -> None:
-        result = rt.merge("x", task_vectors=[])
-        assert result.get("method") == "task_arithmetic"
+    def test_merge_rejects_unknown_method(self, rt: Runtime) -> None:
+        with pytest.raises(ValueError, match="unsupported merge method"):
+            rt.merge("fictional/model", task_vectors=[{"path": "/missing"}], method="unknown")
 
 
 class TestInitV4Layers:

@@ -260,6 +260,20 @@ class GreenPowerManager:
             "throttle_events": self._stats.throttle_events,
         }
 
+    def get_status(self) -> dict[str, Any]:
+        """Return the public R7 status payload used by SDK and REST callers."""
+        status = self.summary()
+        status.update(
+            {
+                "current_power_w": self._current_power_w,
+                "carbon_intensity_gco2_kwh": self._carbon_intensity,
+                "current_region": self._region,
+                "dvfs_active": bool(self._dvfs_hints) and self.mode != self.MODE_PERFORMANCE,
+                "power_budget_watts": self._tdp_cap_w,
+            }
+        )
+        return status
+
 
 class _GreenStats:
     __slots__ = ("total_energy_mj", "total_carbon_gco2", "total_requests", "throttle_events")

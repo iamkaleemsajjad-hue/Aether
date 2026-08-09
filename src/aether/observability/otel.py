@@ -124,6 +124,8 @@ class AetherTracer:
         total_ms: float,
         model_id: str = "unknown",
         adapter_id: str | None = None,
+        actual_start_time_ns: int | None = None,
+        actual_end_time_ns: int | None = None,
     ) -> Span:
         """Record a complete inference request as a single span."""
         span = self.start_span(
@@ -140,9 +142,12 @@ class AetherTracer:
                 "adapter_id": adapter_id or "base",
             },
         )
-        # Simulate time passing
-        span.start_time_ns = time.time_ns() - int(total_ms * 1_000_000)
-        span.end_time_ns = time.time_ns()
+        # Callers that have measured wall-clock boundaries can provide them.
+        # Without boundaries this helper records an instantaneous event; it
+        # never backdates timestamps to manufacture latency.
+        span.start_time_ns = actual_start_time_ns or time.time_ns()
+        span.end_time_ns = actual_end_time_ns or span.start_time_ns
+        span.attributes["duration_source"] = "measured" if actual_start_time_ns and actual_end_time_ns else "event_only"
         span.add_event("prefill_complete", {"ttft_ms": ttft_ms, "prompt_tokens": prompt_tokens})
         span.add_event("decode_complete", {"generated_tokens": generated_tokens})
         self._finished_spans.append(span)

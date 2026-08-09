@@ -19,6 +19,8 @@ from typing import Any
 from aether.core.aeg_ir import AEGIRModule
 from aether.core.constants import (
     AEG_FORMAT_VERSION,
+    AEG_MINIMUM_COMPATIBLE_VERSION,
+    AEG_SUPPORTED_FORMAT_VERSIONS,
     AEG_GRAPH_FILENAME,
     AEG_IR_FILE_EXTENSION,
     AEG_MANIFEST_FILENAME,
@@ -28,6 +30,22 @@ from aether.core.constants import (
 from aether.core.exceptions import AEGFormatError, AEGIntegrityError, AEGVersionError
 from aether.core.hash_utils import compute_content_hash, compute_directory_hash, compute_file_hash, verify_file_hash
 from aether.core.types import AEGVersion, ModelArchitecture, Precision, ShardingPlan
+
+
+def _safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
+    """Extract an AEG archive without path traversal or link escapes."""
+    root = destination.resolve()
+    for member in archive.getmembers():
+        if member.issym() or member.islnk():
+            raise AEGFormatError(f"link archive members are not permitted: {member.name!r}")
+        candidate = (root / member.name.replace("\\", "/")).resolve()
+        try:
+            inside = candidate == root or candidate.is_relative_to(root)
+        except AttributeError:  # Python 3.8 compatibility
+            inside = str(candidate).startswith(str(root) + str(Path("/"))) or candidate == root
+        if not inside or member.name.replace("\\", "/").startswith("/"):
+            raise AEGFormatError(f"unsafe archive member path: {member.name!r}")
+    archive.extractall(root)
 
 
 @dataclass
@@ -228,20 +246,26 @@ class AEGManifest:
             AEGIntegrityError: If the manifest hash does not match.
         """
         current = AEGVersion.current()
+        minimum = AEGVersion.parse(AEG_MINIMUM_COMPATIBLE_VERSION)
+        if self.format_version not in AEG_SUPPORTED_FORMAT_VERSIONS:
+            raise AEGVersionError(
+                f"AEG format {self.format_version} is not supported by this runtime",
+                aeg_version=self.format_version,
+            )
         try:
             manifest_version = AEGVersion.parse(self.format_version)
         except (ValueError, IndexError) as exc:
             msg = f"Invalid AEG format version: {self.format_version}"
             raise AEGVersionError(msg, aeg_version=self.format_version) from exc
-        if not manifest_version.is_compatible_with(current):
+        if manifest_version.major == 1 and not manifest_version.is_compatible_with(minimum):
             msg = (
                 f"AEG format {self.format_version} is not compatible with runtime "
-                f"{current}. Minimum compatible: {current}"
+                f"{current}. Minimum compatible: {minimum}"
             )
             raise AEGVersionError(
                 msg,
                 aeg_version=self.format_version,
-                minimum_version=str(current),
+                minimum_version=str(minimum),
             )
         if self.manifest_hash:
             payload = self.to_dict()
@@ -285,6 +309,10 @@ class AEGPackage:
         self.weights: dict[str, Any] = {}
         self._weight_store: Any = None
         self._is_loaded = False
+        # Retained only for packages loaded from an archive.  Keeping the
+        # TemporaryDirectory object alive keeps the extracted package usable
+        # for the lifetime of the returned AEGPackage.
+        self._archive_tempdir: Any | None = None
 
     @property
     def is_loaded(self) -> bool:
@@ -373,6 +401,13 @@ class AEGPackage:
             raise FileNotFoundError(msg)
         self.manifest = AEGManifest.from_json(manifest_path.read_text(encoding="utf-8"))
         self.manifest.verify()
+        format_sentinel = self.root / "FORMAT_VERSION"
+        if format_sentinel.exists():
+            declared = format_sentinel.read_text(encoding="utf-8").strip()
+            if declared != self.manifest.format_version:
+                raise AEGFormatError(
+                    f"AEG FORMAT_VERSION disagrees with manifest: {declared!r} != {self.manifest.format_version!r}"
+                )
         # Load graph
         graph_path = self.root / "graph" / AEG_GRAPH_FILENAME
         if graph_path.exists():
@@ -435,6 +470,15 @@ class AEGPackage:
         (self.root / "mla").mkdir(exist_ok=True)
         (self.root / "speculation").mkdir(exist_ok=True)
         (self.root / "multimodal").mkdir(exist_ok=True)
+        if self.manifest.format_version in {"AEG/2.0", "AEG/3.0"}:
+            for directory in (
+                "structured_output", "merging", "ttt", "green", "tee",
+                "multi_agent", "mcp", "semantic_cache", "training",
+            ):
+                (self.root / directory).mkdir(exist_ok=True)
+        if self.manifest.format_version == "AEG/3.0":
+            for directory in ("video", "cxl", "generated_kernels"):
+                (self.root / directory).mkdir(exist_ok=True)
         # Write format version
         (self.root / "FORMAT_VERSION").write_text(self.manifest.format_version + "\n", encoding="utf-8")
         # Write graph
@@ -503,16 +547,21 @@ class AEGPackage:
         if not archive.exists():
             msg = f"Archive not found: {archive}"
             raise FileNotFoundError(msg)
-        with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = tempfile.TemporaryDirectory(prefix="aether-aeg-")
+        try:
             with tarfile.open(archive, "r:gz") as tar:
-                tar.extractall(tmpdir)
-            extracted_root = Path(tmpdir)
+                _safe_extract_tar(tar, Path(tmpdir.name))
+            extracted_root = Path(tmpdir.name)
             # Find the AEG package root inside the archive
             candidates = list(extracted_root.glob("*"))
             package_root = candidates[0] if candidates else extracted_root
             package = AEGPackage(package_root)
+            package._archive_tempdir = tmpdir  # noqa: SLF001 - lifetime ownership
             package.load()
             return package
+        except Exception:
+            tmpdir.cleanup()
+            raise
 
     def verify_integrity(self) -> None:
         """Verify the integrity of all package files using stored hashes.
@@ -540,6 +589,44 @@ class AEGPackage:
             if stored != computed:
                 msg = f"AEG graph file hash mismatch: stored {stored}, computed {computed}"
                 raise AEGIntegrityError(msg, file_path=str(package_hash_path), expected_hash=stored, actual_hash=computed)
+
+        # Verify every payload declared by the manifest. Previously only the
+        # graph was checked, so a tampered weight blob, kernel plan, safety
+        # file, or provenance artifact could pass integrity verification.
+        for relative_path, expected in self.manifest.artifacts.items():
+            payload = self.root / relative_path
+            if not payload.is_file():
+                raise AEGIntegrityError(
+                    f"Declared AEG artifact is missing: {relative_path}",
+                    file_path=str(payload),
+                    expected_hash=expected,
+                )
+            actual = compute_file_hash(payload)
+            if actual != expected:
+                raise AEGIntegrityError(
+                    f"AEG artifact hash mismatch for {relative_path}: expected {expected}, got {actual}",
+                    file_path=str(payload),
+                    expected_hash=expected,
+                    actual_hash=actual,
+                )
+
+        # Validate the self-describing weight index and blob bounds even when
+        # a caller has not yet requested a tensor through WeightStore.
+        store = self.weight_store()
+        if store.exists:
+            store.load_index()
+            blob_size = store.blob_path.stat().st_size
+            for entry in store.entries.values():
+                for offset, size, label in (
+                    (entry.codes_offset, entry.codes_bytes, "codes"),
+                    (entry.scales_offset, entry.scales_bytes, "scales"),
+                    (entry.zero_points_offset, entry.zero_points_bytes, "zero_points"),
+                ):
+                    if offset < 0 or size < 0 or offset + size > blob_size:
+                        raise AEGIntegrityError(
+                            f"Weight index entry {entry.name!r} has out-of-bounds {label} range",
+                            file_path=str(store.index_path),
+                        )
 
 
     def _write_extended_artifacts(self) -> None:
@@ -693,6 +780,8 @@ class AEGPackage:
                 "optimizations": {"vit_data_parallel": True, "llm_tensor_parallel": True},
             }),
         }
+        if "eval_report" in graph_metadata:
+            defaults["observability/eval_report.json"] = graph_metadata["eval_report"]
         sparsity_plan = graph_metadata.get("sparsity_plan")
         if sparsity_plan is not None:
             defaults["weights/sparsity_masks.json"] = sparsity_plan
@@ -716,6 +805,16 @@ class AEGPackage:
             else:
                 target.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
             artifacts[relative_path] = compute_file_hash(target)
+
+        # Include all package payloads in the manifest, excluding the manifest
+        # itself (which contains these hashes and would be self-referential).
+        for target in self.root.rglob("*"):
+            if not target.is_file():
+                continue
+            relative_path = target.relative_to(self.root).as_posix()
+            if relative_path == AEG_MANIFEST_FILENAME:
+                continue
+            artifacts.setdefault(relative_path, compute_file_hash(target))
         self.manifest.artifacts = artifacts
 
     def get_backend_plan(self, target_id: str) -> str | None:

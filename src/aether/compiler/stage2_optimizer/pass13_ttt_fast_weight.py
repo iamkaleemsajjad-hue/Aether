@@ -162,21 +162,10 @@ def _detect_transformer_layers(graph: Any, architecture: Any) -> list[Any]:
     if hasattr(graph, "iter_layers"):
         return list(graph.iter_layers())
 
-    # Strategy 2: count from architecture metadata.
-    n_layers = 0
-    if isinstance(architecture, dict):
-        for key in ("num_hidden_layers", "n_layers", "num_layers", "num_decoder_layers"):
-            if key in architecture:
-                n_layers = int(architecture[key])
-                break
-    elif hasattr(architecture, "num_hidden_layers"):
-        n_layers = int(architecture.num_hidden_layers)
-
-    if n_layers > 0:
-        # Return placeholder objects so downstream code knows count.
-        return [{"layer_index": i} for i in range(n_layers)]
-
-    # Strategy 3: scan graph nodes for attention / ffn patterns.
+    # Strategy 2: scan graph nodes for attention / ffn patterns.  Architecture
+    # metadata alone is not enough: emitting slots for a layer that is absent
+    # from the executable graph would create an artifact the runtime cannot
+    # apply.  The pass therefore skips unless it has concrete graph nodes.
     # Use .nodes.values() to avoid topological_order() on fused graphs.
     if hasattr(graph, "nodes") and hasattr(graph.nodes, "values"):
         for node in graph.nodes.values():

@@ -132,6 +132,23 @@ class MTPHeadCompilationPass(BasePass):
                 report.details["reason"] = "no_mtp_heads_found"
                 return graph, report
 
+            missing_weights = [
+                int(head["head_index"])
+                for head in heads
+                if head.get("weight_data") is None
+            ]
+            if missing_weights:
+                logger.warning(
+                    "Pass 10: MTP heads were declared but their weight tensors are not available; "
+                    "refusing to emit zero-filled speculation blobs."
+                )
+                report.status = "skipped"
+                report.details = {
+                    "reason": "mtp_head_weights_unavailable",
+                    "missing_head_indices": missing_weights,
+                }
+                return graph, report
+
             logger.info(
                 "Pass 10: Detected %d MTP head(s) — compiling to AEG speculation blobs.",
                 len(heads),
@@ -304,14 +321,19 @@ class MTPHeadCompiler:
           ``[16-byte magic][4-byte head_index][4-byte vocab_size][4-byte hidden_size]
             [4-byte dtype_code][32-byte reserved][vocab_size * hidden_size * 2 bytes weight data]``
 
-        When ``weight_data`` is None (architecture-declaration path), the blob
-        contains only the header with zero-padded weight placeholder.  The
-        AEG loader fills weights from the weight store at load time.
+        ``weight_data`` must be present.  The pass refuses architecture-only
+        declarations before reaching this method so that this lower-level
+        compiler cannot manufacture a runnable-looking zero-filled head.
         """
         vocab_size: int = head["vocab_size"]
         hidden_size: int = head["hidden_size"]
         dtype: str = head["dtype"]
         weight_data: Any = head.get("weight_data")
+        if weight_data is None:
+            raise ValueError(
+                f"MTP head {head_index} has no weight_data; refusing to emit a "
+                "zero-filled speculation blob"
+            )
 
         # BF16: 2 bytes per element.
         weight_bytes_count = vocab_size * hidden_size * 2
@@ -341,12 +363,20 @@ class MTPHeadCompiler:
                 raw = arr.view(np.uint32)
                 bf16_raw = (raw >> 16).astype(np.uint16)
                 weight_bytes = bf16_raw.tobytes()
-            except ImportError:
-                # Without numpy: write zeros (placeholder; filled from weight store).
-                weight_bytes = bytes(weight_bytes_count)
+            except ImportError as exc:
+                raise RuntimeError(
+                    "numpy is required to serialize real MTP head weights"
+                ) from exc
         else:
-            # Placeholder: will be filled from weight store at AEG write time.
-            weight_bytes = bytes(weight_bytes_count)
+            raise ValueError(
+                f"MTP head {head_index} has no serialized weight payload"
+            )
+
+        if len(weight_bytes) != weight_bytes_count:
+            raise ValueError(
+                f"MTP head {head_index} weight payload has {len(weight_bytes)} bytes; "
+                f"expected {weight_bytes_count}"
+            )
 
         return {
             "head_index": head_index,

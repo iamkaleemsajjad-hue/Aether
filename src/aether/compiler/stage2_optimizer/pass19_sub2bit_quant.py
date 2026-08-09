@@ -104,6 +104,20 @@ class Sub2BitQuantizationPass(BasePass):
                 report.details["reason"] = "no_weights_in_graph"
                 return graph, report
 
+            # The old implementation used fixed literature estimates as if
+            # they were a measured perplexity gate.  That can accept a bad
+            # artifact.  Until a real baseline/candidate evaluator is passed
+            # through the compiler, refuse to publish the transformed graph.
+            report.status = "skipped"
+            report.details = {
+                "reason": "quality_evaluator_unavailable",
+                "message": (
+                    "sub-2-bit quantization requires a measured baseline and candidate "
+                    "quality evaluator; hardcoded perplexity estimates are not accepted"
+                ),
+            }
+            return graph, report
+
             # Quantize weights.
             quantizer = _get_quantizer(method)
             quantized_store, scale_tables, bits_per_weight = quantizer.quantize(weight_store)
@@ -334,6 +348,20 @@ def _get_weight_store(graph: Any) -> dict[str, list[float]]:
         for name, param in graph.parameters():
             if hasattr(param, "tolist"):
                 weights[str(name)] = param.reshape(-1).tolist()
+    # Ingestion binds checkpoint tensors to AEGGraph node attributes rather
+    # than to a separate optimizer weight store.  Read those real arrays so
+    # Pass 19 cannot silently report ``no_weights_in_graph`` for a runnable
+    # SafeTensors/ONNX/PyTorch graph.
+    elif hasattr(graph, "nodes"):
+        nodes = graph.nodes.values() if hasattr(graph.nodes, "values") else graph.nodes
+        for node in nodes:
+            node_id = str(getattr(node, "id", "weight"))
+            attributes = getattr(node, "attributes", {})
+            for suffix, key in (("", node_id), ("_up", f"{node_id}_up")):
+                value = attributes.get("up_weight" if suffix else "weight") if isinstance(attributes, dict) else None
+                if value is None or not hasattr(value, "reshape"):
+                    continue
+                weights[key] = [float(v) for v in value.reshape(-1).tolist()]
     return weights
 
 

@@ -67,11 +67,11 @@ class TestArchitectureDetector:
         assert arch.family == "llama_family"
         assert arch.params_billion == 70.0
 
-    def test_detect_unknown_defaults(self) -> None:
+    def test_detect_unknown_fails_closed(self) -> None:
         detector = ArchitectureDetector()
-        arch = detector.detect("unknown/custom-model")
-        assert arch.family == "llama_family"
-        assert arch.layers == 32
+        import pytest
+        with pytest.raises(Exception, match="Could not identify architecture"):
+            detector.detect("unknown/custom-model")
 
     def test_from_config(self) -> None:
         detector = ArchitectureDetector()
@@ -88,6 +88,33 @@ class TestArchitectureDetector:
         arch = detector._from_config(config)
         assert arch.family == "qwen_family"
         assert arch.layers == 24
+
+    @pytest.mark.parametrize(
+        ("model_type", "expected_family"),
+        [
+            ("llama", "llama_family"),
+            ("qwen3", "qwen_family"),
+            ("gemma3", "gemma_family"),
+            ("mixtral", "moe_family"),
+            ("deepseek_v3", "deepseek_family"),
+            ("mamba", "hybrid_ssm_family"),
+        ],
+    )
+    def test_from_config_model_type_aliases(
+        self, model_type: str, expected_family: str
+    ) -> None:
+        """Configs without an ``architectures`` list must still identify safely."""
+        detector = ArchitectureDetector()
+        arch = detector._from_config(
+            {
+                "model_type": model_type,
+                "num_hidden_layers": 2,
+                "hidden_size": 16,
+                "num_attention_heads": 2,
+                "vocab_size": 32,
+            }
+        )
+        assert arch.family == expected_family
 
     def test_check_compatibility_moe(self) -> None:
         detector = ArchitectureDetector()
@@ -149,12 +176,12 @@ class TestCompilerPlan:
     def test_plan_unknown_model(self) -> None:
         compiler = Compiler()
         plan = compiler.plan("unknown/unknown-model-xyz")
-        # Unknown model gets default architecture so it should still be feasible
-        assert plan.is_feasible or len(plan.errors) == 0
+        assert not plan.is_feasible
+        assert plan.errors
 
-    def test_compile_small_model(self, tmp_cache_dir) -> None:
+    def test_compile_small_model(self, tmp_cache_dir, tiny_local_safetensors_model) -> None:
         compiler = Compiler(CompilerConfig(targets=["cpu_avx512"], overwrite=True, dry_run=False))
-        aeg = compiler.compile("Qwen/Qwen3-0.6B", output_path=tmp_cache_dir / "qwen3-0.6b.aeg")
+        aeg = compiler.compile(str(tiny_local_safetensors_model), output_path=tmp_cache_dir / "qwen3-0.6b.aeg")
         assert aeg.root.exists()
         assert (aeg.root / "manifest.json").exists()
 

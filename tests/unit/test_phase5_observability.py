@@ -203,12 +203,10 @@ class TestOTLPExporter:
 class TestBenchmarkRunner:
     def test_run_known_benchmark(self):
         from aether.observability.ci_pipeline import BenchmarkRunner
+        from aether.core.exceptions import BenchmarkError
         runner = BenchmarkRunner(seed=42)
-        result = runner.run("hellaswag")
-        assert result.benchmark == "hellaswag"
-        assert 0.0 <= result.score <= 1.0
-        assert result.num_correct <= result.num_total
-        assert result.latency_ms > 0
+        with pytest.raises(BenchmarkError, match="synthetic scores are disabled"):
+            runner.run("hellaswag")
 
     def test_score_override(self):
         from aether.observability.ci_pipeline import BenchmarkRunner
@@ -225,7 +223,10 @@ class TestBenchmarkRunner:
     def test_run_suite(self):
         from aether.observability.ci_pipeline import BenchmarkRunner
         runner = BenchmarkRunner()
-        results = runner.run_suite(["hellaswag", "mmlu", "gsm8k"])
+        results = runner.run_suite(
+            ["hellaswag", "mmlu", "gsm8k"],
+            score_overrides={"hellaswag": 0.89, "mmlu": 0.84, "gsm8k": 0.91},
+        )
         assert len(results) == 3
         benchmarks = {r.benchmark for r in results}
         assert "hellaswag" in benchmarks

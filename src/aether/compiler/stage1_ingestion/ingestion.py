@@ -8,6 +8,7 @@ AEGGraph that the optimizer passes can consume.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +51,10 @@ class IngestionPipeline:
     """
 
     def __init__(self, config: CompilerConfig | None = None) -> None:
-        self.config = config or CompilerConfig()
+        # The low-level ingestion API is deterministic and local-only by
+        # default.  Network materialization belongs to Compiler, which passes
+        # its explicit ``skip_download`` policy through this object.
+        self.config = config or CompilerConfig(skip_download=True)
         logger.info("Ingestion pipeline initialized")
 
     def ingest(self, model: str, architecture: ModelArchitecture) -> AEGGraph:
@@ -71,19 +75,27 @@ class IngestionPipeline:
         logger.info(f"Ingesting model {model} (format: {format_type})")
 
         if format_type == "safetensors":
-            return self._ingest_safetensors(model, architecture)
-        if format_type == "gguf":
-            return self._ingest_gguf(model, architecture)
-        if format_type == "onnx":
-            return self._ingest_onnx(model, architecture)
-        if format_type == "mlx":
-            return self._ingest_mlx(model, architecture)
-        if format_type == "pytorch":
-            return self._ingest_pytorch(model, architecture)
-        if format_type == "auto":
-            return self._ingest_auto(model, architecture)
-        msg = f"Unsupported model format: {format_type}"
-        raise UnsupportedFormatError(msg)
+            graph = self._ingest_safetensors(model, architecture)
+        elif format_type == "gguf":
+            graph = self._ingest_gguf(model, architecture)
+        elif format_type == "onnx":
+            graph = self._ingest_onnx(model, architecture)
+        elif format_type == "mlx":
+            graph = self._ingest_mlx(model, architecture)
+        elif format_type == "pytorch":
+            graph = self._ingest_pytorch(model, architecture)
+        elif format_type == "auto":
+            graph = self._ingest_auto(model, architecture)
+        else:
+            msg = f"Unsupported model format: {format_type}"
+            raise UnsupportedFormatError(msg)
+        local_path = Path(model)
+        if local_path.exists() and (
+            local_path.is_dir() or local_path.suffix.lower() in {".gguf", ".ggml"}
+        ):
+            graph.set_metadata("source_model_path", str(local_path.resolve()))
+            graph.set_metadata("source_format", format_type)
+        return graph
 
     def _detect_format(self, model: str) -> str:
         """Detect the format of a model from its path or identifier."""
@@ -198,12 +210,46 @@ class IngestionPipeline:
             candidates = lookup.get(key)
             if not candidates:
                 continue
-            # A node may stand in for several checkpoint tensors (a fused QKV node
-            # covers q/k/v); attach the first and record the full set.
-            source_name, value = candidates[0]
+            # A node may stand in for several checkpoint tensors.  Preserve the
+            # real projection semantics instead of silently dropping parameters:
+            # fused QKV nodes receive Q/K/V stacked in that order, while the
+            # single SwiGLU node keeps the separate up projection as metadata for
+            # the weight packer.
+            if key[1] == "qkv" and len(candidates) > 1:
+                def projection_order(item: tuple[str, Any]) -> int:
+                    name = item[0].lower()
+                    return (
+                        0
+                        if "q_proj" in name or "attn_q" in name
+                        else 1
+                        if "k_proj" in name or "attn_k" in name
+                        else 2
+                    )
+
+                ordered = sorted(candidates, key=projection_order)
+                source_name = "+".join(name for name, _ in ordered)
+                import numpy as np
+
+                value = np.concatenate([np.asarray(array) for _, array in ordered], axis=0)
+            else:
+                source_name, value = candidates[0]
             node.add_attribute("weight", value)
             node.add_attribute("weight_shape", list(value.shape))
             node.add_attribute("weight_source", source_name)
+            if key[1] == "gate_proj":
+                up_candidates = [
+                    item
+                    for item in candidates
+                    if "up_proj" in item[0].lower() or "ffn_up" in item[0].lower()
+                ]
+                gate_candidates = [
+                    item
+                    for item in candidates
+                    if "gate_proj" in item[0].lower() or "ffn_gate" in item[0].lower()
+                ]
+                if up_candidates and gate_candidates:
+                    node.add_attribute("up_weight", up_candidates[0][1])
+                    node.add_attribute("up_weight_source", up_candidates[0][0])
             if len(candidates) > 1:
                 node.add_attribute("fused_weight_sources", [n for n, _ in candidates])
             attached += 1
@@ -220,13 +266,24 @@ class IngestionPipeline:
         "k_proj": "qkv",
         "v_proj": "qkv",
         "qkv_proj": "qkv",
+        # Standard llama.cpp/GGUF spellings.
+        "attn_q": "qkv",
+        "attn_k": "qkv",
+        "attn_v": "qkv",
         "o_proj": "out_proj",
+        "attn_output": "out_proj",
         "embed_tokens": "embedding",
+        "token_embd": "embedding",
         "wte": "embedding",
         "input_layernorm": "rmsnorm",
+        "attn_norm": "rmsnorm",
         "post_attention_layernorm": "ffn_norm",
+        "ffn_norm": "ffn_norm",
         "down_proj": "ffn",
+        "ffn_down": "ffn",
         "up_proj": "gate_proj",
+        "ffn_up": "gate_proj",
+        "ffn_gate": "gate_proj",
         # Canonical names, as used in graph node ids.
         "qkv": "qkv",
         "out_proj": "out_proj",
@@ -236,10 +293,12 @@ class IngestionPipeline:
         "ffn": "ffn",
         "gate_proj": "gate_proj",
         "lm_head": "lm_head",
+        "output_norm": "final_norm",
+        "final_norm": "final_norm",
     }
 
     #: Structural path segments that carry no identifying information.
-    _IGNORED_SEGMENTS = frozenset({"model", "transformer", "module", "self_attn", "attn", "mlp", "weight"})
+    _IGNORED_SEGMENTS = frozenset({"model", "transformer", "module", "self_attn", "mlp", "blk", "weight"})
 
     @classmethod
     def _normalise_weight_name(cls, name: str) -> tuple[int | None, str | None]:
@@ -256,9 +315,15 @@ class IngestionPipeline:
         layer_index: int | None = None
         component: str | None = None
 
+        # GGUF uses ``output.weight`` for the LM head.  The bare graph node
+        # ``output`` is structural and must remain unidentifiable, otherwise
+        # it would be counted as a second attachment to ``lm_head``.
+        if tokens == ["output", "weight"]:
+            return None, "lm_head"
+
         for position, token in enumerate(tokens):
             # "layer"/"layers" followed by its index.
-            if token in ("layer", "layers", "blocks", "h") and position + 1 < len(tokens):
+            if token in ("layer", "layers", "blocks", "blk", "h") and position + 1 < len(tokens):
                 if tokens[position + 1].isdigit():
                     layer_index = int(tokens[position + 1])
                 continue
@@ -435,10 +500,66 @@ class IngestionPipeline:
         graph = AEGGraph(name=f"{architecture.family}_auto", architecture=architecture)
         logger.info(f"Auto-ingesting model: {model}")
         self._build_architecture_graph(graph, architecture)
+        source = Path(model)
+        downloaded = False
+        if not source.exists():
+            if self.config.skip_download:
+                graph.set_metadata("weights_attached", 0)
+                graph.set_metadata("source_model_id", model)
+                logger.warning("Skipping model download for %s by compiler configuration", model)
+                return graph
+            source = Path(self._download_hf_snapshot(model))
+            downloaded = True
+        graph.set_metadata("source_model_path", str(source.resolve()))
         # A local directory may still hold SafeTensors shards even when format
         # detection fell through to "auto"; attach them when they are there.
-        self._attach_safetensors_weights(graph, model)
+        attached = 0
+        if list(source.glob("*.safetensors")) or list(source.glob("*.safetensors.index.json")):
+            attached = self._attach_safetensors_weights(graph, str(source))
+        elif list(source.glob("*.gguf")):
+            attached = self._attach_gguf_weights(graph, str(next(source.glob("*.gguf"))))
+        elif list(source.glob("*.onnx")):
+            attached = self._attach_onnx_weights(graph, str(next(source.glob("*.onnx"))))
+        elif list(source.glob("*.bin")) or list(source.glob("*.pt")):
+            attached = self._attach_pytorch_weights(graph, str(source))
+        graph.set_metadata("weights_attached", attached)
+        if downloaded and attached == 0:
+            raise IngestionError(
+                f"No supported model weights were found in materialized model {source}. "
+                "A graph-only artifact is not a runnable compilation."
+            )
         return graph
+
+    def _download_hf_snapshot(self, model: str) -> str:
+        """Materialize a real Hugging Face snapshot for compiler ingestion.
+
+        Downloading is explicit and bounded.  A failed or incomplete snapshot
+        raises instead of allowing the compiler to continue with fabricated
+        parameters.
+        """
+        try:
+            from huggingface_hub import snapshot_download
+            from aether.utils.file_io import aether_cache_dir
+
+            cache_dir = aether_cache_dir(self.config.cache_dir) / "hf_snapshots"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            timeout = float(os.environ.get("AETHER_HF_ETAG_TIMEOUT_S", "10"))
+            path = snapshot_download(
+                repo_id=model,
+                cache_dir=cache_dir,
+                etag_timeout=timeout,
+                local_files_only=os.environ.get("AETHER_HF_OFFLINE", "").lower() in {"1", "true", "yes"},
+                allow_patterns=[
+                    "config.json", "generation_config.json", "tokenizer.*", "*.json",
+                    "*.safetensors", "*.safetensors.index.json", "*.bin", "*.pt", "*.pth",
+                    "*.gguf", "*.onnx", "*.model", "*.txt", "*.py",
+                ],
+            )
+            return path
+        except Exception as exc:
+            raise IngestionError(
+                f"Unable to materialize Hugging Face model {model!r}; no weights were loaded: {exc}"
+            ) from exc
 
     def _build_architecture_graph(self, graph: AEGGraph, architecture: ModelArchitecture) -> AEGGraph:
         """Build a detailed AEG graph from architecture metadata.

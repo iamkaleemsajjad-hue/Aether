@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import json
 import math
-import random
+import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from aether.observability.gates import EvalGate, EvalGateDecision, EvalResult
+from aether.core.exceptions import BenchmarkError
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +99,149 @@ class BenchmarkResult:
         }
 
 
+# A configured evaluator owns dataset loading, prompt construction, model
+# execution, and answer scoring.  The pipeline only accepts its measured
+# result; it never derives a score from non-empty text or from a model name.
+BenchmarkEvaluator = Callable[
+    [str, Mapping[str, Any]], BenchmarkResult | Mapping[str, Any]
+]
+
+
+class JsonlBenchmarkEvaluator:
+    """Evaluate measured exact-match/accuracy examples from a JSONL file.
+
+    Each record must contain ``prompt`` (or ``question``) and one of
+    ``answer``, ``target``, or ``expected``.  Optional ``answer_regex`` allows
+    a benchmark-specific, declarative extractor for answers embedded in model
+    explanations.  This class intentionally does not infer correctness from
+    response length or from successful generation.
+
+    The supplied ``generate_fn`` is the model execution boundary and must
+    accept ``prompt=``, ``benchmark=``, and ``max_tokens=`` keyword arguments.
+    Dataset paths and scoring rules are explicit so the resulting score is
+    reproducible and auditable.
+    """
+
+    def __init__(
+        self,
+        dataset_paths: Mapping[str, str | Path],
+        generate_fn: Callable[..., str],
+        *,
+        max_tokens: int = 256,
+    ) -> None:
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        self.dataset_paths = {str(name): Path(path) for name, path in dataset_paths.items()}
+        self.generate_fn = generate_fn
+        self.max_tokens = max_tokens
+
+    def __call__(self, benchmark: str, spec: Mapping[str, Any]) -> BenchmarkResult:
+        path = self.dataset_paths.get(benchmark)
+        if path is None:
+            raise BenchmarkError(f"No JSONL dataset configured for benchmark {benchmark!r}")
+        if not path.is_file():
+            raise BenchmarkError(f"Benchmark dataset not found: {path}")
+
+        correct = 0
+        total = 0
+        started = time.perf_counter()
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise BenchmarkError(
+                        f"Invalid JSON in {path} at line {line_number}"
+                    ) from exc
+                if not isinstance(record, Mapping):
+                    raise BenchmarkError(
+                        f"Benchmark record at {path}:{line_number} must be an object"
+                    )
+                prompt = record.get("prompt", record.get("question"))
+                expected = next(
+                    (record[key] for key in ("answer", "target", "expected") if key in record),
+                    None,
+                )
+                if not isinstance(prompt, str) or not prompt.strip():
+                    raise BenchmarkError(
+                        f"Benchmark record at {path}:{line_number} has no non-empty prompt"
+                    )
+                if expected is None:
+                    raise BenchmarkError(
+                        f"Benchmark record at {path}:{line_number} has no expected answer"
+                    )
+
+                response = self.generate_fn(
+                    prompt=prompt,
+                    benchmark=benchmark,
+                    max_tokens=self.max_tokens,
+                )
+                if not isinstance(response, str):
+                    raise BenchmarkError(
+                        f"generate_fn returned {type(response).__name__} at {path}:{line_number}; expected str"
+                    )
+                if self._matches(response, expected, record):
+                    correct += 1
+                total += 1
+
+        if total == 0:
+            raise BenchmarkError(f"Benchmark dataset {path} contains no examples")
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        return BenchmarkResult(
+            benchmark=benchmark,
+            score=correct / total,
+            num_correct=correct,
+            num_total=total,
+            perplexity=None,
+            latency_ms=elapsed_ms / total,
+            metadata={
+                "dataset": str(path),
+                "metric": str(spec.get("metric", "exact_match")),
+                "evaluator": "jsonl_exact_match",
+            },
+        )
+
+    @classmethod
+    def _matches(
+        cls, response: str, expected: Any, record: Mapping[str, Any]
+    ) -> bool:
+        answer_regex = record.get("answer_regex")
+        if answer_regex is not None:
+            if not isinstance(answer_regex, str):
+                raise BenchmarkError("answer_regex must be a string")
+            return re.search(answer_regex, response, flags=re.IGNORECASE) is not None and bool(
+                re.search(answer_regex, str(expected), flags=re.IGNORECASE)
+            )
+
+        choices = record.get("choices")
+        if isinstance(choices, list) and choices:
+            if isinstance(expected, int):
+                if not 0 <= expected < len(choices):
+                    raise BenchmarkError("choice answer index is outside choices")
+                expected_values = [choices[expected], chr(ord("A") + expected)]
+            else:
+                expected_values = [expected]
+            normalized_response = cls._normalize(response)
+            for value in expected_values:
+                normalized = cls._normalize(value)
+                if normalized and (
+                    normalized_response == normalized
+                    or normalized_response.startswith(normalized + " ")
+                    or normalized_response.startswith(normalized + ")")
+                    or normalized_response.startswith(normalized + ".")
+                ):
+                    return True
+            return False
+
+        return cls._normalize(response) == cls._normalize(expected)
+
+    @staticmethod
+    def _normalize(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value).strip().casefold()).strip(" .,:;\"'`[]()")
+
+
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
@@ -104,16 +250,22 @@ class BenchmarkRunner:
     """
     Runs benchmark evaluation against a compiled AEG model.
 
-    In production this calls the AEG runtime's generate() for each question.
-    For offline/CI use, it computes a perplexity-proxy score from weight metadata.
+    In production this must call a registered dataset evaluator against the AEG
+    runtime. This class fails closed until such an evaluator is configured; it
+    never invents benchmark scores.
 
     Research basis: lm-evaluation-harness (EleutherAI), AEG quality gates (PRD §19).
     """
 
-    def __init__(self, aeg_path: str | Path | None = None, seed: int = 42) -> None:
+    def __init__(
+        self,
+        aeg_path: str | Path | None = None,
+        seed: int = 42,
+        evaluator: BenchmarkEvaluator | None = None,
+    ) -> None:
         self.aeg_path = Path(aeg_path) if aeg_path else None
         self._seed = seed
-        self._rng = random.Random(seed)
+        self._evaluator = evaluator
 
     def run(
         self,
@@ -127,7 +279,8 @@ class BenchmarkRunner:
         Args:
             benchmark: Name of benchmark from BENCHMARK_REGISTRY.
             score_override: If provided, use this score (for testing / CI replay).
-            perplexity: Optional perplexity from calibration run (lowers score proxy if high).
+            perplexity: Optional measured perplexity associated with an
+                evaluator result; it is not used to manufacture a score.
 
         Returns:
             BenchmarkResult with score, correct counts, and latency.
@@ -137,32 +290,98 @@ class BenchmarkRunner:
 
         spec = BENCHMARK_REGISTRY[benchmark]
         n = spec["num_questions"]
-        baseline = spec["baseline_score"]
-
         if score_override is not None:
-            score = score_override
-        elif perplexity is not None:
-            # Perplexity proxy: higher perplexity → lower accuracy
-            # A well-calibrated model at PPL ~4 scores near baseline
-            ppl_penalty = max(0.0, (perplexity - 4.0) * 0.01)
-            score = max(0.0, baseline - ppl_penalty + self._rng.gauss(0, 0.002))
+            score = float(score_override)
+            if not 0.0 <= score <= 1.0:
+                raise ValueError("score_override must be between 0 and 1")
+            num_correct = round(score * n)
+            latency_ms = 0.0
+            return BenchmarkResult(
+                benchmark=benchmark,
+                score=score,
+                num_correct=num_correct,
+                num_total=n,
+                perplexity=perplexity,
+                latency_ms=latency_ms,
+                metadata={
+                    "aeg_path": str(self.aeg_path),
+                    "seed": str(self._seed),
+                    "replay": True,
+                },
+            )
+
+        if self._evaluator is None:
+            raise BenchmarkError(
+                f"No evaluator is configured for {benchmark!r}. Provide a real dataset/evaluator; "
+                "synthetic scores are disabled."
+            )
+
+        measured = self._evaluator(benchmark, spec)
+        if isinstance(measured, BenchmarkResult):
+            result = measured
+        elif isinstance(measured, Mapping):
+            required = {"score", "num_correct", "num_total", "latency_ms"}
+            missing = sorted(required.difference(measured))
+            if missing:
+                raise BenchmarkError(
+                    f"Evaluator result for {benchmark!r} is missing measured fields: {missing}"
+                )
+            metadata = measured.get("metadata", {})
+            if not isinstance(metadata, Mapping):
+                raise BenchmarkError("Evaluator metadata must be a mapping")
+            result = BenchmarkResult(
+                benchmark=str(measured.get("benchmark", benchmark)),
+                score=float(measured["score"]),
+                num_correct=int(measured["num_correct"]),
+                num_total=int(measured["num_total"]),
+                perplexity=(
+                    None
+                    if measured.get("perplexity") is None
+                    else float(measured["perplexity"])
+                ),
+                latency_ms=float(measured["latency_ms"]),
+                metadata=dict(metadata),
+            )
         else:
-            # Simulate a slightly noisy result near baseline
-            noise = self._rng.gauss(0, 0.003)
-            score = min(1.0, max(0.0, baseline + noise))
+            raise BenchmarkError(
+                f"Evaluator for {benchmark!r} returned {type(measured).__name__}; "
+                "expected BenchmarkResult or a measured mapping"
+            )
 
-        num_correct = round(score * n)
-        latency_ms = n * self._rng.uniform(8.0, 20.0)
+        self._validate_measured_result(result, benchmark)
+        if perplexity is not None and result.perplexity is None:
+            result = BenchmarkResult(
+                benchmark=result.benchmark,
+                score=result.score,
+                num_correct=result.num_correct,
+                num_total=result.num_total,
+                perplexity=perplexity,
+                latency_ms=result.latency_ms,
+                metadata=result.metadata,
+            )
+        return result
 
-        return BenchmarkResult(
-            benchmark=benchmark,
-            score=score,
-            num_correct=num_correct,
-            num_total=n,
-            perplexity=perplexity,
-            latency_ms=latency_ms,
-            metadata={"aeg_path": str(self.aeg_path), "seed": str(self._seed)},
-        )
+    @staticmethod
+    def _validate_measured_result(result: BenchmarkResult, requested: str) -> None:
+        """Reject malformed evaluator output before it reaches the gate."""
+        if result.benchmark != requested:
+            raise BenchmarkError(
+                f"Evaluator returned benchmark {result.benchmark!r}, expected {requested!r}"
+            )
+        if not 0.0 <= result.score <= 1.0:
+            raise BenchmarkError("Evaluator score must be between 0 and 1")
+        if result.num_total <= 0:
+            raise BenchmarkError("Evaluator num_total must be positive")
+        if not 0 <= result.num_correct <= result.num_total:
+            raise BenchmarkError("Evaluator num_correct must be within [0, num_total]")
+        measured_score = result.num_correct / result.num_total
+        if abs(measured_score - result.score) > 1e-6:
+            raise BenchmarkError(
+                f"Evaluator score {result.score} disagrees with measured counts "
+                f"{result.num_correct}/{result.num_total}"
+            )
+        if result.latency_ms < 0.0:
+            raise BenchmarkError("Evaluator latency_ms cannot be negative")
 
     def run_suite(
         self,
@@ -228,9 +447,10 @@ class CIEvalPipeline:
         aeg_path: str | Path,
         max_regression: float = 0.02,
         required_benchmarks: tuple[str, ...] = ("hellaswag", "mmlu", "gsm8k"),
+        evaluator: BenchmarkEvaluator | None = None,
     ) -> None:
         self.aeg_path = Path(aeg_path)
-        self.runner = BenchmarkRunner(aeg_path=aeg_path)
+        self.runner = BenchmarkRunner(aeg_path=aeg_path, evaluator=evaluator)
         self.gate = EvalGate(
             max_relative_regression=max_regression,
             required_benchmarks=required_benchmarks,

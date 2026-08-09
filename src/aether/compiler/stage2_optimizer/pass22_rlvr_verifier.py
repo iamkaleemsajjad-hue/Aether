@@ -342,15 +342,12 @@ class GRPOTrainer:
     def verify_math(self, response: str, ground_truth: str | None = None) -> float:
         """Verify a math response using SymPy symbolic algebra.
 
-        Returns 1.0 if response matches ground truth, 0.0 otherwise.
-        Falls back to pattern matching if SymPy is unavailable.
+        Returns 1.0 if response matches ground truth, 0.0 otherwise.  A
+        missing ground truth is not evidence of correctness and therefore
+        receives zero reward.
         """
         if ground_truth is None:
-            # No ground truth: use heuristic (contains numbers, equations)
-            import re
-            has_number = bool(re.search(r"\d+\.?\d*", response))
-            has_answer = any(kw in response.lower() for kw in ["answer", "=", "result", "therefore"])
-            return 0.5 if (has_number and has_answer) else 0.1
+            return 0.0
 
         try:
             from sympy import simplify, sympify
@@ -386,28 +383,7 @@ class GRPOTrainer:
         Returns fraction of tests passed (0.0–1.0).
         """
         if test_code is None:
-            # No test: check if response contains valid Python
-            import ast
-            code_blocks = []
-            in_block = False
-            for line in response.split("\n"):
-                if "```python" in line.lower():
-                    in_block = True
-                    code_blocks.append([])
-                elif "```" in line and in_block:
-                    in_block = False
-                elif in_block:
-                    code_blocks[-1].append(line)
-
-            if not code_blocks:
-                return 0.1
-
-            full_code = "\n".join(code_blocks[-1])
-            try:
-                ast.parse(full_code)
-                return 0.5  # Syntactically valid
-            except SyntaxError:
-                return 0.0
+            return 0.0
 
         # With test code: run in subprocess
         import subprocess
@@ -506,9 +482,12 @@ class GRPOTrainer:
         elif domain == "code":
             return self.verify_code(response, test_code)
         elif domain in ("logic", "reasoning", "general"):
-            return self.verify_heuristic(response, domain)
+            # These domains require a supplied verifier/dataset.  Surface
+            # heuristic scoring remains available as an explicit helper, but
+            # it is not safe as an RLVR reward source.
+            return 0.0
         else:
-            return self.verify_heuristic(response, domain)
+            return 0.0
 
     def compute_grpo_advantages(
         self, rewards: list[float]
@@ -602,8 +581,12 @@ class GRPOTrainer:
             # Step 3: K2V dense reward shaping (arXiv 2026)
             if self.k2v_dense_rewards and len(responses) > 0:
                 # Decompose into sub-tasks and add intermediate rewards
-                # Heuristic: step by step structure gets bonus
+                # A structural bonus can only refine an already verified
+                # response; it must never turn an unverified response into a
+                # positive reward.
                 for i, resp in enumerate(responses):
+                    if rewards[i] <= 0.0:
+                        continue
                     steps = len([line for line in resp.split("\n") if line.strip()])
                     step_bonus = min(0.1, steps * 0.01)  # up to 10% bonus for more steps
                     rewards[i] = min(1.0, rewards[i] + step_bonus)

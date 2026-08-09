@@ -850,6 +850,18 @@ class PruningSparsityPass(BasePass):
             entry["reason"] = "no weight tensor attached to graph node"
             return entry
 
+        # 2:M kernels require aligned input dimensions. If the real tensor is
+        # not aligned, use a truthful unstructured mask instead of emitting an
+        # invalid structured-kernel claim.
+        weight_shape = getattr(weights, "shape", ())
+        if pattern != "unstructured" and len(weight_shape) >= 2:
+            group_size = int(pattern.split(":", 1)[1])
+            if int(weight_shape[1]) % group_size:
+                pattern = "unstructured"
+                entry["pattern"] = pattern
+                entry["pattern_fallback"] = "unstructured"
+                entry["reason"] = "input dimension is not aligned for the requested N:M pattern"
+
         # Determine effective metric: fall back to magnitude if Wanda norms missing.
         metric = config.pruning_metric
         if metric in ("wanda", "sparsegpt"):
@@ -861,10 +873,39 @@ class PruningSparsityPass(BasePass):
             activation_norms = self._node_activation_norms(node, in_features)
             if activation_norms is None:
                 metric = "magnitude"  # Degrade gracefully without calibration norms.
+                entry["metric_fallback"] = "magnitude"
 
-        # Compute the actual sparsity mask.
-        mask_result = self._compute_magnitude_mask(weights, sparsity, pattern)
-        entry.update(mask_result)
+        # Compute and retain the actual boolean mask. A planning-only report
+        # is insufficient: the runtime/backend needs the same verified mask
+        # that the quality report describes.
+        try:
+            import numpy as np
+            from aether.quantization.pruning import build_mask, verify_nm_pattern
+
+            mask = build_mask(
+                np.asarray(weights, dtype=np.float32),
+                target_sparsity=sparsity,
+                pattern=pattern,
+                metric=metric,
+                activation_norms=(
+                    np.asarray(self._node_activation_norms(node, int(np.asarray(weights).shape[1])), dtype=np.float32)
+                    if self._node_activation_norms(node, int(np.asarray(weights).shape[1])) is not None
+                    else None
+                ),
+            )
+            if hasattr(node, "add_attribute"):
+                node.add_attribute("pruning_mask", mask)
+            entry.update(mask.to_dict())
+            entry["mask_computed"] = True
+            entry["n_weights"] = int(mask.mask.size)
+            entry["n_zeroed"] = int(mask.pruned_count)
+            entry["achieved_sparsity"] = round(mask.achieved_sparsity, 4)
+            if pattern != "unstructured":
+                n_keep, m_group = (int(part) for part in pattern.split(":", 1))
+                entry["nm_pattern_valid"] = bool(verify_nm_pattern(mask.mask, n_keep, m_group))
+        except Exception as exc:  # noqa: BLE001
+            entry["mask_computed"] = False
+            entry["reason"] = f"mask computation error: {exc}"
         entry["importance_metric"] = metric
         return entry
 

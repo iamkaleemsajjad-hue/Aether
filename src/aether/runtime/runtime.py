@@ -9,7 +9,10 @@ decoding, and serves generation requests.
 from __future__ import annotations
 
 import datetime
+import json
+import copy
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,6 +68,9 @@ class InferenceMetrics:
     backend_name: str | None = None
     """Backend plugin that executed the request."""
 
+    extra: dict[str, Any] = field(default_factory=dict)
+    """Additional measured/request metadata such as cascade routing."""
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "throughput_tps": self.throughput_tps,
@@ -76,6 +82,7 @@ class InferenceMetrics:
             "kv_cache_hit_rate": self.kv_cache_hit_rate,
             "memory_pressure": self.memory_pressure,
             "backend_name": self.backend_name,
+            **self.extra,
         }
 
 
@@ -102,6 +109,260 @@ class GenerationResponse:
             "metrics": self.metrics.to_dict(),
             "finish_reason": self.finish_reason,
         }
+
+
+class AttestationReport(dict[str, Any]):
+    """Mapping-compatible attestation report with PRD attribute access.
+
+    The REST API needs a JSON mapping, while the documented Python SDK uses
+    ``report.model_hash`` and ``report.enclave_measurement``.  Keeping one
+    object that supports both prevents callers from receiving different
+    semantics depending on the transport.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "enclave_measurement":
+            return self.get("tdx_report_hash") or self.get("snp_report_hash")
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
+class EvalGateReport(dict[str, Any]):
+    """Mapping-compatible evaluation result with SDK attribute access."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
+class _MultiAgentAgent:
+    """Async facade for one real Runtime-backed agent in an R2 session."""
+
+    def __init__(
+        self,
+        runtime: "Runtime",
+        session: "_MultiAgentSessionHandle",
+        model_id: str,
+        session_id: str,
+        context: str = "",
+        prefix_hash: str | None = None,
+    ) -> None:
+        self._runtime = runtime
+        self._session = session
+        self.model_id = model_id
+        self.session_id = session_id
+        self.context = context
+        self.prefix_hash = prefix_hash
+
+    async def generate(self, prompt: str, **kwargs: Any) -> GenerationResponse:
+        """Run inference through the parent Runtime for this agent."""
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError("agent prompt must be a non-empty string")
+        full_prompt = f"{self.context}\n\n{prompt}" if self.context else prompt
+        return self._runtime.generate(self.model_id, full_prompt, **kwargs)
+
+
+class _MultiAgentSessionHandle(dict[str, Any]):
+    """Dictionary-compatible async context manager for R2 multi-agent KV."""
+
+    _VALID_COORDINATION = frozenset({"relay", "kvcomm", "droidspeak", "swarm"})
+
+    def __init__(
+        self,
+        runtime: "Runtime",
+        models: list[str],
+        coordination: str,
+        agent_count: int,
+        shared_prefix: str,
+    ) -> None:
+        if coordination not in self._VALID_COORDINATION:
+            raise ValueError(
+                f"unsupported coordination mode {coordination!r}; "
+                f"choose one of {sorted(self._VALID_COORDINATION)}"
+            )
+        super().__init__()
+        from aether.runtime.r2_multi_agent_kv import MultiAgentKVCoordinator
+
+        self._runtime = runtime
+        self._coordinator = getattr(runtime, "_multi_agent_coordinator", None)
+        if self._coordinator is None:
+            self._coordinator = MultiAgentKVCoordinator()
+            runtime._multi_agent_coordinator = self._coordinator
+        self._models = list(dict.fromkeys(models))
+        self._coordination = coordination
+        self._shared_prefix = shared_prefix
+        self._shared_prefix_hash = (
+            self._coordinator.hash_prefix(shared_prefix) if shared_prefix else None
+        )
+        self._session_ids: set[str] = set()
+        self._agents: dict[str, _MultiAgentAgent] = {}
+        self._closed = False
+        session_id = str(uuid.uuid4())
+        self.update(
+            {
+                "session_id": session_id,
+                "agent_sessions": [],
+                "agent_count": 0,
+                "models": list(self._models),
+                "coordination": coordination,
+                "shared_prefix_len": len(shared_prefix),
+                "kv_sharing_enabled": True,
+                "research_basis": "SGLang RadixAttention 2024 + MemServe 2025",
+            }
+        )
+        if agent_count:
+            for index in range(agent_count):
+                selected = self._models[index % len(self._models)] if self._models else ""
+                self._create_agent(selected, context=shared_prefix)
+
+    def _create_agent(
+        self,
+        model_id: str,
+        *,
+        context: str = "",
+        prefix_hash: str | None = None,
+    ) -> _MultiAgentAgent:
+        if self._closed:
+            raise AetherRuntimeError("multi-agent session is closed")
+        if self._models and model_id not in self._models:
+            raise ValueError(f"model {model_id!r} is not registered in this session")
+        agent_session_id = f"{self['session_id']}/agent_{len(self._session_ids)}"
+        effective_hash = prefix_hash or self._shared_prefix_hash
+        self._coordinator.create_agent_session(
+            session_id=agent_session_id,
+            prefix_hash=effective_hash,
+        )
+        agent = _MultiAgentAgent(
+            self._runtime,
+            self,
+            model_id,
+            agent_session_id,
+            context=context,
+            prefix_hash=effective_hash,
+        )
+        self._session_ids.add(agent_session_id)
+        self._agents[agent_session_id] = agent
+        self["agent_sessions"].append(agent_session_id)
+        self["agent_count"] = len(self._session_ids)
+        return agent
+
+    async def spawn_agent(
+        self,
+        model: str,
+        *,
+        context: Any = "",
+        inherit_kv_from: _MultiAgentAgent | None = None,
+    ) -> _MultiAgentAgent:
+        """Create an agent backed by the registered model and R2 coordinator."""
+        if not isinstance(model, str) or not model:
+            raise ValueError("spawn_agent requires a non-empty model identifier")
+        context_text = context if isinstance(context, str) else json.dumps(context, sort_keys=True)
+        inherited_hash = (
+            inherit_kv_from.prefix_hash
+            if isinstance(inherit_kv_from, _MultiAgentAgent)
+            else None
+        )
+        return self._create_agent(
+            model,
+            context=context_text,
+            prefix_hash=inherited_hash,
+        )
+
+    def close(self) -> None:
+        """Release all coordinator sessions owned by this handle."""
+        if self._closed:
+            return
+        for session_id in tuple(self._session_ids):
+            self._coordinator.release_session(session_id)
+        self._session_ids.clear()
+        self._closed = True
+        self["status"] = "closed"
+
+    async def __aenter__(self) -> "_MultiAgentSessionHandle":
+        if self._closed:
+            raise AetherRuntimeError("multi-agent session is closed")
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+
+class _AgenticRuntimeSession:
+    """Async conversation wrapper with explicit session lifecycle.
+
+    The wrapper preserves conversation context by sending the accumulated
+    messages through the real Runtime.  It records a session in the agentic
+    KV manager, but does not claim zero-prefill reuse until the selected
+    backend exposes actual K/V tensors.
+    """
+
+    def __init__(self, runtime: "Runtime", model_id: str, system: str) -> None:
+        self._runtime = runtime
+        self.model_id = model_id
+        self.system = system
+        self.session_id = str(uuid.uuid4())
+        self._manager: Any | None = None
+        self._history: list[tuple[str, str]] = []
+        self._closed = False
+
+    async def __aenter__(self) -> "_AgenticRuntimeSession":
+        from aether.runtime.agentic_session import AgenticKVSessionManager
+
+        if self._closed:
+            raise AetherRuntimeError("agentic session is closed")
+        self._manager = getattr(self._runtime, "_agentic_session_manager", None)
+        if self._manager is None:
+            self._manager = AgenticKVSessionManager()
+            self._runtime._agentic_session_manager = self._manager
+        # Token IDs are intentionally not fabricated here.  The manager still
+        # tracks lifecycle; actual prefix KV registration waits for backend
+        # tensor hooks.
+        self._manager.create_session(self.session_id, metadata={"model_id": self.model_id})
+        return self
+
+    async def generate(self, prompt: str, **kwargs: Any) -> GenerationResponse:
+        if self._closed:
+            raise AetherRuntimeError("agentic session is closed")
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError("agentic prompt must be a non-empty string")
+        turns = []
+        if self.system:
+            turns.append(f"System: {self.system}")
+        for role, text_value in self._history:
+            turns.append(f"{role.title()}: {text_value}")
+        turns.append(f"User: {prompt}")
+        # Keep the assistant role marker in the cached prompt.  Subsequent
+        # turns then contain the exact token prefix (including the marker)
+        # before the prior generated tokens, which makes CPU KV reuse safe.
+        turns.append("Assistant:")
+        kwargs["aether_kv_session_id"] = self.session_id
+        response = self._runtime.generate(self.model_id, "\n\n".join(turns), **kwargs)
+        self._history.extend([("user", prompt), ("assistant", response.text)])
+        response.metrics.extra.update(
+            {
+                "agentic_session_id": self.session_id,
+                "agentic_turn": len(self._history) // 2,
+            }
+        )
+        # Backends that do not expose a session cache remain explicit rather
+        # than inheriting a misleading positive claim.
+        response.metrics.extra.setdefault("kv_reuse", False)
+        return response
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._runtime._release_agentic_kv(self.model_id, self.session_id)
+        if self._manager is not None:
+            self._manager.close_session(self.session_id)
+        self._closed = True
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
 
 
 class Runtime:
@@ -137,6 +398,18 @@ class Runtime:
         self._loaded_backends: dict[str, Backend] = {}
         self._aeg_packages: dict[str, AEGPackage] = {}
         self._lock = threading.RLock()
+        from aether.observability.otel import AetherTracer, MetricsCollector
+
+        self.tracer = AetherTracer()
+        self.metrics_collector = MetricsCollector()
+        self.safety_engine: Any | None = None
+        if self.config.enable_safety_layer:
+            from aether.safety.policy import ContentPolicyEngine
+
+            safety_root = Path(self.config.model_cache_dir) if self.config.model_cache_dir else aether_cache_dir()
+            self.safety_engine = ContentPolicyEngine(
+                audit_path=safety_root / "safety" / "audit.jsonl",
+            )
 
         # v4.0 runtime layer handles — initialized lazily on first model load
         # or when explicitly enabled via RuntimeConfig.
@@ -208,9 +481,28 @@ class Runtime:
                     return backend
             # Find or compile AEG
             aeg_path = self._resolve_aeg_path(model_id)
+            requested_path = Path(model_id)
+            if aeg_path is None and (requested_path.suffix.lower() in {".aeg", ".aegpkg"} or requested_path.parent != Path(".")):
+                raise ModelNotFoundError(
+                    f"AEG artifact does not exist or has no manifest: {model_id}",
+                    model_id=model_id,
+                )
             backend = self._resolve_backend()
-            self._loaded_models[model_id] = backend.load_model(model_id, aeg_path)
+            self._loaded_models[model_id] = backend.load_model(
+                model_id,
+                aeg_path,
+                offline=self.config.hf_offline,
+                download_timeout_s=self.config.model_download_timeout_s,
+                trust_remote_code=self.config.allow_remote_code,
+            )
             self._loaded_backends[model_id] = backend
+            # Optional v4/v5 layers are initialized at the same reachability
+            # boundary as model loading.  They remain feature-gated by the
+            # artifact manifest, but no longer exist only in isolated stats
+            # helpers while inference bypasses them.
+            if aeg_path is not None:
+                self._init_v4_layers(aeg_path)
+                self._init_v5_layers(aeg_path)
             return backend
 
     def _resolve_aeg_path(self, model_id: str) -> str | None:
@@ -317,6 +609,36 @@ class Runtime:
         Returns:
             A GenerationResponse with text, usage, and metrics.
         """
+        if prompt is not None:
+            prompt = self._check_safety_prompt(prompt)
+        cache_bypass = bool(kwargs.pop("cache_bypass", False))
+        cache_config = {
+            "max_new_tokens": max_tokens or self.config.default_max_tokens,
+            "temperature": temperature if temperature is not None else self.config.default_temperature,
+            "top_p": top_p if top_p is not None else self.config.default_top_p,
+            "top_k": top_k,
+        }
+        if self.config.enable_semantic_cache:
+            self._init_v5_layers()
+            cache = getattr(self, "_semantic_cache", None)
+            if cache is not None and prompt is not None:
+                cached = cache.lookup(prompt, model_id, cache_config, bypass=cache_bypass)
+                if cached is not None:
+                    cached_text = self._check_safety_output(cached.response)
+                    completion_tokens = len(cached.response.split())
+                    return GenerationResponse(
+                        text=cached_text,
+                        usage={
+                            "prompt_tokens": len(prompt.split()),
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": len(prompt.split()) + completion_tokens,
+                        },
+                        metrics=InferenceMetrics(
+                            kernel_target=self.fingerprint.target_id,
+                            backend_name="semantic_cache",
+                            extra={"cache_hit": True, "similarity": cached.similarity_score},
+                        ),
+                    )
         backend = self._load_model(model_id)
         request = GenerationRequest(
             model_id=model_id,
@@ -330,9 +652,43 @@ class Runtime:
             extra=kwargs,
         )
         start = datetime.datetime.now(datetime.timezone.utc)
-        result = backend.generate(request)
+        start_ns = time.time_ns()
+        try:
+            result = backend.generate(request)
+        except Exception as exc:
+            error_span = self.tracer.start_span(
+                "aether.inference", attributes={"model_id": model_id, "error": str(exc)}
+            )
+            error_span.set_error(str(exc))
+            self.tracer.finish_span(error_span)
+            self.metrics_collector.record(0.0, 0.0, (time.time_ns() - start_ns) / 1_000_000, is_error=True)
+            raise
+        result.text = self._check_safety_output(result.text)
         end = datetime.datetime.now(datetime.timezone.utc)
         duration_s = (end - start).total_seconds()
+        end_ns = time.time_ns()
+        self.tracer.trace_request(
+            request_id=uuid.uuid4().hex,
+            prompt_tokens=result.prompt_tokens,
+            generated_tokens=result.completion_tokens,
+            ttft_ms=result.metrics.get("ttft_ms", duration_s * 1000),
+            total_ms=duration_s * 1000,
+            model_id=model_id,
+            actual_start_time_ns=start_ns,
+            actual_end_time_ns=end_ns,
+        )
+        self.metrics_collector.record(
+            result.metrics.get("ttft_ms", duration_s * 1000),
+            result.completion_tokens / max(duration_s, 1e-9),
+            duration_s * 1000,
+            eagle_accept_rate=self.kv_cache.hit_rate(),
+            kv_hit_rate=self.kv_cache.hit_rate(),
+        )
+        backend_metrics = {
+            key: value
+            for key, value in result.metrics.items()
+            if key not in {"ttft_ms", "throughput_tps"}
+        }
         metrics = InferenceMetrics(
             throughput_tps=result.completion_tokens / max(duration_s, 1e-6),
             ttft_ms=result.metrics.get("ttft_ms", duration_s * 1000),
@@ -342,8 +698,9 @@ class Runtime:
             kv_cache_hit_rate=self.kv_cache.hit_rate(),
             memory_pressure=0.0,
             backend_name=result.backend_name or backend.name,
+            extra=backend_metrics,
         )
-        return GenerationResponse(
+        response = GenerationResponse(
             text=result.text,
             usage={
                 "prompt_tokens": result.prompt_tokens,
@@ -353,6 +710,98 @@ class Runtime:
             metrics=metrics,
             finish_reason=result.finish_reason,
         )
+        if self.config.enable_semantic_cache and prompt is not None:
+            cache = getattr(self, "_semantic_cache", None)
+            if cache is not None:
+                cache.store(prompt, result.text, model_id, cache_config, tokens_saved=0)
+        return response
+
+    def _check_safety_prompt(self, prompt: str) -> str:
+        """Apply the configured prompt safety policy before inference."""
+        if self.safety_engine is None:
+            return prompt
+        decision = self.safety_engine.check_prompt(prompt)
+        if not decision.allowed:
+            raise AetherRuntimeError(
+                f"prompt rejected by safety policy: {', '.join(decision.reasons) or 'policy violation'}"
+            )
+        return prompt
+
+    def generate_stream(
+        self,
+        model_id: str,
+        prompt: str,
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int = 0,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Yield text deltas from the backend's incremental decoder.
+
+        Streaming intentionally bypasses the semantic response cache because a
+        cache hit has no incremental decoder state. Safety-enabled runtimes
+        reject this API rather than emitting output that has not been checked
+        as a complete response; callers should use :meth:`generate` when the
+        safety layer is enabled.
+        """
+        if self.safety_engine is not None:
+            raise AetherRuntimeError(
+                "streaming is disabled when the safety layer is enabled; "
+                "use generate() for complete-output policy enforcement"
+            )
+        prompt = self._check_safety_prompt(prompt)
+        backend = self._load_model(model_id)
+        request = GenerationRequest(
+            model_id=model_id,
+            prompt=prompt,
+            max_tokens=max_tokens or self.config.default_max_tokens,
+            temperature=temperature if temperature is not None else self.config.default_temperature,
+            top_p=top_p if top_p is not None else self.config.default_top_p,
+            top_k=top_k,
+            stream=True,
+            stop=stop,
+            extra={"cache_bypass": True, **kwargs},
+        )
+        stream = backend.generate_stream(request)
+        pending = ""
+        retain = max((len(sequence) - 1 for sequence in (stop or []) if sequence), default=0)
+        for chunk in stream:
+            pending += str(chunk)
+            if stop:
+                cutoff = min(
+                    (
+                        pending.find(sequence)
+                        for sequence in stop
+                        if sequence and sequence in pending
+                    ),
+                    default=-1,
+                )
+                if cutoff >= 0:
+                    if cutoff:
+                        yield pending[:cutoff]
+                    return
+            if retain and len(pending) > retain:
+                yield pending[:-retain]
+                pending = pending[-retain:]
+            elif not retain:
+                yield pending
+                pending = ""
+        if pending:
+            yield pending
+
+    def _check_safety_output(self, output: str) -> str:
+        """Filter generated output and reject content the policy blocks."""
+        if self.safety_engine is None:
+            return output
+        decision = self.safety_engine.check_output(output)
+        if not decision.allowed:
+            raise AetherRuntimeError(
+                f"output rejected by safety policy: {', '.join(decision.reasons) or 'policy violation'}"
+            )
+        return decision.redacted_text or output
 
     def chat(
         self,
@@ -361,6 +810,12 @@ class Runtime:
         **kwargs: Any,
     ) -> GenerationResponse:
         """Chat completion with a list of messages."""
+        prompt_text = "\n".join(
+            str(message.get("content", ""))
+            for message in messages
+            if isinstance(message, dict)
+        )
+        self._check_safety_prompt(prompt_text)
         backend = self._load_model(model_id)
         request = GenerationRequest(
             model_id=model_id,
@@ -379,7 +834,7 @@ class Runtime:
             backend_name=result.backend_name or backend.name,
         )
         return GenerationResponse(
-            text=result.text,
+            text=self._check_safety_output(result.text),
             usage={
                 "prompt_tokens": result.prompt_tokens,
                 "completion_tokens": result.completion_tokens,
@@ -437,6 +892,173 @@ class Runtime:
             "ttft_ms": result.metrics.get("ttft_ms", 0.0),
         }
 
+    def get_attestation_report(self, model_id: str | None = None) -> AttestationReport:
+        """Return the active TEE report, or an explicit unavailable result."""
+        model_hash: str | None = None
+        if model_id is not None:
+            aeg_path = self._resolve_aeg_path(model_id)
+            if aeg_path is not None:
+                self._init_v4_layers(aeg_path)
+                try:
+                    package = load_aeg_package(aeg_path)
+                    model_hash = package.manifest.manifest_hash if package.manifest else None
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Unable to read AEG hash for attestation", error=str(exc))
+        if self.tee_manager is None:
+            return AttestationReport(
+                enabled=False,
+                hardware_backed=False,
+                model_hash=model_hash,
+                enclave_measurement=None,
+                reason="TEE is not enabled by the loaded AEG",
+            )
+        report = AttestationReport(self.tee_manager.get_attestation_report())
+        report["enabled"] = bool(report.get("enclave_initialized", False))
+        report["model_hash"] = model_hash
+        report["enclave_measurement"] = (
+            report.get("tdx_report_hash") or report.get("snp_report_hash")
+        )
+        return report
+
+    def quantization_report(self, model_id: str) -> dict[str, Any]:
+        """Return quantization metadata from a loaded AEG artifact."""
+        aeg_path = self._resolve_aeg_path(model_id)
+        if aeg_path is None:
+            raise ModelNotFoundError(f"Model {model_id} not found", model_id=model_id)
+        aeg = load_aeg_package(aeg_path)
+        info = self.info(model_id)
+        precision_map = info["precision_map"]
+        if not precision_map:
+            raise AetherRuntimeError(f"AEG {model_id!r} contains no precision map")
+        counts: dict[str, int] = {}
+        for precision in precision_map.values():
+            counts[precision] = counts.get(precision, 0) + 1
+        entries = aeg.weight_store().load_index()
+        weight_bytes = aeg.weight_store().total_bytes if entries else None
+        total_elements = sum(entry.num_elements for entry in entries.values())
+        weighted_bits = sum(entry.num_elements * entry.bits for entry in entries.values())
+        effective_bits = weighted_bits / total_elements if total_elements else None
+        bf16_bytes = total_elements * 2 if total_elements else None
+        reduction = (bf16_bytes / weight_bytes) if bf16_bytes and weight_bytes else None
+        unique_precisions = sorted(set(precision_map.values()))
+        precision = unique_precisions[0] if len(unique_precisions) == 1 else "mixed"
+        return {
+            "model_id": model_id,
+            "status": "measured" if entries else "metadata_only",
+            "precision": precision,
+            "precision_map": precision_map,
+            "precision_counts": counts,
+            "tensor_count": len(precision_map),
+            "weight_tensor_count": len(entries),
+            "memory_mb": (weight_bytes / (1024 * 1024)) if weight_bytes is not None else None,
+            "weight_bytes": weight_bytes,
+            "effective_bits_per_weight": effective_bits,
+            "vs_bf16_reduction": f"{reduction:.2f}x" if reduction is not None else None,
+            "energy_savings_est_pct": None,
+        }
+
+    def set_task_weights(
+        self,
+        weights: dict[str, float] | str,
+        **task_weights: float,
+    ) -> dict[str, float]:
+        """Set normalized task-routing weights used by this runtime session."""
+        # The v4 public API accepts ``set_task_weights(model_id, legal=..., ...)``
+        # while the internal API accepts a mapping.  The model identifier is
+        # retained for future per-artifact routing, but weights are normalized
+        # and applied to the active runtime session immediately.
+        task_model_id = weights if isinstance(weights, str) else None
+        if task_model_id is not None:
+            weights = task_weights
+        elif task_weights:
+            raise ValueError("keyword task weights cannot be combined with a mapping")
+        if not weights or any(not isinstance(value, (int, float)) or value < 0 for value in weights.values()):
+            raise ValueError("task weights must be a non-empty mapping of non-negative numbers")
+        total = float(sum(weights.values()))
+        if total <= 0:
+            raise ValueError("at least one task weight must be greater than zero")
+        normalized = {name: float(value) / total for name, value in weights.items()}
+        if task_model_id is not None:
+            if not hasattr(self, "_task_weights_by_model"):
+                self._task_weights_by_model: dict[str, dict[str, float]] = {}
+            self._task_weights_by_model[task_model_id] = normalized
+        self._task_weights = normalized
+        return dict(self._task_weights)
+
+    def generate_cascade(
+        self,
+        query: str,
+        *,
+        model_routing: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> GenerationResponse:
+        """Route a request to a configured model tier and execute it.
+
+        Routing is deterministic and complexity-based.  A missing tier is an
+        explicit configuration error; the runtime never returns a successful
+        response from a nonexistent or simulated model.
+        """
+        routes = dict(model_routing or self.config.model_routing)
+        if not routes:
+            raise AetherRuntimeError("cascade routing requires RuntimeConfig.model_routing")
+        from aether.runtime.cascade_router import CascadeRouter, ModelTier
+
+        router = CascadeRouter()
+        tier_order = (("simple", 0.25), ("complex", 0.7), ("reasoning", 1.0))
+        for index, (name, limit) in enumerate(tier_order):
+            model_id = routes.get(name)
+            if model_id:
+                router.register_tier(
+                    ModelTier(
+                        tier_id=index, model_id=model_id, max_complexity=limit,
+                        supports_reasoning=name == "reasoning",
+                    )
+                )
+        if not router.tiers:
+            raise AetherRuntimeError("model_routing must define at least one of simple, complex, reasoning")
+        decision = router.route(query)
+        response = self.generate(decision.tier.model_id, query, **kwargs)
+        response.metrics.extra["cascade"] = decision.to_dict()
+        return response
+
+    def generate_with_tools(
+        self,
+        model_id: str,
+        prompt: str,
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> GenerationResponse:
+        """Execute explicitly requested MCP tools, then generate from results.
+
+        Tool execution is fail-closed: an MCP layer and registered server must
+        exist, and tool errors are surfaced rather than converted into model
+        text that could be mistaken for a successful call.
+        """
+        mcp_tools = kwargs.pop("mcp_tools", None)
+        if mcp_tools is not None:
+            if tools is not None:
+                raise ValueError("provide only one of tools or mcp_tools")
+            tools = [
+                {"name": item, "arguments": {}} if isinstance(item, str) else item
+                for item in mcp_tools
+            ]
+        self._init_v4_layers(self._resolve_aeg_path(model_id))
+        if tools:
+            if self.mcp_layer is None:
+                raise AetherRuntimeError("MCP is not enabled by the loaded AEG")
+            results = []
+            for tool in tools:
+                name = tool.get("name")
+                arguments = tool.get("arguments", {})
+                if not isinstance(name, str) or not isinstance(arguments, dict):
+                    raise ValueError("each tool request requires string name and object arguments")
+                result = self.mcp_layer.call_tool(name, arguments)
+                if result.get("isError"):
+                    raise AetherRuntimeError(f"MCP tool {name!r} failed: {result}")
+                results.append({"tool": name, "result": result})
+            prompt = f"{prompt}\n\nTool results:\n{results}"
+        return self.generate(model_id, prompt, **kwargs)
+
     # ── v4.0 Runtime Extensions ────────────────────────────────────────────────
 
     def _init_v4_layers(self, aeg_path: str | None = None) -> None:
@@ -451,6 +1073,101 @@ class Runtime:
         """
         if aeg_path is None:
             return
+
+        # Native AEG/1.1 and AEG/2.x artifacts do not necessarily expose the
+        # AEGPackageV2 convenience manifest API.  Initialize optional runtime
+        # layers from the artifact's actual files first.  This keeps the
+        # runtime coupled to persisted artifacts rather than to compiler-side
+        # Python objects, which is essential after a process restart.
+        root = Path(aeg_path)
+        if (root / "manifest.json").is_file():
+            def _read_json(path: Path) -> dict[str, Any] | None:
+                try:
+                    if not path.is_file():
+                        return None
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    return value if isinstance(value, dict) else None
+                except (OSError, ValueError) as exc:
+                    logger.warning("optional AEG configuration unreadable", path=str(path), error=str(exc))
+                    return None
+
+            # R3 Grammar FSM Engine
+            grammar_path = root / "grammar" / "fsm_config.json"
+            if grammar_path.is_file() and self.grammar_engine is None:
+                try:
+                    from aether.runtime.r3_grammar_fsm import GrammarFSMEngine
+                    engine = GrammarFSMEngine()
+                    if engine.load_from_config(str(root)):
+                        self.grammar_engine = engine
+                        logger.info("R3 Grammar FSM Engine initialized")
+                except Exception as exc:
+                    logger.warning("R3 Grammar FSM Engine init failed", error=str(exc))
+
+            # R5 TTT Fast-Weight Engine
+            ttt_path = root / "ttt" / "fast_weight_config.json"
+            if ttt_path.is_file() and self.ttt_engine is None:
+                try:
+                    from aether.runtime.r5_ttt_engine import TTTFastWeightEngine
+                    self.ttt_engine = TTTFastWeightEngine(ttt_config_path=str(ttt_path))
+                    logger.info("R5 TTT Fast-Weight Engine initialized")
+                except Exception as exc:
+                    logger.warning("R5 TTT Engine init failed", error=str(exc))
+
+            # R7 Green Power Manager.  Ignore disabled/default profiles so a
+            # normal AEG does not unexpectedly activate energy scheduling.
+            green_path = root / "green" / "energy_profile.json"
+            if not green_path.is_file():
+                green_path = root / "metadata" / "green_profile.json"
+            green_data = _read_json(green_path)
+            if green_data and self.green_power_manager is None:
+                enabled = bool(green_data.get("enabled", True))
+                if enabled and (self.config.green_power_management or green_data.get("estimated_joules_per_token", 0) or green_data.get("dvfs_hints")):
+                    try:
+                        from aether.runtime.r7_green_power_manager import GreenPowerManager
+                        self.green_power_manager = GreenPowerManager(green_profile_path=str(green_path))
+                        logger.info("R7 Green Power Manager initialized")
+                    except Exception as exc:
+                        logger.warning("R7 Green Power Manager init failed", error=str(exc))
+
+            # R8 TEE Runtime Manager.  A CPU process must not pretend that a
+            # TEE exists; only initialize a configured backend and let the
+            # manager report unsupported hardware at use time.
+            tee_path = root / "tee" / "enclave_config.json"
+            if not tee_path.is_file():
+                tee_path = root / "security" / "tee_config.json"
+            tee_data = _read_json(tee_path)
+            tee_backend = (tee_data or {}).get("backend") or (tee_data or {}).get("tee_backend")
+            if tee_backend is None and self.config.tee_mode not in ("", "auto", "none"):
+                tee_backend = self.config.tee_mode
+            if tee_backend and tee_backend != "none" and self.tee_manager is None:
+                try:
+                    from aether.runtime.r8_tee_manager import TEERuntimeManager
+                    self.tee_manager = TEERuntimeManager(tee_config_path=str(tee_path), backend=str(tee_backend))
+                    logger.info("R8 TEE Runtime Manager initialized", backend=str(tee_backend))
+                except Exception as exc:
+                    logger.warning("R8 TEE Manager init failed", error=str(exc))
+
+            # R6 MCP Integration Layer.  Registration is persisted in the AEG
+            # when present, while RuntimeConfig can supply additional servers.
+            mcp_path = root / "mcp" / "mcp_config.json"
+            mcp_data = _read_json(mcp_path)
+            servers = list((mcp_data or {}).get("server_registry", []))
+            if self.config.mcp_servers:
+                servers.extend({"id": key, **value} for key, value in self.config.mcp_servers.items())
+            if servers and self.mcp_layer is None:
+                try:
+                    from aether.runtime.r6_mcp_integration import MCPIntegrationLayer
+                    self.mcp_layer = MCPIntegrationLayer(timeout_s=self.config.mcp_timeout_ms / 1000.0)
+                    for server in servers:
+                        if isinstance(server, dict) and server.get("id"):
+                            self.mcp_layer.add_server(
+                                str(server["id"]), str(server.get("transport", "stdio")), server.get("endpoint")
+                            )
+                    logger.info("R6 MCP Integration Layer initialized", servers=len(servers))
+                except Exception as exc:
+                    logger.warning("R6 MCP Layer init failed", error=str(exc))
+            return
+
         try:
             from aether.compiler.aeg_format_v2 import AEGPackageV2
             pkg = AEGPackageV2(aeg_path)
@@ -460,7 +1177,8 @@ class Runtime:
             if manifest.has_grammar_fsm and self.grammar_engine is None:
                 try:
                     from aether.runtime.r3_grammar_fsm import GrammarFSMEngine
-                    self.grammar_engine = GrammarFSMEngine(aeg_path=aeg_path)
+                    self.grammar_engine = GrammarFSMEngine()
+                    self.grammar_engine.load_from_config(aeg_path)
                     logger.info("R3 Grammar FSM Engine initialized")
                 except Exception as exc:
                     logger.warning("R3 Grammar FSM Engine init failed", error=str(exc))
@@ -469,7 +1187,9 @@ class Runtime:
             if manifest.has_ttt_fast_weights and self.ttt_engine is None:
                 try:
                     from aether.runtime.r5_ttt_engine import TTTFastWeightEngine
-                    self.ttt_engine = TTTFastWeightEngine(aeg_path=aeg_path)
+                    self.ttt_engine = TTTFastWeightEngine(
+                        ttt_config_path=str(Path(aeg_path) / "ttt" / "fast_weight_config.json")
+                    )
                     logger.info("R5 TTT Fast-Weight Engine initialized")
                 except Exception as exc:
                     logger.warning("R5 TTT Engine init failed", error=str(exc))
@@ -478,7 +1198,9 @@ class Runtime:
             if manifest.has_green_profile and self.green_power_manager is None:
                 try:
                     from aether.runtime.r7_green_power_manager import GreenPowerManager
-                    self.green_power_manager = GreenPowerManager(aeg_path=aeg_path)
+                    self.green_power_manager = GreenPowerManager(
+                        green_profile_path=str(Path(aeg_path) / "green" / "energy_profile.json")
+                    )
                     logger.info("R7 Green Power Manager initialized")
                 except Exception as exc:
                     logger.warning("R7 Green Power Manager init failed", error=str(exc))
@@ -489,8 +1211,8 @@ class Runtime:
                     from aether.runtime.r8_tee_manager import TEERuntimeManager
                     tee_cfg = pkg.read_tee_config()
                     self.tee_manager = TEERuntimeManager(
-                        aeg_path=aeg_path,
-                        backend=tee_cfg.tee_backend if tee_cfg else "auto",
+                        tee_config_path=str(Path(aeg_path) / "tee" / "enclave_config.json"),
+                        backend=tee_cfg.tee_backend if tee_cfg else "nvidia_cc",
                     )
                     logger.info("R8 TEE Runtime Manager initialized")
                 except Exception as exc:
@@ -502,9 +1224,13 @@ class Runtime:
                     from aether.runtime.r6_mcp_integration import MCPIntegrationLayer
                     mcp_cfg = pkg.read_mcp_config()
                     self.mcp_layer = MCPIntegrationLayer(
-                        aeg_path=aeg_path,
-                        server_registry=mcp_cfg.server_registry if mcp_cfg else [],
+                        timeout_s=self.config.mcp_timeout_ms / 1000.0,
                     )
+                    for server in (mcp_cfg.server_registry if mcp_cfg else []):
+                        if server.get("id"):
+                            self.mcp_layer.add_server(
+                                server["id"], server.get("transport", "stdio"), server.get("endpoint")
+                            )
                     logger.info("R6 MCP Integration Layer initialized")
                 except Exception as exc:
                     logger.warning("R6 MCP Layer init failed", error=str(exc))
@@ -640,32 +1366,110 @@ class Runtime:
             Task Arithmetic (ICLR 2023), TIES-Merging (NeurIPS 2023),
             DARE-TIES (arXiv 2024), FREE-Merging (arXiv 2026).
         """
-        try:
-            from aether.compiler.stage2_optimizer.optimizer import ModelMergingPass
-            pass_instance = ModelMergingPass()
-            result = pass_instance.apply_task_vectors(
-                model_id=model_id,
-                task_vectors=task_vectors,
-                method=method,
-                density=density,
+        if not task_vectors:
+            raise ValueError("at least one task vector source is required")
+        if not 0.0 < density <= 1.0:
+            raise ValueError("density must be greater than 0 and no more than 1")
+        method_aliases = {"dare_ties": "dare", "task-arithmetic": "task_arithmetic"}
+        method = method_aliases.get(method, method)
+        supported_methods = {"task_arithmetic", "dare", "ties", "free", "evolutionary", "soup"}
+        if method not in supported_methods:
+            raise ValueError(f"unsupported merge method {method!r}; choose one of {sorted(supported_methods)}")
+
+        # Runtime merging operates on native AEG artifacts.  It deliberately
+        # does not return a recorded/config-only success: a caller receives a
+        # new artifact only after real source weights were read and persisted.
+        base_path = self._resolve_aeg_path(model_id)
+        if base_path is None:
+            raise ModelNotFoundError(f"base AEG model {model_id!r} was not found", model_id=model_id)
+        base = load_aeg_package(base_path)
+        if not base.has_weights:
+            raise AetherRuntimeError(f"base AEG {model_id!r} has no persisted weights")
+
+        import numpy as np
+        from aether.compiler.stage2_optimizer.pass12_model_merging import (
+            _apply_delta,
+            _compute_task_vectors,
+            _get_merger,
+            _load_source_weights,
+        )
+        from aether.quantization.formats import quantize_tensor
+
+        store = base.weight_store()
+        entries = store.load_index()
+        base_weights = {
+            name: tensor.reshape(-1).astype("float32").tolist()
+            for name, tensor in store.dequantize_all().items()
+        }
+        sources: list[dict[str, list[float]]] = []
+        coefficients: list[float] = []
+        for item in task_vectors:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                raise ValueError("each task vector requires a readable 'path'")
+            source = _load_source_weights(item["path"], base)
+            if not source:
+                raise AetherRuntimeError(f"task vector source has no readable weights: {item['path']}")
+            sources.append(source)
+            coefficient = item.get("coefficient", 1.0 / len(task_vectors))
+            if not isinstance(coefficient, (int, float)) or coefficient < 0:
+                raise ValueError("task vector coefficients must be non-negative numbers")
+            coefficients.append(float(coefficient))
+        if sum(coefficients) <= 0:
+            raise ValueError("at least one task vector coefficient must be greater than zero")
+
+        # Keep coefficients as supplied for task arithmetic; normalize only
+        # for algorithms whose semantics require a convex combination.
+        if method in {"soup", "free", "evolutionary"}:
+            total = sum(coefficients)
+            coefficients = [value / total for value in coefficients]
+        merger = _get_merger(method)
+        task_delta = _compute_task_vectors(base_weights, sources)
+        merged_delta = merger.merge(task_delta, coefficients, self.config)
+        if not merged_delta:
+            raise AetherRuntimeError("task vector sources have no overlapping tensor names")
+        merged_weights = _apply_delta(base_weights, merged_delta)
+
+        output_root = Path(base_path).with_name(Path(base_path).name + ".merged")
+        if output_root.exists():
+            raise AetherRuntimeError(f"merge output already exists: {output_root}; remove it explicitly first")
+        tokenizer_root = Path(base_path) / "tokenizer"
+        if not tokenizer_root.is_dir():
+            raise AetherRuntimeError("base AEG has no packaged tokenizer; merged text generation cannot be portable")
+        import shutil
+
+        merged = copy.deepcopy(base)
+        merged.root = output_root.resolve()
+        merged._weight_store = None  # noqa: SLF001 - invalidate copied disk reader
+        merged.weights = {}
+        merged.manifest.model_id = f"{base.manifest.model_id or model_id}+merged"
+        merged.metadata["model_merge"] = {
+            "method": method,
+            "density": density,
+            "sources": [item["path"] for item in task_vectors],
+            "coefficients": coefficients,
+            "tensor_count": len(merged_delta),
+        }
+        for name, values in merged_weights.items():
+            entry = entries.get(name)
+            precision = (entry.precision if entry is not None else base.precision_map.get(name, "BF16"))
+            shape = entry.shape if entry is not None else (len(values),)
+            merged.weights[name] = quantize_tensor(
+                np.asarray(values, dtype=np.float32).reshape(shape), precision
             )
-            return result
-        except (ImportError, AttributeError):
-            # Graceful fallback: record the merge config without executing
-            return {
-                "model": model_id,
-                "method": method,
-                "task_count": len(task_vectors),
-                "density": density,
-                "status": "recorded",
-                "note": (
-                    "Pass 12 ModelMergingPass.apply_task_vectors() not available. "
-                    "Re-compile model with enable_model_merging=True."
-                ),
-            }
-        except Exception as exc:
-            logger.error("Model merge failed", model=model_id, error=str(exc))
-            raise
+        shutil.copytree(tokenizer_root, output_root / "tokenizer")
+        merged.save()
+        # Reload verifies manifest, payload hashes, graph and weight index.
+        verified = load_aeg_package(output_root)
+        verified.verify_integrity()
+        return {
+            "model": model_id,
+            "output_model": str(output_root),
+            "method": method,
+            "task_count": len(task_vectors),
+            "density": density,
+            "tensor_count": len(merged_delta),
+            "status": "merged",
+        }
 
     # ── v5.0 Runtime Extensions (PRD v5.0) ────────────────────────────────────
 
@@ -688,7 +1492,7 @@ class Runtime:
                 logger.warning(f"R9 init failed: {exc}")
 
         # R11 Semantic Request Cache
-        if not hasattr(self, "_semantic_cache"):
+        if self.config.enable_semantic_cache and not hasattr(self, "_semantic_cache"):
             try:
                 from aether.runtime.r11_semantic_kv_cache import SemanticRequestCache
                 threshold = getattr(self.config, "semantic_cache_threshold", 0.92)
@@ -751,36 +1555,40 @@ class Runtime:
         Returns:
             GenerationResponse with guaranteed valid output.
         """
+        if sum(value is not None for value in (grammar, schema, regex)) != 1:
+            raise AetherRuntimeError("Provide exactly one of grammar, schema, or regex")
         backend = self._load_model(model_id)
-        # Convert schema/regex to grammar if grammar engine is available
-        if self.grammar_engine is not None:
-            try:
-                if schema is not None:
-                    grammar_id = self.grammar_engine.compile_json_schema(schema)
-                elif regex is not None:
-                    grammar_id = self.grammar_engine.compile_regex(regex)
-                elif grammar is not None:
-                    grammar_id = self.grammar_engine.compile_grammar(grammar)
-                else:
-                    grammar_id = None
-
-                if grammar_id:
-                    kwargs["grammar_id"] = grammar_id
-                    kwargs["token_mask_fn"] = self.grammar_engine.get_token_mask
-            except Exception as exc:
-                logger.warning(f"Grammar engine failed to compile constraint: {exc}")
-
+        if self.grammar_engine is None:
+            raise AetherRuntimeError(
+                "No trusted tokenizer-aware grammar FSM is loaded; compile the requested constraint with a tokenizer-aware grammar backend first"
+            )
+        source = grammar
+        if schema is not None:
+            source = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+        assert source is not None
+        if not self.grammar_engine.matches_compiled_constraint(source):
+            raise AetherRuntimeError(
+                "The requested constraint does not match a trusted tokenizer-aware grammar compiled into this AEG"
+            )
+        if not backend.supports("grammar_constraints"):
+            raise AetherRuntimeError(
+                f"Backend {backend.name!r} does not implement decode-time grammar constraints"
+            )
+        kwargs["grammar_session"] = self.grammar_engine.create_session()
         return self.generate(model_id, prompt, **kwargs)
 
     def grpo_train_step(
         self,
-        model_id: str,
-        prompts: list[str],
+        model_id: str | None = None,
+        prompts: list[str] | None = None,
         group_size: int = 8,
         domain: str = "math",
         learning_rate: float = 1e-6,
         clip_ratio: float = 0.2,
         max_tokens: int = 2048,
+        *,
+        model: str | None = None,
+        verifier_domain: str | None = None,
     ) -> dict[str, Any]:
         """Execute one GRPO (Group Relative Policy Optimization) training step.
 
@@ -808,38 +1616,42 @@ class Runtime:
         Returns:
             Training step report with loss, mean reward, and policy update stats.
         """
-        try:
-            from aether.compiler.stage2_optimizer.pass22_rlvr_verifier import (
-                RLVRVerifierHeadInjectionPass,
-            )
-            pass22 = RLVRVerifierHeadInjectionPass()
-            return pass22.grpo_train_step(
-                model_id=model_id,
-                prompts=prompts,
-                group_size=group_size,
-                domain=domain,
-                learning_rate=learning_rate,
-                clip_ratio=clip_ratio,
-                max_tokens=max_tokens,
-                generate_fn=lambda p, **kw: self.generate(model_id, p, **kw).text,
-            )
-        except Exception as exc:
-            logger.error(f"grpo_train_step failed: {exc}")
-            return {
-                "status": "failed",
-                "error": str(exc),
-                "prompts": len(prompts),
-                "group_size": group_size,
-                "domain": domain,
-            }
+        model_id = model_id or model
+        prompts = prompts or []
+        if verifier_domain is not None:
+            domain = verifier_domain
+        if not model_id:
+            raise ValueError("grpo_train_step requires model or model_id")
+        if not prompts:
+            raise ValueError("grpo_train_step requires at least one prompt")
+        if group_size < 2:
+            raise ValueError("group_size must be at least 2 for GRPO")
+
+        # Runtime.generate is an inference-only path.  It cannot provide
+        # gradient-carrying logits or an optimizer step, so reporting GRPO
+        # success here would be a false training result.  The standalone
+        # RLVRTrainingHarness accepts explicit model/optimizer callbacks for a
+        # real training integration.
+        return {
+            "status": "failed",
+            "error": (
+                "GRPO training requires a gradient-capable policy backend and optimizer callback; "
+                "the inference Runtime has neither configured"
+            ),
+            "prompts": len(prompts),
+            "group_size": group_size,
+            "domain": domain,
+        }
 
     def generate_video(
         self,
-        model_id: str,
-        video_path: str,
-        prompt: str,
+        model_id: str | None = None,
+        video_path: str | None = None,
+        prompt: str | None = None,
         compression: str = "stc",
         max_visual_tokens: int = 4096,
+        *,
+        model: str | None = None,
         **kwargs: Any,
     ) -> GenerationResponse:
         """Generate a response about a video using Pass 20 STC/STORM compression.
@@ -860,23 +1672,20 @@ class Runtime:
 
         Research basis: STC CVPR 2026, STORM arXiv 2026, Mage-VL 2026.
         """
-        try:
-            from aether.compiler.stage2_optimizer.pass20_video_compression import (
-                VideoTokenCompressionPass,
-            )
-            pass20 = VideoTokenCompressionPass()
-            video_tokens, compression_stats = pass20.compress_video_runtime(
-                video_path=video_path,
-                strategy=compression,
-                max_visual_tokens=max_visual_tokens,
-            )
-            full_prompt = f"{prompt}\n[VIDEO_TOKENS: {len(video_tokens)} compressed visual tokens]"
-            response = self.generate(model_id, full_prompt, **kwargs)
-            response.metrics.throughput_tps = compression_stats.get("token_reduction_pct", 0.0)
-            return response
-        except Exception as exc:
-            logger.warning(f"Video compression failed ({exc}), falling back to text-only")
-            return self.generate(model_id, prompt, **kwargs)
+        model_id = model_id or model
+        if not model_id or not video_path or not prompt:
+            raise ValueError("generate_video requires model, video_path, and prompt")
+        video = Path(video_path)
+        if not video.is_file():
+            raise FileNotFoundError(f"video input does not exist: {video_path}")
+        # Pass 20 currently emits compile-time graph opcodes.  It does not
+        # provide a decoder/vision encoder that can turn pixels into model
+        # embeddings at runtime.  Refusing the request is safer than silently
+        # dropping the video and returning a text-only answer.
+        raise AetherRuntimeError(
+            "video generation requires a runtime VLM/video encoder backend; "
+            "the compiled artifact contains no executable video encoder"
+        )
 
     def semantic_cache_stats(self) -> dict[str, Any]:
         """Return semantic request cache statistics (R11).
@@ -918,11 +1727,18 @@ class Runtime:
 
     def eval_gate(
         self,
-        model_id: str,
+        model_id: str | None = None,
         domain: str = "general",
         num_examples: int = 100,
         quality_threshold: float = 0.98,
-    ) -> dict[str, Any]:
+        *,
+        model: str | None = None,
+        benchmarks: list[str] | None = None,
+        baseline_model: str | None = None,
+        max_regression: float | None = None,
+        evaluator: Any | None = None,
+        baselines: dict[str, float] | None = None,
+    ) -> EvalGateReport:
         """Run a quality evaluation gate before deployment.
 
         Evaluates the compiled model against a domain benchmark. If quality drops
@@ -937,36 +1753,67 @@ class Runtime:
         Returns:
             Eval report with pass/fail, quality_score, and detailed metrics.
         """
-        import time as _time
-        start = _time.perf_counter()
-        try:
-            backend = self._load_model(model_id)
-            # Run sample generations for quality assessment
-            test_prompts = self._get_eval_prompts(domain, num_examples)
-            responses = []
-            for p in test_prompts[:min(num_examples, 20)]:  # cap at 20 for speed
-                try:
-                    r = self.generate(model_id, p, max_tokens=256, temperature=0.0)
-                    responses.append(len(r.text) > 10)  # non-empty = basic quality pass
-                except Exception:
-                    responses.append(False)
+        model_id = model_id or model
+        if not model_id:
+            raise ValueError("eval_gate requires model or model_id")
+        if benchmarks:
+            domain = ",".join(benchmarks)
+        if max_regression is not None:
+            if not 0 <= max_regression <= 1:
+                raise ValueError("max_regression must be between 0 and 1")
+            quality_threshold = 1.0 - max_regression
 
-            quality_score = sum(responses) / max(1, len(responses))
-            passed = quality_score >= quality_threshold
-            duration_s = _time.perf_counter() - start
+        if evaluator is not None:
+            if not callable(evaluator):
+                raise TypeError("evaluator must be callable")
+            from aether.observability.ci_pipeline import CIEvalPipeline
 
-            return {
-                "model_id": model_id,
-                "domain": domain,
-                "num_examples_run": len(responses),
-                "quality_score": round(quality_score, 4),
-                "quality_threshold": quality_threshold,
-                "passed": passed,
-                "duration_s": round(duration_s, 2),
-                "backend": backend.name,
-            }
-        except Exception as exc:
-            return {"passed": False, "error": str(exc), "model_id": model_id}
+            requested = tuple(benchmarks or ([domain] if domain in {"hellaswag", "mmlu", "gsm8k", "math-500", "humaneval", "aime"} else []))
+            if not requested:
+                raise ValueError(
+                    "A configured evaluator requires benchmark names such as "
+                    "hellaswag, mmlu, gsm8k, math-500, humaneval, or aime"
+                )
+            pipeline = CIEvalPipeline(
+                aeg_path=model_id,
+                max_regression=1.0 - quality_threshold,
+                required_benchmarks=requested,
+                evaluator=evaluator,
+            )
+            quality = pipeline.run(list(requested), baselines=baselines)
+            payload = quality.to_dict()
+            payload.update(
+                {
+                    "model_id": model_id,
+                    "domain": domain,
+                    "status": "passed" if quality.gate_decision.passed else "failed",
+                    "passed": quality.gate_decision.passed,
+                    "quality_threshold": quality_threshold,
+                    "num_examples_requested": num_examples,
+                    "baseline_model": baseline_model,
+                }
+            )
+            return EvalGateReport(payload)
+
+        # A generation being non-empty is not a benchmark score.  The previous
+        # implementation accepted artifacts on that proxy, which could allow a
+        # severely regressed model through the PRD quality gate.  Real dataset
+        # evaluators are supplied through CIEvalPipeline/BenchmarkRunner; this
+        # public convenience method must fail closed until one is configured.
+        return EvalGateReport(
+            model_id=model_id,
+            domain=domain,
+            num_examples_requested=num_examples,
+            quality_threshold=quality_threshold,
+            benchmarks=benchmarks or [domain],
+            baseline_model=baseline_model,
+            passed=False,
+            status="unavailable",
+            reason=(
+                "No real benchmark evaluator is configured. Configure a dataset evaluator "
+                "and measured baseline/candidate scores before accepting this artifact."
+            ),
+        )
 
     def _get_eval_prompts(self, domain: str, n: int) -> list[str]:
         """Return domain-specific evaluation prompts."""
@@ -1011,8 +1858,12 @@ class Runtime:
         self,
         model_a: str,
         model_b: str,
-        prompt: str,
+        prompt: str = "",
         traffic_split_pct: int = 50,
+        *,
+        traffic_split: float | None = None,
+        auto_rollout: bool = False,
+        rollback_on_regression: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Run an A/B traffic split between two compiled models.
@@ -1030,6 +1881,12 @@ class Runtime:
         Returns:
             Dict with model_a_response, model_b_response, and routing decision.
         """
+        if traffic_split is not None:
+            if not 0.0 <= traffic_split <= 1.0:
+                raise ValueError("traffic_split must be between 0 and 1")
+            traffic_split_pct = int(round(traffic_split * 100))
+        if not 0 <= traffic_split_pct <= 100:
+            raise ValueError("traffic_split_pct must be between 0 and 100")
         import random
         route_to_a = random.randint(1, 100) <= traffic_split_pct
 
@@ -1038,6 +1895,9 @@ class Runtime:
 
         return {
             "traffic_split_pct": traffic_split_pct,
+            "traffic_split": traffic_split_pct / 100.0,
+            "auto_rollout": auto_rollout,
+            "rollback_on_regression": rollback_on_regression,
             "route_to_a": route_to_a,
             "served_model": model_a if route_to_a else model_b,
             "model_a": {
@@ -1054,63 +1914,76 @@ class Runtime:
             },
         }
 
+    def _release_agentic_kv(self, model_id: str, session_id: str) -> None:
+        """Release backend-owned KV state for a closed agentic session."""
+        backend = self._loaded_backends.get(model_id)
+        releaser = getattr(backend, "release_session_cache", None)
+        if callable(releaser):
+            try:
+                releaser(model_id, session_id)
+            except Exception as exc:  # noqa: BLE001 - cleanup must not mask close
+                logger.warning("agentic KV cleanup failed", session_id=session_id, error=str(exc))
+
+    def agentic_session(
+        self,
+        model_id: str,
+        system: str = "",
+    ) -> _AgenticRuntimeSession:
+        """Return an async multi-turn session backed by this Runtime.
+
+        The method matches the v3.1 SDK contract.  Conversation history is
+        preserved and each turn uses the real model backend; backends that do
+        not expose reusable KV tensors are explicitly reported as
+        ``kv_reuse=False`` in response metrics.
+        """
+        if not isinstance(model_id, str) or not model_id:
+            raise ValueError("agentic_session requires a model identifier")
+        if not isinstance(system, str):
+            raise ValueError("agentic_session system prompt must be a string")
+        return _AgenticRuntimeSession(self, model_id, system)
+
     def multi_agent_session(
         self,
-        agent_count: int = 4,
+        models: list[str] | str | int | None = None,
+        coordination: str = "relay",
+        agent_count: int | str | None = None,
         shared_prefix: str = "",
         model_id: str = "",
-    ) -> dict[str, Any]:
-        """Create a multi-agent KV sharing session (R2 MultiAgentKVCoordinator).
+    ) -> _MultiAgentSessionHandle:
+        """Create a real R2 session usable as an async context manager.
 
-        All agents share the KV cache for the shared_prefix (system prompt,
-        tool schemas), with copy-on-write for per-agent divergence.
-
-        Args:
-            agent_count: Number of agent instances.
-            shared_prefix: Common system prompt / context to share.
-            model_id: Model to use for all agents.
-
-        Returns:
-            Session descriptor with session_id and per-agent session IDs.
+        The PRD form is ``multi_agent_session(models=[...],
+        coordination="relay")``.  The historical positional form used by the
+        REST endpoint (``agent_count, shared_prefix, model``) is recognized as
+        well and returns the same dictionary-compatible handle.
         """
-        try:
-            from aether.runtime.r2_multi_agent_kv import MultiAgentKVCoordinator
-            if not hasattr(self, "_multi_agent_coordinator"):
-                self._multi_agent_coordinator = MultiAgentKVCoordinator()
+        # Backward-compatible interpretation of the old three-positional API.
+        if isinstance(models, int):
+            old_count = models
+            old_shared_prefix = coordination
+            old_model = agent_count if isinstance(agent_count, str) else model_id
+            models = [old_model] if old_model else []
+            coordination = "relay"
+            agent_count = old_count
+            shared_prefix = old_shared_prefix
+        elif isinstance(models, str):
+            models = [models]
+        elif models is None:
+            models = [model_id] if model_id else []
 
-            coord = self._multi_agent_coordinator
-            session_id = str(uuid.uuid4())
-            agent_sessions = []
-
-            if shared_prefix:
-                # Pre-compute shared KV for the prefix
-                prefix_hash = coord.hash_prefix(shared_prefix)
-                for i in range(agent_count):
-                    agent_session_id = f"{session_id}/agent_{i}"
-                    sess = coord.create_agent_session(
-                        session_id=agent_session_id,
-                        prefix_hash=prefix_hash,
-                    )
-                    agent_sessions.append(agent_session_id)
-            else:
-                for i in range(agent_count):
-                    agent_sessions.append(f"{session_id}/agent_{i}")
-
-            return {
-                "session_id": session_id,
-                "agent_sessions": agent_sessions,
-                "agent_count": agent_count,
-                "shared_prefix_len": len(shared_prefix),
-                "kv_sharing_enabled": True,
-                "research_basis": "SGLang RadixAttention 2024 + MemServe 2025",
-            }
-        except Exception as exc:
-            return {
-                "session_id": str(uuid.uuid4()),
-                "agent_count": agent_count,
-                "kv_sharing_enabled": False,
-                "error": str(exc),
-            }
+        if agent_count is None:
+            initial_count = 0
+        elif isinstance(agent_count, int) and agent_count >= 0:
+            initial_count = agent_count
+        else:
+            raise ValueError("agent_count must be a non-negative integer")
+        return _MultiAgentSessionHandle(
+            self,
+            [model for model in models if isinstance(model, str) and model],
+            coordination,
+            initial_count,
+            shared_prefix,
+        )
 
     def __repr__(self) -> str:
         return (

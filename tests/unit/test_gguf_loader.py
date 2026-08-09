@@ -17,6 +17,7 @@ import pytest
 from aether.compiler.stage1_ingestion.gguf_loader import (
     GGUFLoader,
     GGUFReader,
+    export_gguf_tokenizer_metadata,
     _dequant_f16,
     _dequant_bf16,
     _dequant_q8_0,
@@ -71,6 +72,27 @@ def _build_gguf(
         elif isinstance(v, float):
             kv_bytes += struct.pack("<I", 6)  # FLOAT32
             kv_bytes += struct.pack("<f", v)
+        elif isinstance(v, list):
+            if not v:
+                raise ValueError("test GGUF arrays must not be empty")
+            if all(isinstance(item, str) for item in v):
+                elem_type = 8
+            elif all(isinstance(item, int) for item in v):
+                elem_type = 4
+            elif all(isinstance(item, (int, float)) for item in v):
+                elem_type = 6
+            else:
+                raise ValueError(f"unsupported test GGUF array: {v!r}")
+            kv_bytes += struct.pack("<I", 9)
+            kv_bytes += struct.pack("<I", elem_type)
+            kv_bytes += struct.pack("<Q", len(v))
+            for item in v:
+                if elem_type == 8:
+                    kv_bytes += _pack_string(str(item))
+                elif elem_type == 4:
+                    kv_bytes += struct.pack("<I", int(item))
+                else:
+                    kv_bytes += struct.pack("<f", float(item))
 
     # --- Tensor info ---
     tensor_info_bytes = b""
@@ -304,3 +326,131 @@ class TestGGUFLoader:
     def test_repr(self):
         loader = GGUFLoader("/some/path.gguf")
         assert "GGUFLoader" in repr(loader)
+
+
+def test_architecture_detector_reads_gguf_header(tmp_path: Path) -> None:
+    from aether.compiler.stage1_ingestion.architecture_detector import ArchitectureDetector
+
+    path = tmp_path / "model.gguf"
+    path.write_bytes(
+        _build_gguf(
+            tensors=[
+                {
+                    "name": "token_embd.weight",
+                    "shape": [8, 16],
+                    "type": _GGML_TYPE_F32,
+                    "data": np.zeros(128, dtype=np.float32).tobytes(),
+                }
+            ],
+            metadata={
+                "general.architecture": "llama",
+                "llama.block_count": 2,
+                "llama.embedding_length": 16,
+                "llama.attention.head_count": 2,
+                "llama.attention.head_count_kv": 1,
+                "llama.context_length": 128,
+                "llama.feed_forward_length": 32,
+                "llama.vocab_size": 8,
+            },
+        )
+    )
+    architecture = ArchitectureDetector().detect(str(path))
+    assert architecture.family == "llama_family"
+    assert architecture.layers == 2
+    assert architecture.hidden_size == 16
+    assert architecture.num_kv_heads == 1
+
+
+def test_embedded_gguf_tokenizer_exports_as_loadable_fast_tokenizer(tmp_path: Path) -> None:
+    from transformers import AutoTokenizer
+
+    output = tmp_path / "tokenizer"
+    info = export_gguf_tokenizer_metadata(
+        {
+            "tokenizer.ggml.tokens": ["<unk>", "▁hello", "▁world"],
+            "tokenizer.ggml.scores": [0.0, -0.1, -0.2],
+            "tokenizer.ggml.unknown_token_id": 0,
+            "tokenizer.ggml.eos_token_id": 0,
+        },
+        output,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(output, local_files_only=True)
+    encoded = tokenizer("hello world")
+    assert encoded["input_ids"]
+    assert info["token_count"] == 3
+
+
+@pytest.mark.integration
+def test_tiny_gguf_compiles_reloads_and_generates(tmp_path: Path) -> None:
+    """Exercise GGUF metadata, weights, tokenizer export, and CPU execution."""
+    from aether import Compiler, CompilerConfig, Runtime, RuntimeConfig
+
+    hidden = 16
+    vocab = 8
+    intermediate = 32
+    rng = np.random.default_rng(11)
+
+    def tensor(name: str, shape: list[int], values: np.ndarray) -> dict:
+        # GGUF stores dimensions in reverse order relative to the runtime
+        # tensor shape used by the loader.
+        return {
+            "name": name,
+            "shape": list(reversed(shape)),
+            "type": _GGML_TYPE_F32,
+            "data": values.astype(np.float32).tobytes(),
+        }
+
+    tensors = [
+        tensor("token_embd.weight", [vocab, hidden], rng.normal(size=(vocab, hidden))),
+        tensor("output_norm.weight", [hidden], np.ones(hidden)),
+        tensor("blk.0.attn_norm.weight", [hidden], np.ones(hidden)),
+        tensor("blk.0.attn_q.weight", [hidden, hidden], rng.normal(size=(hidden, hidden))),
+        tensor("blk.0.attn_k.weight", [hidden // 2, hidden], rng.normal(size=(hidden // 2, hidden))),
+        tensor("blk.0.attn_v.weight", [hidden // 2, hidden], rng.normal(size=(hidden // 2, hidden))),
+        tensor("blk.0.attn_output.weight", [hidden, hidden], rng.normal(size=(hidden, hidden))),
+        tensor("blk.0.ffn_norm.weight", [hidden], np.ones(hidden)),
+        tensor("blk.0.ffn_gate.weight", [intermediate, hidden], rng.normal(size=(intermediate, hidden))),
+        tensor("blk.0.ffn_up.weight", [intermediate, hidden], rng.normal(size=(intermediate, hidden))),
+        tensor("blk.0.ffn_down.weight", [hidden, intermediate], rng.normal(size=(hidden, intermediate))),
+        tensor("output.weight", [vocab, hidden], rng.normal(size=(vocab, hidden))),
+    ]
+    model = tmp_path / "model.gguf"
+    model.write_bytes(
+        _build_gguf(
+            tensors,
+            metadata={
+                "general.architecture": "llama",
+                "llama.block_count": 1,
+                "llama.embedding_length": hidden,
+                "llama.attention.head_count": 2,
+                "llama.attention.head_count_kv": 1,
+                "llama.context_length": 128,
+                "llama.feed_forward_length": intermediate,
+                "llama.vocab_size": vocab,
+                "tokenizer.ggml.tokens": ["<unk>", "▁hello", "▁world", "tok3", "tok4", "tok5", "tok6", "tok7"],
+                "tokenizer.ggml.scores": [0.0, -0.1, -0.2, -0.3, -0.4, -0.5, -0.6, -0.7],
+                "tokenizer.ggml.unknown_token_id": 0,
+                "tokenizer.ggml.eos_token_id": 0,
+            },
+        )
+    )
+
+    artifact = tmp_path / "model.aeg"
+    Compiler(
+        CompilerConfig(
+            targets=["cpu_avx512"],
+            overwrite=True,
+            calibration_tokens=8,
+            cache_dir=str(tmp_path / "cache"),
+        )
+    ).compile(str(model), output_path=artifact)
+
+    package = __import__("aether.core.aeg_format", fromlist=["load_aeg_package"]).load_aeg_package(artifact)
+    package.verify_integrity()
+    assert package.has_weights
+    assert (artifact / "tokenizer" / "tokenizer.json").is_file()
+
+    response = Runtime(
+        RuntimeConfig(hf_offline=True, enable_semantic_cache=False, default_max_tokens=2)
+    ).generate(str(artifact), "hello", max_tokens=2, temperature=0.0)
+    assert response.usage["completion_tokens"] == 2
