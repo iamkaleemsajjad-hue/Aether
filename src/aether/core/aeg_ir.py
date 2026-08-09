@@ -691,11 +691,18 @@ class AEGIRModule:
             results.append(op_result)
             op_mapping[node.id] = out_name
             inputs = [op_mapping.get(in_id, in_id) for in_id in node.inputs]
+            # Weight payloads belong to the content-addressed weight store,
+            # not to the textual IR.  Convert compiler-side rich metadata
+            # (numpy arrays, pruning masks, enums) to deterministic wire data
+            # so save/load never falls back to object repr strings.
+            from aether.core.hash_utils import _canonicalize_for_hash
+
+            safe_attributes = _canonicalize_for_hash(dict(node.attributes))
             inst = AEGInstruction(
                 results=results,
                 op_code=aeg_op,
                 inputs=inputs,
-                attributes=dict(node.attributes),
+                attributes=safe_attributes,
                 comment=node.name,
             )
             block.add_instruction(inst)

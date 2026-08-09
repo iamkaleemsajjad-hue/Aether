@@ -42,6 +42,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from aether.core.exceptions import RuntimeError as AetherRuntimeError
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -281,32 +282,17 @@ class MDLMDrafter:
         Returns:
             Per-position logits list of shape [K, vocab_size].
         """
-        import numpy as np
-
-        K = len(masked_block)
-        sigma = self.noise_schedule(t, T)
-
         # When the actual head is loaded, run the forward pass
         if self._head is not None:
             try:
                 return self._head.forward(hidden_states, masked_block, t, T, temperature)
             except Exception as e:
-                logger.debug(f"R9: Draft head forward failed: {e}")
+                raise AetherRuntimeError(f"R9 diffusion draft head forward failed: {e}") from e
 
-        # Fallback: random logits for when head weights are not available
-        # In production this is replaced by the real head forward pass
-        rng = np.random.default_rng(seed=sum(masked_block) + t)
-        logits = []
-        for pos, tok in enumerate(masked_block):
-            if tok != mask_token_id:
-                # Already unmasked: put mass on current token
-                pos_logits = [0.0] * self.vocab_size
-                pos_logits[tok] = 10.0  # sharp peak
-            else:
-                # Masked: sample from vocab distribution
-                pos_logits = rng.standard_normal(self.vocab_size).tolist()
-            logits.append(pos_logits)
-        return logits
+        raise AetherRuntimeError(
+            "R9 diffusion drafting requires a loaded MDLM drafter head; "
+            "refusing to generate random draft logits"
+        )
 
     def draft_block(
         self,
@@ -570,7 +556,7 @@ class DiffusionSpecEngine:
 
     def is_ready(self) -> bool:
         """Return True if the engine is ready to draft."""
-        return True  # Can operate in fallback mode even without loaded weights
+        return self._loaded
 
     def draft(
         self,

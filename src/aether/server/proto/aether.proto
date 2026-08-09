@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package aether;
+
+import "google/protobuf/struct.proto";
+
+service AetherRuntime {
+  rpc Generate(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc GenerateStream(google.protobuf.Struct) returns (stream google.protobuf.Struct);
+  rpc Health(google.protobuf.Struct) returns (google.protobuf.Struct);
+}

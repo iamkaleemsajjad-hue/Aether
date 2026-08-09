@@ -145,9 +145,14 @@ class PyTorchLoader:
                 except TypeError:
                     ckpt = torch.load(str(shard), map_location="cpu")
                 shard_weights, _ = self._extract_weights(ckpt)
+                if not shard_weights:
+                    raise IngestionError(f"PyTorch shard contains no tensor weights: {shard}")
                 weights.update(shard_weights)
             except Exception as exc:
-                logger.warning("Skipping shard %s: %s", shard, exc)
+                raise IngestionError(f"Failed to load PyTorch shard {shard}: {exc}") from exc
+
+        if not weights:
+            raise IngestionError(f"No readable tensor weights found in {directory}")
 
         logger.info(
             "Loaded sharded PyTorch checkpoint",

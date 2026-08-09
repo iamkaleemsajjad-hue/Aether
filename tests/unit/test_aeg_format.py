@@ -64,7 +64,7 @@ class TestAEGManifest:
             architecture=small_architecture,
         )
         assert manifest.model_id == "test-model"
-        assert manifest.format_version == "AEG/1.0"
+        assert manifest.format_version == "AEG/1.1"
         assert manifest.architecture.family == "llama_family"
 
     def test_manifest_json_roundtrip(self, small_architecture: ModelArchitecture) -> None:

@@ -126,12 +126,16 @@ class ModelMergingPass(BasePass):
 
             # Load base weights from graph.
             base_weights = _extract_weights(graph, "base")
+            if not base_weights:
+                raise ValueError("model merging requires real base weights in the graph")
 
             # Load source weights.
             source_weights_list: list[dict[str, Any]] = []
             for src_path in sources:
                 try:
                     src_weights = _load_source_weights(src_path, graph)
+                    if not src_weights:
+                        raise ValueError("source contains no readable tensors")
                     source_weights_list.append(src_weights)
                     logger.debug("  Loaded source: %s (%d tensors)", src_path, len(src_weights))
                 except Exception as exc:  # noqa: BLE001
@@ -144,6 +148,10 @@ class ModelMergingPass(BasePass):
 
             # Compute task vectors.
             task_vectors = _compute_task_vectors(base_weights, source_weights_list)
+            if not any(task_vectors):
+                report.status = "skipped"
+                report.details["reason"] = "sources_have_no_overlapping_tensors"
+                return graph, report
             logger.info("Pass 12: Computed %d task vectors.", len(task_vectors))
 
             # Apply merging method.
@@ -240,6 +248,23 @@ def _load_source_weights(source_path: str, base_graph: Any) -> dict[str, list[fl
     if not p.exists():
         logger.debug("Source path does not exist: %s", source_path)
         return {}
+
+    # AEG is the native artifact format.  Read and dequantize its persisted
+    # weight store instead of treating the directory as an opaque success.
+    if p.is_dir() and (p / "manifest.json").is_file():
+        try:
+            from aether.core.aeg_format import AEGPackage
+
+            package = AEGPackage(p).load()
+            if not package.has_weights:
+                return {}
+            return {
+                name: tensor.reshape(-1).astype("float32").tolist()
+                for name, tensor in package.weight_store().dequantize_all().items()
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("AEG source load failed: %s", exc)
+            return {}
 
     # Try safetensors.
     if p.suffix == ".safetensors" or (p.is_dir() and (p / "model.safetensors").exists()):

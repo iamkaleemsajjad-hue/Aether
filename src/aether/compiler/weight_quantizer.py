@@ -148,7 +148,12 @@ class GraphWeightQuantizer:
         stats = QuantizationStats()
         quantized: dict[str, QuantizedTensor] = {}
 
-        for node in graph:
+        # Pass 1 retains fused source nodes for inspection but excludes them
+        # from the executable topological order. Their checkpoint tensors are
+        # still required by the backend, so quantization must visit the full
+        # node store rather than silently dropping weights hidden by fusion.
+        nodes = graph._nodes.values() if hasattr(graph, "_nodes") else graph
+        for node in nodes:
             stats.total_nodes += 1
 
             # Skip structural ops that never carry parameters.
@@ -181,6 +186,16 @@ class GraphWeightQuantizer:
                 qt = quantize_tensor(weight, precision, self.block_size)
                 quantized[name] = qt
                 stats.record(precision, qt)
+                # The ingestion graph models SwiGLU's gate and up projections
+                # as one logical node, but they are distinct checkpoint tensors.
+                # Persist both real tensors so the CPU engine can reconstruct
+                # the original block without substituting zeros.
+                up_weight = getattr(node, "attributes", {}).get("up_weight")
+                if up_weight is not None and node_id.endswith("_gate_proj"):
+                    up_name = f"layer_{layer_index}_up_proj"
+                    up_qt = quantize_tensor(np.asarray(up_weight, dtype=np.float32), precision, self.block_size)
+                    quantized[up_name] = up_qt
+                    stats.record(precision, up_qt)
 
         package.weights = quantized
         logger.info(

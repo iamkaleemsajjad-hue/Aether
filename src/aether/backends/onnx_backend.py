@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
+from aether.core.exceptions import BackendError
 
 
 class ONNXBackend(Backend):
@@ -50,21 +51,19 @@ class ONNXBackend(Backend):
         return session
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
-        """Generate text using ONNX Runtime.
+        """Generate text using an ONNX autoregressive runtime.
 
-        Note: ONNX Runtime is not natively designed for autoregressive LLM text
-        generation. This method runs a single forward pass and returns the result
-        as a placeholder. For production LLM generation, use a specialized ONNX
-        LLM runtime or a different backend.
+        A plain ONNX Runtime session only exposes tensor inference; it does not
+        provide tokenization, sampling, or an autoregressive decode loop. Aether
+        therefore fails closed here until an ONNX artifact carries a compatible
+        tokenizer and decode adapter instead of returning fabricated text.
         """
         session = self._models.get(request.model_id)
         if session is None:
             session = self.load_model(request.model_id)
-        return GenerationResult(
-            text="ONNX Runtime single forward pass placeholder.",
-            prompt_tokens=0,
-            completion_tokens=1,
-            finish_reason="stop",
+        raise BackendError(
+            "ONNX Runtime model loaded, but no autoregressive tokenizer/decode "
+            "adapter is attached to this artifact; refusing fabricated output.",
             backend_name=self.name,
         )
 

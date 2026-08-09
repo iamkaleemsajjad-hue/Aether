@@ -8,14 +8,31 @@ for the Aether test suite.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 from aether.core.aeg_format import AEGPackage
 from aether.core.aeg_ir import AEGIRModule, AEGInstruction, AEGOpCode, AEGOperand, Block, Function
 from aether.core.types import ModelArchitecture
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Keep the default suite deterministic when external model access is absent.
+
+    Network-marked tests remain available with ``AETHER_RUN_NETWORK_TESTS=1``;
+    they must not turn a disconnected CI worker into a wall of connection
+    failures or conceal the local test results.
+    """
+    if os.environ.get("AETHER_RUN_NETWORK_TESTS", "").lower() in {"1", "true", "yes"}:
+        return
+    skip = pytest.mark.skip(reason="network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable")
+    for item in items:
+        if "network" in item.keywords:
+            item.add_marker(skip)
 
 
 @pytest.fixture
@@ -121,6 +138,48 @@ def minimal_aeg_package(tmp_path: Path, small_architecture: ModelArchitecture) -
     package.ir = ir
     package.save()
     return package
+
+
+@pytest.fixture
+def tiny_local_safetensors_model(tmp_path: Path) -> Path:
+    """Write a real, offline, tokenizer-backed tiny Llama checkpoint."""
+    safetensors = pytest.importorskip("safetensors.numpy")
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    path = tmp_path / "tiny-llama"
+    path.mkdir()
+    vocab_size, hidden, intermediate = 32, 16, 32
+    (path / "config.json").write_text(json.dumps({
+        "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+        "num_hidden_layers": 1, "hidden_size": hidden,
+        "intermediate_size": intermediate, "num_attention_heads": 2,
+        "num_key_value_heads": 1, "vocab_size": vocab_size,
+        "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+        "torch_dtype": "float32",
+    }), encoding="utf-8")
+    rng = np.random.default_rng(7)
+    tensors = {
+        "model.embed_tokens.weight": rng.normal(size=(vocab_size, hidden)).astype("float32"),
+        "model.norm.weight": np.ones(hidden, dtype="float32"),
+        "lm_head.weight": rng.normal(size=(vocab_size, hidden)).astype("float32"),
+        "model.layers.0.input_layernorm.weight": np.ones(hidden, dtype="float32"),
+        "model.layers.0.post_attention_layernorm.weight": np.ones(hidden, dtype="float32"),
+        "model.layers.0.self_attn.q_proj.weight": rng.normal(size=(16, hidden)).astype("float32"),
+        "model.layers.0.self_attn.k_proj.weight": rng.normal(size=(8, hidden)).astype("float32"),
+        "model.layers.0.self_attn.v_proj.weight": rng.normal(size=(8, hidden)).astype("float32"),
+        "model.layers.0.self_attn.o_proj.weight": rng.normal(size=(hidden, hidden)).astype("float32"),
+        "model.layers.0.mlp.gate_proj.weight": rng.normal(size=(intermediate, hidden)).astype("float32"),
+        "model.layers.0.mlp.up_proj.weight": rng.normal(size=(intermediate, hidden)).astype("float32"),
+        "model.layers.0.mlp.down_proj.weight": rng.normal(size=(hidden, intermediate)).astype("float32"),
+    }
+    safetensors.save_file(tensors, str(path / "model.safetensors"))
+    vocab = {"<unk>": 0, "hello": 1, "world": 2}
+    vocab.update({f"tok{i}": i + 3 for i in range(vocab_size - 3)})
+    tokenizer = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocab=vocab, unk_token="<unk>"))
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    tokenizer.save(str(path / "tokenizer.json"))
+    transformers.PreTrainedTokenizerFast(tokenizer_file=str(path / "tokenizer.json"), unk_token="<unk>").save_pretrained(str(path))
+    return path
 
 
 @pytest.fixture

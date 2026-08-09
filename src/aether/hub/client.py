@@ -32,6 +32,24 @@ from aether.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _safe_extract_zip(archive: zipfile.ZipFile, destination: Path) -> None:
+    """Extract a Hub archive without allowing traversal or symlink escapes."""
+    root = destination.resolve()
+    for info in archive.infolist():
+        normalized = info.filename.replace("\\", "/")
+        candidate = (root / normalized).resolve()
+        try:
+            inside = candidate == root or candidate.is_relative_to(root)
+        except AttributeError:  # Python 3.8 compatibility
+            inside = str(candidate).startswith(str(root) + str(Path("/"))) or candidate == root
+        if not inside or normalized.startswith("/"):
+            raise HubError(f"unsafe archive member path: {info.filename!r}")
+        # ZIP symlinks encode a Unix symlink mode in the external attributes.
+        if ((info.external_attr >> 16) & 0o170000) == 0o120000:
+            raise HubError(f"symlink archive members are not permitted: {info.filename!r}")
+    archive.extractall(root)
+
+
 @dataclass
 class HubManifest:
     """Manifest for an AEG artifact on the Hub."""
@@ -92,6 +110,7 @@ class HubClient:
         self.auth_token = auth_token
         self.timeout_s = timeout_s
         self._local_cache: dict[str, HubManifest] = {}
+        self._local_packages: dict[str, bytes] = {}
         logger.info("Hub client initialized", hub_url=self.hub_url, auth=auth_token is not None)
 
     # ------------------------------------------------------------------
@@ -132,6 +151,12 @@ class HubClient:
                 req = urllib.request.Request(url, data=body, headers=headers, method=method)
                 with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
                     raw = resp.read()
+                    expected_hash = resp.headers.get("X-Content-Hash")
+                    if expected_hash and self._content_hash(raw) != expected_hash:
+                        raise HubError(
+                            f"Hub artifact hash mismatch for {model_id!r}: "
+                            f"expected {expected_hash}, got {self._content_hash(raw)}"
+                        )
                     if not raw:
                         return {}
                     return json.loads(raw.decode("utf-8"))
@@ -173,7 +198,9 @@ class HubClient:
                 headers={"User-Agent": "aether-runtime/1.0.0"},
                 method="GET",
             )
-            with urllib.request.urlopen(req, timeout=5):
+            # Health probing is only a capability check; it must not block
+            # normal local-cache operations for the full artifact timeout.
+            with urllib.request.urlopen(req, timeout=min(1.0, max(0.1, self.timeout_s))):
                 return True
         except Exception:
             return False
@@ -275,10 +302,20 @@ class HubClient:
             except Exception:
                 pass
 
+        aether_version = "unknown"
+        aeg_version = "unknown"
+        if manifest_json and manifest_json.exists():
+            try:
+                mdata = json.loads(manifest_json.read_text(encoding="utf-8"))
+                aether_version = str(mdata.get("aether_version") or mdata.get("compiler_version") or "unknown")
+                aeg_version = str(mdata.get("format_version") or "unknown")
+            except Exception:
+                pass
+
         manifest = HubManifest(
             model_id=model_id,
-            aether_version="1.0.0",
-            aeg_version="AEG/1.0",
+            aether_version=aether_version,
+            aeg_version=aeg_version,
             targets=targets,
             architecture=arch,
             file_size_bytes=len(data),
@@ -307,6 +344,7 @@ class HubClient:
                 logger.warning("Remote Hub upload failed: %s — stored locally", exc)
 
         self._local_cache[model_id] = manifest
+        self._local_packages[model_id] = data
         logger.info("Model cached locally", model_id=model_id, size_bytes=len(data))
         return manifest
 
@@ -350,7 +388,7 @@ class HubClient:
                     try:
                         dest_dir.mkdir(parents=True, exist_ok=True)
                         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                            zf.extractall(dest_dir)
+                            _safe_extract_zip(zf, dest_dir)
                         logger.info("Downloaded & extracted AEG from Hub", model_id=model_id, dst=str(dest_dir))
                         return dest_dir
                     except zipfile.BadZipFile:
@@ -362,15 +400,23 @@ class HubClient:
             except Exception as exc:
                 logger.warning("Hub download failed: %s — falling back to local cache", exc)
 
-        # Local cache fallback
+        # Local cache fallback.  Metadata alone is not a model artifact: only
+        # a retained uploaded package archive may be downloaded locally.
         manifest = self._local_cache.get(model_id)
-        if manifest is None:
+        package_data = self._local_packages.get(model_id)
+        if manifest is None or package_data is None:
             msg = f"Model '{model_id}' not found on Hub or in local cache"
             raise HubError(msg)
-        package_file = output_path / f"{safe_id}.aeg"
-        package_file.write_text(json.dumps(manifest.to_dict(), indent=2), encoding="utf-8")
-        logger.info("Downloaded model from local cache", model_id=model_id, dst=str(package_file))
-        return package_file
+        try:
+            if manifest.content_hash and self._content_hash(package_data) != manifest.content_hash:
+                raise HubError(f"local Hub artifact hash mismatch for {model_id!r}")
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(io.BytesIO(package_data)) as zf:
+                _safe_extract_zip(zf, dest_dir)
+        except (zipfile.BadZipFile, OSError) as exc:
+            raise HubError(f"local Hub payload for {model_id!r} is not a valid AEG archive") from exc
+        logger.info("Downloaded model package from local cache", model_id=model_id, dst=str(dest_dir))
+        return dest_dir
 
     # ------------------------------------------------------------------
     # Listing & manifest queries
@@ -405,6 +451,7 @@ class HubClient:
             msg = "Authentication required to delete from Hub"
             raise AuthenticationError(msg)
         self._local_cache.pop(model_id, None)
+        self._local_packages.pop(model_id, None)
         if self._is_hub_available():
             try:
                 encoded_id = urllib.parse.quote(model_id, safe="")

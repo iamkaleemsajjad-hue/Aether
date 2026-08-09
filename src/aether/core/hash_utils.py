@@ -11,12 +11,68 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import dataclasses
+import enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from aether.core.aeg_ir import AEGIRModule
     from aether.core.graph import AEGGraph
+
+
+def _canonicalize_for_hash(value: Any) -> Any:
+    """Convert graph metadata into deterministic JSON-safe values.
+
+    In-memory graphs legitimately carry weight arrays on nodes during
+    compilation. Serializing those arrays directly makes packaging fail and
+    would encourage callers to drop them before hashing. Preserve their
+    identity instead using dtype, shape, and a content digest; the actual
+    payload is hashed separately in the AEG weight manifest.
+    """
+    try:
+        import numpy as np
+    except ImportError:  # pragma: no cover - numpy is a core dependency
+        np = None  # type: ignore[assignment]
+
+    if np is not None and isinstance(value, np.ndarray):
+        contiguous = np.ascontiguousarray(value)
+        return {
+            "__ndarray__": {
+                "dtype": str(contiguous.dtype),
+                "shape": list(contiguous.shape),
+                "sha256": hashlib.sha256(contiguous.tobytes()).hexdigest(),
+            }
+        }
+    if np is not None and isinstance(value, np.generic):
+        return _canonicalize_for_hash(value.item())
+    if isinstance(value, enum.Enum):
+        return _canonicalize_for_hash(value.value)
+    if isinstance(value, dict):
+        return {str(key): _canonicalize_for_hash(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_for_hash(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_canonicalize_for_hash(item) for item in value), key=repr)
+    if isinstance(value, Path):
+        return str(value)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _canonicalize_for_hash(dataclasses.asdict(value))
+    # Compiler metadata may contain rich value objects (for example the
+    # pruning mask produced by Pass 9).  Prefer their explicit wire format so
+    # hashes are based on semantic content rather than object identity.
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _canonicalize_for_hash(to_dict())
+    if isinstance(value, (bool, int, float, str)) or value is None:
+        return value
+    if isinstance(value, bytes):
+        return {"__bytes__": hashlib.sha256(value).hexdigest(), "length": len(value)}
+    raise TypeError(
+        f"Cannot canonicalize object of type {type(value).__name__}; "
+        "provide a JSON-compatible value or a deterministic to_dict() method"
+    )
+    return value
 
 
 def _ensure_bytes(data: object) -> bytes:
@@ -54,7 +110,12 @@ def compute_content_hash(data: object) -> str:
         hasher.update(_ensure_bytes(data))
     else:
         try:
-            canonical = json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+            canonical = json.dumps(
+                _canonicalize_for_hash(data),
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
             hasher.update(canonical.encode("utf-8"))
         except TypeError as exc:
             msg = "Content is not JSON-serializable; convert to string or bytes first"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,20 @@ def aether_cache_dir(cache_dir: str | Path | None = None) -> Path:
         Resolved cache directory path.
     """
     if cache_dir is None:
-        cache_dir = os.environ.get("AETHER_CACHE_DIR", DEFAULT_CACHE_DIR)
+        cache_dir = os.environ.get("AETHER_CACHE_DIR")
+        if not cache_dir:
+            # ``~/.aether`` is appropriate on POSIX, but Windows installations
+            # can have a redirected/protected profile root.  Use the standard
+            # per-user local application directory there so first-run model
+            # downloads do not fail with an avoidable ACL error.
+            if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+                cache_dir = str(Path(os.environ["LOCALAPPDATA"]) / "Aether")
+            else:
+                cache_dir = DEFAULT_CACHE_DIR
+    elif os.name == "nt" and str(cache_dir).replace("\\", "/") in {"~/.aether", DEFAULT_CACHE_DIR} and os.environ.get("AETHER_CACHE_DIR") is None and os.environ.get("LOCALAPPDATA"):
+        # CompilerConfig carries the POSIX default as a concrete dataclass
+        # value, so normalize that default here as well.
+        cache_dir = str(Path(os.environ["LOCALAPPDATA"]) / "Aether")
     root = Path(cache_dir).expanduser().resolve()
     subdirs = [
         "models",
@@ -34,7 +48,14 @@ def aether_cache_dir(cache_dir: str | Path | None = None) -> Path:
         "logs",
         "hub",
     ]
-    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        # Sandboxed/locked-down hosts may deny both the profile and
+        # LOCALAPPDATA locations.  Keep the cache usable in a per-user temp
+        # directory rather than failing before the model path is even known.
+        root = Path(tempfile.gettempdir()) / "aether-runtime"
+        root.mkdir(parents=True, exist_ok=True)
     for subdir in subdirs:
         (root / subdir).mkdir(parents=True, exist_ok=True)
     return root

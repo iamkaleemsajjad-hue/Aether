@@ -110,6 +110,8 @@ class AdvancedPEFTCompilationPass(BasePass):
             for adapter_path in adapter_paths:
                 try:
                     adapter_data = _load_adapter(adapter_path)
+                    if not adapter_data.get("lora_A") or not adapter_data.get("lora_B"):
+                        raise ValueError("adapter contains no paired lora_A/lora_B tensors")
                     compiled = _compile_lora_plus(
                         adapter_data=adapter_data,
                         adapter_path=adapter_path,
@@ -198,8 +200,8 @@ def _load_adapter(adapter_path: str) -> dict[str, Any]:
     adapter: dict[str, Any] = {"lora_A": {}, "lora_B": {}, "rank": 16, "config": {}}
 
     if not p.exists():
-        logger.debug("Adapter path does not exist: %s — using empty adapter.", adapter_path)
-        return adapter
+        logger.debug("Adapter path does not exist: %s", adapter_path)
+        return {}
 
     # Try adapter_config.json.
     config_path = p / "adapter_config.json" if p.is_dir() else p.parent / "adapter_config.json"

@@ -8,10 +8,13 @@ fine-tuned variants, and future architectures.
 
 from __future__ import annotations
 
+import os
 import re
+from pathlib import Path
 from typing import Any
 
 from aether.core.constants import ARCHITECTURE_BY_MODEL_PREFIX, SUPPORTED_ARCHITECTURES
+from aether.core.exceptions import ArchitectureDetectionError
 from aether.core.types import ModelArchitecture
 
 ARCHITECTURE_PATTERNS = {
@@ -79,6 +82,31 @@ class ArchitectureDetector:
         if spec:
             return self._spec_to_architecture(model, spec)
 
+        # GGUF stores the architecture and model dimensions in its header.
+        # Read that authoritative metadata before filename heuristics; a file
+        # named ``model.gguf`` must not be guessed as Llama merely because it
+        # is a common llama.cpp container.
+        model_path = Path(model)
+        if model_path.is_file() and model_path.suffix.lower() in {".gguf", ".ggml"}:
+            return self._from_gguf(model_path)
+
+        # Do not make an unbounded network request for an identifier whose
+        # architecture cannot even be inferred from its name. Custom Hub
+        # repositories can opt into config discovery explicitly; otherwise
+        # fail fast and let the caller report an actionable unsupported-model
+        # error.
+        local_config = Path(model) / "config.json"
+        has_local_config = local_config.is_file()
+        if (
+            self._match_family(model) is None
+            and not has_local_config
+            and os.environ.get("AETHER_ALLOW_HF_DISCOVERY", "") not in {"1", "true", "yes"}
+        ):
+            raise ArchitectureDetectionError(
+                f"Could not identify architecture for {model!r}; provide a local config.json "
+                "or set AETHER_ALLOW_HF_DISCOVERY=1 for bounded Hub discovery."
+            )
+
         # 2. Try config.json loading
         try:
             config = self._load_config_json(model)
@@ -89,7 +117,12 @@ class ArchitectureDetector:
 
         # 3. Try model name prefix matching
         family = self._match_family(model)
-        # Build a best-guess architecture
+        if family is None:
+            raise ArchitectureDetectionError(
+                f"Could not identify architecture for {model!r}; provide a local config.json "
+                "or a supported Hugging Face model identifier."
+            )
+        # Build a best-guess architecture only for a recognized family.
         return ModelArchitecture(
             family=family,
             params_billion=0.0,
@@ -100,6 +133,53 @@ class ArchitectureDetector:
             context_length=4096,
             vocab_size=32000,
             intermediate_size=11008,
+        )
+
+    def _from_gguf(self, path: Path) -> ModelArchitecture:
+        """Read architecture dimensions from a local GGUF header."""
+        try:
+            from aether.compiler.stage1_ingestion.gguf_loader import GGUFReader
+
+            reader = GGUFReader(path)
+        except Exception as exc:  # noqa: BLE001 - normalize parser failures
+            raise ArchitectureDetectionError(
+                f"Could not read GGUF architecture metadata from {path}: {exc}"
+            ) from exc
+
+        arch_type = str(reader.metadata.get("general.architecture", reader.architecture))
+        family = self._detect_family_from_arch_type(arch_type)
+        if family is None:
+            raise ArchitectureDetectionError(
+                f"Unsupported GGUF architecture {arch_type!r}; refusing to assume Llama"
+            )
+
+        prefix = arch_type + "."
+
+        def metadata_int(*keys: str, default: int) -> int:
+            for key in keys:
+                value = reader.metadata.get(prefix + key, reader.metadata.get(key))
+                if value is not None:
+                    try:
+                        return int(value)
+                    except (TypeError, ValueError):
+                        continue
+            return default
+
+        num_experts = metadata_int("expert_count", default=0)
+        activated_experts = metadata_int("expert_used_count", default=0)
+        return ModelArchitecture(
+            family=family,
+            params_billion=0.0,
+            layers=metadata_int("block_count", "num_layers", default=32),
+            hidden_size=metadata_int("embedding_length", "hidden_size", default=4096),
+            num_attention_heads=metadata_int("attention.head_count", "num_attention_heads", default=32),
+            num_kv_heads=metadata_int("attention.head_count_kv", "num_key_value_heads", default=0) or None,
+            context_length=metadata_int("context_length", "max_position_embeddings", default=4096),
+            vocab_size=metadata_int("vocab_size", default=32000),
+            intermediate_size=metadata_int("feed_forward_length", "intermediate_size", default=11008),
+            is_moe=num_experts > 0,
+            num_experts=num_experts,
+            num_activated_experts=activated_experts,
         )
 
     def _normalize_model_name(self, model: str) -> str:
@@ -133,8 +213,6 @@ class ArchitectureDetector:
 
     def _load_config_json(self, model: str) -> dict[str, Any] | None:
         """Try to load config.json from a local model path or HuggingFace."""
-        from pathlib import Path
-
         # Try local path
         config_path = Path(model) / "config.json"
         if config_path.exists():
@@ -143,7 +221,12 @@ class ArchitectureDetector:
         # Try HuggingFace
         try:
             from huggingface_hub import hf_hub_download
-            config_data = hf_hub_download(repo_id=model, filename="config.json")
+            config_data = hf_hub_download(
+                repo_id=model,
+                filename="config.json",
+                etag_timeout=float(os.environ.get("AETHER_HF_ETAG_TIMEOUT_S", "5")),
+                local_files_only=os.environ.get("AETHER_HF_OFFLINE", "").lower() in {"1", "true", "yes"},
+            )
             import json
             return json.loads(Path(config_data).read_text())
         except Exception:
@@ -151,8 +234,15 @@ class ArchitectureDetector:
 
     def _from_config(self, config: dict[str, Any]) -> ModelArchitecture:
         """Parse a HuggingFace config.json into a ModelArchitecture."""
-        arch_type = config.get("architectures", ["LlamaForCausalLM"])[0] if config.get("architectures") else "LlamaForCausalLM"
+        architectures = config.get("architectures") or config.get("model_type")
+        arch_type = architectures[0] if isinstance(architectures, list) else architectures
+        if not arch_type:
+            raise ArchitectureDetectionError("Local config.json does not declare an architecture")
         family = self._detect_family_from_arch_type(arch_type)
+        if family is None:
+            raise ArchitectureDetectionError(
+                f"Unsupported Hugging Face architecture {arch_type!r}; refusing to assume Llama"
+            )
 
         num_hidden_layers = config.get("num_hidden_layers", config.get("num_layers", 32))
         hidden_size = config.get("hidden_size", config.get("d_model", 4096))
@@ -182,11 +272,12 @@ class ArchitectureDetector:
             num_activated_experts=num_activated_experts,
         )
 
-    def _detect_family_from_arch_type(self, arch_type: str) -> str:
+    def _detect_family_from_arch_type(self, arch_type: str) -> str | None:
         """Map a HuggingFace architecture type to an Aether family."""
         mapping = {
             "LlamaForCausalLM": "llama_family",
             "Qwen2ForCausalLM": "qwen_family",
+            "Qwen3ForCausalLM": "qwen_family",
             "Qwen2VLForConditionalGeneration": "qwen_family",
             "Qwen2MoeForCausalLM": "qwen_family",
             "GemmaForCausalLM": "gemma_family",
@@ -202,16 +293,51 @@ class ArchitectureDetector:
             "MambaForCausalLM": "hybrid_ssm_family",
             "JambaForCausalLM": "hybrid_ssm_family",
             "RwkvForCausalLM": "hybrid_ssm_family",
+            # Some repositories publish only ``model_type`` rather than a
+            # fully-qualified ``architectures`` entry.  These aliases make
+            # local config ingestion independent of a model-name guess.
+            "llama": "llama_family",
+            "llama2": "llama_family",
+            "llama3": "llama_family",
+            "qwen": "qwen_family",
+            "qwen2": "qwen_family",
+            "qwen3": "qwen_family",
+            "qwen2_moe": "moe_family",
+            "qwen2_vl": "qwen_family",
+            "qwen2_5_vl": "qwen_family",
+            "qwen3_vl": "qwen_family",
+            "gemma": "gemma_family",
+            "gemma2": "gemma_family",
+            "gemma3": "gemma_family",
+            "mistral": "mistral_family",
+            "mixtral": "moe_family",
+            "deepseek": "deepseek_family",
+            "deepseek_v2": "deepseek_family",
+            "deepseek_v3": "deepseek_family",
+            "deepseek_vl": "deepseek_family",
+            "phi3": "phi_family",
+            "phi4": "phi_family",
+            "falcon": "falcon_family",
+            "whisper": "whisper_family",
+            "vit": "vision_family",
+            "llava": "vision_family",
+            "internvl": "vision_family",
+            "mamba": "hybrid_ssm_family",
+            "jamba": "hybrid_ssm_family",
+            "rwkv": "hybrid_ssm_family",
         }
-        return mapping.get(arch_type, "llama_family")
+        if arch_type in mapping:
+            return mapping[arch_type]
+        normalized = arch_type.lower().replace("-", "_").replace(".", "_")
+        return mapping.get(normalized)
 
-    def _match_family(self, model: str) -> str:
+    def _match_family(self, model: str) -> str | None:
         """Match a model name to an architecture family."""
         lower = model.lower().replace("-", "").replace("_", "")
         for name_part in ["llama", "qwen", "gemma", "deepseek", "mixtral", "mistral", "phi", "falcon", "whisper", "vit", "mamba", "jamba", "bamba", "rwkv"]:
             if name_part in lower:
                 return ARCHITECTURE_BY_MODEL_PREFIX.get(name_part, "llama_family")
-        return "llama_family"
+        return None
 
     def list_known_models(self) -> list[tuple[str, float, int]]:
         """Return a list of (name, params_billion, layers) for known models."""

@@ -68,7 +68,7 @@ class TestPass10MTPHead:
         g = _make_graph()
         cfg = _make_config(enable_mtp_head=True, mtp_num_heads=3)
         result_g, report = p.run(g, _make_arch(), cfg)
-        assert report.status in ("ok", "skipped", "failed")
+        assert report.status in ("applied", "ok", "skipped", "failed")
 
     def test_skip_when_disabled(self):
         p = self._import()
@@ -110,7 +110,7 @@ class TestPass11GrammarConstraint:
         g = _make_graph()
         cfg = _make_config(enable_grammar_constraint=True, grammar_type="json", grammar_spec="{}")
         _, report = p.run(g, _make_arch(), cfg)
-        assert report.status in ("ok", "skipped", "failed")
+        assert report.status in ("applied", "ok", "skipped", "failed")
 
     def test_skip_when_disabled(self):
         p = self._import()
@@ -153,7 +153,7 @@ class TestPass14SemanticKV:
         p, *_ = self._import()
         cfg = _make_config(enable_semantic_kv=True, semantic_kv_compression_ratio=0.5)
         _, report = p.run(_make_graph(), _make_arch(n_layers=4), cfg)
-        assert report.status in ("ok", "skipped", "failed")
+        assert report.status in ("applied", "ok", "skipped", "failed")
 
     def test_skip_when_disabled(self):
         p, *_ = self._import()
@@ -227,7 +227,7 @@ class TestPass15CrossLayerKV:
         p, _ = self._import()
         cfg = _make_config(enable_cross_layer_kv=True, cross_layer_kv_share_threshold=0.5)
         _, report = p.run(_make_graph(), _make_arch(n_layers=8), cfg)
-        assert report.status in ("ok", "skipped", "failed")
+        assert report.status in ("applied", "ok", "skipped", "failed")
 
     def test_skip_when_disabled(self):
         p, _ = self._import()
@@ -266,7 +266,7 @@ class TestPass16GreenEnergy:
         p, _ = self._import()
         cfg = _make_config(enable_green_energy=True, green_carbon_region="eu-north", green_target_tdp_watts=300.0)
         _, report = p.run(_make_graph(), _make_arch(), cfg)
-        assert report.status in ("ok", "skipped", "failed")
+        assert report.status in ("applied", "ok", "skipped", "failed")
 
     def test_skip_when_disabled(self):
         p, _ = self._import()
@@ -301,7 +301,7 @@ class TestPass17TEE:
         p = self._import()
         cfg = _make_config(enable_tee=True, tee_backend="nvidia_cc", tee_attest_endpoint=None)
         _, report = p.run(_make_graph(), _make_arch(), cfg)
-        assert report.status in ("ok", "skipped", "failed")
+        assert report.status in ("applied", "ok", "skipped", "failed")
 
     def test_skip_when_disabled(self):
         p = self._import()
@@ -323,7 +323,7 @@ class TestPass17TEE:
             p = self._import()
             cfg = _make_config(enable_tee=True, tee_backend=backend, tee_attest_endpoint=None)
             _, report = p.run(_make_graph(), _make_arch(), cfg)
-            assert report.status in ("ok", "skipped", "failed")
+            assert report.status in ("applied", "ok", "skipped", "failed")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -356,7 +356,7 @@ class TestPass18MDLM:
         p, _ = self._import()
         cfg = _make_config(enable_mdlm_drafter=True, mdlm_drafter_steps=5, mdlm_draft_block_size=4)
         _, report = p.run(_make_graph(), _make_arch(), cfg)
-        assert report.status in ("ok", "skipped", "failed")
+        assert report.status in ("applied", "ok", "skipped", "failed")
 
     def test_speedup_positive(self):
         p, _ = self._import()
@@ -404,7 +404,7 @@ class TestPass19Sub2Bit:
         g.weight_store = {"layer.weight": [1.0, -2.0, 0.5, 0.0, -0.1]}
         cfg = _make_config(enable_sub2bit=True, sub2bit_method="bitnet", sub2bit_quality_gate_ppl=0.10)
         _, report = p.run(g, _make_arch(), cfg)
-        assert report.status in ("ok", "skipped", "failed")
+        assert report.status in ("applied", "ok", "skipped", "failed")
 
     def test_skip_when_disabled(self):
         p, _ = self._import()
@@ -505,7 +505,7 @@ class TestPass22RLVR:
         p = self._import()
         cfg = _make_config(enable_rlvr_verifier=True, rlvr_verifier_type="sympy", rlvr_group_size=4)
         _, report = p.run(_make_graph(), _make_arch(), cfg)
-        assert report.status in ("ok", "skipped", "failed")
+        assert report.status in ("applied", "ok", "skipped", "failed")
 
     def test_skip_when_disabled(self):
         p = self._import()

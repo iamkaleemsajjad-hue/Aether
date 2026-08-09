@@ -10,27 +10,38 @@ backend (vLLM, llama.cpp, etc.) is available.
 from __future__ import annotations
 
 import json
+import os
+import socket
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
+from aether.core.exceptions import BackendError
 
 
 @dataclass
 class CompiledAEGHandle:
     """Lightweight handle for locally compiled AEG artifacts.
 
-    This is used when a compiled artifact exists but model weights are not
-    available locally. It keeps offline smoke tests and graph-only workflows
-    functional while full backends can still load real weights when available.
+    This handle is used for a compiled artifact with a real executable engine
+    and tokenizer.  Session-scoped CPU KV caches are kept here rather than in
+    the global Runtime so independent models and tenants cannot accidentally
+    share state.
     """
 
     model_id: str
     aeg_path: Path
     manifest: dict[str, Any]
     precision_map: dict[str, str] = field(default_factory=dict)
+    engine: Any | None = None
+    tokenizer: Any | None = None
+    session_caches: dict[str, tuple[Any, Any]] = field(default_factory=dict)
+
+    def clear_session_cache(self, session_id: str) -> None:
+        """Release the incremental KV state owned by one agentic session."""
+        self.session_caches.pop(session_id, None)
 
     @property
     def architecture_family(self) -> str:
@@ -52,12 +63,14 @@ class TorchBackend(Backend):
             capabilities=[
                 "generate", "chat", "embed", "rerank", "vision", "transcribe",
                 "flash_attention", "cpu_offload", "bitsandbytes",
+                "structured_output", "grammar_constraints",
             ],
         )
         super().__init__(info)
         self._models: dict[str, Any] = {}
         self._tokenizers: dict[str, Any] = {}
         self._device: str = "cpu"
+        self._allow_remote_code = False
         self._try_detect_device()
 
     def _try_detect_device(self) -> None:
@@ -107,15 +120,32 @@ class TorchBackend(Backend):
         load_kwargs: dict[str, Any] = {
             "torch_dtype": kwargs.get("torch_dtype", torch.float16 if self._device == "cuda" else torch.float32),
             "device_map": kwargs.get("device_map", "auto"),
-            "trust_remote_code": kwargs.get("trust_remote_code", True),
+            "trust_remote_code": bool(kwargs.get("trust_remote_code", False)),
         }
+        self._allow_remote_code = bool(kwargs.get("trust_remote_code", False))
+        if kwargs.get("offline", False):
+            load_kwargs["local_files_only"] = True
         if "low_cpu_mem_usage" not in kwargs:
             load_kwargs["low_cpu_mem_usage"] = True
         load_kwargs.update(kwargs)
 
         start = time.perf_counter()
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+        previous_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(float(kwargs.get("download_timeout_s", os.environ.get("AETHER_HF_DOWNLOAD_TIMEOUT_S", "30"))))
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                trust_remote_code=self._allow_remote_code,
+                local_files_only=bool(kwargs.get("offline", False)),
+            )
+            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+        except Exception as exc:
+            raise BackendError(
+                f"Unable to load model {model_id!r}; no model was loaded and no synthetic fallback is permitted: {exc}",
+                backend_name=self.name,
+            ) from exc
+        finally:
+            socket.setdefaulttimeout(previous_timeout)
         load_time = time.perf_counter() - start
         self._models[model_id] = model
         self._tokenizers[model_id] = tokenizer
@@ -130,19 +160,62 @@ class TorchBackend(Backend):
         if not manifest_path.exists():
             return None
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        eval_report_path = root / "observability" / "eval_report.json"
+        if eval_report_path.is_file():
+            eval_report = json.loads(eval_report_path.read_text(encoding="utf-8"))
+            gate = eval_report.get("gate", {})
+            if gate.get("passed") is False:
+                raise BackendError(
+                    "AEG artifact is rejected by its persisted evaluation gate: "
+                    + ", ".join(gate.get("failing_benchmarks", [])),
+                    backend_name=self.name,
+                )
         precision_path = root / "weights" / "quantized" / "precision_map.json"
         precision_map = {}
         if precision_path.exists():
             precision_map = json.loads(precision_path.read_text(encoding="utf-8"))
+        engine = None
+        tokenizer = None
+        try:
+            from aether.runtime.aeg_loader import load_engine_from_path, package_is_runnable
+
+            from aether.core.aeg_format import AEGPackage
+
+            package = AEGPackage(root)
+            package.load()
+            if package_is_runnable(package):
+                engine = load_engine_from_path(root)
+                tokenizer_root = root / "tokenizer"
+                if tokenizer_root.exists():
+                    from transformers import AutoTokenizer
+
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        tokenizer_root,
+                        local_files_only=True,
+                        trust_remote_code=False,
+                    )
+        except Exception as exc:
+            raise BackendError(
+                f"AEG artifact {root} declares executable weights but could not be loaded: {exc}",
+                backend_name=self.name,
+            ) from exc
         return CompiledAEGHandle(
             model_id=model_id,
             aeg_path=root,
             manifest=manifest,
             precision_map=precision_map,
+            engine=engine,
+            tokenizer=tokenizer,
         )
 
     def get_capabilities(self) -> list[str]:
         return self.info.capabilities
+
+    def release_session_cache(self, model_id: str, session_id: str) -> None:
+        """Release a compiled-AEG session cache after its owner closes."""
+        model = self._models.get(model_id)
+        if isinstance(model, CompiledAEGHandle):
+            model.clear_session_cache(session_id)
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         """Generate text using a loaded model."""
@@ -176,18 +249,64 @@ class TorchBackend(Backend):
             inputs = {k: v.to(self._device) for k, v in inputs.items()}
 
         input_tokens = inputs["input_ids"].shape[1]
+        generate_kwargs: dict[str, Any] = {
+            "max_new_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "top_k": request.top_k if request.top_k > 0 else None,
+            "do_sample": request.temperature > 0.0,
+            "stop_strings": request.stop,
+            "tokenizer": tokenizer,
+        }
+        grammar_session = request.extra.get("grammar_session")
+        if grammar_session is not None:
+            try:
+                from transformers import LogitsProcessor, LogitsProcessorList
+
+                class _GrammarLogitsProcessor(LogitsProcessor):
+                    def __init__(self, session: Any, prompt_length: int) -> None:
+                        self.session = session
+                        self.last_length = prompt_length
+
+                    def __call__(self, input_ids: Any, scores: Any) -> Any:
+                        current_length = int(input_ids.shape[-1])
+                        if current_length > self.last_length:
+                            for token_id in input_ids[0, self.last_length:current_length].tolist():
+                                if self.session.advance(int(token_id)) < 0:
+                                    raise BackendError(
+                                        "The model produced a token rejected by the grammar FSM",
+                                        backend_name="pytorch",
+                                    )
+                            self.last_length = current_length
+                        mask = self.session.get_token_mask()
+                        if len(mask) * 8 < int(scores.shape[-1]):
+                            raise BackendError(
+                                "Grammar FSM vocabulary is smaller than model vocabulary",
+                                backend_name="pytorch",
+                            )
+                        invalid = [
+                            token_id for token_id in range(int(scores.shape[-1]))
+                            if not (mask[token_id // 8] & (1 << (token_id % 8)))
+                        ]
+                        if len(invalid) == int(scores.shape[-1]):
+                            raise BackendError(
+                                "Grammar FSM has no valid next token",
+                                backend_name="pytorch",
+                            )
+                        scores[:, invalid] = -float("inf")
+                        return scores
+
+                generate_kwargs["logits_processor"] = LogitsProcessorList(
+                    [_GrammarLogitsProcessor(grammar_session, int(input_tokens))]
+                )
+            except ImportError as exc:
+                raise BackendError(
+                    "Grammar-constrained generation requires transformers logits processors",
+                    backend_name=self.name,
+                ) from exc
         start = time.perf_counter()
         with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=request.max_tokens,
-                temperature=request.temperature,
-                top_p=request.top_p,
-                top_k=request.top_k if request.top_k > 0 else None,
-                do_sample=request.temperature > 0.0,
-                stop_strings=request.stop,
-                tokenizer=tokenizer,
-            )
+            outputs = model.generate(**inputs, **generate_kwargs)
         end = time.perf_counter()
         generated_ids = outputs[0][input_tokens:]
         generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -209,50 +328,80 @@ class TorchBackend(Backend):
         )
 
     def _generate_from_compiled_aeg(self, handle: CompiledAEGHandle, request: GenerationRequest) -> GenerationResult:
-        """Generate deterministic text from a graph-only AEG artifact."""
-        start = time.perf_counter()
-        prompt_text = self._request_text(request)
-        prompt_tokens = max(1, len(prompt_text.split()))
-        max_tokens = max(1, request.max_tokens)
-        architecture = handle.manifest.get("architecture", {})
-        family = handle.architecture_family.replace("_", " ")
-        precision_count = len(handle.precision_map)
-        generated_words = [
-            "Aether",
-            "loaded",
-            "the",
-            "compiled",
-            "AEG",
-            "artifact",
-            "for",
-            family,
-            "and",
-            "executed",
-            "a",
-            "portable",
-            "graph",
-            "plan",
-            "offline",
-        ]
-        if precision_count:
-            generated_words.extend(["with", str(precision_count), "precision", "entries"])
-        if architecture.get("layers"):
-            generated_words.extend(["across", str(architecture["layers"]), "layers"])
-        selected_words = generated_words[:max_tokens]
-        duration_s = max(time.perf_counter() - start, 1e-6)
-        return GenerationResult(
-            text=" ".join(selected_words),
-            prompt_tokens=prompt_tokens,
-            completion_tokens=len(selected_words),
-            finish_reason="length" if len(selected_words) >= max_tokens else "stop",
+        if handle.engine is not None and handle.tokenizer is not None:
+            text = self._request_text(request)
+            encoded = handle.tokenizer(text, return_tensors="np")
+            prompt_ids = encoded["input_ids"][0]
+            start = time.perf_counter()
+            session_id = request.extra.get("aether_kv_session_id")
+            reused_tokens = 0
+            cached_state = handle.session_caches.get(session_id) if isinstance(session_id, str) else None
+            cache = None
+            suffix = prompt_ids
+            if cached_state is not None:
+                import numpy as np
+
+                cached_ids, cached_cache = cached_state
+                cached_ids = np.asarray(cached_ids, dtype=np.int64)
+                candidate = np.asarray(prompt_ids, dtype=np.int64)
+                if candidate.size >= cached_ids.size and np.array_equal(candidate[: cached_ids.size], cached_ids):
+                    cache = cached_cache
+                    suffix = candidate[cached_ids.size :]
+                    reused_tokens = int(cached_ids.size)
+                else:
+                    # A session may only reuse an exact token prefix.  Drop
+                    # stale state instead of silently serving the wrong cache.
+                    handle.clear_session_cache(session_id)
+
+            if cache is not None or isinstance(session_id, str):
+                generated_ids, updated_cache = handle.engine.generate_with_cache(
+                    suffix,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    top_k=request.top_k,
+                    eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+                    grammar_session=request.extra.get("grammar_session"),
+                    cache=cache,
+                )
+            else:
+                generated_ids = handle.engine.generate(
+                    prompt_ids,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    top_k=request.top_k,
+                    eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+                    grammar_session=request.extra.get("grammar_session"),
+                )
+                updated_cache = None
+
+            if isinstance(session_id, str):
+                import numpy as np
+
+                full_ids = np.concatenate(
+                    [np.asarray(prompt_ids, dtype=np.int64), np.asarray(generated_ids, dtype=np.int64)]
+                )
+                if updated_cache is not None:
+                    handle.session_caches[session_id] = (full_ids, updated_cache)
+            generated_text = handle.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            elapsed = time.perf_counter() - start
+            return GenerationResult(
+                text=generated_text,
+                prompt_tokens=int(len(prompt_ids)),
+                completion_tokens=len(generated_ids),
+                finish_reason="length" if len(generated_ids) >= request.max_tokens else "stop",
+                backend_name=self.name,
+                metrics={
+                    "ttft_ms": elapsed * 1000.0,
+                    "throughput_tps": len(generated_ids) / max(elapsed, 1e-9),
+                    "device": "cpu",
+                    "kv_reuse": reused_tokens > 0,
+                    "kv_reused_tokens": reused_tokens,
+                },
+            )
+        raise BackendError(
+            f"AEG {handle.aeg_path} contains compiled graph data but no tokenizer-backed "
+            "generation adapter for the PyTorch backend. Refusing to return fabricated output.",
             backend_name=self.name,
-            metrics={
-                "ttft_ms": duration_s * 1000,
-                "throughput_tps": len(selected_words) / duration_s,
-                "device": self._device,
-                "execution_mode": "compiled_aeg_metadata",
-                "aeg_path": str(handle.aeg_path),
-            },
         )
 
     def _request_text(self, request: GenerationRequest) -> str:
@@ -262,10 +411,15 @@ class TorchBackend(Backend):
         return request.prompt or ""
 
     def generate_stream(self, request: GenerationRequest) -> Any:
-        """Stream generation."""
+        """Stream generated text as the backend produces tokens."""
+        model = self._models.get(request.model_id)
+        if isinstance(model, CompiledAEGHandle):
+            yield from self._generate_compiled_aeg_stream(model, request)
+            return
+
+        import threading
         import torch
 
-        model = self._models.get(request.model_id)
         tokenizer = self._tokenizers.get(request.model_id)
         if model is None or tokenizer is None:
             self.load_model(request.model_id)
@@ -277,16 +431,113 @@ class TorchBackend(Backend):
         if self._device != "cpu":
             inputs = {k: v.to(self._device) for k, v in inputs.items()}
 
-        streamer = _SimpleStreamer(tokenizer)
-        model.generate(
-            **inputs,
-            max_new_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            do_sample=request.temperature > 0.0,
-            streamer=streamer,
+        try:
+            from transformers import TextIteratorStreamer
+        except ImportError as exc:
+            raise BackendError(
+                "streaming generation requires transformers.TextIteratorStreamer",
+                backend_name=self.name,
+            ) from exc
+
+        streamer = TextIteratorStreamer(
+            tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=1.0
         )
-        return streamer
+        failure: list[BaseException] = []
+
+        def run_generation() -> None:
+            try:
+                with torch.no_grad():
+                    model.generate(
+                        **inputs,
+                        max_new_tokens=request.max_tokens,
+                        temperature=request.temperature,
+                        top_p=request.top_p,
+                        top_k=request.top_k if request.top_k > 0 else None,
+                        do_sample=request.temperature > 0.0,
+                        streamer=streamer,
+                    )
+            except BaseException as exc:  # noqa: BLE001
+                failure.append(exc)
+                streamer.end()
+
+        worker = threading.Thread(target=run_generation, name="aether-generation", daemon=True)
+        worker.start()
+        try:
+            for chunk in streamer:
+                yield str(chunk)
+        finally:
+            worker.join(timeout=30.0)
+        if failure:
+            raise BackendError(
+                f"streaming generation failed: {failure[0]}", backend_name=self.name
+            ) from failure[0]
+
+    def _generate_compiled_aeg_stream(
+        self, handle: CompiledAEGHandle, request: GenerationRequest
+    ) -> Any:
+        """Stream token deltas from the executable CPU AEG engine."""
+        if handle.engine is None or handle.tokenizer is None:
+            raise BackendError(
+                f"AEG {handle.aeg_path} has no executable tokenizer-backed engine",
+                backend_name=self.name,
+            )
+        import numpy as np
+
+        text = self._request_text(request)
+        encoded = handle.tokenizer(text, return_tensors="np")
+        prompt_ids = np.asarray(encoded["input_ids"][0], dtype=np.int64)
+        session_id = request.extra.get("aether_kv_session_id")
+        cached_state = handle.session_caches.get(session_id) if isinstance(session_id, str) else None
+        cache = None
+        suffix = prompt_ids
+        if cached_state is not None:
+            cached_ids, cached_cache = cached_state
+            cached_ids = np.asarray(cached_ids, dtype=np.int64)
+            if prompt_ids.size >= cached_ids.size and np.array_equal(prompt_ids[: cached_ids.size], cached_ids):
+                cache = cached_cache
+                suffix = prompt_ids[cached_ids.size :]
+            else:
+                handle.clear_session_cache(session_id)
+
+        updated_cache: list[Any] = [None]
+
+        def remember(value: Any) -> None:
+            updated_cache[0] = value
+
+        token_ids: list[int] = []
+        emitted = False
+        previous = ""
+        iterator = handle.engine.generate_iter(
+            suffix,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_k=request.top_k,
+            eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+            grammar_session=request.extra.get("grammar_session"),
+            cache=cache,
+            cache_callback=remember,
+        )
+        for token_id in iterator:
+            token_ids.append(int(token_id))
+            decoded = handle.tokenizer.decode(
+                token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            if decoded.startswith(previous):
+                delta = decoded[len(previous) :]
+            else:
+                # Some tokenizers normalize preceding whitespace. In that case
+                # preserve the actual decoded text rather than dropping output.
+                delta = decoded
+            previous = decoded
+            if delta:
+                emitted = True
+                yield delta
+
+        if isinstance(session_id, str) and updated_cache[0] is not None:
+            full_ids = np.concatenate([prompt_ids, np.asarray(token_ids, dtype=np.int64)])
+            handle.session_caches[session_id] = (full_ids, updated_cache[0])
+        if not emitted:
+            yield ""
 
     def _apply_chat_template(self, messages: list[dict[str, str]], tokenizer: Any) -> str:
         """Apply chat template if available; otherwise fallback to concatenation."""
@@ -308,8 +559,8 @@ class TorchBackend(Backend):
             msg = "transformers is required for embeddings"
             raise ImportError(msg)
 
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=self._allow_remote_code)
+        model = AutoModel.from_pretrained(model_id, trust_remote_code=self._allow_remote_code)
         import torch
         encodings = tokenizer(inputs, return_tensors="pt", padding=True, truncation=True)
         with torch.no_grad():
@@ -325,8 +576,8 @@ class TorchBackend(Backend):
             msg = "transformers is required for reranking"
             raise ImportError(msg)
 
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        model = AutoModelForSequenceClassification.from_pretrained(model_id, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=self._allow_remote_code)
+        model = AutoModelForSequenceClassification.from_pretrained(model_id, trust_remote_code=self._allow_remote_code)
         import torch
         scores: list[float] = []
         for doc in documents:
@@ -350,8 +601,8 @@ class TorchBackend(Backend):
             msg = "transformers is required for transcription"
             raise ImportError(msg)
 
-        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=self._allow_remote_code)
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id, trust_remote_code=self._allow_remote_code)
         pipe = pipeline(
             "automatic-speech-recognition",
             model=model,

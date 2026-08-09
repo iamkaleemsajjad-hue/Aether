@@ -58,7 +58,7 @@ AEG_MINIMUM_COMPATIBLE = "AEG/1.0"
 # All v4.0 new kernel target directories (appended to existing v3.1 targets)
 _V4_KERNEL_TARGETS = [
     "cuda_sm120",       # Rubin R100
-    "cuda_sm130",       # Rubin Ultra (placeholder)
+    "cuda_sm130",       # Rubin Ultra profile (kernel must be registered)
     "cuda_sm100_tee",   # B200 Confidential Computing
     "riscv_mips_s8200",     # MIPS S8200 NPU
     "riscv_sifive_x160",    # SiFive X160
@@ -436,56 +436,70 @@ class AEGPackageV2:
             manifest = AEGManifest()
         self.write_manifest(manifest)
 
-        # Write empty config stubs for all new directories
-        self._write_stub(self._root / "speculation" / "p_eagle_config.json",
+        # Write explicit disabled descriptors for optional features.  A newly
+        # created package must not look as if an optimizer or hardware backend
+        # was compiled merely because a directory exists.
+        self._write_default_config(self._root / "speculation" / "p_eagle_config.json",
                          asdict(SpeculationConfig()))
-        self._write_stub(self._root / "speculation" / "saguaro_config.json",
+        self._write_default_config(self._root / "speculation" / "saguaro_config.json",
                          asdict(SpeculationConfig(algorithm="saguaro", hardware_decoupled=True)))
-        self._write_stub(self._root / "structured_output" / "grammar_manifest.json",
+        self._write_default_config(self._root / "structured_output" / "grammar_manifest.json",
                          asdict(GrammarManifest()))
-        self._write_stub(self._root / "merging" / "manifest.json",
+        self._write_default_config(self._root / "merging" / "manifest.json",
                          {"merges": [], "format_version": AEG_FORMAT_VERSION_V2})
-        self._write_stub(self._root / "ttt" / "config.json",
+        self._write_default_config(self._root / "ttt" / "config.json",
                          {"enabled": False, "learning_rate": 1e-4, "max_steps": 10,
                           "update_interval": 1, "vds_verifier_enabled": False})
-        self._write_stub(self._root / "green" / "energy_profile.json",
+        self._write_default_config(self._root / "green" / "energy_profile.json",
                          asdict(GreenEnergyProfile()))
-        self._write_stub(self._root / "green" / "carbon_intensity_map.json",
+        self._write_default_config(self._root / "green" / "carbon_intensity_map.json",
                          {"regions": {}, "last_updated": time.time()})
-        self._write_stub(self._root / "green" / "dvfs_hints.json",
+        self._write_default_config(self._root / "green" / "dvfs_hints.json",
                          {"prefill_freq_mhz": None, "decode_freq_mhz": None,
                           "idle_freq_mhz": None, "voltage_mv": None})
-        self._write_stub(self._root / "tee" / "enclave_config.json",
+        self._write_default_config(self._root / "tee" / "enclave_config.json",
                          asdict(TEEConfig()))
-        self._write_stub(self._root / "tee" / "attestation_policy.json",
+        self._write_default_config(self._root / "tee" / "attestation_policy.json",
                          {"policy": "strict", "allowed_measurements": []})
-        self._write_stub(self._root / "multi_agent" / "kv_sharing_config.json",
+        self._write_default_config(self._root / "multi_agent" / "kv_sharing_config.json",
                          asdict(MultiAgentConfig()))
-        self._write_stub(self._root / "multi_agent" / "relay_caching_config.json",
+        self._write_default_config(self._root / "multi_agent" / "relay_caching_config.json",
                          {"enabled": False, "prefix_sharing_enabled": False,
                           "max_shared_prefix_tokens": 0})
-        self._write_stub(self._root / "multi_agent" / "droidspeak_config.json",
+        self._write_default_config(self._root / "multi_agent" / "droidspeak_config.json",
                          {"enabled": False, "cross_model": False, "vocab_alignment": "none"})
-        self._write_stub(self._root / "mcp" / "mcp_config.json",
+        self._write_default_config(self._root / "mcp" / "mcp_config.json",
                          asdict(MCPConfig()))
-        self._write_stub(self._root / "mcp" / "server_registry.json",
+        self._write_default_config(self._root / "mcp" / "server_registry.json",
                          {"servers": [], "format_version": AEG_FORMAT_VERSION_V2})
-        self._write_stub(self._root / "semantic_cache" / "config.json",
+        self._write_default_config(self._root / "semantic_cache" / "config.json",
                          {"enabled": False, "similarity_threshold": 0.95,
                           "max_cache_entries": 10000, "embedding_model": None})
-        self._write_stub(self._root / "training" / "config.json",
+        self._write_default_config(self._root / "training" / "config.json",
                          {"ttt_enabled": False, "adapter_type": None,
                           "fast_weight_layers": []})
-        self._write_stub(self._root / "parallelism" / "config.json",
+        self._write_default_config(self._root / "parallelism" / "config.json",
                          {"strategy": "none", "tensor_parallel": 1, "pipeline_parallel": 1,
                           "data_parallel": 1, "nvlink_bandwidth_gb_s": 0.0,
                           "all_reduce_algorithm": "ring"})
 
     @staticmethod
-    def _write_stub(path: Path, data: dict[str, Any]) -> None:
-        """Write a JSON stub file only if it doesn't already exist."""
+    def _write_default_config(path: Path, data: dict[str, Any]) -> None:
+        """Write an explicit disabled feature descriptor if absent.
+
+        These records describe an unconfigured package; they are not evidence
+        that a compiler pass, kernel, or runtime backend exists.  Real enabled
+        payloads are written by the corresponding pass-specific methods.
+        """
         if not path.exists():
-            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            payload = {
+                "format_version": AEG_FORMAT_VERSION_V2,
+                "status": "disabled",
+                "enabled": False,
+                "reason": "feature was not compiled into this package",
+                **data,
+            }
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     # ── Manifest ──────────────────────────────────────────────────────────────
 
@@ -533,7 +547,9 @@ class AEGPackageV2:
         fname = "saguaro_config.json" if algo == "saguaro" else "p_eagle_config.json"
         path = self._root / "speculation" / fname
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
+        payload = {"format_version": AEG_FORMAT_VERSION_V2, "status": "enabled", "enabled": True, **asdict(config)}
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._set_manifest_flag("has_speculation_config")
 
     def read_speculation_config(self, algorithm: str = "p_eagle") -> SpeculationConfig | None:
         """Read speculation config."""
@@ -549,7 +565,10 @@ class AEGPackageV2:
         """Write grammar FSM manifest."""
         path = self._root / "structured_output" / "grammar_manifest.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(manifest), indent=2), encoding="utf-8")
+        payload = {"format_version": AEG_FORMAT_VERSION_V2, "status": "enabled", "enabled": True, **asdict(manifest)}
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        if manifest.grammars:
+            self._set_manifest_flag("has_grammar_fsm")
 
     def read_grammar_manifest(self) -> GrammarManifest | None:
         """Read grammar FSM manifest."""
@@ -564,7 +583,9 @@ class AEGPackageV2:
         """Write energy and carbon profile."""
         path = self._root / "green" / "energy_profile.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(profile), indent=2), encoding="utf-8")
+        payload = {"format_version": AEG_FORMAT_VERSION_V2, "status": "enabled", "enabled": True, **asdict(profile)}
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._set_manifest_flag("has_green_profile")
 
     def read_green_profile(self) -> GreenEnergyProfile | None:
         """Read energy and carbon profile."""
@@ -579,7 +600,10 @@ class AEGPackageV2:
         """Write TEE enclave configuration."""
         path = self._root / "tee" / "enclave_config.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
+        payload = {"format_version": AEG_FORMAT_VERSION_V2, "status": "enabled", "enabled": True, **asdict(config)}
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        if config.tee_backend != "none":
+            self._set_manifest_flag("has_tee_enclave")
 
     def read_tee_config(self) -> TEEConfig | None:
         """Read TEE enclave configuration."""
@@ -594,7 +618,9 @@ class AEGPackageV2:
         """Write multi-agent KV coordination config."""
         path = self._root / "multi_agent" / "kv_sharing_config.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
+        payload = {"format_version": AEG_FORMAT_VERSION_V2, "status": "enabled", "enabled": True, **asdict(config)}
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._set_manifest_flag("has_multi_agent_config")
 
     def read_multi_agent_config(self) -> MultiAgentConfig | None:
         """Read multi-agent KV coordination config."""
@@ -609,11 +635,30 @@ class AEGPackageV2:
         """Write MCP server registry and config."""
         path = self._root / "mcp" / "mcp_config.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
+        payload = {"format_version": AEG_FORMAT_VERSION_V2, "status": "enabled", **asdict(config)}
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         # Write server_registry.json as well
         (self._root / "mcp" / "server_registry.json").write_text(
             json.dumps({"servers": config.server_registry}, indent=2), encoding="utf-8"
         )
+        if config.enabled and config.server_registry:
+            self._set_manifest_flag("has_mcp_config")
+
+    def _set_manifest_flag(self, field_name: str) -> None:
+        """Persist a feature flag after writing its concrete payload.
+
+        Feature flags are claims about package contents, not user intent.  Keeping
+        the update in the payload writers prevents a caller from producing an
+        enabled-looking config while leaving the manifest inconsistent.
+        """
+        path = self._root / "manifest.json"
+        if not path.exists():
+            return
+        manifest = self.read_manifest()
+        if not hasattr(manifest, field_name):
+            raise ValueError(f"Unknown AEG manifest feature flag: {field_name}")
+        setattr(manifest, field_name, True)
+        self.write_manifest(manifest)
 
     def read_mcp_config(self) -> MCPConfig | None:
         """Read MCP config."""
@@ -666,6 +711,7 @@ class AEGPackageV2:
         if task_name not in [t["name"] for t in m["task_vectors"]]:
             m["task_vectors"].append({"name": task_name, "config": config})
         manifest_path.write_text(json.dumps(m, indent=2), encoding="utf-8")
+        self._set_manifest_flag("has_task_vectors")
 
     def add_ttt_fast_weights(self, layer_id: str, fast_w: bytes) -> None:
         """Add TTT fast-weight parameter slots for a layer (Pass 13).
@@ -675,6 +721,7 @@ class AEGPackageV2:
         layer_dir = self._root / "weights" / "ttt_fast_weights" / layer_id
         layer_dir.mkdir(parents=True, exist_ok=True)
         (layer_dir / "fast_W.bin").write_bytes(fast_w)
+        self._set_manifest_flag("has_ttt_fast_weights")
 
     def validate(self) -> list[str]:
         """Validate the package structure.
@@ -699,13 +746,127 @@ class AEGPackageV2:
 
         # For v2.0 packages, check new directories
         if fv == AEG_FORMAT_VERSION_V2:
-            manifest = self.read_manifest()
-            if manifest.has_tee_enclave and not (self._root / "tee").exists():
-                errors.append("Manifest declares has_tee_enclave but tee/ directory missing")
-            if manifest.has_grammar_fsm and not (self._root / "structured_output").exists():
-                errors.append("Manifest declares has_grammar_fsm but structured_output/ missing")
-            if manifest.has_mtp_heads and not (self._root / "graph" / "mtp_heads.aeg-ir").exists():
+            manifest_path = self._root / "manifest.json"
+            try:
+                manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest = AEGManifest.from_dict(manifest_data)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                errors.append(f"Invalid manifest.json: {exc}")
+                return errors
+            if manifest.format_version != fv:
+                errors.append(
+                    "FORMAT_VERSION and manifest.format_version disagree: "
+                    f"{fv!r} != {manifest.format_version!r}"
+                )
+
+            # Every present optional payload must be valid JSON.  Empty files,
+            # malformed data, and a disabled descriptor cannot be accepted as
+            # an enabled feature claim.
+            for relative in (
+                "speculation/p_eagle_config.json",
+                "speculation/saguaro_config.json",
+                "structured_output/grammar_manifest.json",
+                "merging/manifest.json",
+                "ttt/config.json",
+                "green/energy_profile.json",
+                "tee/enclave_config.json",
+                "multi_agent/kv_sharing_config.json",
+                "mcp/mcp_config.json",
+                "semantic_cache/config.json",
+                "training/config.json",
+                "parallelism/config.json",
+            ):
+                path = self._root / relative
+                if path.exists():
+                    try:
+                        payload = json.loads(path.read_text(encoding="utf-8"))
+                        if not isinstance(payload, dict):
+                            errors.append(f"Optional payload is not an object: {relative}")
+                    except (OSError, json.JSONDecodeError) as exc:
+                        errors.append(f"Invalid optional payload {relative}: {exc}")
+
+            def require_enabled_payload(flag: str, relative: str) -> dict[str, Any] | None:
+                """Require a concrete enabled JSON payload for a manifest claim."""
+                if not getattr(manifest, flag):
+                    return None
+                path = self._root / relative
+                if not path.is_file():
+                    errors.append(f"Manifest declares {flag} but {relative} is missing")
+                    return None
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    errors.append(f"Invalid enabled payload {relative}: {exc}")
+                    return None
+                if not isinstance(payload, dict) or payload.get("enabled") is not True:
+                    errors.append(f"Manifest declares {flag} but {relative} is not enabled")
+                    return None
+                return payload
+
+            if manifest.has_speculation_config:
+                speculation_payloads = [
+                    self._root / "speculation" / "p_eagle_config.json",
+                    self._root / "speculation" / "saguaro_config.json",
+                ]
+                enabled_speculation = False
+                for path in speculation_payloads:
+                    if not path.is_file():
+                        continue
+                    try:
+                        payload = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError) as exc:
+                        errors.append(f"Invalid enabled payload {path.relative_to(self._root)}: {exc}")
+                        continue
+                    if isinstance(payload, dict) and payload.get("enabled") is True:
+                        enabled_speculation = True
+                if not enabled_speculation:
+                    errors.append("Manifest declares has_speculation_config but no enabled speculation config exists")
+            grammar_payload = require_enabled_payload(
+                "has_grammar_fsm", "structured_output/grammar_manifest.json"
+            )
+            if grammar_payload is not None and not grammar_payload.get("grammars"):
+                errors.append("Manifest declares has_grammar_fsm but no compiled grammars are listed")
+            tee_payload = require_enabled_payload("has_tee_enclave", "tee/enclave_config.json")
+            if tee_payload is not None and tee_payload.get("tee_backend") == "none":
+                errors.append("Manifest declares has_tee_enclave but tee_backend is 'none'")
+            require_enabled_payload("has_multi_agent_config", "multi_agent/kv_sharing_config.json")
+            mcp_payload = require_enabled_payload("has_mcp_config", "mcp/mcp_config.json")
+            if mcp_payload is not None and not mcp_payload.get("server_registry"):
+                errors.append("Manifest declares has_mcp_config but no MCP servers are registered")
+            if manifest.has_mtp_heads and not (self._root / "graph" / "mtp_heads.aeg-ir").is_file():
                 errors.append("Manifest declares has_mtp_heads but graph/mtp_heads.aeg-ir missing")
+            if manifest.has_task_vectors:
+                task_manifest = self._root / "weights" / "task_vectors" / "manifest.json"
+                if not task_manifest.is_file():
+                    errors.append("Manifest declares has_task_vectors but task_vectors/manifest.json is missing")
+                else:
+                    try:
+                        task_data = json.loads(task_manifest.read_text(encoding="utf-8"))
+                        if not isinstance(task_data, dict) or not task_data.get("task_vectors"):
+                            errors.append("Manifest declares has_task_vectors but no task vector payloads are listed")
+                    except (OSError, json.JSONDecodeError) as exc:
+                        errors.append(f"Invalid task vector manifest: {exc}")
+            if manifest.has_ttt_fast_weights:
+                ttt_weights = self._root / "weights" / "ttt_fast_weights"
+                if not ttt_weights.is_dir() or not any(ttt_weights.rglob("*.bin")):
+                    errors.append("Manifest declares has_ttt_fast_weights but no fast-weight payload exists")
+
+            # These passes emit graph-level plans.  A flag without a plan is a
+            # metadata claim only and must not validate as a compiled feature.
+            graph_claims = {
+                "has_semantic_kv_compression": "graph/kv_compression_plan.json",
+                "has_cross_layer_kv": "graph/cross_layer_kv_plan.json",
+            }
+            for flag, relative in graph_claims.items():
+                if getattr(manifest, flag) and not (self._root / relative).is_file():
+                    errors.append(f"Manifest declares {flag} but {relative} is missing")
+
+            if manifest.has_green_profile:
+                profile = self._root / "green" / "energy_profile.json"
+                if not profile.is_file():
+                    errors.append("Manifest declares has_green_profile but green/energy_profile.json is missing")
+            if manifest.has_parallelism_plan and not (self._root / "parallelism").is_dir():
+                errors.append("Manifest declares has_parallelism_plan but parallelism/ is missing")
 
         return errors
 
@@ -714,27 +875,12 @@ class AEGPackageV2:
 
         Idempotent: safe to call on an already v2.0 package.
         """
-        current_version = self.get_format_version()
-        if current_version == AEG_FORMAT_VERSION_V2:
-            return  # Already v2.0
-
-        # Add new directories
-        for d in _V4_DIRECTORIES:
-            (self._root / d).mkdir(exist_ok=True)
-
-        # Add new kernel target directories
-        kernels_dir = self._root / "kernels"
-        if kernels_dir.exists():
-            for target in _V4_KERNEL_TARGETS + _V5_KERNEL_TARGETS:
-                (kernels_dir / target).mkdir(exist_ok=True)
-
-        # Update FORMAT_VERSION
-        (self._root / "FORMAT_VERSION").write_text(AEG_FORMAT_VERSION_V2, encoding="utf-8")
-
-        # Update manifest format_version
         manifest = self.read_manifest()
         manifest.format_version = AEG_FORMAT_VERSION_V2
-        self.write_manifest(manifest)
+        # Reuse the canonical creator so upgrades receive the same explicit
+        # disabled descriptors and directory layout as newly-created v2
+        # packages, while existing payloads remain untouched.
+        self.create(manifest)
 
     def summary(self) -> dict[str, Any]:
         """Return a human-readable summary of the package contents."""

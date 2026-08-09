@@ -41,7 +41,7 @@ class RuntimeConfig:
     optimize_for: str = DEFAULT_OPTIMIZE_FOR
     """Optimization objective: 'latency', 'throughput', or 'quality'."""
 
-    speculative_decoding: bool = DEFAULT_SPECULATIVE_DECODING
+    speculative_decoding: bool | str = DEFAULT_SPECULATIVE_DECODING
     """Enable tree-speculative decoding for faster generation."""
 
     speculative_tree_depth: int = DEFAULT_SPECULATIVE_TREE_DEPTH
@@ -89,6 +89,19 @@ class RuntimeConfig:
     model_cache_dir: str | None = None
     """Custom model cache directory."""
 
+    model_download_timeout_s: float = 30.0
+    """Maximum socket timeout used while downloading a model or tokenizer."""
+
+    hf_offline: bool = False
+    """Only use local Hugging Face files when true; never contact the Hub."""
+
+    allow_remote_code: bool = False
+    """Explicitly allow execution of custom code from a model repository.
+
+    This is disabled by default because ``trust_remote_code`` executes Python
+    supplied by the model publisher. Enable it only for a reviewed repository.
+    """
+
     lazy_model_loading: bool = True
     """Load models on first use rather than at registration."""
 
@@ -106,6 +119,24 @@ class RuntimeConfig:
 
     extra: dict[str, Any] = field(default_factory=dict)
     """Additional runtime-specific parameters."""
+
+    # Public v3/v4 configuration names.  Runtime consumes these values at
+    # model-load and request-routing boundaries; they are not no-op aliases.
+    model_routing: dict[str, str] = field(default_factory=dict)
+    reasoning_budget: int = 0
+    enable_safety_layer: bool = False
+    telemetry_endpoint: str | None = None
+    saguaro_enabled: bool = False
+    multi_agent_kv_mode: str = "relay"
+    scheduler: str = "continuous_batching"
+    slo_profiles: dict[str, dict[str, float | None]] = field(default_factory=dict)
+    ttt_enabled: bool = False
+    ttt_reset_between_requests: bool = True
+    mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    mcp_timeout_ms: int = 5000
+    green_power_management: bool = False
+    green_target_region: str = "lowest_carbon"
+    tee_mode: str = "auto"
 
     # ── v5.0 Runtime Config ─────────────────────────────────────────────────
 
@@ -147,6 +178,10 @@ class RuntimeConfig:
         if self.optimize_for not in ("latency", "throughput", "quality"):
             msg = f"optimize_for must be 'latency', 'throughput', or 'quality', got '{self.optimize_for}'"
             raise RuntimeConfigError(msg)
+        if isinstance(self.speculative_decoding, str) and self.speculative_decoding not in {
+            "eagle3", "p_eagle", "saguaro", "none", "off"
+        }:
+            raise RuntimeConfigError(f"unsupported speculative_decoding mode: {self.speculative_decoding}")
         if self.speculative_tree_depth < 1 or self.speculative_tree_depth > 10:
             msg = f"speculative_tree_depth must be between 1 and 10, got {self.speculative_tree_depth}"
             raise RuntimeConfigError(msg)
@@ -159,6 +194,17 @@ class RuntimeConfig:
         if self.kv_cache_dtype not in ("fp8", "fp16", "bf16"):
             msg = f"kv_cache_dtype must be 'fp8', 'fp16', or 'bf16', got '{self.kv_cache_dtype}'"
             raise RuntimeConfigError(msg)
+        if self.model_download_timeout_s <= 0:
+            msg = f"model_download_timeout_s must be positive, got {self.model_download_timeout_s}"
+            raise RuntimeConfigError(msg)
+        if self.reasoning_budget < 0:
+            raise RuntimeConfigError("reasoning_budget must be non-negative")
+        if self.scheduler not in ("continuous_batching", "slo_aware"):
+            raise RuntimeConfigError("scheduler must be 'continuous_batching' or 'slo_aware'")
+        if self.multi_agent_kv_mode not in ("relay", "kvcomm", "droidspeak", "swarm"):
+            raise RuntimeConfigError("multi_agent_kv_mode must be relay, kvcomm, droidspeak, or swarm")
+        if self.mcp_timeout_ms <= 0:
+            raise RuntimeConfigError("mcp_timeout_ms must be positive")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -178,9 +224,38 @@ class RuntimeConfig:
             "default_max_tokens": self.default_max_tokens,
             "default_top_p": self.default_top_p,
             "backend_name": self.backend_name,
+            "model_cache_dir": self.model_cache_dir,
+            "model_download_timeout_s": self.model_download_timeout_s,
+            "hf_offline": self.hf_offline,
+            "allow_remote_code": self.allow_remote_code,
+            "enable_memory_profiling": self.enable_memory_profiling,
+            "enable_telemetry": self.enable_telemetry,
+            "extra": dict(self.extra),
             "lazy_model_loading": self.lazy_model_loading,
             "enable_continuous_batching": self.enable_continuous_batching,
             "enable_prefix_caching": self.enable_prefix_caching,
+            "model_routing": dict(self.model_routing),
+            "reasoning_budget": self.reasoning_budget,
+            "enable_safety_layer": self.enable_safety_layer,
+            "telemetry_endpoint": self.telemetry_endpoint,
+            "saguaro_enabled": self.saguaro_enabled,
+            "multi_agent_kv_mode": self.multi_agent_kv_mode,
+            "scheduler": self.scheduler,
+            "slo_profiles": dict(self.slo_profiles),
+            "ttt_enabled": self.ttt_enabled,
+            "ttt_reset_between_requests": self.ttt_reset_between_requests,
+            "mcp_servers": dict(self.mcp_servers),
+            "mcp_timeout_ms": self.mcp_timeout_ms,
+            "green_power_management": self.green_power_management,
+            "green_target_region": self.green_target_region,
+            "tee_mode": self.tee_mode,
+            "vocab_size": self.vocab_size,
+            "semantic_cache_threshold": self.semantic_cache_threshold,
+            "cxl_pool_size_gb": self.cxl_pool_size_gb,
+            "enable_diffusion_spec": self.enable_diffusion_spec,
+            "enable_semantic_cache": self.enable_semantic_cache,
+            "diffusion_spec_K": self.diffusion_spec_K,
+            "diffusion_spec_T": self.diffusion_spec_T,
         }
 
     @staticmethod
@@ -202,6 +277,35 @@ class RuntimeConfig:
             default_max_tokens=data.get("default_max_tokens", DEFAULT_MAX_TOKENS),
             default_top_p=data.get("default_top_p", DEFAULT_TOP_P),
             backend_name=data.get("backend_name"),
+            model_cache_dir=data.get("model_cache_dir"),
+            model_download_timeout_s=data.get("model_download_timeout_s", 30.0),
+            hf_offline=data.get("hf_offline", False),
+            allow_remote_code=data.get("allow_remote_code", False),
+            enable_memory_profiling=data.get("enable_memory_profiling", False),
+            enable_telemetry=data.get("enable_telemetry", True),
+            extra=dict(data.get("extra", {})),
+            model_routing=dict(data.get("model_routing", {})),
+            reasoning_budget=data.get("reasoning_budget", 0),
+            enable_safety_layer=data.get("enable_safety_layer", False),
+            telemetry_endpoint=data.get("telemetry_endpoint"),
+            saguaro_enabled=data.get("saguaro_enabled", False),
+            multi_agent_kv_mode=data.get("multi_agent_kv_mode", "relay"),
+            scheduler=data.get("scheduler", "continuous_batching"),
+            slo_profiles=dict(data.get("slo_profiles", {})),
+            ttt_enabled=data.get("ttt_enabled", False),
+            ttt_reset_between_requests=data.get("ttt_reset_between_requests", True),
+            mcp_servers=dict(data.get("mcp_servers", {})),
+            mcp_timeout_ms=data.get("mcp_timeout_ms", 5000),
+            green_power_management=data.get("green_power_management", False),
+            green_target_region=data.get("green_target_region", "lowest_carbon"),
+            tee_mode=data.get("tee_mode", "auto"),
+            vocab_size=data.get("vocab_size", 128000),
+            semantic_cache_threshold=data.get("semantic_cache_threshold", 0.92),
+            cxl_pool_size_gb=data.get("cxl_pool_size_gb", 0.0),
+            enable_diffusion_spec=data.get("enable_diffusion_spec", True),
+            enable_semantic_cache=data.get("enable_semantic_cache", True),
+            diffusion_spec_K=data.get("diffusion_spec_K", 8),
+            diffusion_spec_T=data.get("diffusion_spec_T", 4),
         )
 
     @staticmethod
@@ -220,6 +324,10 @@ class RuntimeConfig:
             config.server_port = int(os.environ["AETHER_SERVER_PORT"])
         if "AETHER_BACKEND" in os.environ:
             config.backend_name = os.environ["AETHER_BACKEND"]
+        if "AETHER_MODEL_DOWNLOAD_TIMEOUT_S" in os.environ:
+            config.model_download_timeout_s = float(os.environ["AETHER_MODEL_DOWNLOAD_TIMEOUT_S"])
+        if "AETHER_HF_OFFLINE" in os.environ:
+            config.hf_offline = os.environ["AETHER_HF_OFFLINE"].lower() in ("1", "true", "yes")
         config.validate()
         return config
 

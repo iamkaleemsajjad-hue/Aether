@@ -363,8 +363,56 @@ class CompilerConfig:
     verbose: bool = False
     """Enable verbose compiler output."""
 
+    # Public PRD aliases.  The internal pass names predate the v4/v5 API
+    # spelling; accepting both forms keeps the documented SDK executable while
+    # mapping every alias to the same real compiler controls.
+    enable_mtp_compilation: bool | None = None
+    grammar_schemas: list[str] = field(default_factory=list)
+    merge_task_models: list[str] = field(default_factory=list)
+    merge_strategy: str | None = None
+    merge_coefficients: list[float] = field(default_factory=list)
+    ttt_mode: str | None = None
+    ttt_layers: list[int] = field(default_factory=list)
+    ttt_update_lr: float | None = None
+    ttt_vds_enabled: bool | None = None
+    semantic_kv_compression: str | None = None
+    kv_compression_ratio: float | None = None
+    cross_layer_kv_sharing: bool | None = None
+    kv_sharing_target_reduction: float | None = None
+    enable_green_profile: bool | None = None
+    green_carbon_api_key: str | None = None
+    tee_mode: str | None = None
+    seal_weights: bool = False
+    additional_targets: list[str] = field(default_factory=list)
+
     def __post_init__(self) -> None:
         """Validate the configuration."""
+        if self.enable_mtp_compilation is not None:
+            self.enable_mtp_head = self.enable_mtp_compilation
+        if self.grammar_schemas and self.grammar_schema is None:
+            self.grammar_schema = self.grammar_schemas[0]
+        if self.merge_task_models:
+            self.model_merging_sources = list(self.merge_task_models)
+        if self.merge_strategy is not None:
+            self.model_merging_method = self.merge_strategy
+        if self.merge_coefficients:
+            self.model_merging_coefficients = list(self.merge_coefficients)
+        if self.ttt_update_lr is not None:
+            self.ttt_learning_rate = self.ttt_update_lr
+        if self.semantic_kv_compression is not None:
+            self.enable_semantic_kv = True
+            self.semantic_kv_strategy = self.semantic_kv_compression.replace("_kv", "")
+        if self.kv_compression_ratio is not None:
+            self.semantic_kv_compression_ratio = self.kv_compression_ratio
+        if self.cross_layer_kv_sharing is not None:
+            self.enable_cross_layer_kv = self.cross_layer_kv_sharing
+        if self.enable_green_profile is not None:
+            self.enable_green_energy = self.enable_green_profile
+        if self.tee_mode is not None:
+            self.enable_tee = True
+            self.tee_backend = self.tee_mode
+        if self.additional_targets:
+            self.targets = list(dict.fromkeys([*self.targets, *self.additional_targets]))
         self.validate()
 
     def validate(self) -> None:

@@ -91,6 +91,7 @@ class GenerationRequest:
             "stop": self.stop,
             "images": self.images,
             "audio": self.audio,
+            "extra": self.extra,
         }
 
 

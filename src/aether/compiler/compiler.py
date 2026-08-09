@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -224,6 +225,10 @@ class Compiler:
         quality_budget: float | None = None,
         calibration_dataset: str | None = None,
         output_path: str | Path | None = None,
+        evaluation_evaluator: Any | None = None,
+        eval_benchmarks: list[str] | None = None,
+        eval_baselines: dict[str, float] | None = None,
+        eval_max_regression: float | None = None,
     ) -> AEGPackage:
         """Compile a model into an AEG artifact.
 
@@ -234,6 +239,13 @@ class Compiler:
             calibration_dataset: Optional calibration dataset override.
             output_path: Optional path to save the AEG package. If None, uses
                 the Aether cache directory.
+            evaluation_evaluator: Optional measured benchmark callback. When
+                supplied, the callback is executed through the CI evaluation
+                gate before the artifact is accepted.
+            eval_benchmarks: Benchmark names required by the evaluator.
+            eval_baselines: Measured baseline scores keyed by benchmark.
+            eval_max_regression: Maximum relative score regression. Defaults
+                to the configured quality budget when an evaluator is supplied.
 
         Returns:
             A compiled `AEGPackage`.
@@ -272,10 +284,19 @@ class Compiler:
             msg = f"Model ingestion failed for {model}: {exc}"
             raise CompilationError(msg, model_id=model_id, stage="stage1_ingestion") from exc
 
+        # Optional optimizer passes emit binary/config artifacts while they
+        # transform the in-memory graph.  Give those passes a real staging
+        # directory, then copy the resulting files into the AEG package during
+        # Stage 4.  Previously ``graph.output_dir`` was never set, so enabled
+        # v4/v5 passes reported success while emitting no persisted artifact.
+        pass_artifact_dir = Path(tempfile.mkdtemp(prefix="aether-pass-artifacts-"))
+        setattr(graph, "output_dir", str(pass_artifact_dir))
+
         # Stage 2: Optimize
         try:
             optimized_graph, pass_reports = self._stage2_optimize(graph, architecture, config)
         except Exception as exc:
+            shutil.rmtree(pass_artifact_dir, ignore_errors=True)
             msg = f"Optimization failed for {model}: {exc}"
             raise CompilationError(msg, model_id=model_id, stage="stage2_optimizer") from exc
 
@@ -283,6 +304,7 @@ class Compiler:
         try:
             target_profiles = self._stage3_target(optimized_graph, architecture, config)
         except Exception as exc:
+            shutil.rmtree(pass_artifact_dir, ignore_errors=True)
             msg = f"Hardware targeting failed for {model}: {exc}"
             raise CompilationError(msg, model_id=model_id, stage="stage3_targeting") from exc
 
@@ -299,8 +321,56 @@ class Compiler:
                 start_time,
             )
         except Exception as exc:
+            shutil.rmtree(pass_artifact_dir, ignore_errors=True)
             msg = f"AEG packaging failed for {model}: {exc}"
             raise CompilationError(msg, model_id=model_id, stage="stage4_packaging") from exc
+
+        shutil.rmtree(pass_artifact_dir, ignore_errors=True)
+
+        if evaluation_evaluator is not None:
+            if not callable(evaluation_evaluator):
+                raise CompilationError(
+                    "evaluation_evaluator must be callable",
+                    model_id=model_id,
+                    stage="evaluation",
+                )
+            try:
+                from aether.observability.ci_pipeline import CIEvalPipeline
+
+                benchmarks = tuple(eval_benchmarks or ("hellaswag", "mmlu", "gsm8k"))
+                max_regression = (
+                    config.quality_budget
+                    if eval_max_regression is None
+                    else float(eval_max_regression)
+                )
+                if not 0.0 <= max_regression:
+                    raise ValueError("eval_max_regression must be non-negative")
+                quality_report = CIEvalPipeline(
+                    aeg_path=package.root,
+                    max_regression=max_regression,
+                    required_benchmarks=benchmarks,
+                    evaluator=evaluation_evaluator,
+                ).run(list(benchmarks), baselines=eval_baselines)
+                package.metadata["eval_report"] = quality_report.to_dict()
+                # Re-save so the report is included in the manifest's declared
+                # artifact hashes and survives a process restart.
+                package.save()
+                package.verify_integrity()
+                if not quality_report.gate_decision.passed:
+                    raise CompilationError(
+                        "Evaluation gate failed; the compiled AEG is rejected",
+                        model_id=model_id,
+                        stage="evaluation",
+                        details=quality_report.to_dict(),
+                    )
+            except CompilationError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - normalize evaluator failures
+                raise CompilationError(
+                    f"Evaluation gate could not complete: {exc}",
+                    model_id=model_id,
+                    stage="evaluation",
+                ) from exc
 
         logger.info("Compilation complete", model_id=model_id, package_path=str(package.root))
         return package
@@ -422,6 +492,21 @@ class Compiler:
             shutil.rmtree(output_path)
 
         package = AEGPackage.create(output_path, model_id=model_id, aether_version=AETHER_VERSION)
+
+        # Materialize files emitted by optimizer passes before package.save()
+        # computes the manifest's content hashes.  Copying only files from the
+        # private staging directory prevents compiler internals from leaking
+        # into the artifact while preserving the pass-produced subdirectories.
+        staged_dir = getattr(graph, "output_dir", None)
+        if staged_dir:
+            staged_path = Path(staged_dir)
+            if staged_path.is_dir():
+                for child in staged_path.iterdir():
+                    destination = package.root / child.name
+                    if child.is_dir():
+                        shutil.copytree(child, destination, dirs_exist_ok=True)
+                    elif child.is_file() and child.name not in {"manifest.json", "FORMAT_VERSION"}:
+                        shutil.copy2(child, destination)
 
         # Convert graph to AEG-IR
         if isinstance(graph, AEGIRModule):
@@ -622,8 +707,30 @@ class Compiler:
             1 for r in pass_reports if r.pass_name == "operator_fusion" and r.status == "applied"
         )
         fusion_passes = [r.details.get("fusion_pattern", "unknown") for r in pass_reports if r.pass_name == "operator_fusion"]
-        applied_passes = [r.pass_name for r in pass_reports if r.status == "applied"]
+        applied_passes = [r.pass_name for r in pass_reports if r.status in {"applied", "ok"}]
         package.metadata["optimizer_passes"] = applied_passes
+        v4_passes = {
+            "mtp_head_compilation",
+            "grammar_constraint_compilation",
+            "model_merging",
+            "ttt_fast_weight_injection",
+            "semantic_kv_compression",
+            "cross_layer_kv_sharing",
+            "green_energy_compilation",
+            "tee_kernel_wrapping",
+        }
+        v5_passes = {
+            "mdlm_drafter_compilation",
+            "sub2bit_quantization",
+            "video_token_compression",
+            "advanced_peft_compilation",
+            "rlvr_verifier_head_injection",
+        }
+        if v5_passes.intersection(applied_passes):
+            package.manifest.format_version = "AEG/3.0"
+        elif v4_passes.intersection(applied_passes):
+            package.manifest.format_version = "AEG/2.0"
+        package.metadata["aeg_format_version"] = package.manifest.format_version
         optimization = OptimizationMetadata(
             fusion_passes_applied=fusion_passes or applied_passes,
             fused_ops_count=fused_ops_count,
@@ -644,6 +751,38 @@ class Compiler:
         package.manifest.architecture = architecture
         package.manifest.compiled_at = start_time.isoformat()
         package.manifest.graph_hash = graph_hash
+
+        # Text AEGs must carry the exact tokenizer used by the source model.
+        # Without it, a package can contain numeric weights but cannot provide
+        # faithful text inference after the compiler process exits.  Keep this
+        # local-only: a successful compile never hides a missing tokenizer by
+        # falling back to a different vocabulary.
+        source_model_path = package.metadata.get("source_model_path")
+        if source_model_path and architecture.family not in {"vision_family", "whisper_family"}:
+            try:
+                if package.metadata.get("source_format") == "gguf":
+                    from aether.compiler.stage1_ingestion.gguf_loader import export_gguf_tokenizer
+
+                    tokenizer_info = export_gguf_tokenizer(
+                        source_model_path, package.root / "tokenizer"
+                    )
+                    package.metadata["tokenizer_info"] = tokenizer_info
+                else:
+                    from transformers import AutoTokenizer
+
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        source_model_path,
+                        local_files_only=True,
+                        trust_remote_code=False,
+                    )
+                    tokenizer.save_pretrained(package.root / "tokenizer")
+                package.metadata["tokenizer_path"] = "tokenizer"
+            except Exception as exc:
+                raise CompilationError(
+                    f"Could not package the source model tokenizer from {source_model_path}: {exc}",
+                    model_id=model_id,
+                    stage="stage4_packaging",
+                ) from exc
 
         package.save()
         return package

@@ -4,6 +4,8 @@ Tests for the Aether runtime, KV cache, scheduler, and speculative engine.
 
 from __future__ import annotations
 
+import pytest
+
 from aether.core.types import MemoryTier
 from aether.runtime.kv_cache import KVCacheManager
 from aether.runtime.scheduler import DisaggregatedScheduler
@@ -176,23 +178,22 @@ class TestTreeSpeculativeEngine:
 class TestTorchBackendCompiledAEG:
     """Tests for local compiled AEG fallback execution."""
 
-    def test_generate_from_compiled_aeg_without_hub_download(self, minimal_aeg_package) -> None:
+    def test_generate_from_compiled_aeg_without_tokenizer_fails_closed(self, minimal_aeg_package) -> None:
         from aether.backends.base import GenerationRequest
         from aether.backends.torch_backend import CompiledAEGHandle, TorchBackend
+        from aether.core.exceptions import BackendError
 
         backend = TorchBackend()
         model = backend.load_model("test-model", str(minimal_aeg_package.root))
         assert isinstance(model, CompiledAEGHandle)
-        result = backend.generate(
-            GenerationRequest(
-                model_id="test-model",
-                prompt="Explain AEG",
-                max_tokens=8,
+        with pytest.raises(BackendError, match="tokenizer-backed generation adapter"):
+            backend.generate(
+                GenerationRequest(
+                    model_id="test-model",
+                    prompt="Explain AEG",
+                    max_tokens=8,
+                )
             )
-        )
-        assert result.text
-        assert result.completion_tokens > 0
-        assert result.metrics["execution_mode"] == "compiled_aeg_metadata"
 
 
 class TestRuntimeBasics:

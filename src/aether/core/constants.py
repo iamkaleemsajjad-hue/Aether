@@ -20,17 +20,20 @@ AETHER_VERSION_TUPLE: tuple[int, int, int] = (0, 1, 0)
 
 # ── AEG format version ─────────────────────────────────────────────────────────
 
-AEG_FORMAT_VERSION: str = "AEG/1.0"
-"""Current AEG format version string. Embedded in every AEG manifest."""
+AEG_FORMAT_VERSION: str = "AEG/1.1"
+"""Current v3.1 AEG format version embedded in every manifest."""
 
 AEG_FORMAT_VERSION_MAJOR: int = 1
 """AEG format major version. Changed only on breaking changes."""
 
-AEG_FORMAT_VERSION_MINOR: int = 0
+AEG_FORMAT_VERSION_MINOR: int = 1
 """AEG format minor version. Incremented for backward-compatible additions."""
 
 AEG_MINIMUM_COMPATIBLE_VERSION: str = "AEG/1.0"
 """Oldest AEG format version the current runtime can read."""
+
+AEG_SUPPORTED_FORMAT_VERSIONS: tuple[str, ...] = ("AEG/1.0", "AEG/1.1", "AEG/2.0", "AEG/3.0")
+"""Format versions understood by this runtime's package reader."""
 
 # ── File extensions ────────────────────────────────────────────────────────────
 
@@ -305,8 +308,8 @@ DEFAULT_PRUNING_PASS: bool = True
 
 # ── PRD v4.0 compiler pass defaults ───────────────────────────────────────────
 
-DEFAULT_MTP_HEAD_PASS: bool = True
-"""Pass 10: Enable native MTP head compilation by default."""
+DEFAULT_MTP_HEAD_PASS: bool = False
+"""Pass 10: Native MTP head compilation is opt-in."""
 
 DEFAULT_GRAMMAR_CONSTRAINT_PASS: bool = False
 """Pass 11: Grammar constraint FSM pre-compilation — opt-in (schema required)."""
@@ -317,11 +320,11 @@ DEFAULT_MODEL_MERGING_PASS: bool = False
 DEFAULT_TTT_PASS: bool = False
 """Pass 13: TTT fast-weight injection — opt-in (requires fast-weight slots)."""
 
-DEFAULT_SEMANTIC_KV_PASS: bool = True
-"""Pass 14: Semantic KV compression — enabled by default."""
+DEFAULT_SEMANTIC_KV_PASS: bool = False
+"""Pass 14: Semantic KV compression is opt-in."""
 
-DEFAULT_CROSS_LAYER_KV_PASS: bool = True
-"""Pass 15: Cross-layer KV sharing — enabled by default."""
+DEFAULT_CROSS_LAYER_KV_PASS: bool = False
+"""Pass 15: Cross-layer KV sharing is opt-in."""
 
 DEFAULT_GREEN_ENERGY_PASS: bool = False
 """Pass 16: Green energy-aware compilation — opt-in (requires carbon API)."""
@@ -337,11 +340,11 @@ DEFAULT_MDLM_DRAFTER_PASS: bool = False
 DEFAULT_SUB2BIT_PASS: bool = False
 """Pass 19: Sub-2-bit ternary quantization — opt-in (requires BitNet checkpoint)."""
 
-DEFAULT_VIDEO_COMPRESSION_PASS: bool = True
-"""Pass 20: Video token compression — auto-detected for VLMs."""
+DEFAULT_VIDEO_COMPRESSION_PASS: bool = False
+"""Pass 20: Video token compression is opt-in for VLMs."""
 
-DEFAULT_ADVANCED_PEFT_PASS: bool = True
-"""Pass 21: Advanced PEFT compilation (LoRA+, LoRAMoE, MoLF) — enabled."""
+DEFAULT_ADVANCED_PEFT_PASS: bool = False
+"""Pass 21: Advanced PEFT compilation is opt-in."""
 
 DEFAULT_RLVR_VERIFIER_PASS: bool = False
 """Pass 22: RLVR verifier head injection — opt-in (training workflow only)."""

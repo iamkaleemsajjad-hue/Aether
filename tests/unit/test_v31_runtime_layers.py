@@ -107,11 +107,11 @@ def test_multimodal_unified_graph_plan() -> None:
     assert graph["optimizations"]["mm_sparse_attention"] is True
 
 
-def test_compiled_package_emits_remaining_v31_artifact_contracts(tmp_path) -> None:
+def test_compiled_package_emits_remaining_v31_artifact_contracts(tmp_path, tiny_local_safetensors_model) -> None:
     from aether import Compiler
 
     compiler = Compiler(CompilerConfig(targets=["cpu_avx512"], overwrite=True, calibration_tokens=128))
-    package = compiler.compile("Qwen/Qwen3-0.6B", output_path=tmp_path / "qwen.aeg")
+    package = compiler.compile(str(tiny_local_safetensors_model), output_path=tmp_path / "qwen.aeg")
     loaded = AEGPackage(package.root).load()
     expected = [
         "agentic/workflow_cache.json",

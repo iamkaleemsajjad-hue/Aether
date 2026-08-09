@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
+from aether.core.exceptions import BackendError
 
 
 class TensorRTLLMBackend(Backend):
@@ -37,16 +38,13 @@ class TensorRTLLMBackend(Backend):
         """Load a TensorRT-LLM engine or build one from the AEG."""
         if model_id in self._engines:
             return self._engines[model_id]
-        msg = "TensorRT-LLM engine loading requires a pre-built engine path in kwargs['engine_path']"
-        raise NotImplementedError(msg)
+        msg = "TensorRT-LLM engine loading requires a supported pre-built engine path in kwargs['engine_path']"
+        raise BackendError(msg, backend_name=self.name)
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         """Generate text using TensorRT-LLM."""
-        return GenerationResult(
-            text="TensorRT-LLM generation not yet implemented in this backend.",
-            prompt_tokens=0,
-            completion_tokens=0,
-            finish_reason="stop",
+        raise BackendError(
+            "TensorRT-LLM generation is unavailable until a real engine is loaded",
             backend_name=self.name,
         )
 

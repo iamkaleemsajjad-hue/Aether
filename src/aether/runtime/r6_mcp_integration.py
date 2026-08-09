@@ -35,9 +35,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
+import subprocess
 import threading
 import time
 import uuid
+import urllib.request
 from typing import Any, Callable, Coroutine
 
 from aether.utils.logging import get_logger
@@ -126,6 +129,7 @@ class MCPClient:
         self._pending_calls: dict[str, asyncio.Future] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
+        self._process: subprocess.Popen[str] | None = None
 
     def connect(self) -> bool:
         """Establish connection to the MCP server.
@@ -135,6 +139,15 @@ class MCPClient:
         For http/ws transport, opens a persistent connection.
         """
         try:
+            if self.transport == "stdio":
+                if not self.server_id:
+                    raise ValueError("stdio MCP transport requires server_id as the executable command")
+                self._process = subprocess.Popen(
+                    shlex.split(self.server_id, posix=False), stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+                )
+            elif self.transport in {"http", "ws"} and not self.endpoint:
+                raise ValueError(f"{self.transport} MCP transport requires an endpoint")
             # Start dedicated event loop thread for async I/O.
             self._loop = asyncio.new_event_loop()
             self._loop_thread = threading.Thread(
@@ -161,6 +174,9 @@ class MCPClient:
 
         except Exception as exc:  # noqa: BLE001
             logger.warning("R6: Failed to connect to %r: %s", self.server_id, exc)
+            if self._process is not None:
+                self._process.kill()
+                self._process = None
             return False
 
     def list_tools(self) -> list[dict]:
@@ -202,9 +218,8 @@ class MCPClient:
     def _rpc_call_sync(self, method: str, params: dict) -> dict | None:
         """Execute a JSON-RPC call synchronously (blocks up to timeout_s).
 
-        In production this would use the actual stdio/WebSocket transport.
-        In this implementation we provide the correct protocol structure
-        and a simulation path for testing without a live MCP server.
+        The request is sent over the configured real transport.  There is no
+        local-success simulation: absent or malformed servers return an error.
         """
         call_id = str(uuid.uuid4())
         payload = {
@@ -214,28 +229,56 @@ class MCPClient:
             "params": params,
         }
 
-        # Simulate a successful response for testing.
-        # Production: send to transport and await response.
-        if method == "initialize":
-            return {
-                "protocolVersion": _MCP_PROTOCOL_VERSION,
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": self.server_id, "version": "1.0"},
-            }
-        elif method == "tools/list":
-            return {"tools": []}
-        elif method == "tools/call":
-            return {
-                "content": [{"type": "text", "text": f"[{self.server_id}] {params.get('name', '')} result"}],
-                "isError": False,
-            }
-        return None
+        if self.transport == "http":
+            request = urllib.request.Request(
+                self.endpoint or "", data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Accept": "application/json"}, method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        elif self.transport == "ws":
+            try:
+                import websocket  # type: ignore[import]
+            except ImportError as exc:
+                raise RuntimeError("WebSocket MCP transport requires websocket-client") from exc
+            connection = websocket.create_connection(self.endpoint or "", timeout=self.timeout_s)
+            try:
+                connection.send(json.dumps(payload))
+                body = json.loads(connection.recv())
+            finally:
+                connection.close()
+        elif self.transport == "stdio":
+            process = self._process
+            if process is None or process.stdin is None or process.stdout is None:
+                raise RuntimeError("MCP stdio client is not connected")
+            process.stdin.write(json.dumps(payload) + "\n")
+            process.stdin.flush()
+            result_holder: list[str] = []
+
+            def read_response() -> None:
+                result_holder.append(process.stdout.readline())
+
+            reader = threading.Thread(target=read_response, daemon=True)
+            reader.start()
+            reader.join(self.timeout_s)
+            if reader.is_alive() or not result_holder or not result_holder[0]:
+                raise TimeoutError(f"MCP server {self.server_id!r} did not answer within {self.timeout_s}s")
+            body = json.loads(result_holder[0])
+        else:
+            raise ValueError(f"Unsupported MCP transport: {self.transport}")
+
+        if "error" in body:
+            raise RuntimeError(f"MCP JSON-RPC error: {body['error']}")
+        return body.get("result")
 
     def disconnect(self) -> None:
         """Disconnect from the MCP server."""
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
         self._connected = False
+        if self._process is not None:
+            self._process.terminate()
+            self._process = None
 
     @property
     def is_connected(self) -> bool:

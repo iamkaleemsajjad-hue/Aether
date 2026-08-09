@@ -60,6 +60,7 @@ class GrammarFSMEngine:
 
     def __init__(self) -> None:
         self._grammars: dict[str, "_LoadedFSA"] = {}
+        self._grammar_metadata: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
         self._stats = _FSMStats()
 
@@ -103,7 +104,11 @@ class GrammarFSMEngine:
             config = json.loads(config_path.read_text(encoding="utf-8"))
             bin_file = config.get("blob_file", "fsm.bin")
             bin_path = Path(aeg_dir) / "grammar" / bin_file
-            return self.load(str(bin_path), grammar_id)
+            loaded = self.load(str(bin_path), grammar_id)
+            if loaded:
+                with self._lock:
+                    self._grammar_metadata[grammar_id] = config
+            return loaded
         except Exception as exc:  # noqa: BLE001
             logger.warning("R3: Failed to load from config %s: %s", config_path, exc)
             return False
@@ -144,6 +149,18 @@ class GrammarFSMEngine:
         """List of loaded grammar IDs."""
         with self._lock:
             return list(self._grammars.keys())
+
+    def matches_compiled_constraint(self, source: str, grammar_id: str = "default") -> bool:
+        """Check that a request matches a trusted, tokenizer-aware compiled FSA."""
+        import hashlib
+
+        with self._lock:
+            metadata = self._grammar_metadata.get(grammar_id)
+        expected = str(metadata.get("schema_hash", "")) if metadata else ""
+        if not metadata or metadata.get("tokenizer_aware") is not True:
+            return False
+        actual = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+        return bool(expected) and expected == actual
 
     @property
     def stats(self) -> "_FSMStats":

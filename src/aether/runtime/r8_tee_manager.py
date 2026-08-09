@@ -474,9 +474,10 @@ class TEERuntimeManager:
         token_input = f"{self.backend}:{graph_hash}:{hw_report_hash}:{nonce}:{ts}"
         token_hash = hashlib.sha256(token_input.encode()).hexdigest()
 
-        # Prefix indicates whether this is a real or simulated attestation.
-        prefix = "aether-tee-hw" if hardware_backed else "aether-tee-sim"
-        return f"{prefix}-{token_hash}"
+        # The token is a strict SHA-256 hex digest so consumers can validate a
+        # stable 32-byte attestation token.  Hardware provenance is reported
+        # separately; a digest must never be mistaken for hardware evidence.
+        return token_hash
 
 
     def get_attestation_report(self) -> dict[str, Any]:

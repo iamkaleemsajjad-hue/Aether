@@ -275,6 +275,11 @@ class CascadeRouter:
         self._tiers.append(tier)
         self._tiers.sort(key=lambda t: t.tier_id)
         self._route_counts.setdefault(tier.tier_id, 0)
+
+    @property
+    def tiers(self) -> tuple[ModelTier, ...]:
+        """Return a read-only snapshot of the registered tiers."""
+        return tuple(self._tiers)
         logger.debug("Cascade router: registered tier %d → %s", tier.tier_id, tier.model_id)
 
     def register_default_tiers(

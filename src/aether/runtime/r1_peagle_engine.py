@@ -44,12 +44,14 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
+from aether.core.exceptions import RuntimeError as AetherRuntimeError
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Optional torch import — graceful fallback to pure-Python when unavailable.
+# Optional torch import. Missing draft weights are an explicit unsupported
+# state; speculation never fabricates token logits.
 # ---------------------------------------------------------------------------
 try:
     import torch
@@ -263,13 +265,11 @@ class PEAGLEEngine:
                 if len(draft_tokens) >= self.draft_K:
                     break
 
-        # Fill any remaining slots with greedy fallback.
-        while len(draft_tokens) < self.draft_K:
-            offset = len(draft_tokens)
-            token_id = _greedy_fallback_token(context_tokens, offset)
-            draft_tokens.append(token_id)
-            # Uniform log-prob as draft distribution for fallback.
-            draft_log_probs.append(-math.log(_DEFAULT_VOCAB))
+        if len(draft_tokens) < self.draft_K:
+            raise AetherRuntimeError(
+                "P-EAGLE requires loaded MTP/EAGLE draft weights for every draft token; "
+                "refusing to use a synthetic draft"
+            )
 
         return draft_tokens[: self.draft_K], draft_log_probs[: self.draft_K]
 
@@ -310,34 +310,10 @@ class PEAGLEEngine:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("P-EAGLE: MTP head %d torch forward failed: %s", head_idx, exc)
 
-        if _TORCH_AVAILABLE and hidden is not None:
-            try:
-                # No weight blob but torch available: random projection surrogate.
-                if not isinstance(hidden, torch.Tensor):
-                    hidden = torch.tensor(hidden, dtype=torch.float32)
-                h = hidden.float().flatten()
-                # Seeded random projection so results are deterministic per head.
-                gen = torch.Generator()
-                gen.manual_seed(head_idx)
-                proj = torch.randn(vocab_size, h.shape[0], generator=gen)
-                logits = torch.matmul(proj, h)
-                log_probs = torch.log_softmax(logits, dim=-1)
-                token_id = int(torch.argmax(logits).item())
-                log_prob = float(log_probs[token_id].item())
-                return token_id, log_prob
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("P-EAGLE: torch surrogate failed for head %d: %s", head_idx, exc)
-
-        # Pure-Python fallback: deterministic hash-based surrogate.
-        if isinstance(hidden, (list, tuple)) and hidden:
-            h_val = sum(float(x) for x in hidden if isinstance(x, (int, float)))
-        elif isinstance(hidden, (int, float)):
-            h_val = float(hidden)
-        else:
-            h_val = 0.0
-        token_id = int(abs(hash((h_val, head_idx))) % vocab_size)
-        log_prob = -math.log(vocab_size)
-        return token_id, log_prob
+        raise AetherRuntimeError(
+            f"P-EAGLE MTP head {head_idx} has no executable weight tensor; "
+            "refusing synthetic projection"
+        )
 
     # ------------------------------------------------------------------
     # Verification and acceptance

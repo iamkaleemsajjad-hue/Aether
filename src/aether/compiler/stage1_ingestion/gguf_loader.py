@@ -571,3 +571,86 @@ class GGUFLoader:
 
     def __repr__(self) -> str:
         return f"GGUFLoader({self.model_path})"
+
+
+def export_gguf_tokenizer_metadata(
+    metadata: dict[str, Any], output_dir: str | Path
+) -> dict[str, Any]:
+    """Export a standard GGUF tokenizer vocabulary for AEG runtime use.
+
+    Modern GGUF files commonly embed SentencePiece-style token strings and
+    scores under ``tokenizer.ggml.*``.  Those values are sufficient to build a
+    local Hugging Face fast tokenizer without downloading a separate tokenizer.
+    The function refuses incomplete metadata instead of silently using a
+    different vocabulary.
+    """
+    tokens = metadata.get("tokenizer.ggml.tokens")
+    if not isinstance(tokens, list) or not tokens or not all(isinstance(t, str) for t in tokens):
+        raise IngestionError(
+            "GGUF does not contain tokenizer.ggml.tokens; a tokenizer-backed AEG cannot be emitted"
+        )
+    if len(set(tokens)) != len(tokens):
+        raise IngestionError("GGUF tokenizer vocabulary contains duplicate token strings")
+
+    scores = metadata.get("tokenizer.ggml.scores")
+    if scores is None:
+        scores = [-10.0] * len(tokens)
+    if not isinstance(scores, list) or len(scores) != len(tokens):
+        raise IngestionError(
+            "GGUF tokenizer.ggml.scores must be a list with one score per token"
+        )
+    try:
+        vocab = [(token, float(score)) for token, score in zip(tokens, scores)]
+    except (TypeError, ValueError) as exc:
+        raise IngestionError("GGUF tokenizer scores contain a non-numeric value") from exc
+
+    unk_id = int(metadata.get("tokenizer.ggml.unknown_token_id", 0))
+    if not 0 <= unk_id < len(tokens):
+        raise IngestionError("GGUF tokenizer unknown token id is outside the vocabulary")
+
+    try:
+        from tokenizers import Tokenizer
+        from tokenizers.decoders import Metaspace as MetaspaceDecoder
+        from tokenizers.models import Unigram
+        from tokenizers.pre_tokenizers import Metaspace
+        from transformers import PreTrainedTokenizerFast
+    except ImportError as exc:
+        raise IngestionError(
+            "GGUF tokenizer export requires tokenizers and transformers"
+        ) from exc
+
+    tokenizer = Tokenizer(Unigram(vocab=vocab, unk_id=unk_id))
+    tokenizer.pre_tokenizer = Metaspace(replacement="▁", prepend_scheme="always")
+    tokenizer.decoder = MetaspaceDecoder(replacement="▁", prepend_scheme="always")
+
+    def special_token(key: str, default_id: int | None = None) -> str | None:
+        raw_id = metadata.get(key, default_id)
+        if raw_id is None:
+            return None
+        token_id = int(raw_id)
+        if not 0 <= token_id < len(tokens):
+            raise IngestionError(f"GGUF tokenizer special token id is outside vocabulary: {key}")
+        return tokens[token_id]
+
+    fast = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        unk_token=tokens[unk_id],
+        bos_token=special_token("tokenizer.ggml.bos_token_id"),
+        eos_token=special_token("tokenizer.ggml.eos_token_id"),
+        pad_token=special_token("tokenizer.ggml.padding_token_id"),
+    )
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    fast.save_pretrained(destination)
+    return {
+        "token_count": len(tokens),
+        "tokenizer_type": "gguf_embedded_unigram",
+        "path": "tokenizer",
+    }
+
+
+def export_gguf_tokenizer(model_path: str | Path, output_dir: str | Path) -> dict[str, Any]:
+    """Read a GGUF file and export its embedded tokenizer."""
+    path = Path(model_path)
+    reader = GGUFReader(path)
+    return export_gguf_tokenizer_metadata(reader.metadata, output_dir)

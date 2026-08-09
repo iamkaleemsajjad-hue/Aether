@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package aether;
+
+import "google/protobuf/struct.proto";
+
+// The Struct payloads keep the wire contract forward-compatible while the
+// public fields are documented in the Python client.  Responses contain the
+// same normalized data returned by Runtime.generate().
+service AetherRuntime {
+  rpc Generate(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc GenerateStream(google.protobuf.Struct) returns (stream google.protobuf.Struct);
+  rpc Health(google.protobuf.Struct) returns (google.protobuf.Struct);
+}

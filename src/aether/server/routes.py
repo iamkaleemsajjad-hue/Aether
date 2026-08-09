@@ -33,8 +33,10 @@ v4.0 NEW endpoints (PRD §22 Extended Developer API v4.0):
   DELETE /v1/tee/session/{id} — close a TEE session
 """
 
+import json
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from aether.runtime import Runtime
@@ -44,12 +46,19 @@ def create_router(runtime: Runtime) -> Any:
     """Create a FastAPI router with all v3.1 + v4.0 endpoints."""
     try:
         from fastapi import APIRouter, HTTPException
+        from starlette.responses import StreamingResponse
         from pydantic import BaseModel, Field
     except ImportError:
         msg = "fastapi and pydantic are required for the server"
         raise ImportError(msg)
 
     router = APIRouter()
+    eval_jobs: dict[str, dict[str, Any]] = {}
+    merge_jobs: dict[str, dict[str, Any]] = {}
+    grpo_jobs: dict[str, dict[str, Any]] = {}
+    video_jobs: dict[str, dict[str, Any]] = {}
+    ab_experiments: dict[str, dict[str, Any]] = {}
+    multi_agent_sessions: dict[str, Any] = {}
 
     # ── Request / Response models ─────────────────────────────────────────────
 
@@ -125,6 +134,83 @@ def create_router(runtime: Runtime) -> Any:
     class PullRequest(BaseModel):
         model: str
 
+    class CascadeRequest(BaseModel):
+        query: str
+        model_routing: dict[str, str] | None = None
+        max_tokens: int = 1024
+        temperature: float = 0.7
+
+    class StructuredRequest(BaseModel):
+        model: str
+        prompt: str
+        schema: dict[str, Any] | None = None
+        grammar: str | None = None
+        regex: str | None = None
+        max_tokens: int = 1024
+        temperature: float = 0.0
+
+    class EvalRequest(BaseModel):
+        model: str
+        domain: str = "general"
+        num_examples: int = 100
+        quality_threshold: float = 0.98
+
+    class ABStartRequest(BaseModel):
+        model_a: str
+        model_b: str
+        prompt: str
+        traffic_split_pct: int = 50
+        max_tokens: int = 128
+
+    class ABRollbackRequest(BaseModel):
+        experiment_id: str
+
+    class MergeRequest(BaseModel):
+        model: str
+        task_vectors: list[dict[str, Any]]
+        merge_method: str = "task_arithmetic"
+        density: float = 1.0
+
+    class ReweightRequest(BaseModel):
+        model: str
+        weights: dict[str, float]
+
+    class MultiAgentRequest(BaseModel):
+        agent_count: int = 4
+        shared_prefix: str = ""
+        model: str = ""
+
+    class TTTAdaptRequest(BaseModel):
+        model: str
+        session_id: str
+        hidden_states: list[list[float]]
+        layer_idx: int = -1
+
+    class MCPRegisterRequest(BaseModel):
+        server_id: str
+        transport: str = "stdio"
+        endpoint: str | None = None
+        command: str | None = None
+
+    class GreenRouteRequest(BaseModel):
+        regions: list[str]
+        latency_deadline_s: float = 1.0
+
+    class VideoRequest(BaseModel):
+        model: str
+        video_path: str
+        prompt: str
+        compression: str = "stc"
+        max_visual_tokens: int = 4096
+
+    class GRPORequest(BaseModel):
+        model: str
+        prompts: list[str]
+        group_size: int = 8
+        domain: str = "math"
+        learning_rate: float = 1e-6
+        max_tokens: int = 2048
+
     # ── v4.0 NEW request models ───────────────────────────────────────────────
 
     class MCPToolCallRequest(BaseModel):
@@ -190,6 +276,30 @@ def create_router(runtime: Runtime) -> Any:
     async def generate(req: GenerateRequest):
         """Text completion with optional structured output and SLO deadline."""
         try:
+            if req.stream:
+                async def event_stream() -> Any:
+                    try:
+                        for index, chunk in enumerate(
+                            runtime.generate_stream(
+                                model_id=req.model,
+                                prompt=req.prompt,
+                                max_tokens=req.max_tokens,
+                                temperature=req.temperature,
+                                top_p=req.top_p,
+                                top_k=req.top_k,
+                                stop=req.stop,
+                            )
+                        ):
+                            yield f"data: {json.dumps({'text': chunk, 'index': index})}\n\n"
+                        yield "data: [DONE]\n\n"
+                    except Exception as exc:  # noqa: BLE001
+                        # Once an SSE response starts, HTTP status cannot be
+                        # changed. Emit an explicit terminal error event and do
+                        # not emit [DONE], so clients cannot mistake failure for
+                        # a successful completion.
+                        yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+
+                return StreamingResponse(event_stream(), media_type="text/event-stream")
             response = runtime.generate(
                 model_id=req.model,
                 prompt=req.prompt,
@@ -322,23 +432,418 @@ def create_router(runtime: Runtime) -> Any:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
-    @router.get("/models/{name:path}", tags=["Model Management"])
-    async def get_model(name: str):
-        """Get model info including AEG format version and hardware targets."""
+    @router.post("/generate/cascade", tags=["Generation"])
+    async def generate_cascade(req: CascadeRequest):
         try:
-            info = runtime.info(name)
-            return info
+            response = runtime.generate_cascade(
+                req.query,
+                model_routing=req.model_routing,
+                max_tokens=req.max_tokens,
+                temperature=req.temperature,
+            )
+            return response.to_dict()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.post("/generate/structured", tags=["Structured Output"])
+    async def generate_structured(req: StructuredRequest):
+        if sum(value is not None for value in (req.schema, req.grammar, req.regex)) != 1:
+            raise HTTPException(status_code=422, detail="exactly one of schema, grammar, or regex is required")
+        try:
+            response = runtime.generate_constrained(
+                req.model,
+                req.prompt,
+                schema=req.schema,
+                grammar=req.grammar,
+                regex=req.regex,
+                max_tokens=req.max_tokens,
+                temperature=req.temperature,
+            )
+            return response.to_dict()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.get("/models/{name:path}/graph", tags=["Model Management"])
+    async def model_graph(name: str):
+        try:
+            package = __import__("aether.core.aeg_format", fromlist=["load_aeg_package"]).load_aeg_package(
+                runtime._resolve_aeg_path(name) or name
+            )
+            if package.ir is None:
+                raise ValueError("AEG contains no AEG-IR module")
+            return {"model": name, "ir": package.ir.to_dict(), "text": package.ir.to_text()}
         except Exception as exc:
             raise HTTPException(status_code=404, detail=str(exc))
 
-    @router.delete("/models/{name:path}", tags=["Model Management"])
-    async def delete_model(name: str):
-        """Remove a compiled model."""
+    @router.get("/models/{name:path}/mla", tags=["Model Management"])
+    async def model_mla(name: str):
         try:
-            runtime.remove(name)
-            return {"status": "success", "model": name}
+            info = runtime.info(name)
+            return {"model": name, "mla": info.get("architecture", {}).get("attention_type", "MHA").upper() == "MLA", "plan": info}
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @router.get("/models/{name:path}/reasoning", tags=["Model Management"])
+    async def model_reasoning(name: str):
+        try:
+            root = runtime._resolve_aeg_path(name) or name
+            path = Path(root) / "graph" / "reasoning_graph.aeg-ir"
+            if not path.exists():
+                raise FileNotFoundError(path)
+            return {"model": name, "reasoning_graph": json.loads(path.read_text(encoding="utf-8"))}
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @router.post("/eval", tags=["Evaluation"])
+    async def start_eval(req: EvalRequest):
+        job_id = str(uuid.uuid4())
+        try:
+            result = runtime.eval_gate(req.model, req.domain, req.num_examples, req.quality_threshold)
+            # An unavailable or failed quality gate is not a successful job.
+            # Returning ``succeeded`` here allowed callers to deploy an
+            # artifact whose evaluation never ran.
+            passed = bool(result.get("passed", False)) if isinstance(result, dict) else False
+            eval_status = "succeeded" if passed else "failed"
+            eval_jobs[job_id] = {"job_id": job_id, "status": eval_status, "result": result}
+            return eval_jobs[job_id]
+        except Exception as exc:
+            eval_jobs[job_id] = {"job_id": job_id, "status": "failed", "error": str(exc)}
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.get("/eval/{job_id}", tags=["Evaluation"])
+    async def get_eval(job_id: str):
+        result = eval_jobs.get(job_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"evaluation job {job_id!r} not found")
+        return result
+
+    @router.post("/ab/start", tags=["Rollout"])
+    async def start_ab(req: ABStartRequest):
+        if not 0 <= req.traffic_split_pct <= 100:
+            raise HTTPException(status_code=422, detail="traffic_split_pct must be between 0 and 100")
+        experiment_id = str(uuid.uuid4())
+        try:
+            result = runtime.ab_rollout(req.model_a, req.model_b, req.prompt, req.traffic_split_pct, max_tokens=req.max_tokens)
+            ab_experiments[experiment_id] = {"experiment_id": experiment_id, "status": "active", "config": req.model_dump(), "last_result": result}
+            return ab_experiments[experiment_id]
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.get("/ab/{experiment_id}", tags=["Rollout"])
+    async def get_ab(experiment_id: str):
+        result = ab_experiments.get(experiment_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"A/B experiment {experiment_id!r} not found")
+        return result
+
+    @router.post("/ab/rollback", tags=["Rollout"])
+    async def rollback_ab(req: ABRollbackRequest):
+        result = ab_experiments.get(req.experiment_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"A/B experiment {req.experiment_id!r} not found")
+        result["status"] = "rolled_back"
+        return {"experiment_id": req.experiment_id, "status": result["status"]}
+
+    @router.get("/traces", tags=["Observability"])
+    async def traces():
+        return runtime.tracer.export_otlp_json()
+
+    @router.post("/merge", tags=["Model Management"])
+    async def merge(req: MergeRequest):
+        job_id = str(uuid.uuid4())
+        try:
+            result = runtime.merge(req.model, req.task_vectors, req.merge_method, req.density)
+            merge_jobs[job_id] = {"job_id": job_id, "status": "succeeded", "result": result}
+            return merge_jobs[job_id]
+        except Exception as exc:
+            merge_jobs[job_id] = {"job_id": job_id, "status": "failed", "error": str(exc)}
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.get("/merge/{job_id}", tags=["Model Management"])
+    async def get_merge(job_id: str):
+        result = merge_jobs.get(job_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"merge job {job_id!r} not found")
+        return result
+
+    @router.post("/merge/reweight", tags=["Model Management"])
+    async def reweight(req: ReweightRequest):
+        try:
+            return {"model": req.model, "weights": runtime.set_task_weights(req.model, **req.weights)}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.post("/multi_agent/session", tags=["Multi-Agent"])
+    async def create_multi_agent(req: MultiAgentRequest):
+        if req.agent_count < 1:
+            raise HTTPException(status_code=422, detail="agent_count must be positive")
+        result = runtime.multi_agent_session(
+            models=[req.model] if req.model else [],
+            coordination="relay",
+            agent_count=req.agent_count,
+            shared_prefix=req.shared_prefix,
+        )
+        multi_agent_sessions[result["session_id"]] = result
+        return result
+
+    @router.delete("/multi_agent/session/{session_id}", tags=["Multi-Agent"])
+    async def delete_multi_agent(session_id: str):
+        session = multi_agent_sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="multi-agent session not found")
+        session.close()
+        multi_agent_sessions.pop(session_id, None)
+        return {"session_id": session_id, "status": "closed"}
+
+    @router.get("/slo/status", tags=["Scheduling"])
+    async def slo_status():
+        return runtime.scheduler.summary()
+
+    @router.post("/slo/profile", tags=["Scheduling"])
+    async def slo_profile(profile: dict[str, Any]):
+        name = profile.get("name")
+        if not isinstance(name, str) or not name:
+            raise HTTPException(status_code=422, detail="profile.name is required")
+        values = {key: profile.get(key) for key in ("max_ttft_ms", "max_tbt_ms")}
+        runtime.config.slo_profiles[name] = values
+        return {"name": name, "profile": values}
+
+    @router.post("/ttt/adapt", tags=["TTT"])
+    async def ttt_adapt(req: TTTAdaptRequest):
+        runtime._init_v4_layers(runtime._resolve_aeg_path(req.model))
+        if runtime.ttt_engine is None:
+            raise HTTPException(status_code=503, detail="TTT is not enabled by the loaded AEG")
+        runtime.ttt_engine.begin_request(req.session_id)
+        loss = runtime.ttt_engine.adapt(req.session_id, req.hidden_states, req.layer_idx)
+        return {"session_id": req.session_id, "loss": loss, "status": "updated"}
+
+    @router.post("/ttt/reset", tags=["TTT"])
+    async def ttt_reset(req: dict[str, Any]):
+        session_id = req.get("session_id")
+        if not isinstance(session_id, str):
+            raise HTTPException(status_code=422, detail="session_id is required")
+        if runtime.ttt_engine is None:
+            raise HTTPException(status_code=503, detail="TTT is not enabled")
+        runtime.ttt_engine.end_request(session_id)
+        return {"session_id": session_id, "status": "reset"}
+
+    @router.get("/mcp/tools", tags=["MCP Tools"])
+    async def mcp_tools():
+        if runtime.mcp_layer is None:
+            return {"tools": [], "connected_servers": [], "enabled": False}
+        return {"tools": runtime.mcp_layer.list_tools(), "connected_servers": runtime.mcp_layer.connected_servers, "enabled": True}
+
+    @router.post("/mcp/server/register", tags=["MCP Tools"])
+    async def mcp_register(req: MCPRegisterRequest):
+        if runtime.mcp_layer is None:
+            raise HTTPException(status_code=503, detail="MCP is not enabled by the loaded AEG")
+        command = req.command or req.server_id
+        connect = getattr(runtime.mcp_layer, "add_server", None)
+        if not callable(connect):
+            raise HTTPException(status_code=503, detail="MCP server registration is unavailable")
+        connected = connect(req.server_id, transport=req.transport, endpoint=req.endpoint)
+        if not connected:
+            raise HTTPException(status_code=502, detail=f"MCP server {req.server_id!r} failed to connect")
+        return {"server_id": req.server_id, "connected": True, "tools": runtime.mcp_layer.list_tools()}
+
+    @router.get("/green/metrics", tags=["Green Inference"])
+    async def green_metrics():
+        return runtime.green_power_manager.get_status() if runtime.green_power_manager is not None else {"enabled": False}
+
+    @router.get("/green/carbon_intensity", tags=["Green Inference"])
+    async def green_carbon_intensity():
+        if runtime.green_power_manager is None:
+            return {"enabled": False, "regions": {}}
+        return {"enabled": True, "status": runtime.green_power_manager.get_status()}
+
+    @router.post("/green/route", tags=["Green Inference"])
+    async def green_route(req: GreenRouteRequest):
+        if runtime.green_power_manager is None:
+            raise HTTPException(status_code=503, detail="green power manager is not enabled")
+        return {"region": runtime.green_power_manager.select_region(req.regions, req.latency_deadline_s)}
+
+    @router.get("/tee/attestation", tags=["Confidential Inference"])
+    async def tee_attestation():
+        report = runtime.get_attestation_report()
+        if not report.get("enabled", False):
+            raise HTTPException(status_code=503, detail=report.get("reason", "TEE unavailable"))
+        return report
+
+    @router.post("/tee/verify", tags=["Confidential Inference"])
+    async def tee_verify(report: dict[str, Any]):
+        if runtime.tee_manager is None:
+            raise HTTPException(status_code=503, detail="TEE unavailable")
+        expected = runtime.tee_manager.get_attestation_report()
+        if report.get("model_hash") != expected.get("model_hash"):
+            raise HTTPException(status_code=400, detail="attestation model hash mismatch")
+        return {"verified": True, "model_hash": expected.get("model_hash")}
+
+    @router.get("/tee/status", tags=["Confidential Inference"])
+    async def tee_status():
+        if runtime.tee_manager is None:
+            return {"enabled": False, "hardware_backed": False}
+        return {"enabled": runtime.tee_manager.is_initialized(), **runtime.tee_manager.get_attestation_report()}
+
+    @router.get("/hardware/rubin", tags=["System"])
+    async def hardware_rubin():
+        from aether.compiler.stage3_targeting.hardware_profile import HardwareProfile
+        profile = HardwareProfile.from_target_id("cuda_sm120")
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Rubin sm120 profile unavailable")
+        return profile.to_dict()
+
+    @router.post("/kernels/rubin/profile", tags=["System"])
+    async def rubin_profile(payload: dict[str, Any]):
+        if runtime.fingerprint.target_id != "cuda_sm120":
+            raise HTTPException(status_code=503, detail="Rubin kernel profiling requires cuda_sm120 hardware")
+        return {"target": "cuda_sm120", "profile": payload, "status": "accepted"}
+
+    @router.post("/video/generate", tags=["Video"])
+    async def video_generate(req: VideoRequest):
+        job_id = str(uuid.uuid4())
+        try:
+            response = runtime.generate_video(
+                req.model, req.video_path, req.prompt, req.compression, req.max_visual_tokens
+            )
+            result = {"job_id": job_id, "status": "succeeded", "response": response.to_dict()}
+            video_jobs[job_id] = result
+            return result
+        except Exception as exc:
+            video_jobs[job_id] = {"job_id": job_id, "status": "failed", "error": str(exc)}
+            raise HTTPException(status_code=501, detail={"job_id": job_id, "error": str(exc)})
+
+    @router.get("/video/{job_id}/stats", tags=["Video"])
+    async def video_stats(job_id: str):
+        result = video_jobs.get(job_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"video job {job_id!r} not found")
+        response = result.get("response")
+        if isinstance(response, dict):
+            metrics = response.get("metrics", {})
+            return {
+                "job_id": job_id,
+                "status": result["status"],
+                "visual_tokens_used": metrics.get("visual_tokens_used"),
+                "compression_ratio": metrics.get("video_compression_ratio"),
+                "error": result.get("error"),
+            }
+        return {"job_id": job_id, "status": result["status"], "error": result.get("error")}
+
+    @router.get("/cache/semantic/stats", tags=["Caching"])
+    async def semantic_cache_stats():
+        return runtime.semantic_cache_stats()
+
+    @router.post("/cache/semantic/flush", tags=["Caching"])
+    async def semantic_cache_flush():
+        runtime._init_v5_layers()
+        cache = getattr(runtime, "_semantic_cache", None)
+        if cache is None:
+            raise HTTPException(status_code=503, detail="semantic cache unavailable")
+        return {"removed": cache.flush()}
+
+    @router.post("/cache/semantic/bypass", tags=["Caching"])
+    async def semantic_cache_bypass(payload: dict[str, Any]):
+        runtime._init_v5_layers()
+        cache = getattr(runtime, "_semantic_cache", None)
+        if cache is None:
+            raise HTTPException(status_code=503, detail="semantic cache unavailable")
+        model = payload.get("model")
+        prompt = payload.get("prompt")
+        if not isinstance(model, str) or not model:
+            raise HTTPException(status_code=422, detail="model is required")
+        if not isinstance(prompt, str) or not prompt:
+            raise HTTPException(status_code=422, detail="prompt is required")
+        try:
+            response = runtime.generate(
+                model,
+                prompt,
+                max_tokens=payload.get("max_tokens"),
+                temperature=payload.get("temperature"),
+                top_p=payload.get("top_p"),
+                cache_bypass=True,
+            )
+            return {
+                "bypass": True,
+                "prompt_hash": cache._hash(cache._normalize(prompt), model, {}),
+                "response": response.to_dict(),
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.post("/train/grpo/start", tags=["Training"])
+    async def grpo_start(req: GRPORequest):
+        job_id = str(uuid.uuid4())
+        try:
+            result = runtime.grpo_train_step(
+                req.model,
+                req.prompts,
+                req.group_size,
+                req.domain,
+                req.learning_rate,
+                max_tokens=req.max_tokens,
+            )
+            if result.get("status") == "failed":
+                grpo_jobs[job_id] = {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "result": result,
+                }
+                raise HTTPException(
+                    status_code=501,
+                    detail={"job_id": job_id, "error": result.get("error", "GRPO unavailable")},
+                )
+            grpo_jobs[job_id] = {"job_id": job_id, "status": result.get("status", "unknown"), "result": result}
+            return grpo_jobs[job_id]
+        except Exception as exc:
+            if isinstance(exc, HTTPException):
+                raise
+            grpo_jobs[job_id] = {"job_id": job_id, "status": "failed", "error": str(exc)}
+            raise HTTPException(status_code=400, detail={"job_id": job_id, "error": str(exc)})
+
+    @router.get("/train/grpo/{job_id}", tags=["Training"])
+    async def grpo_status(job_id: str):
+        result = grpo_jobs.get(job_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"GRPO job {job_id!r} not found")
+        return result
+
+    @router.post("/train/grpo/verify", tags=["Training"])
+    async def grpo_verify(payload: dict[str, Any]):
+        response = payload.get("response")
+        if not isinstance(response, str) or not response:
+            raise HTTPException(status_code=422, detail="response is required")
+        domain = payload.get("domain", payload.get("verifier_domain", "math"))
+        if not isinstance(domain, str):
+            raise HTTPException(status_code=422, detail="domain must be a string")
+        try:
+            from aether.compiler.stage2_optimizer.pass22_rlvr_verifier import GRPOTrainer
+
+            reward = GRPOTrainer().verify_response(
+                response,
+                domain=domain,
+                ground_truth=payload.get("ground_truth"),
+                test_code=payload.get("test_code"),
+            )
+            return {"status": "verified", "domain": domain, "reward": reward}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.get("/kv/transfer/stats", tags=["KV"])
+    async def kv_transfer_stats():
+        return runtime.kv_transfer_stats()
+
+    @router.get("/kv/cxl/pool", tags=["KV"])
+    async def cxl_pool():
+        return runtime.cxl_pool_status()
+
+    @router.post("/kv/cxl/defrag", tags=["KV"])
+    async def cxl_defrag():
+        runtime._init_v5_layers()
+        pool = getattr(runtime, "_cxl_pool", None)
+        if pool is None:
+            raise HTTPException(status_code=503, detail="CXL pool is not configured")
+        return pool.defragment()
+
 
     @router.get("/hardware", tags=["System"])
     async def hardware():
@@ -652,6 +1157,32 @@ def create_router(runtime: Runtime) -> Any:
                 runtime.tee_manager.close_session(session_id)
                 return {"session_id": session_id, "status": "closed"}
             return {"session_id": session_id, "status": "not_found"}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @router.get("/models/{name:path}/sub2bit", tags=["Quantization"])
+    async def sub2bit_report(name: str):
+        """Return measured quantization storage data for an AEG artifact."""
+        try:
+            return runtime.quantization_report(name)
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    # These catch-all model routes must be registered last.  FastAPI matches
+    # path parameters in declaration order, and placing them earlier would
+    # swallow /models/{name}/graph, /merge, and /ttt requests.
+    @router.get("/models/{name:path}", tags=["Model Management"])
+    async def get_model(name: str):
+        try:
+            return runtime.info(name)
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @router.delete("/models/{name:path}", tags=["Model Management"])
+    async def delete_model(name: str):
+        try:
+            runtime.remove(name)
+            return {"status": "success", "model": name}
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 

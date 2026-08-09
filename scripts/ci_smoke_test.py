@@ -299,12 +299,17 @@ def test_e2e_compile_quantize_save_load_infer() -> None:
         "embedding": mw.embedding, "final_norm": mw.final_norm, "lm_head": mw.lm_head,
         "layer_0_rmsnorm": lw.attention_norm, "layer_0_qkv": np.concatenate([lw.q_proj, lw.k_proj, lw.v_proj], 0),
         "layer_0_out_proj": lw.o_proj, "layer_0_ffn_norm": lw.ffn_norm,
-        "layer_0_gate_proj": lw.gate_proj, "layer_0_ffn": lw.down_proj, "layer_0_up_proj": lw.up_proj,
+        "layer_0_gate_proj": lw.gate_proj, "layer_0_ffn": lw.down_proj,
     }
     for node in graph:
         w = weight_map.get(getattr(node, "id", ""))
         if w is not None:
             node.add_attribute("weight", w)
+        # The architecture graph represents the SwiGLU gate and up
+        # projections as one logical node. Preserve both real checkpoint
+        # tensors using the same binding contract as Stage 1 ingestion.
+        if getattr(node, "id", "") == "layer_0_gate_proj":
+            node.add_attribute("up_weight", lw.up_proj)
 
     with tempfile.TemporaryDirectory() as tmp:
         pkg_path = Path(tmp) / "ci_test.aeg"

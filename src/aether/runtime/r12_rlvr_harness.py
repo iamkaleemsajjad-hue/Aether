@@ -160,10 +160,7 @@ class RLVRTrainingHarness:
         # Step 6: Apply gradient step.
         grad_norm = 0.0
         if self._optimizer_step_fn is not None and loss is not None:
-            try:
-                grad_norm = float(self._optimizer_step_fn(loss) or 0.0)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("R12: Optimizer step failed: %s", exc)
+            grad_norm = float(self._optimizer_step_fn(loss))
 
         elapsed_ms = (time.perf_counter() - start) * 1000
 
@@ -206,7 +203,8 @@ class RLVRTrainingHarness:
     ) -> list[str]:
         """Sample K solutions from the policy model.
 
-        Uses the model_forward_fn if provided, otherwise generates placeholder solutions.
+        A policy callback is mandatory. Training without a policy would make
+        the verifier score fabricated strings, so this method fails closed.
         """
         solutions: list[str] = []
         for i in range(K):
@@ -220,10 +218,11 @@ class RLVRTrainingHarness:
                     )
                     solutions.append(str(sol))
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("R12: model_forward_fn failed for sample %d: %s", i, exc)
-                    solutions.append(f"[sample_{i}]")
+                    raise RuntimeError(f"Policy sampling failed for sample {i}: {exc}") from exc
             else:
-                solutions.append(f"[placeholder_solution_{i}]")
+                raise RuntimeError(
+                    "RLVR training requires model_forward_fn; refusing to score fabricated solutions"
+                )
         return solutions
 
     def _verify_solution(
@@ -244,7 +243,7 @@ class RLVRTrainingHarness:
         elif self._verifier_type == "llm_judge":
             return self._llm_judge_verify(solution, ground_truth)
         elif self._verifier_type == "human":
-            return 0.5  # Human feedback deferred; use neutral reward.
+            raise RuntimeError("Human verifier integration is not configured")
         return 0.0
 
     def _sympy_verify(self, solution: str, ground_truth: str | None) -> float:
@@ -310,16 +309,25 @@ class RLVRTrainingHarness:
             return 0.0
 
     def _llm_judge_verify(self, solution: str, ground_truth: str | None) -> float:
-        """Verify using LLM judge model (placeholder — calls model_forward_fn)."""
-        if ground_truth is None:
-            return 0.5
-        # Simplified: check if solution contains key elements from ground_truth.
-        gt_words = set(ground_truth.lower().split())
-        sol_words = set(solution.lower().split())
-        if not gt_words:
-            return 0.0
-        overlap = len(gt_words & sol_words) / len(gt_words)
-        return min(1.0, overlap * 1.5)
+        """Verify using a configured LLM judge callback."""
+        if self._model_forward_fn is None:
+            raise RuntimeError("llm_judge verifier requires a configured judge/model callback")
+        result = self._model_forward_fn(
+            prompt=(
+                "Score the candidate solution from 0 to 1. Return only a number.\n"
+                f"Reference: {ground_truth or '<none>'}\nCandidate: {solution}"
+            ),
+            max_new_tokens=8,
+            temperature=0.0,
+            sample_idx=0,
+        )
+        try:
+            reward = float(str(result).strip())
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("LLM judge callback did not return a numeric reward") from exc
+        if not 0.0 <= reward <= 1.0:
+            raise RuntimeError("LLM judge reward must be between 0 and 1")
+        return reward
 
     def _k2v_decompose_and_reward(
         self,

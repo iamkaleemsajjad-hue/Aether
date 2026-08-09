@@ -21,7 +21,17 @@ import pytest
 class TestR1PEAGLEEngine:
     def _make(self, **kwargs):
         from aether.runtime.r1_peagle_engine import PEAGLEEngine
-        return PEAGLEEngine(draft_K=3, mode="mtp", **kwargs)
+        import torch
+
+        engine = PEAGLEEngine(draft_K=3, mode="mtp", **kwargs)
+        # Use real executable MTP projection weights.  The runtime must not
+        # manufacture draft tokens merely to satisfy a unit test.
+        engine._mtp_heads = [
+            {"index": i, "vocab_size": 8, "hidden_size": 3}
+            for i in range(3)
+        ]
+        engine._mtp_weights = [torch.ones((8, 3), dtype=torch.float32) * (i + 1) for i in range(3)]
+        return engine
 
     def test_propose_returns_proposal(self):
         e = self._make()
@@ -37,7 +47,7 @@ class TestR1PEAGLEEngine:
     def test_acceptance_rate_in_range(self):
         e = self._make()
         for _ in range(5):
-            e.propose(lambda h: None, lambda h: None, [1, 2, 3])
+            e.propose([1.0, 0.5, -0.3], lambda h: None, [1, 2, 3])
         rate = e.current_acceptance_rate
         assert 0.0 <= rate <= 1.0
 
@@ -73,7 +83,7 @@ class TestR1PEAGLEEngine:
 
     def test_reset_stats(self):
         e = self._make()
-        e.propose(lambda h: None, lambda h: None, [1, 2])
+        e.propose([1.0, 0.5, -0.3], lambda h: None, [1, 2])
         e.reset_stats()
         assert e.stats.total_cycles == 0
         assert e.stats.total_proposed == 0
@@ -695,7 +705,7 @@ class TestR11SemanticKVCache:
 class TestR12RLVRHarness:
     def _make(self, verifier="sympy"):
         from aether.runtime.r12_rlvr_harness import RLVRTrainingHarness
-        h = RLVRTrainingHarness()
+        h = RLVRTrainingHarness(model_forward_fn=lambda **kwargs: "4")
         h._verifier_type = verifier
         h._K = 4
         return h
