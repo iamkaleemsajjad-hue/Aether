@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aether-runtime"
-version = "0.1.0"
+version = "1.0.0"
 description = "Aether Runtime — the compiler for AI models. Compile any model into a portable Aether Execution Graph (AEG) and run it on any hardware."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -26,7 +26,7 @@ keywords = [
     "speculative-decoding",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
@@ -141,9 +141,23 @@ benchmark = [
     "scipy>=1.13.0",
 ]
 
+# Distributed execution extras
+distributed = [
+    "grpcio>=1.66.0",
+    "protobuf>=5.28.3",
+]
+
+# Safety / compliance extras (uses stdlib only — no extra packages required)
+safety = []
+
+# Evaluation extras
+eval = [
+    "datasets>=2.19.0",
+]
+
 # Convenience group that installs everything testable on CPU
 dev = [
-    "aether-runtime[lint,test,docs,benchmark]",
+    "aether-runtime[lint,test,docs,benchmark,distributed,eval]",
 ]
 
 [project.urls]
@@ -175,6 +189,36 @@ reasoning_graph = "aether.compiler.stage2_optimizer.pass7_reasoning_graph:Reason
 sparse_attention = "aether.compiler.stage2_optimizer.pass8_sparse_attention:SparseAttentionPass"
 pruning_sparsity = "aether.compiler.stage2_optimizer.pass9_pruning_sparsity:PruningSparsityPass"
 
+[project.entry-points."aether.ingestion.loaders"]
+vlm = "aether.compiler.stage1_ingestion.vlm_loader:VLMLoader"
+ssm = "aether.compiler.stage1_ingestion.ssm_loader:SSMLoader"
+video = "aether.compiler.stage1_ingestion.vlm_loader:VideoModelLoader"
+
+[project.entry-points."aether.backends.hardware"]
+cuda = "aether.backends.hardware_backends:CUDABackend"
+rocm = "aether.backends.hardware_backends:ROCmBackend"
+metal = "aether.backends.hardware_backends:MetalBackend"
+tensorrt_llm = "aether.backends.hardware_backends:TensorRTLLMBackend"
+riscv_npu = "aether.backends.hardware_backends:RISCVNPUBackend"
+fpga = "aether.backends.hardware_backends:FPGABackend"
+qualcomm = "aether.backends.hardware_backends:QualcommBackend"
+
+[project.entry-points."aether.safety"]
+production = "aether.safety.production_safety:ProductionSafetyEngine"
+guardrails = "aether.safety.guardrails:PromptGuard"
+policy = "aether.safety.policy:ContentPolicyEngine"
+
+[project.entry-points."aether.hub"]
+server = "aether.hub.server:AetherHubServer"
+client = "aether.hub.client:HubClient"
+
+[project.entry-points."aether.distributed"]
+fleet = "aether.parallelism.distributed:DistributedFleetManager"
+collective = "aether.parallelism.distributed:CollectiveBackend"
+
+[project.entry-points."aether.eval"]
+evaluators = "aether.observability.evaluators:EVALUATOR_REGISTRY"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/aether"]
 
@@ -199,7 +243,7 @@ include = [
 
 [tool.hatch.version]
 source = "vcs"
-fallback-version = "0.1.0"
+fallback-version = "1.0.0"
 
 [tool.ruff]
 target-version = "py310"
