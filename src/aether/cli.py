@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import time
+import builtins
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,21 @@ from aether.utils.file_io import aether_cache_dir, delete_model
 from aether.utils.logging import configure_logging
 
 console = Console()
+
+
+def _require_applied_pass(aeg: Any, pass_name: str, feature: str) -> None:
+    """Refuse to report a feature that the compiler did not apply.
+
+    Optimizer passes are allowed to skip when their real inputs or backend
+    artifacts are unavailable.  A CLI command must not turn that explicit
+    skip into a successful-looking artifact message.
+    """
+    metadata = getattr(aeg, "metadata", {}) or {}
+    applied = metadata.get("optimizer_passes", [])
+    if not isinstance(applied, builtins.list) or pass_name not in applied:
+        raise click.ClickException(
+            f"{feature} was not applied; the requested real backend/artifact is unavailable"
+        )
 
 
 @click.group()
@@ -65,9 +81,37 @@ def cli(ctx: click.Context, verbose: bool, cache_dir: str | None) -> None:
 @click.option("--dry-run", is_flag=True, help="Plan compilation without producing an AEG.")
 @click.option("--overwrite", is_flag=True, help="Overwrite existing AEG package.")
 @click.option("--mtp", "enable_mtp", is_flag=True, help="Compile native MTP heads.")
-@click.option("--sub2bit", is_flag=True, help="Enable verified sub-2-bit quantization.")
+@click.option(
+    "--sub2bit",
+    type=click.Choice(["bitnet", "ternary", "btc_llm", "nanoq", "nanoquant"]),
+    is_flag=False,
+    flag_value="bitnet",
+    default=None,
+    help="Enable verified sub-2-bit quantization (optional mode: ternary, btc_llm, or nanoq).",
+)
 @click.option("--mdlm-drafter", is_flag=True, help="Compile an MDLM speculative drafter.")
-@click.option("--video-compression", is_flag=True, help="Enable VLM/video token compression.")
+@click.option(
+    "--mdlm-K",
+    "mdlm_k",
+    type=click.IntRange(2, 64),
+    default=None,
+    help="MDLM draft block size K (requires --mdlm-drafter).",
+)
+@click.option(
+    "--mdlm-T",
+    "mdlm_t",
+    type=click.IntRange(1, 64),
+    default=None,
+    help="MDLM denoising steps T (requires --mdlm-drafter).",
+)
+@click.option(
+    "--video-compression",
+    type=click.Choice(["stc", "storm", "streamingtom", "streaming_tom", "infotok", "mage_vl"]),
+    is_flag=False,
+    flag_value="stc",
+    default=None,
+    help="Enable VLM/video token compression (optional strategy).",
+)
 @click.option("--grammar-schema", type=click.Path(exists=True), help="Grammar schema for constrained decoding.")
 @click.option("--ttt", "enable_ttt", is_flag=True, help="Inject TTT fast-weight slots.")
 @click.option("--green", "enable_green", is_flag=True, help="Embed green energy profile.")
@@ -84,9 +128,11 @@ def compile(
     dry_run: bool,
     overwrite: bool,
     enable_mtp: bool,
-    sub2bit: bool,
+    sub2bit: str | None,
     mdlm_drafter: bool,
-    video_compression: bool,
+    mdlm_k: int | None,
+    mdlm_t: int | None,
+    video_compression: str | None,
     grammar_schema: str | None,
     enable_ttt: bool,
     enable_green: bool,
@@ -104,9 +150,13 @@ def compile(
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
         verbose=ctx.obj.get("verbose", False),
         enable_mtp_compilation=enable_mtp,
-        enable_sub2bit=sub2bit,
+        enable_sub2bit=sub2bit is not None,
+        sub2bit_mode=sub2bit,
         enable_mdlm_drafter=mdlm_drafter,
-        enable_video_compression=video_compression,
+        mdlm_draft_block_size=mdlm_k or 8,
+        mdlm_denoising_steps=mdlm_t or 6,
+        enable_video_compression=video_compression is not None,
+        video_compression_strategy=video_compression,
         enable_ttt=enable_ttt,
         enable_green_profile=enable_green,
         enable_tee=enable_tee,
@@ -135,6 +185,25 @@ def compile(
 
     with console.status(f"[bold green]Compiling {model}..."):
         aeg = compiler.compile(model, output_path=output)
+    requested_passes = []
+    if enable_mtp:
+        requested_passes.append(("mtp_head_compilation", "MTP compilation"))
+    if sub2bit is not None:
+        requested_passes.append(("sub2bit_quantization", "sub-2-bit quantization"))
+    if mdlm_drafter:
+        requested_passes.append(("mdlm_drafter_compilation", "MDLM drafter compilation"))
+    if video_compression is not None:
+        requested_passes.append(("video_token_compression", "video compression"))
+    if grammar_schema:
+        requested_passes.append(("grammar_constraint_compilation", "grammar compilation"))
+    if enable_ttt:
+        requested_passes.append(("ttt_fast_weight_injection", "TTT compilation"))
+    if enable_green:
+        requested_passes.append(("green_energy_compilation", "green-energy compilation"))
+    if enable_tee:
+        requested_passes.append(("tee_kernel_wrapping", "TEE compilation"))
+    for pass_name, feature in requested_passes:
+        _require_applied_pass(aeg, pass_name, feature)
     console.print(f"[bold green]Compiled AEG saved to[/bold green] {aeg.root}")
 
 
@@ -456,6 +525,7 @@ def merge(ctx: click.Context, models: tuple[str, ...], method: str, output: str 
     with console.status(f"[bold green]Merging {len(models)} models via {method.upper()}..."):
         compiler = Compiler(config)
         aeg = compiler.compile(models[0], output_path=output)
+    _require_applied_pass(aeg, "model_merging", "model merging")
     console.print(f"[bold green]Merged AEG saved to[/bold green] {aeg.root}")
     table = Table(title="Merge Summary")
     table.add_column("Model", style="cyan")
@@ -498,6 +568,7 @@ def ttt_config(ctx: click.Context, model: str, adapter_rank: int, ttl: int, laye
         compiler = Compiler(config)
         aeg = compiler.compile(model)
 
+    _require_applied_pass(aeg, "ttt_fast_weight_injection", "TTT compilation")
     console.print(f"[bold green]TTT-enabled AEG saved to[/bold green] {aeg.root}")
     table = Table(title="TTT Configuration")
     table.add_column("Parameter", style="cyan")
@@ -541,6 +612,10 @@ def kv_compress(ctx: click.Context, model: str, method: str, retention: float, c
         compiler = Compiler(config)
         aeg = compiler.compile(model)
 
+    if method in ("semantic", "both"):
+        _require_applied_pass(aeg, "semantic_kv_compression", "semantic KV compression")
+    if method in ("cross-layer", "both"):
+        _require_applied_pass(aeg, "cross_layer_kv_sharing", "cross-layer KV sharing")
     console.print(f"[bold green]KV-compressed AEG saved to[/bold green] {aeg.root}")
     table = Table(title="KV Compression Summary")
     table.add_column("Setting", style="cyan")
@@ -591,6 +666,7 @@ def green_profile(
         compiler = Compiler(config)
         aeg = compiler.compile(model)
 
+    _require_applied_pass(aeg, "green_energy_compilation", "green-energy compilation")
     console.print(f"[bold green]Green AEG saved to[/bold green] {aeg.root}")
     table = Table(title="Green Energy Profile")
     table.add_column("Setting", style="cyan")
@@ -625,6 +701,7 @@ def tee(ctx: click.Context, model: str, backend: str, output: str | None, report
         compiler = Compiler(config)
         aeg = compiler.compile(model, output_path=output)
 
+    _require_applied_pass(aeg, "tee_kernel_wrapping", "TEE compilation")
     console.print(f"[bold green]TEE-wrapped AEG saved to[/bold green] {aeg.root}")
 
     if report:
@@ -732,11 +809,76 @@ def version() -> None:
 @click.option("--domain", default="general", help="Evaluation domain.")
 @click.option("--examples", type=click.IntRange(1), default=100, help="Number of examples.")
 @click.option("--threshold", type=click.FloatRange(0.0, 1.0), default=0.98)
+@click.option(
+    "--dataset",
+    "dataset_specs",
+    multiple=True,
+    help="Local benchmark dataset mapping BENCHMARK=PATH; repeat per benchmark.",
+)
+@click.option("--max-tokens", type=click.IntRange(1), default=256)
+@click.option(
+    "--allow-code-execution",
+    is_flag=True,
+    help="Allow explicit HumanEval subprocess execution for supplied datasets.",
+)
 @click.pass_context
-def evaluate(ctx: click.Context, model: str, domain: str, examples: int, threshold: float) -> None:
+def evaluate(
+    ctx: click.Context,
+    model: str,
+    domain: str,
+    examples: int,
+    threshold: float,
+    dataset_specs: tuple[str, ...],
+    max_tokens: int,
+    allow_code_execution: bool,
+) -> None:
     """Run the runtime quality gate and fail if the configured threshold is missed."""
     rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-    report = rt.eval_gate(model, domain=domain, num_examples=examples, quality_threshold=threshold)
+    evaluator = None
+    benchmarks = None
+    if dataset_specs:
+        datasets: dict[str, str] = {}
+        for spec in dataset_specs:
+            benchmark, separator, path = spec.partition("=")
+            benchmark = benchmark.strip().lower()
+            path = path.strip()
+            if not separator or not benchmark or not path:
+                raise click.ClickException(
+                    "--dataset must use BENCHMARK=PATH, for example --dataset mmlu=data.csv"
+                )
+            if benchmark in datasets:
+                raise click.ClickException(f"duplicate dataset benchmark {benchmark!r}")
+            datasets[benchmark] = path
+
+        from aether.observability.ci_pipeline import DatasetBenchmarkEvaluator
+
+        def generate_fn(*, prompt: str, benchmark: str, max_tokens: int) -> str:
+            return rt.generate(
+                model,
+                prompt,
+                max_tokens=max_tokens,
+                temperature=0.0,
+            ).text
+
+        evaluator = DatasetBenchmarkEvaluator(
+            datasets,
+            generate_fn,
+            max_tokens=max_tokens,
+            max_examples=examples,
+            allow_code_execution=allow_code_execution,
+        )
+        # The module also exposes the ``aether list`` command, so its global
+        # name shadows Python's built-in list constructor.
+        benchmarks = builtins.list(datasets)
+
+    report = rt.eval_gate(
+        model,
+        domain=domain,
+        benchmarks=benchmarks,
+        num_examples=examples,
+        quality_threshold=threshold,
+        evaluator=evaluator,
+    )
     console.print(RichJSON(json.dumps(report, indent=2, default=str)))
     if not report.get("passed", False):
         raise click.ClickException("evaluation gate failed")
@@ -898,11 +1040,14 @@ def kernel() -> None:
 @click.argument("op_name")
 @click.option("--output", type=click.Path())
 def kernel_generate(target: str, op_name: str, output: str | None) -> None:
+    """Generate and verify an executable kernel artifact.
+
+    CPU targets use Aether's native shared-library compiler. Vendor targets
+    fail explicitly until their actual compiler/runtime integration is present.
+    """
     from aether.compiler.stage3_targeting.kernel_emitter import KernelEmitter
-    plan = KernelEmitter(target).emit(op_name, [], [])
-    payload = json.dumps(plan.to_dict(), indent=2)
-    if output:
-        Path(output).write_text(payload, encoding="utf-8")
+    artifact = KernelEmitter(target).emit_executable(op_name, output)
+    payload = json.dumps(artifact.to_dict(), indent=2)
     console.print(RichJSON(payload))
 
 
@@ -930,6 +1075,44 @@ def status(ctx: click.Context, model: str) -> None:
         return
     backend = rt._loaded_backends[model].name  # noqa: SLF001
     console.print(f"[bold]{model}[/bold] loaded on backend: {backend}")
+
+
+@cli.command("quantize-report")
+@click.argument("model")
+@click.pass_context
+def quantize_report(ctx: click.Context, model: str) -> None:
+    """Show measured sub-2-bit quantization data for an AEG artifact."""
+    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
+    try:
+        report = rt.quantization_report(model)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print(RichJSON(json.dumps(report, indent=2, default=str)))
+
+
+@cli.group("cache")
+def cache() -> None:
+    """Inspect and control the semantic request cache."""
+
+
+@cache.command("stats")
+@click.pass_context
+def cache_stats(ctx: click.Context) -> None:
+    """Show measured semantic-cache statistics."""
+    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
+    console.print(RichJSON(json.dumps(rt.semantic_cache_stats(), indent=2, default=str)))
+
+
+@cache.command("flush")
+@click.pass_context
+def cache_flush(ctx: click.Context) -> None:
+    """Flush the semantic request cache and report the removed entry count."""
+    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
+    rt._init_v5_layers()  # noqa: SLF001
+    semantic_cache = getattr(rt, "_semantic_cache", None)  # noqa: SLF001
+    if semantic_cache is None:
+        raise click.ClickException("semantic cache is unavailable")
+    console.print(json.dumps({"removed": semantic_cache.flush()}))
 
 
 def main() -> None:

@@ -58,7 +58,7 @@ from aether.utils.logging import get_logger
 logger = get_logger(__name__)
 
 # LoRA magic header for binary files.
-_LORA_MAGIC = b"AETHER_LORA_v1\x00\x00"  # 16 bytes
+_LORA_MAGIC = b"AETHER_LORA_v2\x00\x00"  # 16 bytes; v2 records include tensor shapes
 
 
 class AdvancedPEFTCompilationPass(BasePass):
@@ -197,7 +197,11 @@ def _load_adapter(adapter_path: str) -> dict[str, Any]:
       - 'config': adapter_config.json if present
     """
     p = Path(adapter_path)
-    adapter: dict[str, Any] = {"lora_A": {}, "lora_B": {}, "rank": 16, "config": {}}
+    adapter: dict[str, Any] = {
+        "lora_A": {}, "lora_B": {},
+        "lora_A_shapes": {}, "lora_B_shapes": {},
+        "rank": 16, "config": {},
+    }
 
     if not p.exists():
         logger.debug("Adapter path does not exist: %s", adapter_path)
@@ -225,8 +229,10 @@ def _load_adapter(adapter_path: str) -> dict[str, Any]:
                 flat = tensor.float().reshape(-1).tolist()
                 if "lora_A" in name:
                     adapter["lora_A"][name] = flat
+                    adapter["lora_A_shapes"][name] = list(tensor.shape)
                 elif "lora_B" in name:
                     adapter["lora_B"][name] = flat
+                    adapter["lora_B_shapes"][name] = list(tensor.shape)
             return adapter
         except ImportError:
             pass
@@ -246,8 +252,10 @@ def _load_adapter(adapter_path: str) -> dict[str, Any]:
                 flat = tensor.float().reshape(-1).tolist()
                 if "lora_A" in name:
                     adapter["lora_A"][name] = flat
+                    adapter["lora_A_shapes"][name] = list(tensor.shape)
                 elif "lora_B" in name:
                     adapter["lora_B"][name] = flat
+                    adapter["lora_B_shapes"][name] = list(tensor.shape)
             return adapter
         except ImportError:
             pass
@@ -297,6 +305,14 @@ def _compile_lora_plus(
         "lora_plus_scale": lora_plus_scale,
         "lora_A": lora_A_raw,
         "lora_B": lora_B_scaled,
+        "lora_A_shapes": dict(adapter_data.get("lora_A_shapes", {})),
+        "lora_B_shapes": dict(adapter_data.get("lora_B_shapes", {})),
+        # Inference uses the source adapter's alpha/r scaling.  LoRA+ changes
+        # the trained B values; it does not remove the adapter's normal
+        # inference scale.
+        "runtime_scale": float(
+            adapter_data.get("config", {}).get("lora_alpha", rank) / max(rank, 1)
+        ),
         "n_params": n_A + n_B,
         "hidden_size": hidden_size,
     }
@@ -400,6 +416,7 @@ def _write_adapter_artifacts(
         _write_lora_blob(
             path=adapter_dir / "lora_A.bin",
             weights=adapter["lora_A"],
+            shapes=adapter.get("lora_A_shapes", {}),
             rank=adapter["rank"],
             is_A_matrix=True,
         )
@@ -407,6 +424,7 @@ def _write_adapter_artifacts(
         _write_lora_blob(
             path=adapter_dir / "lora_B.bin",
             weights=adapter["lora_B"],
+            shapes=adapter.get("lora_B_shapes", {}),
             rank=adapter["rank"],
             is_A_matrix=False,
         )
@@ -419,6 +437,11 @@ def _write_adapter_artifacts(
                     "rank": adapter["rank"],
                     "lambda_scale": lambda_scale,
                     "lora_plus_scale": adapter["lora_plus_scale"],
+                    "runtime_scale": adapter["runtime_scale"],
+                    "tensor_shapes": {
+                        "A": adapter.get("lora_A_shapes", {}),
+                        "B": adapter.get("lora_B_shapes", {}),
+                    },
                     "n_params": adapter["n_params"],
                 },
                 indent=2,
@@ -437,6 +460,11 @@ def _write_adapter_artifacts(
                 "n_params": a["n_params"],
                 "lora_A_ref": f"{a['name']}/lora_A.bin",
                 "lora_B_ref": f"{a['name']}/lora_B.bin",
+                "runtime_scale": a["runtime_scale"],
+                "tensor_shapes": {
+                    "A": a.get("lora_A_shapes", {}),
+                    "B": a.get("lora_B_shapes", {}),
+                },
             }
             for a in compiled_adapters
         ],
@@ -451,13 +479,15 @@ def _write_adapter_artifacts(
 def _write_lora_blob(
     path: Path,
     weights: dict[str, list[float]],
+    shapes: dict[str, list[int]],
     rank: int,
     is_A_matrix: bool,
 ) -> None:
     """Write packed BF16 LoRA weight blob.
 
     Format: [16-byte magic][4B rank][4B is_A_matrix][4B n_tensors][4B reserved]
-            [n_tensors × (4B name_len + name_bytes + 4B n_elems + elems×2B BF16)]
+            [n_tensors × (4B name_len + name_bytes + 4B ndim + ndim×4B shape +
+            4B n_elems + elems×2B BF16)]
     """
     header = bytearray(32)
     header[:16] = _LORA_MAGIC
@@ -471,6 +501,11 @@ def _write_lora_blob(
         name_bytes = name.encode("utf-8")
         body += struct.pack("<I", len(name_bytes))
         body += name_bytes
+        tensor_shape = [int(v) for v in shapes.get(name, [])]
+        if not tensor_shape or any(v <= 0 for v in tensor_shape):
+            raise ValueError(f"LoRA tensor {name!r} is missing a positive shape")
+        body += struct.pack("<I", len(tensor_shape))
+        body += struct.pack(f"<{len(tensor_shape)}I", *tensor_shape)
         body += struct.pack("<I", len(vals))
         # Pack as BF16 (truncate float32 to top 2 bytes).
         for v in vals:

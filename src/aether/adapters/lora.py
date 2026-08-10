@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import json
 import math
+import re
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,6 +39,12 @@ import numpy as np
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+_COMPILED_LORA_MAGIC = b"AETHER_LORA_v2\x00\x00"
+_SUPPORTED_PROJECTIONS = {
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -681,3 +689,148 @@ class LoRAHotSwapEngine:
             "request_count": self._request_count,
             **self.pool.stats(),
         }
+
+
+def load_compiled_lora_adapters(aeg_root: str | Path) -> dict[str, dict[tuple[int, str], tuple[np.ndarray, np.ndarray, float]]]:
+    """Load and validate Pass 21 adapter artifacts from a verified AEG.
+
+    The AEG package integrity check must run before this function.  This
+    loader still validates all paths, headers, tensor pairs, dimensions and
+    projection bindings because those checks are part of the execution
+    boundary, not merely archive validation.  The returned matrices use the
+    CPU engine convention ``A=(rank,in)`` and ``B=(out,rank)``.
+
+    No adapter is silently ignored: an unknown target module, malformed blob,
+    duplicate tensor, or shape mismatch raises ``ValueError``.
+    """
+    root = Path(aeg_root).resolve()
+    manifest_path = root / "adapters" / "adapter_manifest.json"
+    if not manifest_path.is_file():
+        return {}
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") != "aether_adapter_manifest_v1":
+        raise ValueError("unsupported AEG adapter manifest format")
+    entries = manifest.get("adapters")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("AEG adapter manifest contains no adapters")
+
+    loaded: dict[str, dict[tuple[int, str], tuple[np.ndarray, np.ndarray, float]]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("adapter manifest entry must be an object")
+        name = str(entry.get("name", ""))
+        if not name or name in loaded or "/" in name or "\\" in name or name in {".", ".."}:
+            raise ValueError(f"invalid or duplicate adapter name {name!r}")
+        a_ref = _safe_adapter_ref(root, entry.get("lora_A_ref"), name)
+        b_ref = _safe_adapter_ref(root, entry.get("lora_B_ref"), name)
+        a_tensors, a_rank = _read_compiled_lora_blob(a_ref, expect_a=True)
+        b_tensors, b_rank = _read_compiled_lora_blob(b_ref, expect_a=False)
+        if a_rank != b_rank or a_rank != int(entry.get("rank", a_rank)):
+            raise ValueError(f"adapter {name!r} has inconsistent LoRA ranks")
+        a_tensors = {_canonical_lora_name(key): value for key, value in a_tensors.items()}
+        b_tensors = {_canonical_lora_name(key): value for key, value in b_tensors.items()}
+        if set(a_tensors) != set(b_tensors):
+            raise ValueError(f"adapter {name!r} has unpaired A/B tensors")
+        scale = float(entry.get("runtime_scale", 1.0 / max(a_rank, 1)))
+        if not math.isfinite(scale) or scale < 0:
+            raise ValueError(f"adapter {name!r} has invalid runtime scale")
+        targets: dict[tuple[int, str], tuple[np.ndarray, np.ndarray, float]] = {}
+        for tensor_name in sorted(a_tensors):
+            target = _parse_projection_target(tensor_name)
+            if target in targets:
+                raise ValueError(f"adapter {name!r} has duplicate target {target}")
+            A, a_shape = a_tensors[tensor_name]
+            B, b_shape = b_tensors[tensor_name]
+            if len(a_shape) != 2 or len(b_shape) != 2:
+                raise ValueError(f"adapter {name!r} tensor {tensor_name!r} is not a matrix")
+            if a_shape[0] != a_rank or b_shape[1] != a_rank:
+                raise ValueError(
+                    f"adapter {name!r} tensor {tensor_name!r} has incompatible A/B shapes "
+                    f"{a_shape} and {b_shape}"
+                )
+            targets[target] = (A, B, scale)
+        if not targets:
+            raise ValueError(f"adapter {name!r} has no supported transformer projections")
+        loaded[name] = targets
+    return loaded
+
+
+def _safe_adapter_ref(root: Path, ref: Any, adapter_name: str) -> Path:
+    if not isinstance(ref, str) or not ref:
+        raise ValueError(f"adapter {adapter_name!r} has an invalid artifact reference")
+    candidate = (root / "adapters" / ref).resolve()
+    adapters_root = (root / "adapters").resolve()
+    if candidate.parent != (adapters_root / adapter_name).resolve() or candidate.is_symlink():
+        raise ValueError(f"adapter {adapter_name!r} artifact escapes its adapter directory")
+    if not candidate.is_file():
+        raise ValueError(f"adapter {adapter_name!r} artifact is missing: {ref}")
+    return candidate
+
+
+def _read_compiled_lora_blob(path: Path, *, expect_a: bool) -> tuple[dict[str, tuple[np.ndarray, list[int]]], int]:
+    data = path.read_bytes()
+    if len(data) < 32 or data[:16] != _COMPILED_LORA_MAGIC:
+        raise ValueError(f"unsupported or truncated LoRA blob: {path.name}")
+    rank, is_a, n_tensors, _reserved = struct.unpack_from("<IIII", data, 16)
+    if rank <= 0 or bool(is_a) is not expect_a or n_tensors <= 0:
+        raise ValueError(f"invalid LoRA blob header: {path.name}")
+    offset = 32
+    result: dict[str, tuple[np.ndarray, list[int]]] = {}
+    for _ in range(n_tensors):
+        if offset + 4 > len(data):
+            raise ValueError(f"truncated LoRA tensor name: {path.name}")
+        name_len = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        if name_len <= 0 or offset + name_len > len(data):
+            raise ValueError(f"invalid LoRA tensor name length: {path.name}")
+        name = data[offset:offset + name_len].decode("utf-8")
+        offset += name_len
+        if offset + 4 > len(data):
+            raise ValueError(f"truncated LoRA tensor shape: {path.name}")
+        ndim = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        if ndim != 2 or offset + 4 * ndim > len(data):
+            raise ValueError(f"invalid LoRA tensor rank: {name}")
+        shape = list(struct.unpack_from("<2I", data, offset))
+        offset += 4 * ndim
+        if any(v <= 0 for v in shape) or offset + 4 > len(data):
+            raise ValueError(f"invalid LoRA tensor shape: {name}")
+        n_values = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        if n_values != shape[0] * shape[1] or offset + 2 * n_values > len(data):
+            raise ValueError(f"invalid LoRA tensor payload length: {name}")
+        values = np.empty(n_values, dtype=np.float32)
+        for index in range(n_values):
+            bf16 = struct.unpack_from("<H", data, offset + index * 2)[0]
+            values[index] = struct.unpack("<f", struct.pack("<I", bf16 << 16))[0]
+        offset += 2 * n_values
+        if name in result:
+            raise ValueError(f"duplicate LoRA tensor: {name}")
+        result[name] = (values.reshape(shape), shape)
+    if offset != len(data):
+        raise ValueError(f"unexpected trailing bytes in LoRA blob: {path.name}")
+    return result, int(rank)
+
+
+def _parse_projection_target(name: str) -> tuple[int, str]:
+    match = re.search(
+        r"(?:^|\.)layers\.(\d+)\..*?\."
+        r"(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+        r"(?:\.weight)?$",
+        name,
+    )
+    if match is None:
+        raise ValueError(f"unsupported LoRA target tensor {name!r}")
+    layer = int(match.group(1))
+    projection = match.group(2)
+    if projection not in _SUPPORTED_PROJECTIONS:
+        raise ValueError(f"unsupported LoRA projection {projection!r}")
+    return layer, projection
+
+
+def _canonical_lora_name(name: str) -> str:
+    """Remove the A/B marker so paired checkpoint tensors share one key."""
+    canonical = re.sub(r"\.lora_[AB](?:\.weight)?$", "", name)
+    if canonical == name:
+        raise ValueError(f"invalid LoRA tensor name {name!r}")
+    return canonical

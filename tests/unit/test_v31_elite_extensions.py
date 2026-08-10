@@ -671,8 +671,10 @@ class TestAEGPackageV31:
             AEGPackageV31("test-model", target="cuda_sm90").build(aeg_dir)
             manifest = json.loads((aeg_dir / "manifest.json").read_text())
             assert "features" in manifest
-            assert manifest["features"]["safety_guardrails"] is True
-            assert manifest["features"]["eu_ai_act_compliant"] is True
+            assert manifest["artifact_kind"] == "metadata_skeleton"
+            assert manifest["executable"] is False
+            assert manifest["features"]["safety_guardrails"] is False
+            assert manifest["features"]["eu_ai_act_compliant"] is False
 
     def test_provenance_manifest_written(self):
         from aether.core.aeg_format_v31 import AEGPackageV31
@@ -682,6 +684,22 @@ class TestAEGPackageV31:
             prov = json.loads((aeg_dir / "provenance" / "manifest.json").read_text())
             assert "eu_ai_act" in prov
             assert "model_hash" in prov
+            assert prov["model_hash"] is None
+            assert prov["source_hash_status"] == "unavailable"
+
+    def test_provenance_hashes_real_source_bytes(self, tmp_path):
+        from aether.core.aeg_format_v31 import ProvenanceManifest
+
+        weights = tmp_path / "weights.bin"
+        weights.write_bytes(b"real-model-bytes")
+        provenance = ProvenanceManifest.from_compile_run(
+            "local-model", model_weights_path=str(weights)
+        )
+        assert provenance.model_hash == "sha256:" + __import__("hashlib").sha256(
+            b"weights.binreal-model-bytes"
+        ).hexdigest()
+        assert provenance.source_hash_status == "verified"
+        assert provenance.eval_gate_passed is False
 
     def test_watermark_config_written(self):
         from aether.core.aeg_format_v31 import AEGPackageV31
@@ -718,8 +736,7 @@ class TestAEGManifestV31:
             AEGPackageV31("test").build(aeg_dir)
             reader = AEGManifestV31(aeg_dir)
             targets = reader.list_available_targets()
-            assert len(targets) > 0
-            assert "cuda_sm90" in targets
+            assert targets == []
 
     def test_has_cuda_graphs(self):
         from aether.core.aeg_format_v31 import AEGPackageV31, AEGManifestV31
@@ -727,7 +744,7 @@ class TestAEGManifestV31:
             aeg_dir = Path(tmpdir) / "model.aeg"
             AEGPackageV31("test", target="cuda_sm90").build(aeg_dir)
             reader = AEGManifestV31(aeg_dir)
-            assert reader.has_cuda_graphs()
+            assert not reader.has_cuda_graphs()
 
     def test_summary_structure(self):
         from aether.core.aeg_format_v31 import AEGPackageV31, AEGManifestV31

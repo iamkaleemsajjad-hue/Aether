@@ -9,6 +9,7 @@ hits, and eviction across tiers.
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -73,6 +74,9 @@ class KVCacheManager:
             "misses": 0,
             "evictions": 0,
             "transfers": 0,
+            "transferred_tokens": 0,
+            "transfers_by_route": {},
+            "last_transfer_monotonic": None,
         }
         logger.info(
             "KV cache manager initialized",
@@ -133,11 +137,30 @@ class KVCacheManager:
                 return True
             old_tier = block.tier
             block.tier = target_tier
-            self._stats["transfers"] += 1
+            self._record_transfer(old_tier, target_tier, block.token_count)
             logger.debug(
                 f"KV block {block_id} moved from {old_tier} to {target_tier}"
             )
             return True
+
+    def _record_transfer(
+        self,
+        source_tier: MemoryTier,
+        destination_tier: MemoryTier,
+        token_count: int,
+    ) -> None:
+        """Record a real tier movement without inventing byte counts.
+
+        KVCacheBlock stores token cardinality but not tensor shape or element
+        width, so this manager can truthfully report blocks/tokens moved and
+        route identity, but must not manufacture bandwidth or byte totals.
+        """
+        route = f"{source_tier.name}->{destination_tier.name}"
+        self._stats["transfers"] += 1
+        self._stats["transferred_tokens"] += max(0, int(token_count))
+        routes = self._stats["transfers_by_route"]
+        routes[route] = int(routes.get(route, 0)) + 1
+        self._stats["last_transfer_monotonic"] = time.monotonic()
 
     def evict_lru(self, tier: MemoryTier | None = None) -> int:
         """Evict least-recently-used blocks from a tier."""
@@ -152,9 +175,13 @@ class KVCacheManager:
             to_evict = candidates[: max(1, len(candidates) // 10)]
             for block in to_evict:
                 if block.tier == MemoryTier.L1_GPU_HBM:
+                    old_tier = block.tier
                     block.tier = MemoryTier.L2_CPU_DRAM
+                    self._record_transfer(old_tier, block.tier, block.token_count)
                 elif block.tier == MemoryTier.L2_CPU_DRAM:
+                    old_tier = block.tier
                     block.tier = MemoryTier.L3_NVME
+                    self._record_transfer(old_tier, block.tier, block.token_count)
                 elif block.tier == MemoryTier.L3_NVME:
                     self._blocks.pop(str(block.block_id), None)
                     if block.prefix_hash:
@@ -166,6 +193,21 @@ class KVCacheManager:
         """Return cache statistics."""
         with self._lock:
             return dict(self._stats)
+
+    def get_transfer_stats(self) -> dict[str, Any]:
+        """Return measured local-tier movement statistics.
+
+        This is intentionally separate from network/RDMA statistics.  The
+        local manager can prove tier transitions, block counts, and tokens
+        moved; it cannot claim NIXL, UCCL, RDMA, or GPU-initiated transfers.
+        """
+        with self._lock:
+            return {
+                "local_tier_transfers": int(self._stats["transfers"]),
+                "transferred_tokens": int(self._stats["transferred_tokens"]),
+                "transfers_by_route": dict(self._stats["transfers_by_route"]),
+                "last_transfer_monotonic": self._stats["last_transfer_monotonic"],
+            }
 
     def hit_rate(self) -> float:
         """Return the prefix cache hit rate."""

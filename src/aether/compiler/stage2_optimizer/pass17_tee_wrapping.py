@@ -91,6 +91,30 @@ class TEEKernelWrappingPass(BasePass):
         if not config.enable_tee:
             return graph, report
 
+        # Configuration and weight hashes are useful attestation inputs, but
+        # they are not an enclave implementation.  A real Pass 17 result must
+        # be backed by executable TEE-wrapped kernel artifacts emitted by a
+        # target backend.  No such backend is present in the current tree;
+        # require a concrete backend-produced bundle rather than publishing a
+        # software-only TEE claim that R8 cannot attest.
+        graph_state = getattr(graph, "__dict__", {})
+        compiled_kernels = (
+            graph_state.get("tee_compiled_kernels")
+            if isinstance(graph_state, dict)
+            else None
+        )
+        if compiled_kernels is None and hasattr(graph, "metadata"):
+            compiled_kernels = graph.metadata.get("tee_compiled_kernels")
+        if not isinstance(compiled_kernels, (list, tuple)) or not compiled_kernels:
+            report.details = {
+                "reason": "tee_backend_artifacts_unavailable",
+                "message": (
+                    "Pass 17 requires executable backend-emitted TEE kernel artifacts; "
+                    "configuration and hashes alone are not an enclave"
+                ),
+            }
+            return graph, report
+
         backend = config.tee_backend
         if backend not in _SUPPORTED_TEE_BACKENDS:
             logger.warning("Pass 17: Unknown TEE backend %r. Using nvidia_cc.", backend)

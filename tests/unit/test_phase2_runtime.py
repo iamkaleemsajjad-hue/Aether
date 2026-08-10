@@ -92,11 +92,26 @@ class TestEAGLE3Engine:
             branching_factor=3,
             acceptance_floor=0.6,
         )
-        return EAGLE3Engine(plan=plan, hidden_size=64, vocab_size=vocab_size)
+        projection = np.linspace(
+            -0.25, 0.25, num=64 * vocab_size, dtype=np.float32
+        ).reshape(64, vocab_size)
+        return EAGLE3Engine(
+            plan=plan,
+            hidden_size=64,
+            vocab_size=vocab_size,
+            output_projection=projection,
+        )
+
+    @staticmethod
+    def _hidden_states() -> list[np.ndarray]:
+        return [
+            np.linspace(-1.0, 1.0, num=64, dtype=np.float32),
+            np.linspace(1.0, -1.0, num=64, dtype=np.float32),
+        ]
 
     def test_build_draft_tree_basic(self):
         engine = self._make_engine()
-        roots = engine.build_draft_tree([1, 2, 3])
+        roots = engine.build_draft_tree([1, 2, 3], hidden_states=self._hidden_states())
         assert len(roots) > 0
         for root in roots:
             assert root.depth == 0
@@ -104,21 +119,21 @@ class TestEAGLE3Engine:
 
     def test_draft_tree_depth(self):
         engine = self._make_engine()
-        roots = engine.build_draft_tree([10])
+        roots = engine.build_draft_tree([10], hidden_states=self._hidden_states())
         # BFS check for children at depth > 0
         has_children = any(len(r.children) > 0 for r in roots)
         assert has_children
 
     def test_path_to_root(self):
         engine = self._make_engine()
-        roots = engine.build_draft_tree([5, 10, 15])
+        roots = engine.build_draft_tree([5, 10, 15], hidden_states=self._hidden_states())
         for root in roots:
             path = root.path_to_root()
             assert path[-1] == root.token_id  # leaf ends with its own id
 
     def test_verify_returns_tokens(self):
         engine = self._make_engine()
-        roots = engine.build_draft_tree([1, 2, 3])
+        roots = engine.build_draft_tree([1, 2, 3], hidden_states=self._hidden_states())
         tokens, accepted, proposed = engine.verify(roots, temperature=1.0)
         assert isinstance(tokens, list)
         assert isinstance(accepted, int)
@@ -135,15 +150,16 @@ class TestEAGLE3Engine:
     def test_acceptance_rate_tracking(self):
         engine = self._make_engine()
         for _ in range(5):
-            roots = engine.build_draft_tree([42])
+            roots = engine.build_draft_tree([42], hidden_states=self._hidden_states())
             engine.verify(roots, temperature=0.5)
         rate = engine.acceptance_rate()
         assert 0.0 <= rate <= 1.0
 
     def test_should_use_speculation_initial(self):
         engine = self._make_engine()
-        # Before any steps, should be optimistic
-        assert engine.should_use_speculation() is True
+        # No acceptance evidence exists yet, so the engine must not claim that
+        # speculation is safe before a verified draft step.
+        assert engine.should_use_speculation() is False
 
     def test_stats_dict(self):
         engine = self._make_engine()
@@ -158,13 +174,27 @@ class TestEAGLE3Engine:
 
     def test_feature_extrapolator_top_k(self):
         from aether.runtime.eagle import FeatureExtrapolator
-        fe = FeatureExtrapolator(hidden_size=64, vocab_size=256, fusion_layers=(0, 1))
-        logits = fe.extrapolate([], last_token_id=7, temperature=1.0)
+        projection = np.eye(64, 256, dtype=np.float32)
+        fe = FeatureExtrapolator(
+            hidden_size=64,
+            vocab_size=256,
+            fusion_layers=(0, 1),
+            output_projection=projection,
+        )
+        logits = fe.extrapolate([np.ones(64, dtype=np.float32)], last_token_id=7, temperature=1.0)
         assert logits.shape == (256,)
         indices, probs = fe.top_k_probs(logits, k=5)
         assert len(indices) == 5
         assert len(probs) == 5
         assert abs(probs.sum() - 1.0) < 1e-4
+
+    def test_missing_draft_projection_fails_closed(self):
+        from aether.core.exceptions import RuntimeError as AetherRuntimeError
+        from aether.runtime.eagle import FeatureExtrapolator
+
+        fe = FeatureExtrapolator(hidden_size=4, vocab_size=8, fusion_layers=())
+        with pytest.raises(AetherRuntimeError, match="refusing synthetic logits"):
+            fe.extrapolate([np.ones(4, dtype=np.float32)], last_token_id=0)
 
 
 # ---------------------------------------------------------------------------

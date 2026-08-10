@@ -8,6 +8,7 @@ HuggingFace ``pytorch_model.bin`` format (which is also a torch.save file).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -62,7 +63,11 @@ class PyTorchLoader:
     Supports:
     - ``torch.save`` state dicts (.pt, .pth, .bin)
     - HuggingFace ``pytorch_model.bin`` sharded checkpoints
-    - Full model saves (``model.state_dict()`` wrappers)
+- Wrapped state dictionaries containing ``state_dict``/``model_state_dict``
+
+Full-object pickle checkpoints are intentionally rejected unless Torch's
+weights-only loader can prove they are safe; the compiler never executes an
+untrusted model pickle as a fallback.
     """
 
     def __init__(self, model_path: str | Path) -> None:
@@ -101,9 +106,15 @@ class PyTorchLoader:
 
         try:
             checkpoint = torch.load(str(path), map_location="cpu", weights_only=True)
-        except TypeError:
-            # weights_only not supported in older torch
-            checkpoint = torch.load(str(path), map_location="cpu")
+        except TypeError as exc:
+            # Falling back to ordinary torch.load would execute arbitrary
+            # pickle code from an untrusted model file.  Aether's compiler
+            # boundary is weights-only by default; old Torch versions must
+            # upgrade rather than silently weakening this security contract.
+            raise IngestionError(
+                "safe PyTorch checkpoint loading requires torch.load(weights_only=True); "
+                "upgrade PyTorch instead of enabling unsafe pickle execution"
+            ) from exc
         except Exception as exc:
             msg = f"Failed to load PyTorch checkpoint {path}: {exc}"
             raise IngestionError(msg) from exc
@@ -126,13 +137,38 @@ class PyTorchLoader:
         """Load all .bin shards from a HuggingFace model directory."""
         import torch
 
-        shard_files = sorted(directory.glob("pytorch_model*.bin")) or sorted(
-            directory.glob("model*.bin")
+        index_candidates = (
+            directory / "pytorch_model.bin.index.json",
+            directory / "model.bin.index.json",
         )
-        if not shard_files:
-            shard_files = sorted(directory.glob("*.pt")) + sorted(
-                directory.glob("*.pth")
+        index_path = next((candidate for candidate in index_candidates if candidate.is_file()), None)
+        if index_path is not None:
+            try:
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+                weight_map = index.get("weight_map")
+                if not isinstance(weight_map, dict) or not weight_map:
+                    raise ValueError("checkpoint index has no weight_map")
+                shard_names = sorted({str(name) for name in weight_map.values()})
+                shard_files = []
+                root = directory.resolve()
+                for shard_name in shard_names:
+                    relative = Path(shard_name)
+                    if relative.is_absolute() or ".." in relative.parts:
+                        raise ValueError(f"unsafe shard path {shard_name!r}")
+                    shard = (directory / relative).resolve()
+                    if not shard.is_relative_to(root):
+                        raise ValueError(f"shard path escapes checkpoint directory: {shard_name!r}")
+                    shard_files.append(shard)
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                raise IngestionError(f"invalid PyTorch checkpoint index {index_path}: {exc}") from exc
+        else:
+            shard_files = sorted(directory.glob("pytorch_model*.bin")) or sorted(
+                directory.glob("model*.bin")
             )
+            if not shard_files:
+                shard_files = sorted(directory.glob("*.pt")) + sorted(
+                    directory.glob("*.pth")
+                )
         if not shard_files:
             msg = f"No PyTorch weight files found in {directory}"
             raise IngestionError(msg)
@@ -142,8 +178,11 @@ class PyTorchLoader:
             try:
                 try:
                     ckpt = torch.load(str(shard), map_location="cpu", weights_only=True)
-                except TypeError:
-                    ckpt = torch.load(str(shard), map_location="cpu")
+                except TypeError as exc:
+                    raise IngestionError(
+                        "safe PyTorch shard loading requires torch.load(weights_only=True); "
+                        "upgrade PyTorch instead of enabling unsafe pickle execution"
+                    ) from exc
                 shard_weights, _ = self._extract_weights(ckpt)
                 if not shard_weights:
                     raise IngestionError(f"PyTorch shard contains no tensor weights: {shard}")

@@ -171,12 +171,22 @@ class GreenPowerManager:
         self,
         n_prompt_tokens: int,
         n_gen_tokens: int,
+        duration_s: float | None = None,
     ) -> float:
         """Estimate energy consumption for a request (mJ).
 
-        Uses roofline model from the green profile's operator energy table.
-        Formula: E ≈ (n_tokens / 1M) × E_per_1M × mode_factor.
+        When ``duration_s`` is supplied, energy is derived from the current
+        power reading when available, otherwise from the compiled TDP cap and
+        the selected mode.  Without a duration this retains the token-based
+        fallback for callers that only have token counts.
         """
+        if duration_s is not None:
+            energy_mj, _ = self.measure_request_energy(
+                duration_s,
+                n_prompt_tokens=n_prompt_tokens,
+                n_gen_tokens=n_gen_tokens,
+            )
+            return energy_mj
         n_tokens = n_prompt_tokens + n_gen_tokens
         # Conservative estimate: ~500 mJ per 1M tokens at full TDP for 7B model.
         base_energy_mj = (n_tokens / 1e6) * 500.0
@@ -188,6 +198,40 @@ class GreenPowerManager:
             self.MODE_ECO: 0.52,       # 48% savings (MELODI 2026 max).
         }.get(self.mode, 1.0)
         return base_energy_mj * (tdp_w / 400.0) * mode_factor
+
+    def measure_request_energy(
+        self,
+        duration_s: float,
+        *,
+        n_prompt_tokens: int = 0,
+        n_gen_tokens: int = 0,
+    ) -> tuple[float, str]:
+        """Return request energy and its evidence source.
+
+        A positive ``update_power_reading`` value is treated as measured
+        device power.  If no device reading exists, the result is explicitly
+        labelled a TDP-duration estimate; it is never presented as hardware
+        telemetry.  The token arguments are retained for future profile-based
+        accounting and make the call site self-describing.
+        """
+        duration_s = float(duration_s)
+        if duration_s < 0.0 or not math.isfinite(duration_s):
+            raise ValueError("duration_s must be a finite non-negative value")
+        del n_prompt_tokens, n_gen_tokens
+        with self._lock:
+            if self._current_power_w > 0.0:
+                power_w = self._current_power_w
+                source = "measured_power_reading"
+            else:
+                power_w = self._tdp_cap_w or 400.0
+                mode_factor = {
+                    self.MODE_PERFORMANCE: 1.00,
+                    self.MODE_BALANCED: 0.65,
+                    self.MODE_ECO: 0.52,
+                }.get(self.mode, 1.0)
+                power_w *= mode_factor
+                source = "tdp_duration_estimate"
+        return power_w * duration_s * 1000.0, source
 
     def estimate_carbon(self, energy_mj: float) -> float:
         """Estimate carbon footprint in gCO₂ equivalent.
@@ -237,12 +281,22 @@ class GreenPowerManager:
 
         return best or (available_regions[0] if available_regions else "default")
 
-    def record_request(self, energy_mj: float, carbon_gco2: float) -> None:
+    def record_request(
+        self,
+        energy_mj: float,
+        carbon_gco2: float,
+        *,
+        source: str = "tdp_duration_estimate",
+    ) -> None:
         """Record energy and carbon for a completed request."""
         with self._lock:
             self._stats.total_energy_mj += energy_mj
             self._stats.total_carbon_gco2 += carbon_gco2
             self._stats.total_requests += 1
+            if source == "measured_power_reading":
+                self._stats.measured_requests += 1
+            else:
+                self._stats.estimated_requests += 1
 
     @property
     def stats(self) -> "_GreenStats":
@@ -256,8 +310,10 @@ class GreenPowerManager:
             "tdp_cap_w": self._tdp_cap_w,
             "dvfs_hints_loaded": len(self._dvfs_hints),
             "total_energy_j": round(self._stats.total_energy_mj / 1000, 3),
-            "total_carbon_gco2": round(self._stats.total_carbon_gco2, 6),
-            "throttle_events": self._stats.throttle_events,
+                "total_carbon_gco2": round(self._stats.total_carbon_gco2, 6),
+                "throttle_events": self._stats.throttle_events,
+                "measured_requests": self._stats.measured_requests,
+                "estimated_requests": self._stats.estimated_requests,
         }
 
     def get_status(self) -> dict[str, Any]:
@@ -276,10 +332,19 @@ class GreenPowerManager:
 
 
 class _GreenStats:
-    __slots__ = ("total_energy_mj", "total_carbon_gco2", "total_requests", "throttle_events")
+    __slots__ = (
+        "total_energy_mj",
+        "total_carbon_gco2",
+        "total_requests",
+        "throttle_events",
+        "measured_requests",
+        "estimated_requests",
+    )
 
     def __init__(self) -> None:
         self.total_energy_mj = 0.0
         self.total_carbon_gco2 = 0.0
         self.total_requests = 0
         self.throttle_events = 0
+        self.measured_requests = 0
+        self.estimated_requests = 0

@@ -20,9 +20,11 @@ from aether.quantization.codecs import (
     NF4Codec,
     PassthroughCodec,
     SymmetricIntCodec,
+    TernaryCodec,
     get_codec,
     supported_precisions,
 )
+from aether.quantization.formats import dequantize_tensor, quantize_tensor
 
 #: Every precision the registry resolves, used for property-based sweeps.
 ALL_PRECISIONS = supported_precisions()
@@ -61,6 +63,7 @@ class TestCodecRegistry:
             ("FP8", FP8Codec),
             ("FP4", FP4Codec),
             ("BF16", PassthroughCodec),
+            ("TERNARY", TernaryCodec),
         ],
     )
     def test_dispatches_to_correct_family(self, precision: str, expected: type) -> None:
@@ -119,6 +122,18 @@ class TestCodecRegistry:
 
     def test_precision_is_case_insensitive(self) -> None:
         assert get_codec("q4_k_m").name == get_codec("Q4_K_M").name
+
+    def test_bitnet_alias_and_packed_tensor_roundtrip(self) -> None:
+        assert get_codec("bitnet").name == "TERNARY"
+        values = np.linspace(-1.0, 1.0, 64, dtype=np.float32).reshape(2, 32)
+        tensor = quantize_tensor(values, "TERNARY", block_size=32)
+        assert tensor.packed is True
+        assert tensor.bits == 2
+        assert tensor.data.nbytes == 16
+        restored = dequantize_tensor(tensor)
+        assert restored.shape == values.shape
+        assert np.isfinite(restored).all()
+        assert np.all(restored[values == 0.0] == 0.0)
 
     @pytest.mark.parametrize(
         ("precision", "bits"),

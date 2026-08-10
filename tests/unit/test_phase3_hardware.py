@@ -213,6 +213,17 @@ class TestMInferencePass:
         g.metadata = {}
         return g
 
+    @staticmethod
+    def _calibration_maps(num_layers: int, num_heads: int) -> dict[tuple[int, int], np.ndarray]:
+        rng = np.random.default_rng(123)
+        maps = {}
+        for layer_idx in range(num_layers):
+            for head_idx in range(num_heads):
+                raw = np.tril(rng.random((64, 64), dtype=np.float32))
+                raw += np.eye(64, dtype=np.float32)
+                maps[(layer_idx, head_idx)] = raw
+        return maps
+
     def test_skips_short_context(self):
         from aether.compiler.stage2_optimizer.pass8_minference import Pass8MInference
         p = Pass8MInference(
@@ -231,7 +242,8 @@ class TestMInferencePass:
                 "num_attention_heads": 8,
                 "num_hidden_layers": 4,
             },
-            model_id="qwen3-72b"
+            model_id="qwen3-72b",
+            calibration_attention_maps=self._calibration_maps(4, 8),
         )
         g = self._make_graph(num_layers=4)
         p.run(g)
@@ -245,7 +257,8 @@ class TestMInferencePass:
                 "max_position_embeddings": 65536,
                 "num_attention_heads": 4,
                 "num_hidden_layers": 4,
-            }
+            },
+            calibration_attention_maps=self._calibration_maps(4, 4),
         )
         p.run(self._make_graph(4))
         for pattern in p.profile.patterns:
@@ -261,12 +274,32 @@ class TestMInferencePass:
                 "num_attention_heads": 2,
                 "num_hidden_layers": 2,
             },
-            model_id="test-model"
+            model_id="test-model",
+            calibration_attention_maps=self._calibration_maps(2, 2),
         )
         p.run(self._make_graph(2), aeg_dir=str(tmp_path))
         loaded = MInferenceProfile.load(tmp_path)
         assert loaded.model_id == "test-model"
+        assert p.profile is not None
+        assert p.profile is not None
         assert len(loaded.patterns) == 4  # 2 layers × 2 heads
+
+
+    def test_skips_long_context_without_calibration(self):
+        from aether.compiler.stage2_optimizer.pass8_minference import Pass8MInference
+
+        g = self._make_graph(2)
+        p = Pass8MInference(
+            model_config={
+                "max_position_embeddings": 65536,
+                "num_attention_heads": 2,
+                "num_hidden_layers": 2,
+            }
+        )
+        p.run(g)
+        assert p.profile is None
+        assert g.metadata["minference_enabled"] is False
+        assert "calibration" in g.metadata["minference_reason"]
 
 
 class TestSparseAttentionKernel:
@@ -368,14 +401,19 @@ class TestPass9PruningSparsity:
         p.run(g, aeg_dir=str(tmp_path))
         assert p.manifest is not None
         assert p.manifest.strategy == "speed"
-        assert p.manifest.estimated_throughput_multiplier > 1.0
+        # No real weights were supplied, so the pass must not claim measured
+        # sparsity or a speedup from a structure-only plan.
+        assert p.manifest.layer_masks == []
+        assert p.manifest.global_sparsity == 0.0
+        assert p.manifest.estimated_throughput_multiplier == 1.0
 
     def test_blackwell_strategy(self):
         from aether.compiler.stage2_optimizer.pass9_pruning_sparsity import Pass9PruningSparsity
         p = Pass9PruningSparsity(strategy="blackwell", model_id="test")
         g = self._make_graph()
         p.run(g)
-        assert p.manifest.estimated_throughput_multiplier >= 1.5
+        assert p.manifest.layer_masks == []
+        assert p.manifest.estimated_throughput_multiplier == 1.0
 
     def test_unknown_strategy_raises(self):
         from aether.compiler.stage2_optimizer.pass9_pruning_sparsity import Pass9PruningSparsity

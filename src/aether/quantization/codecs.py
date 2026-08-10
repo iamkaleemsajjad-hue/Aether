@@ -38,6 +38,7 @@ __all__ = [
     "FP8Codec",
     "FP4Codec",
     "MXFP4Codec",
+    "TernaryCodec",
     "PassthroughCodec",
     "get_codec",
     "supported_precisions",
@@ -500,6 +501,49 @@ class MXFP4Codec(Codec):
 
 
 
+class TernaryCodec(Codec):
+    """BitNet b1.58 ternary codec with real two-bit packed storage.
+
+    Codes use the stable Aether/BitKV mapping ``00 -> 0``, ``01 -> +1`` and
+    ``10 -> -1``.  ``11`` is reserved and decodes as zero, so corrupted or
+    padded lanes cannot introduce an out-of-range weight.  A per-block
+    abs-mean scale preserves the BitNet weight reconstruction rule.
+    """
+
+    name = "TERNARY"
+    bits = 2
+    packable = True
+    asymmetric = False
+
+    def encode(self, blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        scales = np.mean(np.abs(blocks), axis=1).astype(np.float32)
+        degenerate = scales < _EPS
+        normalised = blocks / _safe_divisor(scales)[:, None]
+        signed = np.clip(np.rint(normalised), -1, 1).astype(np.int8)
+        codes = np.where(signed < 0, 2, np.where(signed > 0, 1, 0)).astype(np.uint8)
+        codes[degenerate, :] = 0
+        scales[degenerate] = 0.0
+        zero_points = np.zeros(blocks.shape[0], dtype=np.float32)
+        return codes, scales, zero_points
+
+    def decode(
+        self,
+        codes: np.ndarray,
+        scales: np.ndarray,
+        zero_points: np.ndarray,
+    ) -> np.ndarray:
+        del zero_points
+        values = np.select(
+            [codes == 1, codes == 2],
+            [np.float32(1.0), np.float32(-1.0)],
+            default=np.float32(0.0),
+        )
+        return (values * scales[:, None].astype(np.float32)).astype(np.float32)
+
+    def default_zero_points(self, num_blocks: int) -> np.ndarray:
+        return np.zeros(num_blocks, dtype=np.float32)
+
+
 class PassthroughCodec(Codec):
     """Rounding-only codec for BF16/FP16/FP32.
 
@@ -570,6 +614,8 @@ _SYMMETRIC_FORMATS: dict[str, int] = {
 
 #: Aliases resolving to a canonical codec constructor key.
 _ALIASES: dict[str, str] = {
+    "BITNET": "TERNARY",
+    "TERNARY_2BIT": "TERNARY",
     "NORMALFLOAT4": "NF4",
     "E4M3": "FP8",
     "FP8_E4M3": "FP8",
@@ -585,7 +631,7 @@ _ALIASES: dict[str, str] = {
 def supported_precisions() -> list[str]:
     """Return every precision identifier :func:`get_codec` accepts, sorted."""
     names = (
-        ["BF16", "FP16", "FP32", "NF4", "FP8", "FP8_E5M2", "FP4", "MXFP4"]
+        ["BF16", "FP16", "FP32", "NF4", "FP8", "FP8_E5M2", "FP4", "MXFP4", "TERNARY"]
         + list(_AFFINE_FORMATS)
         + list(_SYMMETRIC_FORMATS)
         + list(_ALIASES)
@@ -618,6 +664,8 @@ def get_codec(precision: str) -> Codec:
         return FP4Codec()
     if key == "MXFP4":
         return MXFP4Codec()
+    if key == "TERNARY":
+        return TernaryCodec()
     if key in _AFFINE_FORMATS:
         return AffineIntCodec(key, _AFFINE_FORMATS[key])
     if key in _SYMMETRIC_FORMATS:

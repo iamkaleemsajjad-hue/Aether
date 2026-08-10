@@ -18,6 +18,7 @@ without doing the expensive work.
 from __future__ import annotations
 
 import datetime
+import json
 import shutil
 import tempfile
 from pathlib import Path
@@ -518,6 +519,19 @@ class Compiler:
         package.ir = ir
         if hasattr(graph, "metadata"):
             package.metadata = dict(getattr(graph, "metadata"))
+        # Persisted optimizer plans are executable runtime inputs, not merely
+        # validation payloads.  Surface the staged Pass 14 plan in metadata so
+        # a fresh AEG loader can attach it to the CPU KV cache after restart.
+        semantic_kv_plan = package.root / "graph" / "kv_compression_plan.json"
+        if semantic_kv_plan.is_file():
+            package.metadata["kv_compression_plan"] = json.loads(
+                semantic_kv_plan.read_text(encoding="utf-8")
+            )
+        cross_layer_kv_plan = package.root / "graph" / "cross_layer_kv_plan.json"
+        if cross_layer_kv_plan.is_file():
+            package.metadata["cross_layer_kv_plan"] = json.loads(
+                cross_layer_kv_plan.read_text(encoding="utf-8")
+            )
         primary_target = target_profiles[0].target_id if target_profiles else "cpu_avx512"
         from aether.agentic import AgentWorkflowOptimizer, ToolCall
         from aether.attention import MLAPlanner
@@ -647,6 +661,37 @@ class Compiler:
                 precision_map.update(report.details.get("precision_map", {}))
         if not precision_map:
             precision_map = {f"layer_{i}": "Q4_K_M" for i in range(architecture.layers)}
+        sub2bit_report = next(
+            (
+                report
+                for report in pass_reports
+                if report.pass_name == "sub2bit_quantization"
+                and report.status == "applied"
+            ),
+            None,
+        )
+        if sub2bit_report is not None:
+            method = str(sub2bit_report.details.get("method", ""))
+            if method != "bitnet":
+                raise CompilationError(
+                    f"Sub-2-bit pass reported unsupported runtime method {method!r}",
+                    model_id=model_id,
+                    stage="stage4_packaging",
+                )
+            # Preserve BF16 embedding/output/norm defaults while assigning the
+            # real BitNet codec to every transformer layer projection.
+            precision_map = {
+                f"layer_{i}": "TERNARY" for i in range(architecture.layers)
+            }
+            package.metadata["sub2bit_runtime"] = {
+                "method": method,
+                "precision": "TERNARY",
+                "backend": "cpu_reference_dense_dequantize",
+                "quality_gate": sub2bit_report.details.get("quality_gate", {}),
+                "weight_reconstruction": sub2bit_report.details.get(
+                    "weight_reconstruction", {}
+                ),
+            }
         package.set_precision_map(precision_map)
 
         # ── Quantize and persist weights into the AEG blob ──────────────────
@@ -701,6 +746,41 @@ class Compiler:
             package.set_backend_plan(profile.target_id, backend_name)
         kernels.backend_plans = {t: package.get_backend_plan(t) for t in kernels.targets if package.get_backend_plan(t)}
         package.manifest.kernels = kernels
+
+        # Embed the real native CPU library when a host toolchain is available.
+        # The file is copied before package.save(), so AEG artifact hashing
+        # covers the executable itself and the reload path can load it instead
+        # of silently recompiling from a machine-local cache.
+        packaged_kernel_artifacts: list[dict[str, Any]] = []
+        try:
+            from aether.compiler.stage3_targeting.kernel_emitter import KernelEmitter
+            from aether.core.exceptions import KernelError
+            from aether.kernels.native_cpu import get_native_kernels
+
+            native = get_native_kernels()
+            if native.ensure_compiled() and native.library_path is not None:
+                for profile in target_profiles:
+                    if not profile.target_id.startswith("cpu_"):
+                        continue
+                    relative = Path("generated_kernels") / profile.target_id / (
+                        f"native_cpu{native.library_path.suffix}"
+                    )
+                    artifact = KernelEmitter(profile.target_id).emit_executable(
+                        "gemm", package.root / relative
+                    )
+                    packaged_kernel_artifacts.append(
+                        {
+                            "target_id": profile.target_id,
+                            "path": relative.as_posix(),
+                            "sha256": artifact.sha256,
+                            "symbols": list(artifact.symbols),
+                            "backend": artifact.backend,
+                        }
+                    )
+        except (KernelError, OSError) as exc:
+            logger.warning("Native CPU kernel was not embedded in AEG: %s", exc)
+        if packaged_kernel_artifacts:
+            package.metadata["kernel_artifacts"] = packaged_kernel_artifacts
 
         # Optimization metadata
         fused_ops_count = sum(

@@ -963,6 +963,9 @@ class ModelArchitecture:
     num_activated_experts: int = 0
     """Number of experts activated per token (top-K) (MoE only)."""
 
+    mtp_heads: int = 0
+    """Number of native multi-token-prediction heads, when declared by the checkpoint."""
+
     attention_type: str = "GQA"
     """Attention type: GQA, MLA, or MHA."""
 
@@ -1017,6 +1020,7 @@ class ModelArchitecture:
             "is_moe": self.is_moe,
             "num_experts": self.num_experts,
             "num_activated_experts": self.num_activated_experts,
+            "mtp_heads": self.mtp_heads,
             "attention_type": self.attention_type,
             "ffn_type": self.ffn_type,
         }
@@ -1040,6 +1044,7 @@ class ModelArchitecture:
             is_moe=data.get("is_moe", False),
             num_experts=data.get("num_experts", 0),
             num_activated_experts=data.get("num_activated_experts", 0),
+            mtp_heads=data.get("mtp_heads", 0),
             attention_type=data.get("attention_type", "GQA"),
             ffn_type=data.get("ffn_type", "SwiGLU"),
         )

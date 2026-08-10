@@ -11,6 +11,11 @@ from __future__ import annotations
 import json
 import math
 import re
+import csv
+import os
+import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -240,6 +245,268 @@ class JsonlBenchmarkEvaluator:
     @staticmethod
     def _normalize(value: Any) -> str:
         return re.sub(r"\s+", " ", str(value).strip().casefold()).strip(" .,:;\"'`[]()")
+
+
+class DatasetBenchmarkEvaluator:
+    """Evaluate common PRD benchmark file formats against a real model callback.
+
+    This adapter deliberately accepts local dataset files only.  It supports
+    the public dataset layouts used by HellaSwag, MMLU, GSM8K/Math-500/AIME,
+    and HumanEval without bundling or downloading copyrighted benchmark data.
+    The callback is the only model execution boundary; no score is inferred
+    from a non-empty response.
+
+    HumanEval execution is disabled by default because generated code is
+    untrusted.  Callers must explicitly set ``allow_code_execution=True`` and
+    accept that this is an evaluation sandbox boundary, not a security sandbox.
+    """
+
+    _SUPPORTED = frozenset({"hellaswag", "mmlu", "gsm8k", "math-500", "humaneval", "aime"})
+
+    def __init__(
+        self,
+        dataset_paths: Mapping[str, str | Path],
+        generate_fn: Callable[..., str],
+        *,
+        max_tokens: int = 256,
+        max_examples: int | None = None,
+        allow_code_execution: bool = False,
+        code_timeout_s: float = 5.0,
+    ) -> None:
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if max_examples is not None and max_examples <= 0:
+            raise ValueError("max_examples must be positive when provided")
+        if code_timeout_s <= 0:
+            raise ValueError("code_timeout_s must be positive")
+        self.dataset_paths = {str(name).lower(): Path(path) for name, path in dataset_paths.items()}
+        self.generate_fn = generate_fn
+        self.max_tokens = max_tokens
+        self.max_examples = max_examples
+        self.allow_code_execution = allow_code_execution
+        self.code_timeout_s = code_timeout_s
+
+    def __call__(self, benchmark: str, spec: Mapping[str, Any]) -> BenchmarkResult:
+        benchmark = str(benchmark).lower()
+        if benchmark not in self._SUPPORTED:
+            raise BenchmarkError(f"Unsupported dataset benchmark {benchmark!r}")
+        path = self.dataset_paths.get(benchmark)
+        if path is None:
+            raise BenchmarkError(f"No dataset configured for benchmark {benchmark!r}")
+        if not path.is_file():
+            raise BenchmarkError(f"Benchmark dataset not found: {path}")
+        if benchmark == "humaneval" and not self.allow_code_execution:
+            raise BenchmarkError(
+                "HumanEval requires allow_code_execution=True because it executes generated code"
+            )
+
+        records = self._load_records(benchmark, path)
+        if self.max_examples is not None:
+            records = records[: self.max_examples]
+        if not records:
+            raise BenchmarkError(f"Benchmark dataset {path} contains no examples")
+
+        correct = 0
+        started = time.perf_counter()
+        for line_number, record in enumerate(records, start=1):
+            if benchmark == "humaneval":
+                passed = self._run_humaneval(record, path, line_number)
+            else:
+                prompt, expected, choices = self._prompt_and_answer(benchmark, record, path, line_number)
+                response = self.generate_fn(
+                    prompt=prompt,
+                    benchmark=benchmark,
+                    max_tokens=self.max_tokens,
+                )
+                if not isinstance(response, str):
+                    raise BenchmarkError(
+                        f"generate_fn returned {type(response).__name__} for {benchmark!r}; expected str"
+                    )
+                passed = self._matches(benchmark, response, expected, choices)
+            correct += int(passed)
+
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        return BenchmarkResult(
+            benchmark=benchmark,
+            score=correct / len(records),
+            num_correct=correct,
+            num_total=len(records),
+            perplexity=None,
+            latency_ms=elapsed_ms / len(records),
+            metadata={
+                "dataset": str(path),
+                "evaluator": "standard_local_dataset",
+                "code_execution": benchmark == "humaneval",
+                "max_examples": len(records),
+            },
+        )
+
+    @staticmethod
+    def _load_records(benchmark: str, path: Path) -> list[Mapping[str, Any]]:
+        if benchmark == "mmlu" or path.suffix.lower() == ".csv":
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                return [dict(row) for row in csv.DictReader(handle)]
+        if benchmark == "humaneval" and path.suffix.lower() == ".json":
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                raise BenchmarkError("HumanEval JSON root must be an array")
+            return [row for row in data if isinstance(row, Mapping)]
+
+        records: list[Mapping[str, Any]] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise BenchmarkError(f"Invalid JSON in {path} at line {line_number}") from exc
+                if not isinstance(row, Mapping):
+                    raise BenchmarkError(f"Dataset record at {path}:{line_number} must be an object")
+                records.append(row)
+        return records
+
+    @classmethod
+    def _prompt_and_answer(
+        cls,
+        benchmark: str,
+        record: Mapping[str, Any],
+        path: Path,
+        line_number: int,
+    ) -> tuple[str, Any, list[Any] | None]:
+        if benchmark == "hellaswag":
+            prompt = record.get("ctx") or record.get("context")
+            choices = record.get("endings") or record.get("choices")
+            expected = record.get("label")
+            if not isinstance(prompt, str) or not isinstance(choices, list) or expected is None:
+                raise BenchmarkError(f"Invalid HellaSwag record at {path}:{line_number}")
+            try:
+                expected = int(expected)
+            except (TypeError, ValueError) as exc:
+                raise BenchmarkError(f"Invalid HellaSwag label at {path}:{line_number}") from exc
+            return prompt, expected, choices
+        if benchmark == "mmlu":
+            prompt = record.get("question")
+            choices = [record.get(letter) for letter in ("A", "B", "C", "D")]
+            expected = record.get("answer")
+            if not isinstance(prompt, str) or any(not isinstance(choice, str) for choice in choices):
+                raise BenchmarkError(f"Invalid MMLU record at {path}:{line_number}")
+            return prompt, expected, choices
+
+        prompt = record.get("question") or record.get("problem")
+        expected = record.get("answer", record.get("target", record.get("expected")))
+        if benchmark == "humaneval":
+            prompt = record.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip() or expected is None:
+            raise BenchmarkError(f"Invalid {benchmark} record at {path}:{line_number}")
+        return prompt, expected, None
+
+    @classmethod
+    def _matches(
+        cls,
+        benchmark: str,
+        response: str,
+        expected: Any,
+        choices: list[Any] | None,
+    ) -> bool:
+        if choices is not None:
+            normalized_response = JsonlBenchmarkEvaluator._normalize(response)
+            if isinstance(expected, int):
+                if not 0 <= expected < len(choices):
+                    return False
+                values = [choices[expected], chr(ord("A") + expected), str(expected)]
+            else:
+                values = [expected]
+            return any(
+                (normalized := JsonlBenchmarkEvaluator._normalize(value))
+                and (
+                    normalized_response == normalized
+                    or normalized_response.startswith(normalized + " ")
+                    or normalized_response.startswith(normalized + ")")
+                    or normalized_response.startswith(normalized + ".")
+                )
+                for value in values
+            )
+        if benchmark in {"gsm8k", "math-500", "aime"}:
+            return cls._math_normalize(cls._extract_math_answer(response)) == cls._math_normalize(
+                cls._extract_math_answer(str(expected))
+            )
+        return JsonlBenchmarkEvaluator._normalize(response) == JsonlBenchmarkEvaluator._normalize(expected)
+
+    @staticmethod
+    def _extract_math_answer(value: str) -> str:
+        matches = re.findall(r"####\s*([^\n]+)", value)
+        if matches:
+            return matches[-1].strip()
+        boxed = re.findall(r"\\boxed\{([^{}]+)\}", value)
+        if boxed:
+            return boxed[-1].strip()
+        return value.strip().splitlines()[-1] if value.strip() else ""
+
+    @staticmethod
+    def _math_normalize(value: str) -> str:
+        value = value.strip().replace(",", "")
+        value = re.sub(r"\\(?:text|mathrm)\{([^{}]*)\}", r"\1", value)
+        value = re.sub(r"\s+", "", value).casefold()
+        try:
+            return f"{float(value):.12g}"
+        except ValueError:
+            return value.strip(" .:;,$")
+
+    def _run_humaneval(self, record: Mapping[str, Any], path: Path, line_number: int) -> bool:
+        prompt = record.get("prompt")
+        tests = record.get("test")
+        entry_point = record.get("entry_point")
+        if not all(isinstance(value, str) and value for value in (prompt, tests, entry_point)):
+            raise BenchmarkError(f"Invalid HumanEval record at {path}:{line_number}")
+        response = self.generate_fn(prompt=prompt, benchmark="humaneval", max_tokens=self.max_tokens)
+        if not isinstance(response, str):
+            raise BenchmarkError("HumanEval generate_fn must return source text")
+        completion = re.sub(
+            r"^```(?:python)?\s*|\s*```$", "", response.strip(), flags=re.IGNORECASE
+        )
+        # HumanEval prompts contain the function signature.  The model may
+        # return only the body or a complete function; support both without
+        # dropping the prompt from the executable candidate.
+        source = completion if completion.startswith("def ") else str(prompt) + completion
+        script = source + "\n\n" + tests + f"\n\ncheck({entry_point})\n"
+        with tempfile.TemporaryDirectory(prefix="aether-humaneval-") as tmp:
+            script_path = Path(tmp) / "candidate.py"
+            script_path.write_text(script, encoding="utf-8")
+            # Windows Python needs system variables such as SystemRoot for
+            # runtime initialization.  Preserve the host environment while
+            # removing import/code injection hooks; this is an explicit
+            # evaluation subprocess, not a security sandbox.
+            secret_prefixes = (
+                "AETHER_",
+                "AWS_",
+                "AZURE_",
+                "GOOGLE_",
+                "GCP_",
+                "HF_",
+                "OPENAI_",
+            )
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if not key.upper().startswith(secret_prefixes)
+            }
+            env.pop("PYTHONPATH", None)
+            env.pop("PYTHONHOME", None)
+            env["PYTHONNOUSERSITE"] = "1"
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-I", str(script_path)],
+                    cwd=tmp,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.code_timeout_s,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return False
+        return completed.returncode == 0
 
 
 # ---------------------------------------------------------------------------

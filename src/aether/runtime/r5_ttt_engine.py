@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import math
+import struct
 import threading
 import time
 from pathlib import Path
@@ -41,6 +42,9 @@ from typing import Any
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+_TTT_SLOT_MAGIC = b"AETHER_TTT_SLOT1"
+_TTT_SLOT_HEADER = struct.Struct("<16sIIII")
 
 
 class TTTFastWeightEngine:
@@ -89,7 +93,7 @@ class TTTFastWeightEngine:
         }
 
     def _load_config(self, config_path: str) -> None:
-        """Load TTT configuration from AEG artifact."""
+        """Load and validate TTT configuration and persisted slot payloads."""
         p = Path(config_path)
         if not p.exists():
             return
@@ -103,6 +107,23 @@ class TTTFastWeightEngine:
             self._base_weights = [
                 self._init_slot(self.hidden_size, self.rank) for _ in range(self.n_layers)
             ]
+            slots = cfg.get("slots")
+            if not isinstance(slots, list) or len(slots) != self.n_layers:
+                raise ValueError(
+                    f"TTT config must describe exactly {self.n_layers} persisted slots"
+                )
+            for descriptor in slots:
+                if not isinstance(descriptor, dict):
+                    raise ValueError("TTT slot descriptor must be an object")
+                layer_index = int(descriptor["layer_index"])
+                if not 0 <= layer_index < self.n_layers:
+                    raise ValueError(f"TTT slot layer index out of range: {layer_index}")
+                slot_file = descriptor.get("slot_file")
+                if not isinstance(slot_file, str) or Path(slot_file).name != slot_file:
+                    raise ValueError("TTT slot_file must be a relative filename")
+                self._base_weights[layer_index] = self._read_slot(
+                    p.parent / slot_file, layer_index
+                )
             logger.info(
                 "R5: TTT config loaded: %d layers, hidden=%d, rank=%d, lr=%.2e.",
                 self.n_layers,
@@ -112,6 +133,45 @@ class TTTFastWeightEngine:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("R5: Failed to load TTT config: %s", exc)
+            raise ValueError(f"invalid TTT artifact {p}: {exc}") from exc
+
+    def _read_slot(self, path: Path, expected_layer: int) -> dict[str, list[float]]:
+        """Read one versioned float32 slot payload and validate its dimensions."""
+        raw = path.read_bytes()
+        if len(raw) < _TTT_SLOT_HEADER.size:
+            raise ValueError(f"TTT slot is truncated: {path}")
+        magic, layer, hidden_size, rank, value_count = _TTT_SLOT_HEADER.unpack_from(raw)
+        if magic != _TTT_SLOT_MAGIC:
+            raise ValueError(f"TTT slot has an invalid magic header: {path}")
+        if layer != expected_layer or hidden_size != self.hidden_size or rank != self.rank:
+            raise ValueError(
+                f"TTT slot dimensions do not match config for layer {expected_layer}: {path}"
+            )
+        expected_values = 4 * self.hidden_size * self.rank + 2 * self.hidden_size
+        if value_count != expected_values:
+            raise ValueError(f"TTT slot value count mismatch: {path}")
+        payload = raw[_TTT_SLOT_HEADER.size :]
+        if len(payload) != value_count * 4:
+            raise ValueError(f"TTT slot payload length mismatch: {path}")
+        import numpy as np
+
+        values = np.frombuffer(payload, dtype="<f4")
+        cursor = 0
+
+        def take(count: int) -> list[float]:
+            nonlocal cursor
+            result = values[cursor : cursor + count].tolist()
+            cursor += count
+            return result
+
+        return {
+            "A": take(self.hidden_size * self.rank),
+            "B": take(self.rank * self.hidden_size),
+            "mu": take(self.hidden_size),
+            "sigma": take(self.hidden_size),
+            "momentum_A": take(self.hidden_size * self.rank),
+            "momentum_B": take(self.rank * self.hidden_size),
+        }
 
     def begin_request(self, request_id: str) -> None:
         """Initialize fast weights for a new request.

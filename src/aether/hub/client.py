@@ -27,6 +27,7 @@ from typing import Any
 
 from aether.core.constants import DEFAULT_HUB_URL, HUB_RETRY_ATTEMPTS, HUB_RETRY_BACKOFF_S
 from aether.core.exceptions import AuthenticationError, HubError
+from aether.utils.file_io import safe_model_id_path
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -371,7 +372,7 @@ class HubClient:
         """
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        safe_id = model_id.replace("/", "_")
+        safe_id = safe_model_id_path(model_id)
         dest_dir = output_path / safe_id
 
         if self._is_hub_available():

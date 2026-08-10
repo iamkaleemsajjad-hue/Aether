@@ -275,13 +275,28 @@ class MTPHeadDetector:
                     if head_idx not in found_nodes:
                         vocab_size = _infer_vocab_size(node, architecture)
                         hidden_size = _infer_hidden_size(node, architecture)
+                        weight_data = None
+                        attributes = getattr(node, "attributes", {}) or {}
+                        candidate = attributes.get("weight") if isinstance(attributes, dict) else None
+                        if candidate is not None:
+                            try:
+                                import numpy as np
+
+                                candidate_array = np.asarray(candidate, dtype=np.float32)
+                                if candidate_array.ndim == 2 and candidate_array.size > 0:
+                                    vocab_size, hidden_size = map(int, candidate_array.shape)
+                                    weight_data = candidate_array
+                            except (TypeError, ValueError):
+                                # A declaration without a valid matrix must
+                                # remain an explicit skipped pass.
+                                weight_data = None
                         found_nodes[head_idx] = {
                             "head_index": head_idx,
                             "weight_node_id": getattr(node, "id", str(head_idx)),
                             "vocab_size": vocab_size,
                             "hidden_size": hidden_size,
                             "dtype": "bf16",
-                            "weight_data": None,
+                            "weight_data": weight_data,
                         }
                     break
 
@@ -341,7 +356,9 @@ class MTPHeadCompiler:
 
         # Build header.
         header = bytearray(self._HEADER_SIZE)
-        header[:16] = self._HEADER_MAGIC
+        # Keep the fixed 64-byte header length; assigning a shorter byte
+        # string to a full slice would shrink the bytearray in Python.
+        header[: len(self._HEADER_MAGIC)] = self._HEADER_MAGIC
         struct.pack_into("<I", header, 16, head_index)
         struct.pack_into("<I", header, 20, vocab_size)
         struct.pack_into("<I", header, 24, hidden_size)

@@ -1,6 +1,6 @@
 ﻿# Aether Runtime â€” Final Adversarial Audit
 
-Audit date: 2026-08-09
+Audit date: 2026-08-10
 
 Repository: C:\Users\pc\Desktop\Aether Runtime
 
@@ -30,11 +30,13 @@ not exercised end-to-end.
 - Grammar-constrained decoding no longer silently falls through to ordinary
   generation. The PyTorch backend now applies a real per-step
   `transformers.LogitsProcessor`, and the compiled CPU engine applies the FSM
-  bitmask before sampling and advances the request-local FSM session. The
-  current built-in compiler marks its character-code approximation as not
-  tokenizer-aware, so Runtime rejects it instead of presenting it as a valid
-  production constraint. `test_generate_applies_grammar_fsm_token_mask` and
-  the local AEG integration tests pass.
+  bitmask before sampling and advances the request-local FSM session. Pass 11
+  now remaps local tokenizer vocabulary through the character automaton and
+  persists and runtime-verifies a tokenizer fingerprint; a real local AEG
+  integration test proves `root ::= "hello"` produces exactly `hello` after
+  reload. A mismatched or unavailable runtime tokenizer is rejected. Artifacts
+  without a local tokenizer remain explicitly rejected instead of being treated
+  as valid production constraints.
 - Unknown model identifiers fail closed unless a local configuration or explicit
   bounded Hub discovery is available; the compiler no longer invents a default
   architecture for an unknown model.
@@ -43,6 +45,12 @@ not exercised end-to-end.
   text-only fallback when no executable video encoder is present.
 - AEG tar and Hub ZIP extraction now reject absolute paths, traversal entries,
   and links; tampered/traversal cases are covered by hardening tests.
+- The compiled-AEG backend now verifies every manifest-declared payload before
+  loading the executable engine, so tampered weights, task-vector archives,
+  kernels, or safety artifacts fail before inference rather than only being
+  detected by a separate inspector call. The local SafeTensors end-to-end test
+  mutates the quantized weight blob and confirms the public Runtime rejects it
+  with a backend integrity error.
 - Hugging Face `trust_remote_code` is disabled by default and is exposed as an
   explicit runtime opt-in rather than being silently enabled by the backend.
 - Windows cache resolution now uses a writable per-user location and falls
@@ -52,6 +60,14 @@ not exercised end-to-end.
   `reasoning`, `mla-stats`, `kv-share`, `multi-agent`, `slo-status`, `hub`,
   `train grpo`, `kernel generate`, and `kv transfer-stats` commands. These
   commands call real runtime/compiler/client code and fail on backend errors.
+- The v5 compiler CLI surface now accepts the documented valued forms
+  `--sub2bit ternary`, `--mdlm-K`, `--mdlm-T`, and
+  `--video-compression stc|storm|streamingtom|infotok|mage_vl`; bare feature
+  flags retain explicit defaults. `quantize-report` and `cache stats/flush`
+  are registered and route through the real Runtime/cache code. Three focused
+  CLI contract tests pass. This proves command parsing and local cache/report
+  behavior, not execution of unavailable quantization, video, or remote-model
+  backends.
 - The measured-evaluator path now accepts only a `BenchmarkResult` (or a
   validated measured mapping), rejects inconsistent counts/scores, and includes
   a JSONL exact-match/accuracy evaluator. A real local AEG integration test
@@ -60,11 +76,23 @@ not exercised end-to-end.
 - Local `torch.save`/`pytorch_model.bin` ingestion now has a real compile,
   AEG integrity, reload, and generation integration test. Corrupt or empty
   PyTorch shards fail closed instead of being silently skipped.
-- The repository now collects **1,719 tests**. The complete local suite
-  finishes with **1,704 passed, 15 skipped, 0 failed** in approximately 252
-  seconds. The full run reports approximately **68% combined statement/
-  branch coverage** under the repository's pytest coverage configuration; this
-  is not equivalent to feature completeness.
+- The current no-coverage full repository run collected **1,792 tests** and
+  finished with **1,777 passed, 15 skipped, 0 failed** in 208.89 seconds. This
+  includes the fail-closed
+  gRPC credential/tokenizer-aware grammar checks, executable CPU kernel tests,
+  persisted TTT-slot/inference, task-reweighting, SLO-admission, and packaged
+  CPU-kernel reload, safety-checked streaming, concrete reference-executor,
+  hardware-gated TEE verification, AEG path-traversal, and cache path-safety
+  tests, plus real Pass 21 adapter artifact loading and runtime execution.
+  The newly added paths pass their focused assertions; the full no-coverage
+  run completed successfully. A
+  coverage-enabled full run remains unverified within the environment's
+  execution limit.
+  The latest command was intentionally `--no-cov`, so it does not establish a
+  new coverage measurement. A prior coverage-enabled run reported
+  approximately **68% combined statement/branch coverage** under the
+  repository's pytest configuration; that number is not equivalent to feature
+  completeness.
   Skips
   are explicitly limited to network/Hugging Face access or synthetic-model
   availability.
@@ -72,17 +100,206 @@ not exercised end-to-end.
   validation rejects enabled flags without concrete enabled payloads, grammar
   entries, MCP registrations, TEE backend, task-vector files, TTT weights, or
   graph plans. Disabled descriptors remain explicitly disabled.
+- The canonical `AEGPackage` loader now validates `graph/metadata.json` pass
+  claims for AEG/2.0 and AEG/3.0 before an artifact is considered loadable. It
+  checks version compatibility, required JSON schemas, binary payload presence
+  and non-emptiness, tokenizer-aware grammar identity, TTT slot descriptors,
+  TEE weight-hash metadata, PEFT references, and v5 payload-specific fields.
+  This closes the previous gap where only the separate legacy V2 helper
+  validated claims while canonical compiler output could load from a pass name
+  and directory layout alone. A positive local AEG/2.0 compile/reload test and
+  two negative canonical-claim tests pass.
 - The compiler now selects AEG/2.0 when applied v4 passes are present and
-  AEG/3.0 when applied v5 passes are present. The manifest and FORMAT_VERSION
-  sentinel are checked for agreement on reload. The local v5-enabled artifact
-  test proves AEG/3.0 save, integrity verification, and reload.
+  AEG/3.0 only when a v5 pass actually applies. The manifest and
+  FORMAT_VERSION sentinel are checked for agreement on reload. The local
+  feature-enabled artifact proves AEG/2.0 save, integrity verification, and
+  reload; Pass 18 now skips without real drafter weights, so it cannot create a
+  misleading v5 artifact from a schedule-only descriptor.
+- Runtime/CPU AEG generation now exposes an incremental token stream. REST
+  `stream=true` emits tested SSE chunks and a terminal `[DONE]` event. The
+  gRPC surface now uses typed protobuf request/response/chunk messages and
+  checked-in typed client/server bindings; authenticated Health, Generate,
+  token streaming, and unauthorized access were exercised against a real local
+  AEG. gRPC metrics are converted back to ordinary JSON-compatible values.
+- The OTLP-compatible observability exporter now has a real HTTP POST path in
+  addition to offline JSON-file export. A local HTTP collector integration
+  test verifies the request body, status handling, and failure surface; this
+  does not prove an external collector or OpenTelemetry SDK interoperability.
+- `aether kernel generate cpu_avx512 argmax` now compiles/copies a real native
+  shared library, records its SHA-256 and exported symbol, and the emitted
+  library was loaded with `ctypes` and executed. Accelerator targets still fail
+  closed instead of returning a plan as if code had been generated.
+- CPU-target compilation now embeds the verified native shared library inside
+  `generated_kernels/` in the AEG. Reload, including reload from an AEG tar
+  archive, verifies the declared hash and loads that packaged library into the
+  executable CPU engine; legacy artifacts without this payload retain their
+  explicit host-cache/reference fallback.
+- `Runtime.merge()` now copies the complete source AEG before rewriting merged
+  graph/weight metadata, preserving packaged kernels and other immutable
+  payloads referenced by the manifest. A regression that previously produced a
+  merged artifact with a missing native library is fixed and the merged
+  artifact now reloads and generates successfully.
+- Pass 11 now emits tokenizer-aware token-ID transitions when a local
+  `tokenizer.json` is available. The compiled local AEG records a six-state
+  literal FSA, tokenizer vocabulary width/fingerprint, and constrained CPU
+  generation returns exactly `hello` for `root ::= "hello"` after artifact
+  reload. R3 recomputes and checks that fingerprint before attaching the FSM
+  to a request. The compiler still fails closed for artifacts without a
+  tokenizer.
 - Pass 12 model merging now reads native AEG weight stores, rejects unreadable
   or empty sources, writes a verified merged AEG with its tokenizer, and has a
   local reload/generation test; sources without overlapping tensors still fail
-  explicitly.
+  explicitly. Merged AEGs now also persist compressed, manifest-hashed task
+  deltas, and `set_task_weights()` applies them in a request-local CPU engine;
+  the integration test proves the payload survives reload and is consumed by
+  inference.
+- Pass 21 adapter artifacts now carry tensor shapes and runtime scaling,
+  are decoded only after AEG integrity verification, and are consumed by the
+  real CPU transformer at the targeted attention/FFN projections. Unknown,
+  malformed, unpaired, legacy, or shape-incompatible adapters fail closed.
+  A real local SafeTensors adapter test proves compile → AEG save/reload →
+  `Runtime.generate(..., adapter_id=...)`; CUDA/ROCm BGMV kernels and advanced
+  LoRAMoE routing remain unimplemented.
+- Pass 8 sparse-attention plans are now consumed by the executable CPU engine:
+  the persisted per-head A-shape, vertical-slash, block-sparse, or dense plan
+  builds a causal attention mask during forward. A real long-context local AEG
+  reload/inference test proves the plan survives packaging and changes the
+  attention computation. The compiler’s current classifier remains heuristic
+  rather than calibration-derived, and optimized vendor kernels are absent.
+- The standalone MInference classifier no longer generates synthetic attention
+  maps. It now requires a complete `(layer, head) -> calibration map` input,
+  validates finite non-negative square maps, and records an explicit skipped
+  state when long-context calibration is absent. Real-map classification,
+  save/load, and the missing-calibration path are covered by focused tests.
+- Pass 9 now has a strict artifact boundary: the standalone structure-only
+  path records no concrete masks or speedup without real weight tensors, while
+  the pipeline’s real `PruningMask` is applied to the weight array immediately
+  before quantization. A malformed or shape-incompatible mask fails
+  compilation. New tests prove both zeroed persisted payloads and fail-closed
+  malformed-mask handling.
+- EAGLE-3 no longer creates random projection weights or token-ID-seeded
+  synthetic hidden states. The engine now requires a validated learned output
+  projection and caller-provided target hidden states, rejects missing draft
+  material with a runtime error, and reports speculation as disabled until a
+  verified step supplies acceptance evidence. The focused EAGLE/runtime slice
+  passed 133 tests and the subsequent full suite passed.
+- ONNX execution is now real for explicit tokenizer-backed autoregressive
+  sessions: the backend validates input/output contracts, executes an actual
+  ONNX Runtime decode loop, supports greedy/top-k/top-p sampling, incremental
+  token streaming, and returns measured usage/throughput metadata. Local
+  `.onnx` models are routed through normal `Runtime` selection; ordinary AEG
+  artifacts remain on their compatible backend. Missing tokenizer/decode
+  adapters and unsupported KV-cache/encoder-decoder input contracts fail
+  closed. Actual ONNX file, ONNX Runtime session, streaming, Runtime route,
+  and negative adapter cases are covered.
+- Pass 14 semantic KV compression is now connected to the executable CPU path:
+  the compiler plan is copied into the AEG and surfaced by a fresh loader;
+  the CPU cache compresses real per-layer K/V rows, preserves original token
+  positions for RoPE and causal masking, and always retains the newest token.
+  A direct cache test and a compile → save → reload → inference integration
+  test pass. Only the chunk/hybrid strategies are enabled; sentence-aware
+  compression still fails closed without tokenizer boundary metadata.
+- Pass 15 cross-layer KV sharing is now consumed by the CPU AEG engine for
+  validated forward-source plans: target layers reuse the exact source K/V
+  ndarray objects, and a real two-layer SafeTensors compile → AEG reload →
+  inference test proves the aliases. Plans with forward references,
+  duplicate targets, mismatched layer counts, or malformed groups fail closed;
+  the compiler's current middle-outward similarity estimate is still heuristic
+  and GPU/distributed sharing is not implemented.
+- R7 green accounting is now reachable from ordinary `Runtime.generate()`:
+  green-enabled AEG requests record energy and carbon metrics, expose them in
+  response metrics, and classify the evidence as either
+  `measured_power_reading` or `tdp_duration_estimate`. A real green-enabled
+  AEG integration test and direct measured/estimated manager tests pass. This
+  does not create hardware telemetry or DVFS control on hosts without NVML or
+  ROCm power readings.
+- Pass 13 now writes versioned, little-endian float32 `ttt/slot_*.bin` payloads
+  for every emitted slot. R5 validates the magic header, layer/dimension
+  metadata, payload length, and loads those persisted tensors after restart;
+  unit and feature-enabled local AEG integration tests pass. The compiled CPU
+  backend now adapts those slots from prompt embeddings, applies them during
+  the real forward pass, and reports the measured adaptation loss; other
+  backends remain unsupported.
+- Runtime configuration `scheduler="slo_aware"` now admits each request through
+  the real R4 priority scheduler, records the selected tier/priority/deadline,
+  and records completed batch latency. REST `slo_deadline_ms` is now passed
+  through to the scheduler, and chat/streaming requests use the same admission
+  path. A local SafeTensors-to-AEG integration test exercises latency-tier
+  completion, chat, and streaming against actual CPU generation; this remains
+  synchronous single-request admission rather than distributed continuous
+  batching.
+- Safety-enabled `Runtime.generate_stream()` now buffers backend chunks until
+  completion, applies the complete output policy, and releases no text when a
+  secret is detected. Safety-disabled streaming remains incremental; a focused
+  split-secret test proves the fail-closed behavior.
+- Compiled CPU AEG chat requests now use the tokenizer's real chat template
+  when available, with a role-preserving fallback that appends an assistant
+  generation marker; local compiled-AEG generation and chat safety checks pass.
+- The generic CPU reference executor now carries concrete input tensors through
+  real RMSNorm, attention, matmul, add, multiply, softmax, and SiLU operations;
+  it no longer returns fabricated zero arrays for shape-only allocations. A
+  direct arithmetic reference-executor test passes; this remains distinct from
+  distributed hardware execution.
+- The REST `/v1/tools/call` route now dispatches using the actual MCP layer
+  signature; a route test exercises a real layer object and verifies the tool
+  name/arguments reach it instead of returning a transport-level success after
+  a `tool_id` keyword mismatch. It now also maps an MCP `isError` result to
+  `success: false` rather than reporting a failed tool invocation as successful.
+- MCP stdio registration now forwards the declared `command` separately from
+  the logical server ID, so `/v1/mcp/server/register` can launch the requested
+  executable rather than accidentally treating the ID as the command.
+- R6 MCP dispatch now validates discovered `inputSchema`/`parameters` with
+  JSON Schema before invoking an external server, accepts qualified
+  `server_name/tool_name` IDs, and returns explicit fail-closed errors for
+  malformed or invalid arguments. `Runtime.generate_with_tools` now also
+  detects structured model-emitted tool calls, dispatches the selected MCP
+  tool, injects the JSON result, and continues for a bounded number of rounds;
+  focused MCP and hardening tests plus the full suite pass. This remains
+  incomplete for tenant isolation, approval policy, and production MCP
+  deployment.
+- The same command field is now forwarded when MCP servers are restored from
+  persisted AEG v2/v3 configuration, so restart does not silently replace the
+  configured executable with the logical server ID.
+- Pass 17 TEE emission now fails closed unless a real backend has attached
+  executable TEE-wrapped kernel artifacts to the graph. The previous
+  configuration/hash-only path no longer marks TEE applied or publishes a
+  software-only enclave claim; the TEE unit and local AEG integration tests
+  assert the explicit skip on this hardware.
 - R11 semantic request caching now intercepts repeated Runtime.generate calls
   and reports a real cache hit on the local CPU AEG path using the offline
   embedding fallback; the cache configuration uses a consistent max-token key.
+  The documented `RuntimeConfig.semantic_cache_size` now validates, survives
+  serialization round-trips, and controls the actual cache capacity; focused
+  configuration and local AEG tests pass.
+- The v5 compiler configuration now accepts documented public spellings such
+  as `mdlm_denoising_steps`, `sub2bit_mode`, `sub2bit_targets`,
+  `video_compression_strategy`, `max_video_frames`, and
+  `compile_rlvr_verifier`, translating them into the existing pass controls.
+  `ternary`/`nanoq` and `streaming_tom` aliases normalize explicitly;
+  `enable_molf` fails closed rather than being silently ignored. A video-pass
+  test proves `max_video_frames` is persisted in the graph plan.
+- R10 KV transfer reporting now measures real local cache-tier movements:
+  transferred blocks/tokens, source-to-destination route counts, and the last
+  movement timestamp. The SDK and `/v1/kv/transfer/stats` route explicitly
+  report `network_available=false` and `local_tier_cache` fallback status, so
+  the CPU path does not fabricate NIXL/RDMA/UCCL metrics. Unit and REST tests
+  pass; network transfer remains unavailable.
+- Pass 19 BitNet now has a real `TERNARY` codec with two-bit packed payloads
+  and per-block abs-mean scales. A local SafeTensors integration test compiles
+  AEG/3.0, verifies `quantization/sub2bit_manifest.json`, reloads the packed
+  weights, and generates on CPU. BTC-LLM and NanoQuant still fail closed
+  without their distinct runtime codecs; model-quality evaluation remains a
+  separate required gate.
+- Pass 10 now consumes real 2-D MTP head tensors attached to graph nodes,
+  emits non-empty, fixed-size BF16 speculation blobs, validates/reloads their
+  headers and dimensions in R1, and records applied head metadata.
+  Architecture-declared MTP heads now also materialize as `mtp_head` graph
+  nodes, use the first-class `aeg.mtp_head` AEG-IR opcode, and bind local
+  `model.mtp_heads.<n>.weight` tensors. A local DeepSeek-style checkpoint with
+  two declared heads now proves compile -> AEG/2.0 package -> reload -> normal
+  CPU `Runtime.generate()` speculative counters. Architecture-only declarations
+  still skip explicitly; sampled/grammar generation, GPU execution, and a
+  full-size real DeepSeek/MTP checkpoint remain unverified.
 - Agentic sessions now pass a session-owned cache handle through the compiled
   CPU AEG backend. The backend reuses only an exact token prefix, reports the
   measured reused-token count, and releases the cache on session close. A new
@@ -97,15 +314,46 @@ not exercised end-to-end.
   pairs), exports embedded Unigram tokenizer metadata, and has a local
   compile/save/reload/generate integration test. GGUF files without embedded
   tokenizer vocabulary still fail explicitly.
+- Additional offline local SafeTensors fixtures using Qwen2, Gemma, and
+  Mistral architecture declarations now compile, reload, and generate through
+  the same CPU AEG path. These are structural compatibility tests with tiny
+  real checkpoints, not evidence for full-size public-model quality or MoE/VLM
+  support.
 - `aether serve <model.aeg>` now validates and preloads the supplied artifact
   before binding the HTTP port. A subprocess integration test starts the real
   CLI, waits for `/health`, sends `/v1/generate` over TCP, verifies model output,
   and shuts the process down cleanly.
+- REST `/v1/generate` and `/v1/chat` now honor grammar and streaming request
+  fields through the real tokenizer-aware constrained decoder; chat streaming
+  passes message arrays into the backend. Unavailable grammar, TEE, and merge
+  capabilities return explicit 503/501 errors rather than queued or
+  `unsupported` success responses. Local constrained-stream and chat-stream
+  integration tests pass.
+- Evaluation now supports measured local HellaSwag JSONL, MMLU CSV,
+  GSM8K/Math-500/AIME JSONL, and explicitly opt-in HumanEval execution through
+  `DatasetBenchmarkEvaluator`. `aether eval` accepts repeated
+  `--dataset BENCHMARK=PATH` inputs and calls the actual Runtime generation
+  callback. REST `/v1/eval` accepts dataset paths only below a configured
+  `RuntimeConfig.extra['eval_data_dir']`, dispatches synchronous evaluation
+  off the event loop, and rejects traversal. Focused evaluator, CLI, and REST
+  tests pass. This does not validate official datasets or benchmark quality.
+- The multimodal reference path no longer creates seeded random ViT or
+  connector weights, and unsupported connector types no longer pass visual
+  tokens through as if they were projected. `MultiModalGraphDispatcher` keeps
+  configuration-only operations available, but image execution now requires
+  validated learned projection/connector tensors and fails closed otherwise.
+  Supplied-tensor processing and missing-weight rejection are covered by
+  focused tests.
+- Reasoning beam/MCTS paths no longer fabricate random tokens or dummy tree
+  expansions when no model callback is supplied. The compute controller now
+  requires model-backed generation/expansion callbacks for non-greedy search;
+  the negative path is tested.
 
 ### Current evidence boundary
 
-The CPU path is now proven for a real local SafeTensors model and one local
-GGUF artifact, but this does not prove arbitrary Hugging Face/GGUF
+The CPU path is now proven for real local SafeTensors models, one local
+GGUF artifact, and a scoped local DeepSeek-style MTP artifact, but this does
+not prove arbitrary Hugging Face/GGUF
 compatibility, model quality, GPU execution,
 AEG/2.0 or AEG/3.0 completeness, CXL, TEE hardware, distributed
 execution, or the v4/v5 performance claims. Those remain classified below as
@@ -191,15 +439,37 @@ The same checker fails under the default Windows CP1252 console because it print
 
 ### Test suite
 
-    Collected: 1,719 tests
-    Full repository run: 1,704 passed, 15 skipped, 0 failed
-    Focused hardening/evaluation/runtime verification: 32 passed
+    Latest completed full no-coverage run: 1,792 collected; 1,777 passed,
+    15 skipped, 0 failed, in 208.89 seconds
+    Current collection: 1,792 tests (`pytest --collect-only -q`)
+    Current focused additions: gRPC/OTLP, tokenizer-aware grammar, executable
+    CPU-kernel, packaged-kernel reload, persisted TTT-slot/inference,
+    task-reweighting, SLO admission, safety-checked streaming, Pass 9
+    pruning-to-payload checks, fail-closed EAGLE-3 checks, and real-map
+    MInference checks passed (10 focused Pass 9/quantizer checks, 133 focused
+    EAGLE/runtime checks, and 7 focused MInference checks in the latest slices)
+    Latest MTP/BitNet/CLI remediation slice: 40 passed, 0 failed; this covers
+    architecture-declared local MTP graph materialization, AEG-IR packaging,
+    MTP blob reload/projection, exact-greedy CPU verification, packed TERNARY
+    codec roundtrip, local AEG/3.0 BitNet generation, and CLI rejection of
+    skipped-pass false success.
+    Latest grammar verification: 1 CPU FSM test, 2 hardening tests, and 1 real
+    local SafeTensors-to-AEG reload/constrained-generation integration test passed
+    Latest standard-dataset evaluator/CLI/REST verification: 10 passed,
+    including HellaSwag/MMLU/math scoring, opt-in HumanEval execution, CLI
+    dataset parsing, REST execution, and evaluation-root traversal rejection
     Local evaluator/AEG verification: 3 focused checks passed
+    Latest focused compiler/runtime/REST integration run: 95 passed,
+    14 skipped, 0 failed in 116.74 seconds; skips were network/Hugging Face
+    tests unavailable in this environment.
+    Latest security/runtime regression run: 76 passed, 0 failed in 10.87
+    seconds, including TEE, MCP, streaming safety, executor, and artifact
+    hardening tests.
     Official CPU smoke: 15/15 passed
-    Full-suite duration: approximately 252 seconds
+    Full no-coverage suite duration: 208.89 seconds
 
-The full local suite completed without failures. The remaining execution
-boundary is:
+The latest completed full local suite finished without failures. The remaining
+execution boundary is:
 
 - real-model integration tests requiring Qwen weights are skipped because the configured proxy cannot reach Hugging Face;
 - compiler tests requiring real remote weights are skipped rather than fabricating parameters;
@@ -218,12 +488,17 @@ real tokenizer-backed artifacts, but not model quality benchmarks.
 
 ### Clean installation
 
-- Building a wheel in the existing environment succeeds.
-- A fresh temporary virtual environment can install the built wheel with
-  `--no-deps` and import `aether` successfully (`0.1.0`).
+- Building the current wheel in the existing environment succeeds:
+  `aether_runtime-0.1.0-py3-none-any.whl`, 723,312 bytes, SHA-256
+  `216bdf0598f674d14037668954759bb020e391dc9bd9d251521190e6cdd819eb`.
+- A fresh temporary virtual environment with system site packages can install
+  the built wheel with `--no-deps`; the installed `aether` entry point imports
+  and `aether --help` completes successfully.
 - Normal isolated installation fails offline while resolving build dependencies.
-- The fresh no-dependency CLI probe did not complete within 30 seconds, and a
-  complete clean install plus compile/run/serve/test workflow was not achieved.
+- A dependency-complete clean install plus compile/run/serve/test workflow was
+  not achieved because this environment cannot resolve packages from the
+  configured package index; the no-dependency wheel/CLI probe does not prove
+  dependency installation or full distributability.
 
 ## 4. Requirements matrix
 
@@ -231,32 +506,32 @@ real tokenizer-backed artifacts, but not model quality benchmarks.
 |---|---|---|---|---|---|---|---|---|---|---|
 | M1 | SafeTensors ingestion | v3.1 | Stage 1 | Load real tensors and bind them to graph | src/aether/compiler/stage1_ingestion/safetensors_loader.py | Yes | Functional for tested local Llama path | Unit + integration | Real local SafeTensors compile/reload/generate passed |  FUNCTIONAL BUT INCOMPLETE |
 | M2 | GGUF ingestion | v3.1 | Stage 1 | Parse GGUF metadata and weights | src/aether/compiler/stage1_ingestion/gguf_loader.py, ingestion.py | Yes | Functional for tested local GGUF with embedded tokenizer; broader GGUF variants incomplete | Unit + integration | Tiny GGUF compiles, saves, reloads, verifies, and generates on CPU |  FUNCTIONAL BUT INCOMPLETE |
-| M3 | ONNX ingestion | v3.1 | Stage 1 | Load graph and initializers | src/aether/compiler/stage1_ingestion/onnx_loader.py | Yes | Partial | Unit tests | ONNX backend cannot perform autoregressive generation | PARTIAL |
+| M3 | ONNX ingestion/execution | v3.1 | Stage 1 + backend | Load real ONNX graph/initializers and execute tokenizer-backed autoregressive decode | src/aether/compiler/stage1_ingestion/onnx_loader.py, src/aether/backends/onnx_backend.py | Yes | Functional for explicit tokenizer-backed ONNX sessions; encoder-decoder/KV-cache contracts remain unsupported | Real ONNX Runtime integration + loader tests | Actual ONNX file executed through ONNX Runtime and normal Runtime routing; missing adapter fails closed | FUNCTIONAL BUT INCOMPLETE |
 | M4 | MLX ingestion | v3.1 | Stage 1 | Load and execute MLX models on Apple | mlx_loader.py, mlx_backend.py | Yes | Unverified | No Apple hardware | MLX unavailable | âšª NOT TESTABLE ON CURRENT HARDWARE |
 | M5 | PyTorch/Hugging Face ingestion | v3.1 | Stage 1 | Materialize weights, configuration, tokenizer, graph | ingestion.py, pytorch_loader.py, torch_backend.py | Yes | Functional for tested local SafeTensors and torch.save checkpoints; remote HF unverified | Local integration; remote blocked | Both local formats compile, reload, verify, and generate; corrupt shards fail closed |  FUNCTIONAL BUT INCOMPLETE |
-| M6 | VLM/video/MLA/MoE/SSM/reasoning/MTP detection | v3.1â€“v5 | Stage 1 | Correct architecture detection and graph extraction | architecture_detector.py | Partial | Not proven | Static/unit tests | Lower-case model_type aliases now tested; no real family-specific graph/model runs | PARTIAL |
+| M6 | VLM/video/MLA/MoE/SSM/reasoning/MTP detection | v3.1â€“v5 | Stage 1 | Correct architecture detection and graph extraction | architecture_detector.py, ingestion.py | Partial | MTP declaration/graph extraction is functional for a local DeepSeek-style fixture; the other families remain unproven | Unit + local MTP/family fixtures | DeepSeek-style `num_nextn_predict_layers` creates graph nodes and binds real head tensors; Qwen2/Gemma/Mistral fixtures compile; no real MLA/MoE/VLM/video/SSM model run | PARTIAL |
 | O1â€“O9 | v3.1 optimizer passes | v3.1 | Stage 2 | Modify graph/IR and produce runtime-consumable artifacts | stage2_optimizer/optimizer.py | Yes | Partial | Unit tests | Several passes produce plans or metadata | PARTIAL |
-| O10â€“O17 | v4 optimizer passes | v4.0 | Stage 2 | Produce real MTP, grammar, merge, TTT, KV, green, TEE artifacts | pass10 through pass17 | Yes | Mostly metadata/configuration | Mock/synthetic tests | No real artifact consumption | PARTIAL |
-| O18â€“O22 | v5 optimizer passes | v5.0 | Stage 2 | Produce diffusion, ternary, video, PEFT, and RLVR artifacts | pass18 through pass22 | Yes | Partial; unsupported paths fail closed | Unit/integration subset | Direct transforms and verifier paths exist; no complete model/runtime integration | PARTIAL |
+| O10â€“O17 | v4 optimizer passes | v4.0 | Stage 2 | Produce real MTP, grammar, merge, TTT, KV, green, TEE artifacts | pass10 through pass17 | Yes | Mixed: real MTP blobs now compile when graph tensors exist; grammar/merge/TTT/semantic-KV/cross-layer-KV/green accounting are CPU-consumed; unsupported TEE fails closed | Focused unit/integration tests | Real MTP tensor/blob test plus local grammar, merge, TTT, semantic-KV, cross-layer-KV, green accounting reload/inference, and negative TEE evidence | PARTIAL |
+| O18â€“O22 | v5 optimizer passes | v5.0 | Stage 2 | Produce diffusion, ternary, video, PEFT, and RLVR artifacts | pass18 through pass22, compiler/config.py | Yes | Partial; BitNet ternary now produces a CPU-consumable packed artifact, while other v5 paths fail closed or remain incomplete | Unit/integration subset | BitNet codec and local SafeTensors AEG/3.0 compile/reload/generate pass; other v5 integrations remain incomplete | PARTIAL |
 | H1 | Hardware target registry | v3.1â€“v5 | Stage 3 | Select executable backend per target | targets/registry.py | Yes | No | Registry tests | Profiles and backend candidates only | PARTIAL |
-| H2 | Target kernel generation | v3.1â€“v5 | Stage 3 | Emit executable PTX, HSACO, MSL, QNN, FPGA, and RISC-V kernels | stage3_targeting/kernel_emitter.py | No | No | Plan tests | Emits KernelPlan, not binaries | NOT IMPLEMENTED |
+| H2 | Target kernel generation | v3.1â€“v5 | Stage 3 | Emit executable PTX, HSACO, MSL, QNN, FPGA, and RISC-V kernels | stage3_targeting/kernel_emitter.py, kernels/native_cpu.py | Partial | Functional for audited native CPU shared-library symbols and packaged CPU AEG reload; vendor targets remain unavailable | Real CPU artifact, archive reload, and CLI execution | `cpu_avx512` AEGs now carry a hashed loadable native library; accelerator requests fail closed; no vendor binaries | PARTIAL |
 | A1 | AEG/1.1 | v3.1 | Artifact | Save/load graph, weights, metadata, kernels, provenance | core/aeg_format.py | Yes | Functional on CPU path | Unit + smoke + local integration | 15/15 smoke and local reload pass |  FUNCTIONAL BUT INCOMPLETE |
 | A2 | AEG/2.0 | v4.0 | Artifact | Persist v4 runtime/compiler features | compiler/aeg_format_v2.py | Yes | Partial | Format + hardening tests | Defaults are explicit disabled descriptors; enabled manifest claims require real payloads | PARTIAL |
-| A3 | AEG/3.0 | v5.0 | Artifact | Persist v5 artifacts and metadata | core/aeg_format.py, compiler/compiler.py | Yes | Partial | Local v5 artifact reload | Versioned save/reload works; required v5 payloads and executable kernels are incomplete | PARTIAL |
+| A3 | AEG/3.0 | v5.0 | Artifact | Persist v5 artifacts and metadata | core/aeg_format.py, compiler/compiler.py | Yes | Partial | Structural/version tests plus local BitNet AEG/3.0 compile/reload/generate | Canonical loader validates the real sub2bit manifest and packed weights; other v5 payloads remain incomplete | PARTIAL |
 | A4 | AEG integrity | v3.1+ | Security | Verify manifest, graph, weights, and declared artifacts | core/aeg_format.py | Yes | Yes for declared files | Direct tamper test passed | Tampered safety artifact rejected | âœ… COMPLETE |
 | R1â€“R8 | v4 runtime layers | v4.0 | Runtime | Execute P-EAGLE, multi-agent KV, grammar, SLO, TTT, MCP, green, and TEE | runtime/r*.py | Yes | Mostly isolated | Component tests | Most are not used by normal generation | PARTIAL |
 | R9â€“R12 | v5 runtime layers | v5.0 | Runtime | Execute diffusion, network KV, semantic cache, and CXL | runtime/r9 through r12 | Yes | Mostly isolated/emulated; R11 local initialization repaired | Component tests + local cache probe | No real CXL/network/diffusion backend | PARTIAL |
-| API1 | Python Runtime and Compiler APIs | v3.1+ | SDK | Match PRD signatures and perform real operations | runtime.py, compiler.py | Yes | Aliases and async session contracts now align; backend-dependent operations remain incomplete | API + integration tests | Full suite plus local SafeTensors/GGUF generation; training/TEE/video/KV backends unavailable | PARTIAL |
-| API2 | Baseline REST endpoints | v3.1 | Server | Implement all baseline /v1 endpoints | server/routes.py, cli.py | Partial | Partial | TestClient + TCP subprocess + OpenAPI probe | Core generation and expanded route registration work; real `aether serve <model.aeg>` now preloads and serves over TCP; full endpoint semantics not proven | PARTIAL |
-| API3 | v4/v5 REST endpoints | v4â€“v5 | Server | Grammar, TTT, MCP, green, TEE, video, cache, GRPO, and CXL routes | server/routes.py | Yes | Partial; unavailable backends fail closed | OpenAPI + server tests | 67 routes registered; GRPO verify/status and video stats now execute/record real outcomes | PARTIAL |
-| API4 | gRPC | v3.1+ | API | Protobuf, server, client, streaming inference | proto/aether.proto, server/grpc_service.py | Yes | Partial | Real local AEG integration | Authenticated Generate/Health and chunked stream pass; generated typed stubs and token-level streaming remain absent | PARTIAL |
-| E1 | Evaluation gates | v3.1 | Quality | Run measured benchmarks and block regressions | observability/ci_pipeline.py, runtime.py | Yes, when configured | Functional for validated evaluator results and JSONL exact-match/accuracy; official datasets are not bundled | Unit + local AEG integration | Real compiled model invoked; deliberately poor result blocked; unavailable path fails closed | PARTIAL |
+| API1 | Python Runtime and Compiler APIs | v3.1+ | SDK | Match PRD signatures and perform real operations | runtime.py, compiler.py, compiler/config.py, runtime/config.py | Yes | Documented compiler aliases and semantic-cache capacity now map to real controls; backend-dependent operations remain incomplete | API + integration tests | Full suite plus local SafeTensors/GGUF generation, compiler alias tests, video-plan persistence, and semantic cache capacity test; training/TEE/video/KV execution remains incomplete | PARTIAL |
+| API2 | Baseline REST endpoints | v3.1 | Server | Implement all baseline /v1 endpoints | server/routes.py, cli.py | Partial | Partial | TestClient + TCP subprocess + OpenAPI probe | Core generation, tested `/v1/generate` SSE streaming, local-dataset `/v1/eval`, and expanded route registration work; real `aether serve <model.aeg>` now preloads and serves over TCP; full endpoint semantics not proven | PARTIAL |
+| API3 | v4/v5 REST endpoints | v4â€“v5 | Server | Grammar, TTT, MCP, green, TEE, video, cache, GRPO, and CXL routes | server/routes.py | Yes | Partial; unavailable backends fail closed | OpenAPI + server tests | 67 routes registered; GRPO verify/status and video stats now execute/record real outcomes; dataset evaluation is root-confined and off the event loop | PARTIAL |
+| API4 | gRPC | v3.1+ | API | Protobuf, server, client, streaming inference | proto/aether.proto, server/grpc_service.py, server/proto/aether_pb2*.py | Yes | Functional for local CPU AEG; TLS/production auth incomplete | Real local AEG integration | Typed protobuf Generate/Health/GenerateStream, JSON-compatible metrics, bearer auth, token chunks, terminal marker, and unauthorized rejection pass; TLS and generated-protoc compatibility remain unverified | PARTIAL |
+| E1 | Evaluation gates | v3.1 | Quality | Run measured benchmarks and block regressions | observability/ci_pipeline.py, runtime.py, cli.py, server/routes.py | Yes, when configured | Functional for validated local HellaSwag/MMLU/math schemas and opt-in HumanEval execution; official dataset/reproducibility runs remain unverified | Unit + CLI/REST + local AEG integration | Real compiled model invoked; deliberately poor result blocked; standard local datasets score from real callbacks; unavailable path fails closed | PARTIAL |
 | P1 | Performance claims | v3.1â€“v5 | Benchmarking | Reproduce latency, throughput, memory, energy, and quality claims | runtime.py, scripts | No | No | No valid benchmark | No real model/baseline comparison | NOT IMPLEMENTED |
 | S1 | Safety and provenance | v3.1+ | Security | Provenance, filtering, prompt injection, integrity, audit logs | safety, provenance, AEG | Partial | Functional when explicitly enabled | Hardening + policy tests | Runtime now enforces prompt/output policy when enabled; default remains opt-in and isolation remains incomplete | PARTIAL |
-| OBS1 | OpenTelemetry | v3.1 | Observability | Export real traces to an OTLP collector | observability/otel.py | Custom implementation | Local JSON only | Unit tests | No OpenTelemetry SDK/exporter | PARTIAL |
+| OBS1 | OpenTelemetry | v3.1 | Observability | Export real traces to an OTLP collector | observability/otel.py | Custom implementation | Functional over OTLP/HTTP JSON; SDK/collector interoperability incomplete | Unit + local HTTP collector test | POST path, payload, status handling, and connection errors are exercised; external collector and SDK compatibility remain unverified | PARTIAL |
 | HUB1 | Aether Hub | v3.1+ | Hub | Login, search, push, pull, integrity, permissions | hub/client.py | Client only | Local archive fallback functional; no live Hub | Local tests | Offline upload/download now preserves and extracts the real uploaded ZIP; remote permissions/deduplication remain unverified | PARTIAL |
 | D1 | Distributed execution | v3.1+ | Fleet/parallelism | Multi-process/multi-node inference and recovery | fleet, parallelism | Planning layer | No | Unit tests | Collectives are CPU reference operations | NOT IMPLEMENTED |
-| I1 | Installation/distribution | v3.1+ | Packaging | New developer can install and execute | pyproject.toml | Yes | Not proven clean | Wheel build | Fresh isolated install failed offline | PARTIAL |
+| I1 | Installation/distribution | v3.1+ | Packaging | New developer can install and execute | pyproject.toml | Yes | Wheel and entry point work in a fresh no-dependency/system-site-packages probe; dependency-complete install remains unverified | Wheel + clean venv probe | Wheel built; installed `aether --help` passed; package-index resolution unavailable | PARTIAL |
 
 ## 5. v3.1 baseline audit
 
@@ -284,11 +559,19 @@ The strict current behavior is:
 
 This is preferable to the older behavior of manufacturing synthetic weights, but it means the actual ingestion path is not complete.
 
+The multimodal dispatcher now follows the same boundary: it can serialize and
+inspect a VLM plan without weights, but `process_image()` rejects a
+configuration-only dispatcher. A supplied-tensor unit path proves the patch
+projection and connector math; there is still no full VLM checkpoint ingestion,
+ViT transformer execution, or VLM-to-LLM generation path.
+
 One real local Llama-style model was successfully taken through compile, AEG
 save/reload, logits, and public Runtime generation using both SafeTensors and
-`torch.save` checkpoint formats. A tiny local GGUF artifact also passes this
-path. Qwen, DeepSeek, Gemma, Mistral, Mixtral, VLM, video, MLA, LoRA, and
-general remote Hugging Face compatibility remain unverified in this environment.
+`torch.save` checkpoint formats. Tiny local Qwen2, Gemma, and Mistral fixtures,
+as well as a DeepSeek-style two-head MTP fixture, also pass their scoped CPU
+paths. A tiny local GGUF artifact passes the same path. Full public Qwen,
+DeepSeek, Gemma, Mistral, Mixtral, VLM, video, MLA, LoRA, and general remote
+Hugging Face compatibility remain unverified in this environment.
 
 ### v3.1 optimizer passes
 
@@ -326,41 +609,41 @@ partial or unavailable.
 | 5 â€” MoE Expert Routing | PARTIAL | Routing/planning logic exists. No real Mixtral/DeepSeek/MoE model run. |
 | 6 â€” Parallelism Discovery | PARTIAL | Produces sharding plans. Distributed code is CPU reference communication. |
 | 7 â€” Reasoning Graph Compiler | PARTIAL | Produces reasoning metadata. No proven generation or quality effect. |
-| 8 â€” Sparse Attention | PARTIAL | Produces sparse patterns. No connected sparse target kernel. |
-| 9 â€” Pruning/Sparsity | PARTIAL | Can compute masks for real tensors, but no complete sparse runtime path. |
-| 10 â€” Native MTP Head Compilation | PARTIAL | Detects MTP declarations, but now refuses to emit zero-filled blobs when real head tensors are unavailable. No real MTP model/runtime proof. |
-| 11 â€” Grammar Constraint Compiler | PARTIAL | FSM compilation produces an artifact and decode loops apply masks for trusted precompiled FSAs. The built-in compiler is explicitly marked non-tokenizer-aware, so its artifacts are rejected for production constrained generation until a tokenizer-aware compiler is integrated. |
-| 12 â€” Model Merging | FUNCTIONAL BUT INCOMPLETE | Runtime.merge now dequantizes real AEG weights, applies the selected strategy, copies the tokenizer, writes a new AEG, verifies integrity, and a local end-to-end test reloads and generates from it. Multi-model quality validation and all source formats remain incomplete. |
-| 13 â€” TTT Fast-Weight Injection | PARTIAL | Configuration and engine exist. No real model adaptation/reload/generation proof. |
-| 14 â€” Semantic KV Compression | PARTIAL | Produces plans. No proof of actual KV tensor compression in inference. |
-| 15 â€” Cross-Layer KV Sharing | PARTIAL | Analysis and plans exist. No verified pointer sharing in a running backend. |
-| 16 â€” Green Energy Compilation | PARTIAL | Produces estimates and hints. No live energy measurement or DVFS control. |
-| 17 â€” TEE Enclave Emission | STUB / PLACEHOLDER | Hashes/configuration/HMAC wrappers exist; no executable enclave kernels. |
-| 18 â€” Diffusion Drafter Compilation | PARTIAL | Produces schedule/configuration metadata. No drafter weights or real diffusion decoding. |
-| 19 â€” Sub-2-Bit/Ternary Quantization | PARTIAL | Direct ternary/BTC/NanoQuant tensor transforms exist, but compilation now fails closed without a measured baseline/candidate evaluator instead of accepting hardcoded perplexity estimates. No integrated ternary model runtime. |
-| 20 â€” Video/Streaming Token Compression | PARTIAL | Planner and frame KV manager exist. No real VLM/video ingestion or generation. |
-| 21 â€” Advanced PEFT Compilation | PARTIAL | Adapter manifests/opcodes exist; empty or missing adapters now fail/skip explicitly. Runtime adapter execution remains unproven. |
+| 8 â€” Sparse Attention | FUNCTIONAL BUT INCOMPLETE | Persisted per-head patterns are now consumed by the CPU attention path with causal masks and a dense fallback. The standalone MInference classifier requires real calibration maps; the pipeline assignment remains heuristic rather than calibration-derived, and no optimized CUDA/ROCm/Metal kernel is proven. |
+| 9 â€” Pruning/Sparsity | FUNCTIONAL BUT INCOMPLETE | Real pipeline masks are now applied before quantization and persisted payloads reflect the zeros; structure-only mode fails closed without fabricated masks/speedups. No complete vendor sparse kernel/runtime path or quality gate. |
+| 10 â€” Native MTP Head Compilation | FUNCTIONAL BUT INCOMPLETE | Extracts real 2-D MTP head tensors from graph nodes and emits fixed-size, header-validated BF16 speculation blobs; architecture-only declarations fail closed. Architecture-declared local MTP nodes now survive AEG-IR packaging, and the compiled CPU AEG path loads these blobs into R1 and performs exact greedy target verification during normal Runtime.generate, with measured counters. Sampling/grammar semantics, GPU integration, and full-size real DeepSeek/MTP validation remain incomplete. |
+| 11 â€” Grammar Constraint Compiler | FUNCTIONAL BUT INCOMPLETE | Local tokenizer-backed compilation now remaps character-FSA transitions to exact tokenizer token IDs, persists vocabulary width/fingerprint metadata, and a real local AEG constrained generation returns the grammar-required token after reload. Complex EBNF, external grammar backends, and broad tokenizer families remain incomplete; artifacts without a local tokenizer still fail closed. |
+| 12 â€” Model Merging | FUNCTIONAL BUT INCOMPLETE | Runtime.merge now dequantizes real AEG weights, applies the selected strategy, persists manifest-hashed per-source task deltas, copies the tokenizer, writes a new AEG, verifies integrity, and a local end-to-end test reloads, generates, and exercises runtime task reweighting. Multi-model quality validation, non-CPU backends, and all source formats remain incomplete. |
+| 13 â€” TTT Fast-Weight Injection | FUNCTIONAL BUT INCOMPLETE | Versioned slot tensors are emitted and validated after reload; the CPU backend performs prompt-driven R5 adaptation and applies the slots during forward, with a measured adaptation-loss integration assertion. GPU/other backend integration and quality validation remain incomplete. |
+| 14 â€” Semantic KV Compression | FUNCTIONAL BUT INCOMPLETE | The compiler persists a verified plan and the CPU AEG engine compresses real K/V rows after attention while preserving original positions and the newest token. Direct and compile/reload/inference tests pass. Sentence-boundary strategy, other backends, quality gates, and vendor kernels remain incomplete. |
+| 15 â€” Cross-Layer KV Sharing | FUNCTIONAL BUT INCOMPLETE | Validated forward-source plans are consumed by the CPU engine as exact K/V ndarray aliases, and a two-layer compile/reload/inference test passes. Plan similarity is heuristic; GPU/distributed sharing and calibration-derived grouping remain incomplete. |
+| 16 â€” Green Energy Compilation | FUNCTIONAL BUT INCOMPLETE | Persists carbon/DVFS metadata and R7 now records request energy/carbon with explicit measured-reading versus TDP-duration-estimate provenance. Live energy telemetry, DVFS actuation, and quality/performance validation remain unavailable. |
+| 17 â€” TEE Enclave Emission | NOT IMPLEMENTED | The pass now skips with `tee_backend_artifacts_unavailable` unless a real backend-emitted executable kernel bundle is attached. Configuration and hashes alone are not treated as an enclave. |
+| 18 â€” Diffusion Drafter Compilation | STUB / PLACEHOLDER | The pass now fails closed with `mdlm_drafter_weights_unavailable` unless a real trained drafter bundle is attached. It no longer emits a schedule-only artifact or claims an applied v5 pass; R9 still lacks a complete compiler weight-ingestion path. |
+| 19 â€” Sub-2-Bit/Ternary Quantization | FUNCTIONAL BUT INCOMPLETE | BitNet now uses a real TERNARY codec with two-bit packed CPU AEG weights, per-block scales, manifest metadata, reload, and generation. BTC-LLM/NanoQuant runtimes and model-quality validation remain incomplete. |
+| 20 â€” Video/Streaming Token Compression | PARTIAL | Planner and frame KV manager exist; the documented frame bound is now persisted into the real compression plan. No real VLM/video ingestion or generation. |
+| 21 â€” Advanced PEFT Compilation | FUNCTIONAL BUT INCOMPLETE | Pass 21 writes shape-bearing, integrity-checked adapter blobs; the CPU backend decodes and applies selected adapters to real transformer projections after reload. GPU BGMV, LoRAMoE/LoRAFusion execution, static merge modes, and quality validation remain incomplete. |
 | 22 â€” RLVR Verifier Head Injection | PARTIAL | SymPy and subprocess verification paths exist when supplied ground truth/tests; unverified text now receives zero reward rather than heuristic credit. Runtime.grpo_train_step now fails explicitly because inference has no gradient/optimizer path; no trained verifier head or integrated GRPO compiler flow. |
 
 ## 7. Runtime layers R1â€“R12
 
 | Layer | Status | Findings |
 |---|---|---|
-| Existing EAGLE-3 | PARTIAL | Planner/engine exists, but normal Runtime.generate does not demonstrably execute EAGLE-3 decoding. |
-| Existing KV manager | FUNCTIONAL BUT INCOMPLETE | CPU allocation/eviction tests pass; no real compiled-model proof. |
+| Existing EAGLE-3 | PARTIAL | Planner/engine exists and now fails closed without learned draft projection/hidden states; normal Runtime.generate still does not demonstrably execute EAGLE-3 decoding. |
+| Existing KV manager | FUNCTIONAL BUT INCOMPLETE | CPU allocation/eviction tests pass; Pass 14 semantic compression now executes in the compiled CPU engine with logical-position preservation. Distributed and non-CPU KV execution remain unproven. |
 | Disaggregated prefill/decode | PARTIAL | Configuration and metadata exist; no multi-process/network deployment. |
 | Dynamic precision | PARTIAL | Manager exists; live backend switching is not proven. |
-| R1 P-EAGLE/Saguaro | PARTIAL | Engine has real weighted MTP projection code, but now fails closed when draft weights are absent; it is still not wired into normal generation and no hardware speculative benchmark is proven. |
+| R1 P-EAGLE/Saguaro | FUNCTIONAL BUT INCOMPLETE | Real MTP blob loading, projection, and exact-greedy target verification are wired through the compiled CPU AEG Runtime.generate path, with draft/accepted/cycle metrics. A local two-head DeepSeek-style checkpoint reaches this path after compile/reload. Sampling/grammar integration, Saguaro asynchronous scheduling, GPU execution, real full-size MTP-family validation, and hardware speedup benchmarks remain unproven. |
 | R2 Multi-Agent KV | PARTIAL | Public async context manager and coordinator are functional; compiled CPU agentic sessions now reuse exact token-prefix KV, while cross-agent tensor sharing, GPU IPC/RDMA, and cross-model reuse remain incomplete. |
-| R3 Grammar FSM | PARTIAL | Precompiled trusted FSAs are consumed by constrained PyTorch/CPU decode paths. The current built-in artifacts are rejected as non-tokenizer-aware; runtime grammar compilation and broad backend coverage remain incomplete. |
-| R4 SLO Scheduler | PARTIAL | Scheduler exists but normal generation does not route through it. |
-| R5 TTT Engine | PARTIAL | Adapt/reset methods exist; no real model weight adaptation path. |
-| R6 MCP | FUNCTIONAL BUT INCOMPLETE | Real JSON-RPC stdio/HTTP/WebSocket client exists and fails closed; not automatically integrated into ordinary generation. |
-| R7 Green Power Manager | PARTIAL | Produces estimates/status; no live hardware energy/carbon integration. |
+| R3 Grammar FSM | FUNCTIONAL BUT INCOMPLETE | Tokenizer-aware local FSAs are consumed by constrained CPU/PyTorch decode paths, R3 verifies the persisted tokenizer fingerprint, and a real local AEG test proves `root ::= "hello"` produces exactly `hello`. Artifacts without tokenizer remapping, complex EBNF, and broad backend coverage remain incomplete. |
+| R4 SLO Scheduler | FUNCTIONAL BUT INCOMPLETE | `scheduler="slo_aware"` routes Runtime.generate, chat, and streaming admission through the priority scheduler; REST deadlines are honored and tier/priority/deadline/latency are recorded on a real local CPU AEG. Multi-request batching, preemption, and distributed serving remain incomplete. |
+| R5 TTT Engine | FUNCTIONAL BUT INCOMPLETE | Persisted slot payloads are consumed and validated; the CPU compiled-AEG path performs adaptation, applies LayerNorm/LoRA fast weights, and reports adaptation loss. GPU/other backend integration and model-quality validation remain incomplete. |
+| R6 MCP | FUNCTIONAL BUT INCOMPLETE | Real JSON-RPC stdio/HTTP/WebSocket client validates discovered tool schemas before dispatch and accepts qualified server/tool IDs. Explicit `generate_with_tools` and bounded model-emitted tool-call continuation are tested on the local path; tenant isolation, approval policy, and production MCP deployment remain incomplete. |
+| R7 Green Power Manager | FUNCTIONAL BUT INCOMPLETE | Green-enabled CPU AEG generation records energy/carbon metrics and evidence source; actual device power readings, DVFS actuation, and distributed carbon routing remain unverified. |
 | R8 Confidential TEE | STUB / PLACEHOLDER | Software simulation can initialize with hardware_backed=false; this is not confidential computing. |
 | R9 Diffusion Speculative Engine | PARTIAL | Component initializes; no real drafter model is loaded by normal generation. |
-| R10 KV Network Transfer | PARTIAL | Structures exist; no NIXL/RDMA/UCCL/NVLink execution. |
-| R11 Semantic Request Cache | FUNCTIONAL BUT INCOMPLETE | Exact cache interception and cache-hit metrics now pass against a real local AEG using the offline embedding fallback; production embedding/model persistence and distributed cache behavior remain incomplete. |
+| R10 KV Network Transfer | FUNCTIONAL BUT INCOMPLETE | Local CPU tier movements now produce measured block/token/route statistics and the public API identifies the local fallback; no NIXL/RDMA/UCCL/NVLink execution is claimed. |
+| R11 Semantic Request Cache | FUNCTIONAL BUT INCOMPLETE | Exact cache interception and cache-hit metrics pass against a real local AEG using the offline embedding fallback; `RuntimeConfig.semantic_cache_size` controls actual capacity and survives serialization; production embedding/model persistence and distributed cache behavior remain incomplete. |
 | R12 CXL Rack-Scale KV Pool | STUB / PLACEHOLDER | File-backed mmap and in-memory fallback exist; no physical CXL or rack-scale pool. |
 
 ## 8. Hardware target matrix
@@ -399,7 +682,13 @@ The registry exposes 28 target profiles. Profiles and backend candidate strings 
 | cpu_neon_ternary | Profile only | âšª NOT TESTABLE ON CURRENT HARDWARE |
 | CPU x86/AVX2 | llama.cpp mentions AVX2, but no complete equivalent target path was verified | PARTIAL |
 
-The critical Stage 3 limitation is that KernelEmitter.emit() returns a KernelPlan. It does not emit PTX, cubin, HSACO, metallib, QNN binary, FPGA bitstream, or RISC-V binary. The normal compiler Stage 3 path creates profiles and backend plans but does not compile these target artifacts.
+The remaining Stage 3 limitation is that vendor targets still create profiles
+and backend plans rather than compiling target artifacts. CPU compilation now
+embeds a real native shared library in `generated_kernels/`, and the loader
+hash-checks and executes that packaged library after directory or archive
+reload. The explicit kernel command exercises the same native implementation.
+The repository does not emit PTX, cubin, HSACO, metallib, QNN binaries, FPGA
+bitstreams, or RISC-V binaries; those requests fail closed.
 
 ## 9. AEG audit
 
@@ -418,7 +707,10 @@ The normal compiler uses AEG/1.1. It supports:
 - runtime metadata
 - declared artifact hashes
 
-AEG integrity is a strong area. A direct test tampering with safety/prompt_guard.json was rejected with AEGIntegrityError.
+AEG integrity is a strong area. Direct tests tampering with
+safety/prompt_guard.json or the quantized weight blob are rejected with
+AEGIntegrityError/BackendError before execution, and packaged CPU kernels are
+also hash-checked during reload.
 
 The official CPU smoke test now loads and executes the generated artifact:
 
@@ -450,15 +742,25 @@ features. Writer methods persist enabled manifest claims only when concrete
 payloads are written, and validation rejects enabled claims without those
 payloads. A newly created package can therefore validate structurally while
 containing no real model weights, kernels, or enabled runtime behavior; that is
-an honest empty package, not v4 implementation.
+an honest empty package, not v4 implementation. The canonical compiler path now
+also records applied v4 passes and validates their actual emitted payloads at
+load/integrity time. A malformed canonical v2 claim fails before weight
+execution. Migration between the legacy V2 schema and the canonical manifest,
+and executable implementation of the v4 runtime layers, remain incomplete.
 
 ### AEG/3.0
 
-The core package writer now emits AEG/3.0 when v5 optimizer passes actually
+The core package writer emits AEG/3.0 only when v5 optimizer passes actually
 apply, creates the v5 extension directories, hashes payloads, and reloads the
-manifest with sentinel validation. This is a real versioning improvement, not
-a claim that every PRD v5 payload is implemented: ternary/video/MDLM/PEFT/RLVR
-artifacts remain partial and target kernels are not executable.
+manifest with sentinel validation. Pass 19 BitNet now produces a real
+executable CPU artifact with packed TERNARY weights; Pass 18 remains explicitly
+skipped without drafter weights. This is a real versioning path, not a claim
+that every PRD v5 payload is implemented: video/MDLM/PEFT/RLVR artifacts remain
+partial and target kernels are not executable. Canonical
+AEG/3.0 load now rejects malformed or missing payloads for any v5 pass recorded
+by the compiler, but this validates artifact honesty; it does not turn a plan
+or configuration into a working diffusion, video, ternary, PEFT, or RLVR
+runtime.
 
 ### AEG round trip
 
@@ -471,8 +773,8 @@ Real local SafeTensors compiled model workflow:
     PASS â€” compile -> save -> close/reload -> logits -> tokenizer-backed
     Runtime.generate -> REST TestClient generation
 
-This proves the tested AEG/1.1 CPU path and a v5-enabled AEG/3.0 versioned
-reload path. The runtime still correctly refuses graph-only AEGs lacking a
+This proves the tested AEG/1.1 CPU path, a v4-enabled AEG/2.0 versioned
+reload path, and a BitNet AEG/3.0 packed-weight reload path. The runtime still correctly refuses graph-only AEGs lacking a
 tokenizer-backed generation adapter rather than returning fabricated output.
 The same integration now saves a tar archive, closes the original package,
 loads the archive, verifies its hashes, and executes a forward pass from the
@@ -496,14 +798,24 @@ Problems:
 
 - aether merge now accepts multiple model arguments, but real merge artifacts still require source tensors.
 - aether run now rejects a missing path-like AEG with a model-not-found error.
-- ttt-config, kv-compress, green-profile, and tee do not robustly validate missing artifacts.
+- ttt-config, kv-compress, green-profile, and tee now reject false-success
+  cases when the requested optimizer pass is skipped; missing source artifacts
+  still fail through the compiler with backend-specific errors.
 - eval, safety, trace, reasoning, mla-stats, multi-agent, slo-status, kv-share,
   Hub, GRPO, kernel, and KV transfer command surfaces are now registered and
   smoke-tested; backend-specific limitations remain.
 - `aether compile` exposes the tested v4/v5 opt-in flags, but those flags do
   not make unavailable hardware or missing model modalities executable.
+- The documented v5 forms `aether compile --sub2bit ternary`,
+  `--mdlm-K/--mdlm-T`, and `--video-compression <strategy>` now parse into
+  validated compiler configuration. `aether quantize-report` and
+  `aether cache stats/flush` execute through Runtime code; quantization report
+  still requires a real compatible model artifact, and cache commands only
+  prove the local process cache.
 
-The kernels command successfully lists 28 profiles, but this proves registry exposure, not kernel execution.
+The kernels command successfully lists 28 profiles, but this proves registry
+exposure, not general kernel execution. The separate CPU `kernel generate`
+path now proves one real exported symbol; vendor targets remain unimplemented.
 
 ## 11. Python SDK audit
 
@@ -519,6 +831,7 @@ Basic imports and object construction work. The current Runtime exposes methods 
 - eval_gate
 - generate_constrained
 - generate_video
+- generate_constrained_stream
 - generate_with_tools
 - get_attestation_report
 - grpo_train_step
@@ -534,7 +847,7 @@ Important PRD incompatibilities:
 | PRD API | Current implementation |
 |---|---|
 | get_attestation_report(model.aeg) | Accepts the model and returns a mapping with PRD attribute access; hardware attestation remains unavailable on this host |
-| set_task_weights(model.aeg, legal=..., medical=...) | Accepted and normalized; model-specific weights are stored but not yet applied by model inference |
+| set_task_weights(model.aeg, legal=..., medical=...) | Validates persisted task-vector names and applies selected manifest-hashed deltas in the compiled CPU AEG path; artifacts without task-vector payloads fail explicitly; other backends remain incomplete |
 | multi_agent_session(models=[...], coordination="relay") | Async context manager backed by the R2 coordinator; agent generation is Runtime-backed, but real model KV capture remains incomplete |
 | grpo_train_step(..., verifier_domain="math") | PRD aliases are accepted, then fails closed because no gradient backend is configured |
 | generate_with_tools(..., mcp_tools=[...]) | PRD alias is accepted and invokes configured MCP tools; MCP server availability remains required |
@@ -585,40 +898,53 @@ Representative routes include:
 
 Authentication works when AETHER_API_KEYS is configured. With no configured
 keys, the server intentionally accepts requests. Route registration is now
-complete for the audited PRD list, but real semantics remain partial: video
-and GRPO report explicit 501/failed jobs when unsupported, cache bypass invokes
+complete for the audited PRD list. `/v1/generate` and `/v1/chat` now route
+streaming and grammar fields into the real constrained decoder; unavailable
+grammar, TEE, and merge capabilities return explicit 503/501 errors. Real
+semantics remain partial: video and GRPO report explicit 501/failed jobs when
+unsupported, cache bypass invokes
 real Runtime generation, and sub-2-bit reports are measurement-backed rather
 than a compile success claim.
 
 ## 13. gRPC audit
 
-The repository now contains `proto/aether.proto` and a real generic gRPC
-service/client using protobuf `Struct` serialization. Authenticated Health,
-Generate, and GenerateStream RPCs were exercised against a real local
-SafeTensors AEG; generation returned actual model output. The stream currently
-chunks a completed Runtime response because Runtime has no token-yielding
-backend contract, and generated typed Python stubs are not checked in.
-Therefore this is functional but incomplete, not a production-complete gRPC
-surface.
+The repository now contains a typed `proto/aether.proto` contract plus
+checked-in typed Python bindings under `src/aether/server/proto/`. The service
+and client use typed `GenerateRequest`, `GenerateResponse`, `GenerateChunk`,
+and `Health` messages rather than a generic `Struct` envelope. Authenticated
+Health, Generate, and GenerateStream RPCs were exercised against a real local
+SafeTensors AEG. The stream is backed by the CPU engine's incremental token
+iterator, and the integration test verifies non-final chunks, exact joined
+text, metrics conversion, and bearer-token rejection.
+
+This remains incomplete for production deployment: the default server/client
+use insecure TCP channels. Optional TLS/mTLS credential configuration now
+exists, but its certificate-chain path was not validated successfully in this
+Windows environment. Authorization remains a single bearer token, and the
+checked-in bindings are runtime-built from the descriptor rather than
+generated by `protoc` in the build pipeline. The local typed API is functional;
+the production security and distribution contract is not proven.
 
 ## 14. Model compatibility audit
 
 | Model/category | Result |
 |---|---|
 | Qwen | Attempted; failed because weights could not be materialized through the configured proxy |
-| Llama | No real weights run |
-| DeepSeek/MLA | Static architecture detection only |
-| Gemma | No real weights run |
-| Mistral | No real weights run |
+| Qwen2 local fixture | Tiny local SafeTensors checkpoint compiles, reloads, and generates on CPU; full Qwen-family coverage remains unverified |
+| Llama | Tiny local Llama-style SafeTensors and PyTorch checkpoints run end-to-end on CPU; public Hugging Face Llama variants remain unverified |
+| Gemma/Mistral local fixtures | Tiny local SafeTensors checkpoints compile, reload, and generate on CPU; public-model compatibility remains unverified |
+| DeepSeek/MLA | Local DeepSeek-style declared-MTP fixture compiles/reloads and reaches exact-greedy CPU speculation; real DeepSeek weights and MLA execution remain unverified |
+| Gemma | Tiny local SafeTensors fixture compiles/reloads/generates on CPU; public Gemma weights remain unverified |
+| Mistral | Tiny local SafeTensors fixture compiles/reloads/generates on CPU; public Mistral weights remain unverified |
 | Mixtral/MoE | MoE logic unit-tested; no real Mixtral compile/run |
 | Qwen-VL/VLM | No real VLM artifact |
 | Video model | No real video model or graph extraction |
 | Reasoning model | Metadata/heuristic support only |
 | Long-context model | Static context handling only |
-| LoRA model | Adapter unit tests only |
+| LoRA model | Local SafeTensors LoRA adapter compiles into AEG, reloads, and changes real CPU Runtime generation when explicitly selected; broader adapter formats/backends remain untested |
 | GGUF | Tiny local GGUF compiles, reloads, verifies, and generates on CPU; broader variants remain untested |
 | SafeTensors | Tiny local Llama-style checkpoint compiles, reloads, verifies, and generates on CPU |
-| Ternary/sub-2-bit | Quantizer logic only |
+| Ternary/sub-2-bit | Local BitNet/TERNARY CPU AEG path now compiles, reloads, and generates; BTC-LLM/NanoQuant and model-quality validation remain unavailable |
 
 Aether cannot honestly claim any Hugging Face model support based on this evidence.
 
@@ -640,10 +966,16 @@ boundary is now real when configured:
   counts, and latency, and validates those fields before gating;
 - `JsonlBenchmarkEvaluator` executes a supplied model callback against explicit
   local JSONL records using exact-match/accuracy rules;
+- `DatasetBenchmarkEvaluator` additionally parses the common local schemas
+  for HellaSwag, MMLU, GSM8K, Math-500/AIME, and HumanEval. It scores responses
+  from the actual callback; HumanEval subprocess execution is deliberately
+  disabled until explicitly opted in and is not a security sandbox;
+- `aether eval --dataset BENCHMARK=PATH` and the root-confined REST `/v1/eval`
+  route now construct that evaluator and invoke normal Runtime generation;
 - a real local compiled AEG was evaluated and a deliberately non-matching
   response failed the gate;
-- no official HellaSwag, MMLU, GSM8K, Math-500, or HumanEval dataset adapters
-  are bundled;
+- official benchmark files, reference prompting, decontamination, and a
+  reproducible full-suite run are not bundled or validated;
 - `score_override` remains a deterministic CI replay mechanism and is not a
   substitute for benchmark execution;
 - compilation-wide rejection is wired when the caller supplies a measured
@@ -682,12 +1014,20 @@ Positive findings:
 
 - AEG manifest and declared artifact hashes are verified.
 - Tampered declared artifacts are rejected.
+- Manifest traversal, escaping, and symlinked artifact paths are rejected
+  before hashing or loading.
+- Cache/model identifiers are normalized before resolution or deletion, so
+  path-like identifiers cannot escape the per-user model cache.
 - API-key authentication works when configured.
 - MCP calls fail closed when a server is unavailable.
 - ONNX generation refuses to fabricate output.
 - PyTorch generation refuses synthetic fallback.
 - `RuntimeConfig(enable_safety_layer=True)` now enforces prompt injection/toxicity
   checks before inference and output filtering/audit logging after inference.
+- TEE REST attestation and verification now fail closed unless the manager
+  reports hardware-backed evidence; verification also requires the current
+  attestation token, not only a matching model hash. Software simulation stays
+  visible in status but is not exposed as enabled confidentiality.
 - TEE reports hardware_backed=false in simulation mode.
 
 Risks:
@@ -697,7 +1037,9 @@ Risks:
    model code is still not sandboxed.
 2. Native kernel compilation executes toolchains and subprocesses without a
    complete isolation boundary.
-3. TEE software simulation can return successful initialization despite providing no hardware confidentiality.
+3. TEE software simulation still initializes an internal diagnostic manager,
+   but public attestation/verification now rejects it; hardware confidentiality
+   remains unavailable on this host.
 4. Hub offline fallback is a local archive cache, not a live Hub; it must not be represented as remote publication.
 5. Multi-tenant isolation is not demonstrated.
 6. Authorization is a basic token check, not production-grade tenant authorization.
@@ -716,8 +1058,13 @@ Implemented:
 - KV/speculation fields
 - Prometheus text rendering
 - OTLP-shaped JSON output
+- OTLP/HTTP JSON POST export with status and transport error handling; a local
+  collector test received and validated a real payload
 
-The implementation is custom rather than a real OpenTelemetry SDK exporter. It writes JSON files and was not shown exporting to Jaeger, Tempo, or an OTLP collector.
+The implementation is intentionally custom and dependency-light rather than
+using the OpenTelemetry SDK. The local HTTP collector path is functional, but
+interoperability with an external Jaeger/Tempo/OTLP deployment remains
+unverified.
 
 Status: PARTIAL.
 
@@ -836,37 +1183,57 @@ Important findings from source inspection:
   it no longer emits deterministic random logits as a success path.
 - R1 P-EAGLE no longer fills missing MTP slots with greedy/hash/random
   surrogates; absent draft weights are an explicit runtime error.
+- EAGLE-3 no longer uses a seeded random vocabulary projection or token-ID
+  synthetic hidden states when draft material is absent. It requires a real
+  projection and hidden-state input, and speculative use is disabled before
+  acceptance evidence exists.
 - Pass 22 RLVR no longer rewards fluent, numeric, or syntactically valid text
   without supplied ground truth or executable tests; its real verifier paths
   remain limited to configured SymPy/subprocess checks.
+- Pass 19 BitNet now serializes real packed ternary tensors and is consumed by
+  the CPU AEG engine; BTC-LLM/NanoQuant remain explicit unsupported paths and
+  no model-quality score is fabricated.
 - Pass 10 no longer marks architecture-only MTP declarations as compiled:
   missing head weights cause an explicit skipped result instead of zero-filled
   speculation blobs.
 - Pass 13 no longer creates TTT slots from architecture layer counts alone;
   concrete executable graph layers are required before a TTT artifact is
   emitted.
-- Pass 21 now rejects an empty/missing adapter; real adapter runtime integration
-  remains incomplete.
+- Pass 21 now rejects an empty/missing adapter and has real local CPU runtime
+  consumption through the compiled AEG adapter blobs. GPU BGMV and advanced
+  LoRAMoE/LoRAFusion execution remain incomplete.
+- The multimodal dispatcher previously used seeded random ViT and connector
+  projections. Those paths now require validated supplied weights and the
+  configuration-only dispatcher rejects `process_image()`; the remaining VLM
+  gap is therefore explicit rather than decorative.
+- Beam search and MCTS previously had random-token/dummy-expansion defaults.
+  Those defaults now fail closed and the controller requires model-backed
+  callbacks for non-greedy reasoning.
 - many tests use MagicMock or synthetic graphs and do not exercise real model execution.
 
 Legitimate abstract methods such as base backend NotImplementedError were not counted as defects by themselves. Concrete TensorRT-LLM placeholder behavior was counted as incomplete.
 
 ## 23. Critical bugs and unresolved blockers
 
-1. AEG/2.0 and AEG/3.0 version selection is now integrated, and v2 default
-   descriptors are explicitly disabled and self-validating. The format
-   payloads are still not all executable because the underlying v4/v5
-   backends are incomplete.
+1. AEG/2.0 and AEG/3.0 version selection is now integrated. Both the legacy V2
+   helper and the canonical package loader reject enabled claims without their
+   required payloads, and canonical v4/v5 claims are checked before execution.
+   The format payloads are still not all executable because the underlying
+   v4/v5 backends and migration semantics are incomplete.
 2. TensorRT-LLM backend has no executable engine loader in this repository.
 3. Several v4/v5 optimizer artifacts are plans/configuration, not executable kernels or runtime tensors.
-4. gRPC is now a generic Struct-based transport, but typed stubs, TLS, and
-   true token streaming are absent.
+4. gRPC typed messages, client/server bindings, authenticated unary calls, and
+   real CPU token streaming now pass locally. Optional TLS/mTLS configuration
+   exists but is unverified here; stronger authorization and build-time
+   generated-stub compatibility remain absent.
 5. Runtime layers are only partially connected to normal generation; hardware/network layers remain unavailable here.
 6. Hub offline download is local fallback behavior and does not prove a live Hub deployment.
 7. The public `Runtime.eval_gate` now fails closed when no real benchmark
    evaluator is configured; HellaSwag/MMLU/GSM8K/Math-500/HumanEval
    evaluators are still not wired into the deployment path.
-8. Clean isolated installation was not successful in the audit environment.
+8. A dependency-complete clean installation was not successful in the audit
+   environment; the wheel and installed CLI entry point did pass a fresh
+   no-dependency/system-site-packages probe.
 9. Windows environment checking still depends on UTF-8 output in the current script.
 10. Remote code is now disabled by default; explicit opt-in execution remains an isolation risk. Archive
     extraction now rejects traversal, absolute, and link entries and is covered
@@ -877,20 +1244,27 @@ Legitimate abstract methods such as base backend NotImplementedError were not co
 
 Priority 0:
 
-1. Complete AEG/2.0 and AEG/3.0 payload schemas, migration, and executable
-   artifact validation beyond the now-integrated version selection.
+1. Complete AEG/2.0 and AEG/3.0 migration compatibility and executable
+   consumption of every declared payload. Canonical load-time schema and
+   integrity validation now exists, but it is not a substitute for the missing
+   v4/v5 runtime implementations.
 2. Replace remaining unavailable backend paths with real engine integrations.
-3. Complete gRPC with generated typed stubs, true token streaming, TLS, and
-   production authentication/authorization.
+3. Complete gRPC production transport with build-time generated typed stubs,
+   TLS/mTLS configuration, stronger authentication/authorization, and
+   interoperability tests. The local typed token stream is now implemented.
 4. Connect v4/v5 runtime layers to executable inference paths.
-5. Add real evaluation adapters and enforce quality gates before artifact acceptance.
+5. Run the standard local dataset adapters against official, version-pinned
+   benchmark corpora with reference prompting/decontamination, and enforce
+   those measured quality gates before artifact acceptance.
 
 Priority 1:
 
 11. Add real target kernel compilation for CUDA, ROCm, Metal, OpenVINO, QNN, and CPU targets.
 12. Implement VLM/video ingestion and generation.
-13. Implement real MTP/speculative decoding.
-14. Implement integrated ternary/sub-2-bit runtime execution.
+13. Validate the now-wired MTP/P-EAGLE path against an actual DeepSeek/MTP
+    model, then add sampling/grammar-safe semantics and GPU execution.
+14. Complete BTC-LLM/NanoQuant runtimes and wire measured model-quality
+    evaluation into the BitNet/sub-2-bit deployment gate.
 15. Add production embedding-model packaging/persistence and distributed
     semantic-cache coordination.
 16. Implement real KV transfer and distributed execution.
@@ -931,8 +1305,8 @@ sm130, GB300, MI455X, CXL rack pools, ternary FPGAs, and new RISC-V NPUs cannot 
   claimed model family and validate it in fresh processes.
 - Package and validate tokenizer/model adapters for every supported format.
 - Complete AEG/2.0 and AEG/3.0 operational payloads and migration.
-- Complete semantics for the expanded CLI/REST surfaces and finish gRPC typed
-  stubs, TLS, authorization, and token streaming.
+- Complete semantics for the expanded CLI/REST surfaces and finish gRPC TLS,
+  authorization, build-time stub generation, and interoperability coverage.
 - Replace placeholder backend behavior.
 - Connect all claimed runtime layers to real inference paths.
 - Add real evaluators and enforce regression blocking.
@@ -946,17 +1320,17 @@ sm130, GB300, MI455X, CXL rack pools, ternary FPGAs, and new RISC-V NPUs cannot 
 | Category | Completion | Functional | Tested | Production ready |
 |---|---:|---:|---:|---:|
 | Model ingestion | 65% | 45% | 55% | 25% |
-| AEG format | 70% | 58% | 70% | 30% |
-| Optimizer | 85% | 50% | 75% | 30% |
+| AEG format | 76% | 64% | 76% | 33% |
+| Optimizer | 85% | 55% | 78% | 31% |
 | Hardware backends | 35% | 10% | 10% | 5% |
-| Runtime | 70% | 50% | 65% | 25% |
+| Runtime | 71% | 51% | 66% | 26% |
 | CLI | 70% | 55% | 55% | 30% |
 | Python SDK | 60% | 40% | 45% | 20% |
 | REST API | 60% | 40% | 50% | 20% |
-| gRPC | 35% | 30% | 35% | 10% |
+| gRPC | 50% | 45% | 60% | 20% |
 | Evaluation | 25% | 20% | 40% | 5% |
 | Performance | 10% | 5% | 10% | 0% |
-| Observability | 60% | 50% | 65% | 25% |
+| Observability | 65% | 55% | 70% | 30% |
 | Safety | 45% | 35% | 40% | 15% |
 | Hub | 35% | 15% | 35% | 5% |
 | Distributed execution | 20% | 10% | 25% | 0% |
@@ -967,10 +1341,10 @@ sm130, GB300, MI455X, CXL rack pools, ternary FPGAs, and new RISC-V NPUs cannot 
 
 Using higher weights for ingestion, AEG, optimizer, hardware, runtime, and installation:
 
-    PRD/code coverage:       59%
-    Functional coverage:     39%
-    Tested coverage:         49%
-    Production readiness:    19%
+    PRD/code coverage:       60%
+    Functional coverage:     42%
+    Tested coverage:         52%
+    Production readiness:    20%
 
 These are requirement-weighted audit estimates, not line-coverage percentages.
 
@@ -982,9 +1356,11 @@ PARTIALLY.
 
 A new developer can use the proven local CPU path with a real local
 tokenizer-backed SafeTensors checkpoint: compile, reload, run, and call the
-public REST surface. They cannot yet rely on the full PRD promise for arbitrary
-Hugging Face models, remote model download in this environment, v4/v5 artifact
-semantics, GPU/hardware targets, gRPC, distributed execution, or quality gates.
+public REST surface or the locally tested typed gRPC surface. They cannot yet
+rely on the full PRD promise for arbitrary Hugging Face models, remote model
+download in this environment, v4/v5 artifact semantics, GPU/hardware targets,
+distributed execution, or quality gates. Production gRPC TLS and external
+interoperability also remain unverified.
 
 ### If I claim on GitHub that Aether is fully implemented according to both PRDs, is that technically honest?
 
@@ -993,7 +1369,8 @@ NO.
 That statement becomes honest only after extending the proven local
 compile/save/load/run path to the claimed model families, implementing
 AEG/2.0 and AEG/3.0 operationally, completing or removing v4/v5
-metadata-only features, completing REST/CLI endpoint semantics and gRPC,
+metadata-only features, completing REST/CLI endpoint semantics and gRPC
+security/interoperability,
 replacing placeholder backends, proving real model compatibility, running
 real evaluation gates, validating supported hardware, completing clean
 installation, and hardening production security.

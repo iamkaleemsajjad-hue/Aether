@@ -83,6 +83,7 @@ class BackendRegistry:
             "llama.cpp": "llamacpp",
             "tensorrt-llm": "trtllm",
             "tensorrt_llm": "trtllm",
+            "onnxruntime": "onnx",
         }
         name = aliases.get(name, name)
         return self._backends.get(name)

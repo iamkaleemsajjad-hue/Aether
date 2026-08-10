@@ -30,7 +30,11 @@ class QuantizationFormat:
     def __init__(self, precision: str) -> None:
         self.precision = precision
         self.bit_width = PRECISION_SIZES_BYTES.get(precision.upper(), 2.0) * 8
-        self.is_quantized = precision.upper().startswith("Q") or precision.upper().startswith("I")
+        self.is_quantized = (
+            precision.upper().startswith("Q")
+            or precision.upper().startswith("I")
+            or precision.upper() in {"TERNARY", "BINARY", "NANOQ", "BITNET"}
+        )
 
     @property
     def name(self) -> str:

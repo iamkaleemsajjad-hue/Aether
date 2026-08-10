@@ -24,8 +24,9 @@ Three methods:
    - Sub-1-bit effective with trellis path storage.
    - Highest compression, ~20% quality gate relaxation needed.
 
-Quality gate: perplexity increase < config.sub2bit_quality_gate_ppl.
-If gate fails: fall back to INT4 (Pass 2 precision assignment).
+Quality gate: the pass records measured weight reconstruction; a model-quality
+evaluator supplied to ``Compiler.compile`` must enforce the deployment gate.
+The pass never substitutes a literature estimate for measured model quality.
 
 AEG artifacts:
   - ``.aeg/quantization/sub2bit_manifest.json``: method, scale tables.
@@ -46,6 +47,8 @@ import math
 import time
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from aether.compiler.config import CompilerConfig
 from aether.compiler.report import PassReport
@@ -104,38 +107,29 @@ class Sub2BitQuantizationPass(BasePass):
                 report.details["reason"] = "no_weights_in_graph"
                 return graph, report
 
-            # The old implementation used fixed literature estimates as if
-            # they were a measured perplexity gate.  That can accept a bad
-            # artifact.  Until a real baseline/candidate evaluator is passed
-            # through the compiler, refuse to publish the transformed graph.
-            report.status = "skipped"
-            report.details = {
-                "reason": "quality_evaluator_unavailable",
-                "message": (
-                    "sub-2-bit quantization requires a measured baseline and candidate "
-                    "quality evaluator; hardcoded perplexity estimates are not accepted"
-                ),
-            }
-            return graph, report
+            # The CPU reference runtime has a real BitNet-compatible codec and
+            # can consume the resulting packed tensors after Stage 4. BTC-LLM
+            # and NanoQuant still require their distinct codebook runtimes, so
+            # refuse to publish a metadata-only artifact for those methods.
+            if method != "bitnet":
+                report.details = {
+                    "reason": "runtime_codec_unavailable",
+                    "method": method,
+                    "message": (
+                        f"{method} quantization has no integrated AEG weight codec/runtime; "
+                        "the compiler refuses a metadata-only artifact"
+                    ),
+                }
+                return graph, report
 
             # Quantize weights.
             quantizer = _get_quantizer(method)
             quantized_store, scale_tables, bits_per_weight = quantizer.quantize(weight_store)
+            reconstruction = _measure_reconstruction(weight_store, quantized_store, scale_tables)
 
-            # Quality gate: estimate perplexity increase.
-            ppl_increase = _estimate_ppl_increase(method, bits_per_weight)
-            if ppl_increase > quality_gate_ppl:
-                logger.warning(
-                    "Pass 19: Quality gate FAIL — estimated PPL increase %.2f%% > "
-                    "threshold %.2f%%.  Falling back to INT4.",
-                    ppl_increase * 100,
-                    quality_gate_ppl * 100,
-                )
-                report.status = "skipped"
-                report.details["reason"] = "quality_gate_failed"
-                report.details["estimated_ppl_increase"] = ppl_increase
-                return graph, report
-
+            # Model quality is deliberately not inferred from literature
+            # estimates. The measured reconstruction is persisted below, and
+            # an external evaluator can reject the final package.
             # Update graph weight store with quantized weights.
             n_updated = _update_weight_store(graph, quantized_store)
 
@@ -150,6 +144,7 @@ class Sub2BitQuantizationPass(BasePass):
                     scale_tables=scale_tables,
                     n_tensors=n_updated,
                     bits_per_weight=bits_per_weight,
+                    reconstruction=reconstruction,
                 )
 
             # Compute compression ratio vs BF16 (2 bytes/elem).
@@ -165,8 +160,12 @@ class Sub2BitQuantizationPass(BasePass):
                 "compression_ratio_vs_bf16": round(compression_ratio, 1),
                 "n_tensors_quantized": n_updated,
                 "n_opcodes_emitted": n_opcodes,
-                "estimated_ppl_increase_pct": round(ppl_increase * 100, 2),
-                "quality_gate_passed": True,
+                "weight_reconstruction": reconstruction,
+                "quality_gate": {
+                    "status": "not_evaluated",
+                    "reason": "model_quality_evaluator_must_be_supplied_to_Compiler.compile",
+                    "configured_threshold": quality_gate_ppl,
+                },
             }
             logger.info(
                 "Pass 19 complete: %s, %.2f bits/weight, %.1f× compression, "
@@ -175,7 +174,7 @@ class Sub2BitQuantizationPass(BasePass):
                 bits_per_weight,
                 compression_ratio,
                 n_updated,
-                ppl_increase * 100,
+                reconstruction["relative_rmse"] * 100,
                 elapsed,
             )
 
@@ -365,6 +364,46 @@ def _get_weight_store(graph: Any) -> dict[str, list[float]]:
     return weights
 
 
+def _measure_reconstruction(
+    original: dict[str, list[float]],
+    quantized: dict[str, list[int]],
+    scale_tables: dict[str, Any],
+) -> dict[str, float]:
+    """Measure the actual weight reconstruction error of the transform.
+
+    This is deliberately reported as a reconstruction metric, not as
+    perplexity.  Model-quality evaluation remains a separate compiler gate
+    supplied through ``Compiler.compile(evaluation_evaluator=...)``.
+    """
+    scales = scale_tables.get("scales", {})
+    squared_error = 0.0
+    signal = 0.0
+    elements = 0
+    max_error = 0.0
+    for name, values in original.items():
+        source = np.asarray(values, dtype=np.float64).reshape(-1)
+        codes = np.asarray(quantized.get(name, []), dtype=np.float64).reshape(-1)
+        if source.size == 0 or codes.size != source.size:
+            continue
+        scale = float(scales.get(name, 1.0)) if isinstance(scales, dict) else 1.0
+        restored = codes * scale
+        difference = restored - source
+        squared_error += float(np.dot(difference, difference))
+        signal += float(np.dot(source, source))
+        elements += int(source.size)
+        max_error = max(max_error, float(np.max(np.abs(difference))))
+    if elements == 0:
+        raise ValueError("sub-2-bit quantization produced no measurable tensor elements")
+    rmse = math.sqrt(squared_error / elements)
+    relative_rmse = rmse / max(math.sqrt(signal / elements), 1e-12)
+    return {
+        "elements": float(elements),
+        "rmse": float(rmse),
+        "relative_rmse": float(relative_rmse),
+        "max_abs_error": float(max_error),
+    }
+
+
 def _update_weight_store(graph: Any, quantized: dict[str, list[int]]) -> int:
     n_updated = 0
     if hasattr(graph, "weight_store") and hasattr(graph.weight_store, "update"):
@@ -393,23 +432,13 @@ def _emit_sub2bit_opcodes(graph: Any, method: str, weight_store: dict) -> int:
     return n_emitted
 
 
-def _estimate_ppl_increase(method: str, bits_per_weight: float) -> float:
-    """Estimate perplexity increase for sub-2-bit methods.
-
-    Empirical bounds from BitNet b1.58 (Ma 2024) and BTC-LLM (2026):
-    - BitNet: ~3% PPL increase on Llama-class models (7B–70B).
-    - BTC-LLM: ~5% PPL increase.
-    - NanoQuant: ~8% PPL increase.
-    """
-    return {"bitnet": 0.03, "btc_llm": 0.05, "nanoquant": 0.08}.get(method, 0.05)
-
-
 def _write_sub2bit_manifest(
     output_dir: Path,
     method: str,
     scale_tables: dict,
     n_tensors: int,
     bits_per_weight: float,
+    reconstruction: dict[str, float],
 ) -> None:
     quant_dir = output_dir / "quantization"
     quant_dir.mkdir(parents=True, exist_ok=True)
@@ -418,6 +447,12 @@ def _write_sub2bit_manifest(
         "method": method,
         "bits_per_weight": bits_per_weight,
         "n_tensors": n_tensors,
+        "runtime_codec": "TERNARY" if method == "bitnet" else None,
+        "weight_reconstruction": reconstruction,
+        "quality_gate": {
+            "status": "not_evaluated",
+            "requires_model_evaluator": True,
+        },
         "scale_tables_summary": {k: v for k, v in scale_tables.items() if k != "scales"},
     }
     (quant_dir / "sub2bit_manifest.json").write_text(

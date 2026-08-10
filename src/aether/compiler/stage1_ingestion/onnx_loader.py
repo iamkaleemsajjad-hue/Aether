@@ -109,8 +109,10 @@ class ONNXLoader:
             model = onnx.load(str(self.model_path))
             onnx.checker.check_model(model)
         except ImportError:
-            # Fall back to raw protobuf parsing without onnx package
-            return self._load_raw_protobuf()
+            raise UnsupportedFormatError(
+                "ONNX ingestion requires the 'onnx' package; refusing to create "
+                "an empty graph from an unparsed protobuf"
+            ) from None
         except Exception as exc:
             msg = f"Failed to load ONNX model {self.model_path}: {exc}"
             raise IngestionError(msg) from exc
@@ -204,26 +206,13 @@ class ONNXLoader:
 
     def _load_raw_protobuf(self) -> dict[str, Any]:
         """
-        Fallback path that reads ONNX files without the onnx package.
-
-        Returns a minimal descriptor — nodes and weights will be empty but
-        the structure is valid for architecture graph construction.
+        Deprecated compatibility hook. A raw protobuf without ONNX schema
+        parsing is not a valid executable ingestion result.
         """
-        logger.warning(
-            "onnx package not installed; ONNX file loaded without protobuf parsing",
-            path=str(self.model_path),
+        raise UnsupportedFormatError(
+            "raw ONNX protobuf fallback is unsupported; install the 'onnx' package "
+            "to parse nodes, shapes, and initializers"
         )
-        data = self.model_path.read_bytes()
-        return {
-            "nodes": [],
-            "inputs": [],
-            "outputs": [],
-            "initializers": {},
-            "weights": {},
-            "opset": 17,
-            "ir_version": 8,
-            "raw_bytes": len(data),
-        }
 
     def __repr__(self) -> str:
         return f"ONNXLoader({self.model_path})"

@@ -416,6 +416,17 @@ class AEGPackage:
         metadata_path = self.root / "graph" / "metadata.json"
         if metadata_path.exists():
             self.metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        # AEG/2.0 and AEG/3.0 are extensible, but an extension is only valid
+        # when its compiler claim has a complete, parseable payload.  Validate
+        # this after metadata is loaded so a stale or hand-edited artifact
+        # cannot reach a runtime merely because its hashes are internally
+        # consistent.
+        feature_errors = self.validate_feature_claims()
+        if feature_errors:
+            raise AEGFormatError(
+                "Invalid AEG optimizer feature claims",
+                details={"errors": feature_errors, "format_version": self.manifest.format_version},
+            )
         # Load precision map
         precision_path = self.root / "weights" / "quantized" / "precision_map.json"
         if precision_path.exists():
@@ -573,8 +584,20 @@ class AEGPackage:
             msg = "Cannot verify package without manifest"
             raise AEGIntegrityError(msg)
         self.manifest.verify()
+        feature_errors = self.validate_feature_claims()
+        if feature_errors:
+            raise AEGFormatError(
+                "Invalid AEG optimizer feature claims",
+                details={"errors": feature_errors, "format_version": self.manifest.format_version},
+            )
         # Verify graph hash
         graph_path = self.root / "graph" / AEG_GRAPH_FILENAME
+        graph_resolved = graph_path.resolve()
+        if graph_path.is_symlink() or not graph_resolved.is_relative_to(self.root.resolve()):
+            raise AEGIntegrityError(
+                "AEG graph path is symlinked or escapes the package root",
+                file_path=str(graph_path),
+            )
         if graph_path.exists():
             expected = self.manifest.graph_hash
             if not verify_file_hash(graph_path, expected):
@@ -593,8 +616,26 @@ class AEGPackage:
         # Verify every payload declared by the manifest. Previously only the
         # graph was checked, so a tampered weight blob, kernel plan, safety
         # file, or provenance artifact could pass integrity verification.
+        package_root = self.root.resolve()
         for relative_path, expected in self.manifest.artifacts.items():
-            payload = self.root / relative_path
+            relative = Path(relative_path)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise AEGIntegrityError(
+                    f"Unsafe AEG artifact path: {relative_path}",
+                    file_path=str(self.root / relative_path),
+                )
+            payload = (package_root / relative).resolve()
+            if not payload.is_relative_to(package_root):
+                raise AEGIntegrityError(
+                    f"AEG artifact escapes package root: {relative_path}",
+                    file_path=str(payload),
+                )
+            original_payload = package_root / relative
+            if original_payload.is_symlink() or payload.is_symlink():
+                raise AEGIntegrityError(
+                    f"Symlinked AEG artifacts are not allowed: {relative_path}",
+                    file_path=str(original_payload),
+                )
             if not payload.is_file():
                 raise AEGIntegrityError(
                     f"Declared AEG artifact is missing: {relative_path}",
@@ -627,6 +668,255 @@ class AEGPackage:
                             f"Weight index entry {entry.name!r} has out-of-bounds {label} range",
                             file_path=str(store.index_path),
                         )
+
+    def validate_feature_claims(self) -> list[str]:
+        """Validate compiler-declared v4/v5 feature payloads.
+
+        The canonical AEG writer stores the applied optimizer pass names in
+        ``graph/metadata.json``.  That metadata is the compatibility bridge
+        between the compiler and runtime; it must therefore be treated as a
+        schema, not as an informational log.  This method validates the
+        concrete payloads emitted by each pass and returns all errors so
+        callers can report the complete artifact defect in one exception.
+
+        AEG/1.0 and AEG/1.1 remain backward compatible and do not require the
+        v4/v5 extension payloads.  AEG/2.0 requires v4 claims to be complete;
+        AEG/3.0 is required for v5 claims.
+        """
+        if self.manifest is None:
+            return ["AEG feature claims cannot be checked without a manifest"]
+
+        version = self.manifest.format_version
+        if version in {"AEG/1.0", "AEG/1.1"}:
+            passes: Any = self.metadata.get("optimizer_passes", [])
+            extension_passes = {
+                "mtp_head_compilation", "grammar_constraint_compilation",
+                "model_merging", "ttt_fast_weight_injection",
+                "semantic_kv_compression", "cross_layer_kv_sharing",
+                "green_energy_compilation", "tee_kernel_wrapping",
+                "mdlm_drafter_compilation", "sub2bit_quantization",
+                "video_token_compression", "advanced_peft_compilation",
+                "rlvr_verifier_head_injection",
+            }
+            if isinstance(passes, list) and extension_passes.intersection(passes):
+                return [
+                    f"AEG {version} contains v4/v5 optimizer claims but is not an extension format"
+                ]
+            return []
+
+        errors: list[str] = []
+        passes = self.metadata.get("optimizer_passes", [])
+        if passes is None:
+            passes = []
+        if not isinstance(passes, list) or not all(isinstance(item, str) for item in passes):
+            return ["graph metadata optimizer_passes must be a list of strings"]
+
+        v4_passes = {
+            "mtp_head_compilation",
+            "grammar_constraint_compilation",
+            "model_merging",
+            "ttt_fast_weight_injection",
+            "semantic_kv_compression",
+            "cross_layer_kv_sharing",
+            "green_energy_compilation",
+            "tee_kernel_wrapping",
+        }
+        v5_passes = {
+            "mdlm_drafter_compilation",
+            "sub2bit_quantization",
+            "video_token_compression",
+            "advanced_peft_compilation",
+            "rlvr_verifier_head_injection",
+        }
+        if version == "AEG/2.0" and v5_passes.intersection(passes):
+            errors.append("AEG/2.0 cannot contain v5 optimizer claims")
+        if version not in {"AEG/2.0", "AEG/3.0"} and (v4_passes | v5_passes).intersection(passes):
+            errors.append(f"unsupported extension format for optimizer claims: {version}")
+
+        def safe_relative(relative: Any) -> Path | None:
+            if not isinstance(relative, str):
+                errors.append("feature payload reference must be a relative string")
+                return None
+            path = Path(relative)
+            if path.is_absolute() or ".." in path.parts:
+                errors.append(f"unsafe feature payload path: {relative!r}")
+                return None
+            resolved = (self.root / path).resolve()
+            if not resolved.is_relative_to(self.root.resolve()):
+                errors.append(f"feature payload escapes package root: {relative!r}")
+                return None
+            return resolved
+
+        def require_file(relative: str, *, nonempty: bool = False) -> Path | None:
+            path = safe_relative(relative)
+            if path is None:
+                return None
+            if not path.is_file():
+                errors.append(f"optimizer claim requires missing payload: {relative}")
+                return None
+            if path.is_symlink():
+                errors.append(f"optimizer payload may not be a symlink: {relative}")
+                return None
+            if nonempty and path.stat().st_size == 0:
+                errors.append(f"optimizer payload is empty: {relative}")
+                return None
+            return path
+
+        def read_object(relative: str) -> dict[str, Any] | None:
+            path = require_file(relative, nonempty=True)
+            if path is None:
+                return None
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                errors.append(f"invalid optimizer JSON payload {relative}: {exc}")
+                return None
+            if not isinstance(payload, dict):
+                errors.append(f"optimizer JSON payload must be an object: {relative}")
+                return None
+            return payload
+
+        def require_format(payload: dict[str, Any], relative: str, expected: str) -> None:
+            if payload.get("format") != expected:
+                errors.append(
+                    f"optimizer payload {relative} has format {payload.get('format')!r}; "
+                    f"expected {expected!r}"
+                )
+
+        for pass_name in passes:
+            if pass_name == "mtp_head_compilation":
+                payload = read_object("speculation/mtp_config.json")
+                if payload is not None:
+                    require_format(payload, "speculation/mtp_config.json", "aether_mtp_v1")
+                    heads = payload.get("heads")
+                    if not isinstance(heads, list) or not heads:
+                        errors.append("MTP claim has no compiled heads")
+                    else:
+                        for head in heads:
+                            if not isinstance(head, dict):
+                                errors.append("MTP head descriptor must be an object")
+                                continue
+                            blob = head.get("blob_file")
+                            if isinstance(blob, str):
+                                require_file(f"speculation/{blob}", nonempty=True)
+                            else:
+                                errors.append("MTP head descriptor has no blob_file")
+            elif pass_name == "grammar_constraint_compilation":
+                payload = read_object("grammar/fsm_config.json")
+                blob = require_file("grammar/fsm.bin", nonempty=True)
+                if payload is not None:
+                    require_format(payload, "grammar/fsm_config.json", "aether_fsa_v1")
+                    if payload.get("tokenizer_aware") is not True:
+                        errors.append("grammar claim is not tokenizer-aware")
+                    if not isinstance(payload.get("tokenizer_fingerprint"), str) or not payload["tokenizer_fingerprint"]:
+                        errors.append("grammar claim has no tokenizer fingerprint")
+                    for key in ("n_states", "n_transitions", "vocab_size"):
+                        if not isinstance(payload.get(key), int) or payload[key] <= 0:
+                            errors.append(f"grammar payload has invalid {key}")
+                if blob is not None and blob.stat().st_size < 64:
+                    errors.append("grammar FSM payload is shorter than its binary header")
+            elif pass_name == "model_merging":
+                payload = read_object("merging/merge_manifest.json")
+                if payload is not None:
+                    require_format(payload, "merging/merge_manifest.json", "aether_merge_manifest_v1")
+                    if int(payload.get("n_sources", 0) or 0) <= 0:
+                        errors.append("model merge claim has no source models")
+                    if not isinstance(payload.get("coefficients"), list):
+                        errors.append("model merge claim has no coefficient list")
+            elif pass_name == "ttt_fast_weight_injection":
+                payload = read_object("ttt/fast_weight_config.json")
+                if payload is not None:
+                    require_format(payload, "ttt/fast_weight_config.json", "aether_ttt_v1")
+                    slots = payload.get("slots")
+                    if not isinstance(slots, list) or not slots:
+                        errors.append("TTT claim has no slot descriptors")
+                    else:
+                        for slot in slots:
+                            if not isinstance(slot, dict) or not isinstance(slot.get("slot_file"), str):
+                                errors.append("TTT slot descriptor has no slot_file")
+                                continue
+                            require_file(f"ttt/{slot['slot_file']}", nonempty=True)
+            elif pass_name == "semantic_kv_compression":
+                payload = read_object("graph/kv_compression_plan.json")
+                if payload is not None:
+                    require_format(payload, "graph/kv_compression_plan.json", "aether_kv_compression_v1")
+                    if not isinstance(payload.get("layers"), list) or not payload["layers"]:
+                        errors.append("semantic KV claim has no layer plan")
+            elif pass_name == "cross_layer_kv_sharing":
+                payload = read_object("graph/cross_layer_kv_plan.json")
+                if payload is not None:
+                    require_format(payload, "graph/cross_layer_kv_plan.json", "aether_cross_layer_kv_v1")
+                    if not isinstance(payload.get("sharing_groups"), list):
+                        errors.append("cross-layer KV claim has no sharing groups")
+            elif pass_name == "green_energy_compilation":
+                payload = read_object("metadata/green_profile.json")
+                if payload is not None:
+                    require_format(payload, "metadata/green_profile.json", "aether_green_profile_v1")
+                    if not isinstance(payload.get("dvfs_hints"), list):
+                        errors.append("green-energy claim has no DVFS hint list")
+            elif pass_name == "tee_kernel_wrapping":
+                payload = read_object("security/tee_config.json")
+                hashes = read_object("security/weight_hash_manifest.json")
+                if payload is not None:
+                    require_format(payload, "security/tee_config.json", "aether_tee_v1")
+                    if payload.get("backend") in {None, "none", ""}:
+                        errors.append("TEE claim has no concrete backend")
+                if hashes is not None:
+                    require_format(hashes, "security/weight_hash_manifest.json", "aether_weight_hash_manifest_v1")
+                    if not isinstance(hashes.get("weight_hashes"), dict):
+                        errors.append("TEE claim has no weight hash map")
+            elif pass_name == "mdlm_drafter_compilation":
+                payload = read_object("diffusion/drafter_config.json")
+                schedule = read_object("diffusion/schedule.json")
+                if payload is not None:
+                    if payload.get("type") != "mdlm_drafter":
+                        errors.append("MDLM drafter payload has the wrong type")
+                    if int(payload.get("T_steps", 0) or 0) <= 0 or int(payload.get("K_block", 0) or 0) <= 0:
+                        errors.append("MDLM drafter payload has invalid dimensions")
+                if schedule is not None:
+                    if not isinstance(schedule.get("alpha_t"), list) or not schedule["alpha_t"]:
+                        errors.append("MDLM drafter schedule has no denoising coefficients")
+            elif pass_name == "sub2bit_quantization":
+                payload = read_object("quantization/sub2bit_manifest.json")
+                if payload is not None:
+                    require_format(payload, "quantization/sub2bit_manifest.json", "aether_sub2bit_v1")
+                    if float(payload.get("bits_per_weight", 0) or 0) <= 0:
+                        errors.append("sub-2-bit claim has invalid bits_per_weight")
+            elif pass_name == "video_token_compression":
+                payload = read_object("graph/video_compression_plan.json")
+                if payload is not None:
+                    require_format(payload, "graph/video_compression_plan.json", "aether_video_compression_v1")
+                    retention = payload.get("retention_ratio")
+                    if not isinstance(retention, (int, float)) or not 0 < retention <= 1:
+                        errors.append("video compression claim has invalid retention_ratio")
+            elif pass_name == "advanced_peft_compilation":
+                payload = read_object("adapters/adapter_manifest.json")
+                if payload is not None:
+                    require_format(payload, "adapters/adapter_manifest.json", "aether_adapter_manifest_v1")
+                    adapters = payload.get("adapters")
+                    if not isinstance(adapters, list) or not adapters:
+                        errors.append("PEFT claim has no adapter descriptors")
+                    else:
+                        for adapter in adapters:
+                            if not isinstance(adapter, dict):
+                                errors.append("PEFT adapter descriptor must be an object")
+                                continue
+                            for key in ("lora_A_ref", "lora_B_ref"):
+                                reference = adapter.get(key)
+                                if isinstance(reference, str):
+                                    require_file(f"adapters/{reference}", nonempty=True)
+                                else:
+                                    errors.append(f"PEFT descriptor has no {key}")
+            elif pass_name == "rlvr_verifier_head_injection":
+                payload = read_object("training/rlvr_config.json")
+                if payload is not None:
+                    require_format(payload, "training/rlvr_config.json", "aether_rlvr_v1")
+                    if int(payload.get("grpo_K", 0) or 0) < 2:
+                        errors.append("RLVR claim has invalid GRPO group size")
+                    if not isinstance(payload.get("opcodes"), list) or not payload["opcodes"]:
+                        errors.append("RLVR claim has no training opcodes")
+
+        return errors
 
 
     def _write_extended_artifacts(self) -> None:

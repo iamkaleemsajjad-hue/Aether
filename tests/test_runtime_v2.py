@@ -385,6 +385,68 @@ class TestR6MCPIntegration:
         schema, server = reg.lookup("calc")
         assert server == "math_server"
 
+    def test_namespaced_lookup_and_schema_validation_fail_closed(self):
+        e = self._make()
+        e._registry.register_server_tools(
+            "math_server",
+            [{
+                "name": "calc",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"expression": {"type": "string"}},
+                    "required": ["expression"],
+                    "additionalProperties": False,
+                },
+            }],
+        )
+
+        class Client:
+            is_connected = True
+
+            def call_tool(self, name, arguments):
+                return {"isError": False, "content": [{"type": "text", "text": arguments["expression"]}]}
+
+        e._clients["math_server"] = Client()
+        valid = e.call_tool("math_server/calc", {"expression": "2+2"})
+        assert valid["isError"] is False
+        invalid = e.call_tool("math_server/calc", {})
+        assert invalid["isError"] is True
+        assert "schema validation" in invalid["content"][0]["text"]
+
+    def test_generate_with_tools_continues_after_model_tool_call(self):
+        from aether.runtime.runtime import GenerationResponse, Runtime
+
+        runtime = Runtime()
+        calls = []
+        prompts = []
+
+        class MCP:
+            def detect_tool_call(self, text):
+                if '"tool": "calc"' in text:
+                    return {"tool": "calc", "arguments": {"expression": "2+2"}}
+                return None
+
+            def call_tool(self, name, arguments):
+                calls.append((name, arguments))
+                return {"isError": False, "content": [{"type": "text", "text": "4"}]}
+
+        sequence = iter([
+            '{"tool": "calc", "arguments": {"expression": "2+2"}}',
+            "The result is 4.",
+        ])
+
+        def fake_generate(model_id, prompt, **kwargs):
+            prompts.append(prompt)
+            return GenerationResponse(text=next(sequence))
+
+        runtime.mcp_layer = MCP()
+        runtime.generate = fake_generate  # type: ignore[method-assign]
+        result = runtime.generate_with_tools("model.aeg", "calculate", max_tool_rounds=2)
+        assert result.text == "The result is 4."
+        assert calls == [("calc", {"expression": "2+2"})]
+        assert "Tool result" in prompts[-1]
+        assert result.metrics.extra["mcp_tool_rounds"] == 1
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # R7 — Green Power Manager
@@ -436,6 +498,18 @@ class TestR7GreenPowerManager:
         gpm = self._make()
         carbon = gpm.estimate_carbon(energy_mj=1000.0)
         assert carbon > 0.0
+
+    def test_request_energy_reports_evidence_source(self):
+        gpm = self._make()
+        estimated, estimated_source = gpm.measure_request_energy(0.25)
+        assert estimated > 0.0
+        assert estimated_source == "tdp_duration_estimate"
+        gpm.update_power_reading(200.0)
+        measured, measured_source = gpm.measure_request_energy(0.25)
+        assert measured == 50_000.0
+        assert measured_source == "measured_power_reading"
+        gpm.record_request(measured, gpm.estimate_carbon(measured), source=measured_source)
+        assert gpm.summary()["measured_requests"] == 1
 
     def test_select_green_region(self):
         gpm = self._make()

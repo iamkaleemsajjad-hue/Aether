@@ -34,12 +34,15 @@ v4.0 NEW endpoints (PRD §22 Extended Developer API v4.0):
 """
 
 import json
+import asyncio
+import builtins
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from aether.runtime import Runtime
+from aether.core.constants import AETHER_VERSION
 
 
 def create_router(runtime: Runtime) -> Any:
@@ -152,8 +155,17 @@ def create_router(runtime: Runtime) -> Any:
     class EvalRequest(BaseModel):
         model: str
         domain: str = "general"
-        num_examples: int = 100
-        quality_threshold: float = 0.98
+        num_examples: int = Field(default=100, gt=0)
+        quality_threshold: float = Field(default=0.98, ge=0.0, le=1.0)
+        datasets: dict[str, str] | None = Field(
+            default=None,
+            description=(
+                "Benchmark-to-file mapping. Paths are relative to the server's "
+                "configured eval_data_dir."
+            ),
+        )
+        max_tokens: int = Field(default=256, gt=0)
+        allow_code_execution: bool = False
 
     class ABStartRequest(BaseModel):
         model_a: str
@@ -279,8 +291,20 @@ def create_router(runtime: Runtime) -> Any:
             if req.stream:
                 async def event_stream() -> Any:
                     try:
-                        for index, chunk in enumerate(
-                            runtime.generate_stream(
+                        if req.grammar:
+                            stream = runtime.generate_constrained_stream(
+                                model_id=req.model,
+                                prompt=req.prompt,
+                                grammar=req.grammar,
+                                max_tokens=req.max_tokens,
+                                temperature=req.temperature,
+                                top_p=req.top_p,
+                                top_k=req.top_k,
+                                stop=req.stop,
+                                slo_deadline_ms=req.slo_deadline_ms,
+                            )
+                        else:
+                            stream = runtime.generate_stream(
                                 model_id=req.model,
                                 prompt=req.prompt,
                                 max_tokens=req.max_tokens,
@@ -288,7 +312,10 @@ def create_router(runtime: Runtime) -> Any:
                                 top_p=req.top_p,
                                 top_k=req.top_k,
                                 stop=req.stop,
+                                slo_deadline_ms=req.slo_deadline_ms,
                             )
+                        for index, chunk in enumerate(
+                            stream
                         ):
                             yield f"data: {json.dumps({'text': chunk, 'index': index})}\n\n"
                         yield "data: [DONE]\n\n"
@@ -300,15 +327,29 @@ def create_router(runtime: Runtime) -> Any:
                         yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
 
                 return StreamingResponse(event_stream(), media_type="text/event-stream")
-            response = runtime.generate(
-                model_id=req.model,
-                prompt=req.prompt,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_p=req.top_p,
-                top_k=req.top_k,
-                stop=req.stop,
-            )
+            if req.grammar:
+                response = runtime.generate_constrained(
+                    model_id=req.model,
+                    prompt=req.prompt,
+                    grammar=req.grammar,
+                    max_tokens=req.max_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                    stop=req.stop,
+                    slo_deadline_ms=req.slo_deadline_ms,
+                )
+            else:
+                response = runtime.generate(
+                    model_id=req.model,
+                    prompt=req.prompt,
+                    max_tokens=req.max_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                    stop=req.stop,
+                    slo_deadline_ms=req.slo_deadline_ms,
+                )
             return GenerateResponse(
                 text=response.text,
                 usage=response.usage,
@@ -322,13 +363,74 @@ def create_router(runtime: Runtime) -> Any:
         """Chat completion (OpenAI-compatible) with structured output and SLO support."""
         try:
             messages = [m.model_dump() for m in req.messages]
-            response = runtime.chat(
-                model_id=req.model,
-                messages=messages,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_p=req.top_p,
-            )
+            response_schema: dict[str, Any] | None = None
+            if req.response_format is not None:
+                if req.grammar:
+                    raise HTTPException(status_code=422, detail="grammar and response_format are mutually exclusive")
+                format_type = req.response_format.get("type")
+                if format_type != "json_schema":
+                    raise HTTPException(
+                        status_code=422,
+                        detail="response_format requires a tokenizer-aware json_schema constraint",
+                    )
+                schema_payload = req.response_format.get("json_schema")
+                if not isinstance(schema_payload, dict):
+                    raise HTTPException(status_code=422, detail="response_format.json_schema must be an object")
+                response_schema = schema_payload.get("schema")
+                if not isinstance(response_schema, dict):
+                    raise HTTPException(status_code=422, detail="response_format.json_schema.schema must be an object")
+            if req.stream:
+                if req.grammar or response_schema is not None:
+                    stream = runtime.generate_constrained_stream(
+                        model_id=req.model,
+                        messages=messages,
+                        grammar=req.grammar,
+                        schema=response_schema,
+                        max_tokens=req.max_tokens,
+                        temperature=req.temperature,
+                        top_p=req.top_p,
+                        slo_deadline_ms=req.slo_deadline_ms,
+                    )
+                else:
+                    stream = runtime.generate_stream(
+                        model_id=req.model,
+                        messages=messages,
+                        max_tokens=req.max_tokens,
+                        temperature=req.temperature,
+                        top_p=req.top_p,
+                        slo_deadline_ms=req.slo_deadline_ms,
+                    )
+
+                async def event_stream() -> Any:
+                    try:
+                        for index, chunk in enumerate(stream):
+                            yield f"data: {json.dumps({'text': chunk, 'index': index})}\n\n"
+                        yield "data: [DONE]\n\n"
+                    except Exception as exc:  # noqa: BLE001
+                        yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+
+                return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+            if req.grammar or response_schema is not None:
+                response = runtime.generate_constrained(
+                    model_id=req.model,
+                    messages=messages,
+                    grammar=req.grammar,
+                    schema=response_schema,
+                    max_tokens=req.max_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    slo_deadline_ms=req.slo_deadline_ms,
+                )
+            else:
+                response = runtime.chat(
+                    model_id=req.model,
+                    messages=messages,
+                    max_tokens=req.max_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    slo_deadline_ms=req.slo_deadline_ms,
+                )
             return {
                 "model": req.model,
                 "text": response.text,
@@ -498,7 +600,68 @@ def create_router(runtime: Runtime) -> Any:
     async def start_eval(req: EvalRequest):
         job_id = str(uuid.uuid4())
         try:
-            result = runtime.eval_gate(req.model, req.domain, req.num_examples, req.quality_threshold)
+            evaluator = None
+            benchmarks = None
+            if req.datasets:
+                root_value = (runtime.config.extra or {}).get("eval_data_dir")
+                if not isinstance(root_value, str) or not root_value.strip():
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "dataset evaluation is unavailable: configure "
+                            "RuntimeConfig.extra['eval_data_dir']"
+                        ),
+                    )
+                root = Path(root_value).expanduser().resolve()
+                if not root.is_dir():
+                    raise HTTPException(status_code=503, detail=f"evaluation data root not found: {root}")
+                resolved: dict[str, str] = {}
+                for benchmark, requested_path in req.datasets.items():
+                    if not benchmark.strip() or not isinstance(requested_path, str) or not requested_path.strip():
+                        raise HTTPException(status_code=422, detail="datasets must map non-empty names to paths")
+                    candidate = (root / requested_path).resolve()
+                    try:
+                        candidate.relative_to(root)
+                    except ValueError as exc:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=f"dataset path escapes configured eval_data_dir: {requested_path!r}",
+                        ) from exc
+                    if not candidate.is_file():
+                        raise HTTPException(status_code=422, detail=f"dataset file not found: {requested_path!r}")
+                    resolved[benchmark.strip().lower()] = str(candidate)
+
+                from aether.observability.ci_pipeline import DatasetBenchmarkEvaluator
+
+                def generate_fn(*, prompt: str, benchmark: str, max_tokens: int) -> str:
+                    return runtime.generate(
+                        req.model,
+                        prompt,
+                        max_tokens=max_tokens,
+                        temperature=0.0,
+                    ).text
+
+                evaluator = DatasetBenchmarkEvaluator(
+                    resolved,
+                    generate_fn,
+                    max_tokens=req.max_tokens,
+                    max_examples=req.num_examples,
+                    allow_code_execution=req.allow_code_execution,
+                )
+                benchmarks = builtins.list(resolved)
+
+            # Generation-backed evaluation is CPU/GPU-bound synchronous work;
+            # keep the FastAPI event loop responsive while preserving the
+            # existing job record and explicit failed status semantics.
+            result = await asyncio.to_thread(
+                runtime.eval_gate,
+                req.model,
+                req.domain,
+                req.num_examples,
+                req.quality_threshold,
+                benchmarks=benchmarks,
+                evaluator=evaluator,
+            )
             # An unavailable or failed quality gate is not a successful job.
             # Returning ``succeeded`` here allowed callers to deploy an
             # artifact whose evaluation never ran.
@@ -506,6 +669,8 @@ def create_router(runtime: Runtime) -> Any:
             eval_status = "succeeded" if passed else "failed"
             eval_jobs[job_id] = {"job_id": job_id, "status": eval_status, "result": result}
             return eval_jobs[job_id]
+        except HTTPException:
+            raise
         except Exception as exc:
             eval_jobs[job_id] = {"job_id": job_id, "status": "failed", "error": str(exc)}
             raise HTTPException(status_code=400, detail=str(exc))
@@ -597,7 +762,8 @@ def create_router(runtime: Runtime) -> Any:
 
     @router.get("/slo/status", tags=["Scheduling"])
     async def slo_status():
-        return runtime.scheduler.summary()
+        scheduler = runtime.slo_scheduler or runtime.scheduler
+        return scheduler.summary()
 
     @router.post("/slo/profile", tags=["Scheduling"])
     async def slo_profile(profile: dict[str, Any]):
@@ -641,7 +807,12 @@ def create_router(runtime: Runtime) -> Any:
         connect = getattr(runtime.mcp_layer, "add_server", None)
         if not callable(connect):
             raise HTTPException(status_code=503, detail="MCP server registration is unavailable")
-        connected = connect(req.server_id, transport=req.transport, endpoint=req.endpoint)
+        connected = connect(
+            req.server_id,
+            transport=req.transport,
+            endpoint=req.endpoint,
+            command=command,
+        )
         if not connected:
             raise HTTPException(status_code=502, detail=f"MCP server {req.server_id!r} failed to connect")
         return {"server_id": req.server_id, "connected": True, "tools": runtime.mcp_layer.list_tools()}
@@ -674,15 +845,30 @@ def create_router(runtime: Runtime) -> Any:
         if runtime.tee_manager is None:
             raise HTTPException(status_code=503, detail="TEE unavailable")
         expected = runtime.tee_manager.get_attestation_report()
+        if not expected.get("enclave_initialized", False) or not expected.get("hardware_backed", False):
+            raise HTTPException(
+                status_code=503,
+                detail="hardware-backed TEE attestation is unavailable",
+            )
         if report.get("model_hash") != expected.get("model_hash"):
             raise HTTPException(status_code=400, detail="attestation model hash mismatch")
-        return {"verified": True, "model_hash": expected.get("model_hash")}
+        if report.get("token") != expected.get("token"):
+            raise HTTPException(status_code=400, detail="attestation token mismatch")
+        return {
+            "verified": True,
+            "model_hash": expected.get("model_hash"),
+            "backend": expected.get("backend"),
+        }
 
     @router.get("/tee/status", tags=["Confidential Inference"])
     async def tee_status():
         if runtime.tee_manager is None:
             return {"enabled": False, "hardware_backed": False}
-        return {"enabled": runtime.tee_manager.is_initialized(), **runtime.tee_manager.get_attestation_report()}
+        report = runtime.tee_manager.get_attestation_report()
+        return {
+            "enabled": bool(runtime.tee_manager.is_initialized() and report.get("hardware_backed", False)),
+            **report,
+        }
 
     @router.get("/hardware/rubin", tags=["System"])
     async def hardware_rubin():
@@ -696,7 +882,12 @@ def create_router(runtime: Runtime) -> Any:
     async def rubin_profile(payload: dict[str, Any]):
         if runtime.fingerprint.target_id != "cuda_sm120":
             raise HTTPException(status_code=503, detail="Rubin kernel profiling requires cuda_sm120 hardware")
-        return {"target": "cuda_sm120", "profile": payload, "status": "accepted"}
+        # A profile request must not be reported as accepted until a real
+        # Rubin profiler and kernel execution backend are connected.
+        raise HTTPException(
+            status_code=501,
+            detail="Rubin kernel profiling backend is not implemented in this runtime",
+        )
 
     @router.post("/video/generate", tags=["Video"])
     async def video_generate(req: VideoRequest):
@@ -872,7 +1063,18 @@ def create_router(runtime: Runtime) -> Any:
     @router.get("/kernels", tags=["System"])
     async def kernels():
         """Return active kernel targets."""
-        return {"target": runtime.fingerprint.target_id}
+        from aether.kernels.native_cpu import get_native_kernels
+
+        native = get_native_kernels()
+        return {
+            "target": runtime.fingerprint.target_id,
+            "native_cpu": {
+                "loaded": native.is_native,
+                "toolchain_detected": native.toolchain is not None,
+                "library": str(native.library_path) if native.library_path else None,
+                "symbols": native.available_kernels() if native.is_native else [],
+            },
+        }
 
     @router.get("/metrics", tags=["System"])
     async def metrics():
@@ -887,7 +1089,7 @@ def create_router(runtime: Runtime) -> Any:
     @router.get("/health", tags=["System"])
     async def health():
         """Health check."""
-        return {"status": "healthy", "version": "4.0"}
+        return {"status": "healthy", "version": AETHER_VERSION}
 
     # ── v4.0 NEW Routes ────────────────────────────────────────────────────────
 
@@ -903,14 +1105,14 @@ def create_router(runtime: Runtime) -> Any:
         """
         try:
             if hasattr(runtime, "mcp_layer") and runtime.mcp_layer is not None:
-                result = runtime.mcp_layer.call_tool(
-                    tool_id=req.tool_id,
-                    arguments=req.arguments,
-                )
+                result = runtime.mcp_layer.call_tool(req.tool_id, req.arguments)
+                if not isinstance(result, dict):
+                    raise ValueError("MCP layer returned a non-object result")
+                tool_error = bool(result.get("isError", False))
                 return {
                     "tool_id": req.tool_id,
                     "result": result,
-                    "success": True,
+                    "success": not tool_error,
                 }
             # Fallback: MCP layer not initialized
             return {
@@ -950,9 +1152,16 @@ def create_router(runtime: Runtime) -> Any:
                 )
                 result.update(fsm_info)
             else:
-                result["status"] = "queued"
-                result["note"] = "Grammar engine not initialized; grammar queued for next model load."
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Grammar compilation requires a loaded tokenizer-aware grammar backend; "
+                        "the request was not queued or accepted"
+                    ),
+                )
             return result
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Grammar compilation failed: {exc}")
 
@@ -997,11 +1206,12 @@ def create_router(runtime: Runtime) -> Any:
                     "task_count": len(req.task_vectors),
                     "result": result,
                 }
-            return {
-                "model": name,
-                "status": "unsupported",
-                "error": "Model merging not available in this runtime build.",
-            }
+            raise HTTPException(
+                status_code=501,
+                detail="Model merging is not available in this runtime build",
+            )
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -1138,14 +1348,15 @@ def create_router(runtime: Runtime) -> Any:
                     "attestation_report": session_info.get("attestation_report"),
                     "enclave_created_at": time.time(),
                 }
-            return {
-                "session_id": session_id,
-                "status": "unsupported",
-                "error": (
+            raise HTTPException(
+                status_code=503,
+                detail=(
                     "TEE manager not initialized. Target must be cuda_sm100_tee or "
-                    "cpu with Intel TDX/AMD SEV-SNP support."
+                    "a host with Intel TDX/AMD SEV-SNP support."
                 ),
-            }
+            )
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"TEE session creation failed: {exc}")
 

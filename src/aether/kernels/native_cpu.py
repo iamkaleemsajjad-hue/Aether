@@ -539,6 +539,43 @@ class NativeCPUKernels:
         logger.info("Native CPU kernels loaded from %s", library.name)
         return True
 
+    def load_library(self, library_path: str | Path, expected_sha256: str | None = None) -> bool:
+        """Load a verified native library carried by an AEG artifact.
+
+        The AEG loader performs manifest validation before calling this method;
+        the optional digest check is retained here as a second boundary for
+        callers that use the kernel provider directly.  The library is bound
+        through the same signatures as the compiler cache path, so packaged
+        kernels are actually executed by the CPU engine rather than merely
+        listed in metadata.
+        """
+        path = Path(library_path).resolve()
+        if not path.is_file():
+            self._build_error = f"native kernel library does not exist: {path}"
+            return False
+        if expected_sha256:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            expected = expected_sha256.removeprefix("sha256:")
+            if digest.lower() != expected.lower():
+                self._build_error = f"native kernel library hash mismatch for {path}"
+                return False
+        try:
+            library = ctypes.CDLL(str(path))
+            previous = self._lib
+            self._lib = library
+            try:
+                self._bind_signatures()
+            except Exception:
+                self._lib = previous
+                raise
+        except (OSError, NativeKernelError) as exc:
+            self._build_error = f"could not load packaged native kernels from {path}: {exc}"
+            return False
+        self.library_path = path
+        self._build_error = None
+        logger.info("Loaded packaged native CPU kernels from %s", path.name)
+        return True
+
     def _compile(self, output: Path) -> bool:
         """Compile the kernel source into ``output``."""
         assert self.toolchain is not None

@@ -273,13 +273,12 @@ class BeamSearchDecoder:
 
                 # Expand beam: try W hypotheses
                 for _ in range(W):
-                    if generate_fn is not None:
-                        token, log_prob = generate_fn(beam.text)
-                    else:
-                        # Simulation: random token/score
-                        rng = np.random.default_rng()
-                        token = f"token_{step}"
-                        log_prob = float(-rng.exponential(0.5))
+                    if generate_fn is None:
+                        raise RuntimeError(
+                            "beam decoding requires a model-backed generate_fn; "
+                            "simulation is not an inference fallback"
+                        )
+                    token, log_prob = generate_fn(beam.text)
 
                     done = token in ("<eos>", "</s>", "<|end|>")
                     new_beams.append(BeamNode(
@@ -364,12 +363,18 @@ class MCTSDecoder:
         Args:
             prompt: Root prompt.
             expand_fn: (text) → [continuation1, continuation2, ...]
-                       If None, uses a dummy expansion.
+            If None, raises because a model-backed expansion function is
+            required for real reasoning search.
 
         Returns:
             Best leaf node found.
         """
         root = MCTSNode(text=prompt)
+        if expand_fn is None:
+            raise RuntimeError(
+                "MCTS requires a model-backed expand_fn; dummy expansion is "
+                "not an inference fallback"
+            )
         c = self.config.ucb_constant
 
         for _ in range(self.config.simulations):
@@ -379,10 +384,7 @@ class MCTSDecoder:
                 node = node.best_child(c)
 
             # Expansion: add children
-            if expand_fn is not None:
-                continuations = expand_fn(node.text)
-            else:
-                continuations = [f"{node.text} [step_{i}]" for i in range(3)]
+            continuations = expand_fn(node.text)
 
             if continuations and node.visits > 0:
                 node.expand(continuations[:3])
@@ -451,6 +453,7 @@ class InferenceComputeController:
         complexity_class: str = "simple",
         candidates: list[str] | None = None,
         generate_fn: Callable[[str], tuple[str, float]] | None = None,
+        expand_fn: Callable[[str], list[str]] | None = None,
     ) -> dict[str, Any]:
         """
         Run inference-time compute scaling for a prompt.
@@ -469,14 +472,17 @@ class InferenceComputeController:
         self._stats[strategy] = self._stats.get(strategy, 0) + 1
         cfg = self.STRATEGIES.get(strategy, {"method": "greedy"})
 
-        if cfg["method"] == "greedy" or not candidates:
+        if cfg["method"] == "greedy":
             result_text = candidates[0] if candidates else prompt
             score = self.prm.score(prompt, result_text)
             best_idx = 0
 
         elif cfg["method"] == "bon":
-            cands = candidates or [prompt]
-            best_text, best_idx, scores = self._bon.select_best(prompt, cands)
+            if not candidates:
+                raise RuntimeError(
+                    "best-of-N reasoning requires model-generated candidates"
+                )
+            best_text, best_idx, scores = self._bon.select_best(prompt, candidates)
             result_text = best_text
             score = scores[best_idx]
 
@@ -487,7 +493,7 @@ class InferenceComputeController:
             best_idx = 0
 
         elif cfg["method"] == "mcts":
-            best_node = self._mcts.search(prompt)
+            best_node = self._mcts.search(prompt, expand_fn=expand_fn)
             result_text = best_node.text
             score = best_node.value
             best_idx = 0

@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 
 from aether.core.exceptions import AEGFormatError
+from aether.kernels.native_cpu import get_native_kernels
 from aether.runtime.cpu_engine import CPUExecutionEngine, LayerWeights, ModelWeights
 from aether.utils.logging import get_logger
 
@@ -88,6 +89,10 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
         AEGLoadError: If the package has no weights or is missing tensors the
             forward pass requires.
     """
+    # Loading a manifest is not sufficient: verify every declared payload
+    # before any weight or packaged-kernel data reaches execution. This also
+    # protects callers that use the loader directly instead of Runtime.
+    package.verify_integrity()
     if not package.has_weights:
         msg = (
             f"AEG package at {package.root} contains no weights; it was compiled "
@@ -132,7 +137,17 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
         rope_theta=float(architecture.get("rope_theta", 10000.0) or 10000.0),
         norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
     )
-    engine = CPUExecutionEngine(weights, num_heads=num_heads, num_kv_heads=num_kv_heads)
+    kernels = get_native_kernels()
+    _load_packaged_native_kernels(package, kernels)
+    engine = CPUExecutionEngine(
+        weights,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        kernels=kernels,
+        sparse_attention_plan=_runtime_sparse_attention_plan(package.metadata, num_heads),
+        semantic_kv_plan=_runtime_semantic_kv_plan(package.metadata, num_layers),
+        cross_layer_kv_plan=_runtime_cross_layer_kv_plan(package.metadata, num_layers),
+    )
     logger.info(
         "Loaded executable engine from %s (%d layers, hidden=%d, heads=%d/%d)",
         package.root.name,
@@ -142,6 +157,129 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
         num_kv_heads,
     )
     return engine
+
+
+def _runtime_sparse_attention_plan(
+    metadata: Any,
+    num_heads: int,
+) -> dict[str, Any] | None:
+    """Validate and return a Pass 8 plan for the executable CPU engine."""
+    if not isinstance(metadata, dict):
+        return None
+    plan = metadata.get("attention_head_patterns")
+    if not isinstance(plan, dict) or not bool(plan.get("enabled")):
+        return None
+    patterns = plan.get("patterns")
+    if not isinstance(patterns, list) or len(patterns) != num_heads:
+        raise AEGLoadError(
+            "enabled sparse attention plan must contain one pattern per attention head"
+        )
+    valid = {"dense", "a_shape", "vertical_slash", "block_sparse"}
+    for descriptor in patterns:
+        if not isinstance(descriptor, dict):
+            raise AEGLoadError("sparse attention pattern must be an object")
+        pattern = descriptor.get("pattern", descriptor.get("pattern_type"))
+        if pattern not in valid:
+            raise AEGLoadError(f"unsupported sparse attention pattern {pattern!r}")
+    return plan
+
+
+def _runtime_semantic_kv_plan(metadata: Any, num_layers: int) -> dict[str, Any] | None:
+    """Validate and return an executable Pass 14 plan."""
+    if not isinstance(metadata, dict):
+        return None
+    plan = metadata.get("kv_compression_plan")
+    if plan is None:
+        return None
+    if not isinstance(plan, dict) or plan.get("format") != "aether_kv_compression_v1":
+        raise AEGLoadError("semantic KV plan has an unsupported format")
+    layers = plan.get("layers")
+    if not isinstance(layers, list) or len(layers) != num_layers:
+        raise AEGLoadError(
+            f"semantic KV plan must contain exactly {num_layers} layer policies"
+        )
+    strategy = str(plan.get("strategy", "chunk"))
+    if strategy not in {"chunk", "hybrid"}:
+        raise AEGLoadError(
+            f"semantic KV strategy {strategy!r} requires tokenizer boundary metadata; "
+            "only chunk and hybrid plans are executable by the CPU cache"
+        )
+    for index, policy in enumerate(layers):
+        if not isinstance(policy, dict):
+            raise AEGLoadError(f"semantic KV policy {index} must be an object")
+        try:
+            retention = float(policy["retention_ratio"])
+            chunk_size = int(policy["chunk_size"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AEGLoadError(f"invalid semantic KV policy {index}") from exc
+        if not 0.0 < retention <= 1.0 or chunk_size <= 0:
+            raise AEGLoadError(f"invalid semantic KV policy {index}")
+    return plan
+
+
+def _runtime_cross_layer_kv_plan(metadata: Any, num_layers: int) -> dict[str, Any] | None:
+    """Validate and return an executable Pass 15 plan."""
+    if not isinstance(metadata, dict):
+        return None
+    plan = metadata.get("cross_layer_kv_plan")
+    if plan is None:
+        return None
+    if not isinstance(plan, dict) or plan.get("format") != "aether_cross_layer_kv_v1":
+        raise AEGLoadError("cross-layer KV plan has an unsupported format")
+    if int(plan.get("n_layers", -1)) != num_layers:
+        raise AEGLoadError("cross-layer KV plan layer count does not match the model")
+    groups = plan.get("sharing_groups")
+    if not isinstance(groups, list):
+        raise AEGLoadError("cross-layer KV plan must contain sharing_groups")
+    targets: set[int] = set()
+    for group in groups:
+        if not isinstance(group, dict):
+            raise AEGLoadError("cross-layer KV sharing group must be an object")
+        source = int(group.get("src_layer", -1))
+        shared = group.get("shared_with")
+        if source < 0 or source >= num_layers or not isinstance(shared, list):
+            raise AEGLoadError("invalid cross-layer KV source group")
+        for target_value in shared:
+            target = int(target_value)
+            if target <= source or target >= num_layers or target in targets:
+                raise AEGLoadError(
+                    "cross-layer KV targets must have one earlier source layer"
+                )
+            targets.add(target)
+    return plan
+
+
+def _load_packaged_native_kernels(package: Any, kernels: Any) -> None:
+    """Load the authenticated native CPU library embedded in an AEG, if any."""
+    metadata = getattr(package, "metadata", {})
+    descriptors = metadata.get("kernel_artifacts", []) if isinstance(metadata, dict) else []
+    if not descriptors:
+        # Older AEG/1.x packages may not carry a packaged library.  Preserve
+        # their existing host-cache/reference-kernel behavior.
+        return
+    if not isinstance(descriptors, list):
+        raise AEGLoadError("AEG kernel_artifacts metadata must be a list")
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict) or descriptor.get("backend") != "native_cpu":
+            continue
+        relative_path = descriptor.get("path")
+        if (
+            not isinstance(relative_path, str)
+            or Path(relative_path).is_absolute()
+            or ".." in Path(relative_path).parts
+        ):
+            raise AEGLoadError("AEG packaged kernel path is unsafe")
+        path = (Path(package.root) / relative_path).resolve()
+        expected = descriptor.get("sha256")
+        if not isinstance(expected, str):
+            raise AEGLoadError(f"AEG packaged kernel {relative_path!r} has no SHA-256 digest")
+        if not path.is_relative_to(Path(package.root).resolve()):
+            raise AEGLoadError("AEG packaged kernel escapes package root")
+        if not kernels.load_library(path, expected_sha256=expected):
+            raise AEGLoadError(
+                f"unable to load packaged native CPU kernel {relative_path!r}: {kernels.build_error}"
+            )
+        return
 
 
 def _architecture_dict(package: Any) -> dict[str, Any]:

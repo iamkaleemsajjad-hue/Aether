@@ -166,6 +166,7 @@ class AEGOpCode:
 
     # ── Speculative decoding ───────────────────────────────────────────────────
     DRAFT_VERIFY = "aeg.draft_verify"
+    MTP_HEAD = "aeg.mtp_head"
     TREE_ATTN = "aeg.tree_attn"
     TREE_MASK = "aeg.tree_mask"
     ACCEPT_TOKENS = "aeg.accept_tokens"
@@ -682,6 +683,7 @@ class AEGIRModule:
             "matmul": AEGOpCode.MATMUL,
             "softmax": AEGOpCode.SOFTMAX,
             "lm_head": AEGOpCode.LM_HEAD,
+            "mtp_head": AEGOpCode.MTP_HEAD,
         }
         for node in graph:
             aeg_op = mapping.get(node.op_type or "", node.op_type or "aeg.tensor")

@@ -522,18 +522,37 @@ class ImagePreprocessor:
 # ---------------------------------------------------------------------------
 
 class ViTEncoder:
-    """
-    Vision Transformer encoder — reference implementation.
+    """Patch projection stage for a loaded vision encoder.
 
-    Produces visual feature tokens from preprocessed image patches.
-    Production: dispatches to compiled ViT AEG artifact.
+    The runtime cannot safely claim VLM inference from image preprocessing
+    alone.  A previous version silently created seeded random projection
+    weights, which produced plausible-shaped but meaningless embeddings.  A
+    compiled ViT artifact or explicitly loaded projection must now be supplied
+    by the caller; the class validates and applies those learned weights.
     """
 
-    def __init__(self, config: VLMConfig) -> None:
+    def __init__(
+        self,
+        config: VLMConfig,
+        patch_projection: np.ndarray | None = None,
+    ) -> None:
         self.config = config
         self._hidden_dim = config.connector_hidden_dim
-        # Fake projection for reference implementation
-        self._rng = np.random.default_rng(42)
+        flat_dim = 3 * config.patch_size * config.patch_size
+        if patch_projection is None:
+            raise RuntimeError(
+                "VLM vision weights are unavailable; supply a compiled ViT "
+                "artifact or a validated patch_projection tensor"
+            )
+        projection = np.asarray(patch_projection, dtype=np.float32)
+        if projection.shape != (flat_dim, self._hidden_dim):
+            raise ValueError(
+                "patch_projection must have shape "
+                f"{(flat_dim, self._hidden_dim)}, got {projection.shape}"
+            )
+        if not np.isfinite(projection).all():
+            raise ValueError("patch_projection contains non-finite values")
+        self._projection = np.ascontiguousarray(projection)
 
     def encode(self, pixel_values: np.ndarray) -> np.ndarray:
         """
@@ -550,10 +569,12 @@ class ViTEncoder:
         num_patches_per_tile = (H // cfg.patch_size) * (W // cfg.patch_size)
         total_patches = num_tiles * num_patches_per_tile
 
-        # Reference: random projection of flattened patches
         flat_dim = C * cfg.patch_size * cfg.patch_size
-        proj = self._rng.normal(0, 1 / flat_dim ** 0.5,
-                                (flat_dim, self._hidden_dim)).astype(np.float32)
+        if flat_dim != self._projection.shape[0]:
+            raise ValueError(
+                f"pixel channel/patch shape requires {flat_dim} projection rows, "
+                f"but loaded vision weights provide {self._projection.shape[0]}"
+            )
 
         visual_tokens = np.zeros((total_patches, self._hidden_dim), dtype=np.float32)
         idx = 0
@@ -566,7 +587,7 @@ class ViTEncoder:
                         ph * cfg.patch_size:(ph+1) * cfg.patch_size,
                         pw * cfg.patch_size:(pw+1) * cfg.patch_size,
                     ].ravel()
-                    visual_tokens[idx] = patch[:flat_dim] @ proj
+                    visual_tokens[idx] = patch[:flat_dim] @ self._projection
                     idx += 1
 
         # Normalize
@@ -632,16 +653,37 @@ class ModalConnector:
     - Cross-Attn:  cross-attention from LLM layers to ViT features
     """
 
-    def __init__(self, config: VLMConfig) -> None:
+    def __init__(
+        self,
+        config: VLMConfig,
+        weights: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> None:
         self.config = config
         hidden = config.connector_hidden_dim
-        vit_hidden = hidden  # assume same dim for reference
-        self._rng = np.random.default_rng(0)
-
-        if config.connector_type == "mlp":
-            # Two-layer MLP: visual_dim → hidden → llm_dim
-            self._W1 = self._rng.normal(0, 0.02, (vit_hidden, hidden)).astype(np.float32)
-            self._W2 = self._rng.normal(0, 0.02, (hidden, hidden)).astype(np.float32)
+        if config.connector_type != "mlp":
+            raise RuntimeError(
+                f"VLM connector type {config.connector_type!r} has no executable "
+                "backend in this runtime"
+            )
+        if weights is None:
+            raise RuntimeError(
+                "VLM connector weights are unavailable; supply the learned "
+                "MLP connector tensors"
+            )
+        if len(weights) != 2:
+            raise ValueError("MLP connector weights must contain W1 and W2")
+        self._W1 = np.asarray(weights[0], dtype=np.float32)
+        self._W2 = np.asarray(weights[1], dtype=np.float32)
+        expected = (hidden, hidden)
+        if self._W1.shape != expected or self._W2.shape != expected:
+            raise ValueError(
+                f"MLP connector weights must both have shape {expected}; "
+                f"got {self._W1.shape} and {self._W2.shape}"
+            )
+        if not np.isfinite(self._W1).all() or not np.isfinite(self._W2).all():
+            raise ValueError("MLP connector weights contain non-finite values")
+        self._W1 = np.ascontiguousarray(self._W1)
+        self._W2 = np.ascontiguousarray(self._W2)
 
     def project(self, visual_tokens: np.ndarray) -> np.ndarray:
         """
@@ -656,9 +698,9 @@ class ModalConnector:
         if self.config.connector_type == "mlp":
             h = np.maximum(0, visual_tokens @ self._W1)   # GELU approx with ReLU
             return h @ self._W2
-        else:
-            # Passthrough for unsupported connector types
-            return visual_tokens
+        raise RuntimeError(
+            f"VLM connector type {self.config.connector_type!r} has no executable backend"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -679,12 +721,27 @@ class MultiModalGraphDispatcher:
     Supports early-fusion (Qwen3-VL) and late-fusion (LLaVA, InternVL2).
     """
 
-    def __init__(self, config: VLMConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: VLMConfig | None = None,
+        *,
+        patch_projection: np.ndarray | None = None,
+        connector_weights: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> None:
         self.config = config or VLMConfig()
         self.preprocessor = ImagePreprocessor(self.config)
-        self.vit           = ViTEncoder(self.config)
+        # Configuration-only operations such as architecture detection and
+        # graph serialization remain available without model weights, but an
+        # actual image request must not silently manufacture them.
+        self.vit           = (
+            ViTEncoder(self.config, patch_projection)
+            if patch_projection is not None else None
+        )
         self.compressor    = VisualTokenCompressor(self.config.compression_ratio)
-        self.connector     = ModalConnector(self.config)
+        self.connector     = (
+            ModalConnector(self.config, connector_weights)
+            if connector_weights is not None else None
+        )
         self._requests_processed = 0
 
     def process_image(self, image: np.ndarray) -> dict[str, Any]:
@@ -695,6 +752,12 @@ class MultiModalGraphDispatcher:
             Dict with visual_tokens, num_visual_tokens, pipeline stats.
         """
         t0 = __import__("time").perf_counter()
+
+        if self.vit is None or self.connector is None:
+            raise RuntimeError(
+                "VLM execution requires loaded ViT and connector weights; "
+                "the current dispatcher contains configuration only"
+            )
 
         # Stage 1: preprocess
         preprocessed = self.preprocessor.preprocess(image)

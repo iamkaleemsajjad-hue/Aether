@@ -73,8 +73,9 @@ def resolve_model_path(model_id: str, cache_dir: str | Path | None = None) -> Pa
     """
     cache = aether_cache_dir(cache_dir)
     model_cache = cache / "models"
-    if (model_cache / model_id.replace("/", "_")).exists():
-        return model_cache / model_id.replace("/", "_")
+    safe_id = safe_model_id_path(model_id)
+    if (model_cache / safe_id).exists():
+        return model_cache / safe_id
     # Check if model is a local path
     local_path = Path(model_id)
     if local_path.exists():
@@ -192,7 +193,10 @@ def delete_model(model_id: str, cache_dir: str | Path | None = None) -> None:
         cache_dir: Custom cache directory.
     """
     cache = aether_cache_dir(cache_dir)
-    model_path = cache / "models" / model_id.replace("/", "_")
+    model_path = (cache / "models" / safe_model_id_path(model_id)).resolve()
+    models_root = (cache / "models").resolve()
+    if not model_path.is_relative_to(models_root):
+        raise ValueError("model identifier resolves outside the Aether cache")
     if model_path.exists():
         import shutil
         shutil.rmtree(model_path)

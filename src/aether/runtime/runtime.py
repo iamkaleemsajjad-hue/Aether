@@ -31,7 +31,7 @@ from aether.runtime.hardware import HardwareDetector
 from aether.runtime.kv_cache import KVCacheManager
 from aether.runtime.scheduler import DisaggregatedScheduler, ScheduledRequest
 from aether.runtime.speculative import TreeSpeculativeEngine
-from aether.utils.file_io import aether_cache_dir, resolve_model_path
+from aether.utils.file_io import aether_cache_dir, resolve_model_path, safe_model_id_path
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -394,6 +394,14 @@ class Runtime:
             max_batch_size=self.config.max_batch_size,
             prefill_chunk_size=self.config.prefill_chunk_size,
         )
+        self.slo_scheduler: Any | None = None
+        if self.config.scheduler == "slo_aware":
+            from aether.runtime.r4_slo_scheduler import SLOScheduler
+
+            self.slo_scheduler = SLOScheduler(
+                max_batch_tokens=self.config.max_batch_size * self.config.prefill_chunk_size,
+                max_prefill_chunk_tokens=self.config.prefill_chunk_size,
+            )
         self._loaded_models: dict[str, Any] = {}
         self._loaded_backends: dict[str, Backend] = {}
         self._aeg_packages: dict[str, AEGPackage] = {}
@@ -428,6 +436,10 @@ class Runtime:
         self.mcp_layer: Any | None = None
         """R6 MCP Integration Layer. Set by _init_v4_layers()."""
 
+        self.peagle_engine: Any | None = None
+        """R1 P-EAGLE engine loaded from persisted MTP speculation blobs."""
+        self._peagle_engines: dict[str, Any] = {}
+
         # Async compilation job registry: {job_id: {status, model, ...}}
         self._compile_jobs: dict[str, dict[str, Any]] = {}
 
@@ -442,9 +454,17 @@ class Runtime:
         """Return the current hardware fingerprint."""
         return self.fingerprint.to_dict()
 
-    def _resolve_backend(self, target_id: str | None = None) -> Backend:
+    def _resolve_backend(
+        self,
+        target_id: str | None = None,
+        model_id: str | None = None,
+    ) -> Backend:
         """Resolve and return the best available backend for the target."""
         with self._lock:
+            explicit_backend = self.config.backend_name is not None
+            is_onnx_model = bool(
+                model_id and Path(model_id).suffix.lower() == ".onnx"
+            )
             if self.config.backend_name:
                 backend = self.backend_registry.get_backend(self.config.backend_name)
                 if backend is not None and backend.is_available():
@@ -456,16 +476,22 @@ class Runtime:
             profile = HardwareProfile.from_target_id(target) or HardwareProfile.auto()
             # Prefer cached backend
             if profile.target_id in self._loaded_backends:
-                return self._loaded_backends[profile.target_id]
+                cached = self._loaded_backends[profile.target_id]
+                if cached.name != "onnx" or is_onnx_model or explicit_backend:
+                    return cached
 
             candidates = profile.backend_candidates
             for backend_name in candidates:
+                if backend_name in {"onnx", "onnxruntime"} and not is_onnx_model:
+                    continue
                 backend = self.backend_registry.get_backend(backend_name)
                 if backend is not None and backend.is_available():
                     self._loaded_backends[profile.target_id] = backend
                     return backend
             # Fallback to any available backend
             for backend in self.backend_registry.get_available_backends():
+                if backend.name == "onnx" and not is_onnx_model:
+                    continue
                 self._loaded_backends[profile.target_id] = backend
                 return backend
 
@@ -482,12 +508,27 @@ class Runtime:
             # Find or compile AEG
             aeg_path = self._resolve_aeg_path(model_id)
             requested_path = Path(model_id)
-            if aeg_path is None and (requested_path.suffix.lower() in {".aeg", ".aegpkg"} or requested_path.parent != Path(".")):
+            local_onnx = requested_path.is_file() and requested_path.suffix.lower() == ".onnx"
+            if aeg_path is None and not local_onnx and (
+                requested_path.suffix.lower() in {".aeg", ".aegpkg"}
+                or requested_path.parent != Path(".")
+            ):
                 raise ModelNotFoundError(
                     f"AEG artifact does not exist or has no manifest: {model_id}",
                     model_id=model_id,
                 )
-            backend = self._resolve_backend()
+            # A local ONNX file has an explicit execution contract. Do not
+            # route it to the generic PyTorch backend merely because that
+            # backend is available on the host.
+            if requested_path.suffix.lower() == ".onnx":
+                backend = self.backend_registry.get_backend("onnx")
+                if backend is None or not backend.is_available():
+                    raise BackendNotAvailableError(
+                        "ONNX Runtime is required to execute .onnx models",
+                        backend_name="onnx",
+                    )
+            else:
+                backend = self._resolve_backend(model_id=model_id)
             self._loaded_models[model_id] = backend.load_model(
                 model_id,
                 aeg_path,
@@ -514,7 +555,7 @@ class Runtime:
             return str(path_candidate.resolve())
 
         cache_root = aether_cache_dir(self.config.model_cache_dir)
-        aeg_path = cache_root / "models" / model_id.replace("/", "_")
+        aeg_path = cache_root / "models" / safe_model_id_path(model_id)
         if aeg_path.exists():
             return str(aeg_path)
         # Check local compiled path
@@ -536,7 +577,11 @@ class Runtime:
         logger.info(f"Pulling and compiling model {model_id}")
         from aether import Compiler
         compiler = Compiler()
-        aeg = compiler.compile(model_id, output_path=self._resolve_aeg_path(model_id) or aether_cache_dir(self.config.model_cache_dir) / "models" / model_id.replace("/", "_"))
+        aeg = compiler.compile(
+            model_id,
+            output_path=self._resolve_aeg_path(model_id)
+            or aether_cache_dir(self.config.model_cache_dir) / "models" / safe_model_id_path(model_id),
+        )
         aeg.save()
 
     def list(self) -> list[str]:
@@ -585,6 +630,7 @@ class Runtime:
         model_id: str,
         prompt: str | None = None,
         *,
+        messages: list[dict[str, str]] | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
@@ -609,8 +655,35 @@ class Runtime:
         Returns:
             A GenerationResponse with text, usage, and metrics.
         """
-        if prompt is not None:
-            prompt = self._check_safety_prompt(prompt)
+        if prompt is None and messages is None:
+            raise ValueError("either prompt or messages must be provided")
+        safety_text = prompt or "\n".join(
+            str(message.get("content", ""))
+            for message in (messages or [])
+            if isinstance(message, dict)
+        )
+        if safety_text:
+            self._check_safety_prompt(safety_text)
+        slo_deadline_ms = kwargs.pop("slo_deadline_ms", None)
+        slo_request: Any | None = None
+        if self.slo_scheduler is not None:
+            from aether.runtime.r4_slo_scheduler import SLOTier
+
+            requested_tier = kwargs.pop("slo_tier", SLOTier.BALANCED)
+            try:
+                slo_request = self.slo_scheduler.submit(
+                    request_id=uuid.uuid4().hex,
+                    prompt_tokens=len(safety_text.split()),
+                    max_new_tokens=max_tokens or self.config.default_max_tokens,
+                    slo_tier=requested_tier,
+                    metadata={"model_id": model_id},
+                    ttft_deadline_ms=slo_deadline_ms,
+                )
+                selected = self.slo_scheduler.next_batch()
+                if not any(item.request_id == slo_request.request_id for item in selected):
+                    raise AetherRuntimeError("SLO scheduler did not admit the request")
+            except (ValueError, KeyError) as exc:
+                raise AetherRuntimeError(f"invalid SLO tier {requested_tier!r}") from exc
         cache_bypass = bool(kwargs.pop("cache_bypass", False))
         cache_config = {
             "max_new_tokens": max_tokens or self.config.default_max_tokens,
@@ -643,6 +716,7 @@ class Runtime:
         request = GenerationRequest(
             model_id=model_id,
             prompt=prompt,
+            messages=messages,
             max_tokens=max_tokens or self.config.default_max_tokens,
             temperature=temperature if temperature is not None else self.config.default_temperature,
             top_p=top_p if top_p is not None else self.config.default_top_p,
@@ -651,6 +725,20 @@ class Runtime:
             stop=stop,
             extra=kwargs,
         )
+        if self.ttt_engine is not None:
+            request.extra.setdefault("ttt_engine", self.ttt_engine)
+            request.extra.setdefault("ttt_request_id", uuid.uuid4().hex)
+        aeg_path_for_request = self._resolve_aeg_path(model_id)
+        peagle_engine = (
+            self._peagle_engines.get(str(Path(aeg_path_for_request).resolve()))
+            if aeg_path_for_request is not None
+            else self.peagle_engine
+        )
+        if peagle_engine is not None:
+            request.extra.setdefault("peagle_engine", peagle_engine)
+        task_weights = getattr(self, "_task_weights_by_model", {}).get(model_id)
+        if task_weights is not None:
+            request.extra.setdefault("task_weights", dict(task_weights))
         start = datetime.datetime.now(datetime.timezone.utc)
         start_ns = time.time_ns()
         try:
@@ -689,6 +777,30 @@ class Runtime:
             for key, value in result.metrics.items()
             if key not in {"ttft_ms", "throughput_tps"}
         }
+        if self.green_power_manager is not None:
+            energy_mj, energy_source = self.green_power_manager.measure_request_energy(
+                duration_s,
+                n_prompt_tokens=result.prompt_tokens,
+                n_gen_tokens=result.completion_tokens,
+            )
+            carbon_gco2 = self.green_power_manager.estimate_carbon(energy_mj)
+            self.green_power_manager.record_request(
+                energy_mj,
+                carbon_gco2,
+                source=energy_source,
+            )
+            backend_metrics.update(
+                {
+                    "energy_mj": energy_mj,
+                    "carbon_gco2": carbon_gco2,
+                    "energy_source": energy_source,
+                }
+            )
+        if slo_request is not None:
+            backend_metrics["slo_tier"] = slo_request.slo_tier.value
+            backend_metrics["slo_priority"] = slo_request.priority
+            backend_metrics["slo_deadline_s"] = slo_request.ttft_deadline_s - slo_request.arrival_time
+            self.slo_scheduler.record_batch_latency(duration_s * 1000.0)
         metrics = InferenceMetrics(
             throughput_tps=result.completion_tokens / max(duration_s, 1e-6),
             ttft_ms=result.metrics.get("ttft_ms", duration_s * 1000),
@@ -730,8 +842,9 @@ class Runtime:
     def generate_stream(
         self,
         model_id: str,
-        prompt: str,
+        prompt: str | None = None,
         *,
+        messages: list[dict[str, str]] | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
@@ -742,55 +855,125 @@ class Runtime:
         """Yield text deltas from the backend's incremental decoder.
 
         Streaming intentionally bypasses the semantic response cache because a
-        cache hit has no incremental decoder state. Safety-enabled runtimes
-        reject this API rather than emitting output that has not been checked
-        as a complete response; callers should use :meth:`generate` when the
-        safety layer is enabled.
+        cache hit has no incremental decoder state. When safety is enabled,
+        output is buffered until the backend finishes so the complete response
+        can be checked before any text is released.
         """
-        if self.safety_engine is not None:
-            raise AetherRuntimeError(
-                "streaming is disabled when the safety layer is enabled; "
-                "use generate() for complete-output policy enforcement"
-            )
-        prompt = self._check_safety_prompt(prompt)
+        if prompt is None and messages is None:
+            raise ValueError("either prompt or messages must be provided")
+        safety_text = prompt or "\n".join(
+            str(message.get("content", ""))
+            for message in (messages or [])
+            if isinstance(message, dict)
+        )
+        safety_text = self._check_safety_prompt(safety_text)
+        slo_deadline_ms = kwargs.pop("slo_deadline_ms", None)
+        slo_request: Any | None = None
+        if self.slo_scheduler is not None:
+            from aether.runtime.r4_slo_scheduler import SLOTier
+
+            requested_tier = kwargs.pop("slo_tier", SLOTier.BALANCED)
+            try:
+                slo_request = self.slo_scheduler.submit(
+                    request_id=uuid.uuid4().hex,
+                    prompt_tokens=len(safety_text.split()),
+                    max_new_tokens=max_tokens or self.config.default_max_tokens,
+                    slo_tier=requested_tier,
+                    metadata={"model_id": model_id, "stream": True},
+                    ttft_deadline_ms=slo_deadline_ms,
+                )
+                selected = self.slo_scheduler.next_batch()
+                if not any(item.request_id == slo_request.request_id for item in selected):
+                    raise AetherRuntimeError("SLO scheduler did not admit the streaming request")
+            except (ValueError, KeyError) as exc:
+                raise AetherRuntimeError(f"invalid SLO tier {requested_tier!r}") from exc
         backend = self._load_model(model_id)
+        request_extra = {"cache_bypass": True, **kwargs}
+        if self.ttt_engine is not None:
+            request_extra.setdefault("ttt_engine", self.ttt_engine)
+            request_extra.setdefault("ttt_request_id", uuid.uuid4().hex)
+        task_weights = getattr(self, "_task_weights_by_model", {}).get(model_id)
+        if task_weights is not None:
+            request_extra.setdefault("task_weights", dict(task_weights))
+        stream_aeg_path = self._resolve_aeg_path(model_id)
+        stream_peagle = (
+            self._peagle_engines.get(str(Path(stream_aeg_path).resolve()))
+            if stream_aeg_path is not None
+            else self.peagle_engine
+        )
+        if stream_peagle is not None:
+            request_extra.setdefault("peagle_engine", stream_peagle)
         request = GenerationRequest(
             model_id=model_id,
             prompt=prompt,
+            messages=messages,
             max_tokens=max_tokens or self.config.default_max_tokens,
             temperature=temperature if temperature is not None else self.config.default_temperature,
             top_p=top_p if top_p is not None else self.config.default_top_p,
             top_k=top_k,
             stream=True,
             stop=stop,
-            extra={"cache_bypass": True, **kwargs},
+            extra=request_extra,
         )
         stream = backend.generate_stream(request)
+        stream_started = time.perf_counter()
         pending = ""
+        # Output policy checks must cover the complete generated response.  A
+        # chunk-by-chunk check can leak a secret split across chunks, and once
+        # emitted text cannot be retracted.  In safety-enabled mode we
+        # therefore buffer the response, apply the same policy as generate(),
+        # and only then release it.  Safety-disabled mode retains true
+        # incremental delivery.
+        safety_buffer: str | None = "" if self.safety_engine is not None else None
         retain = max((len(sequence) - 1 for sequence in (stop or []) if sequence), default=0)
-        for chunk in stream:
-            pending += str(chunk)
-            if stop:
-                cutoff = min(
-                    (
-                        pending.find(sequence)
-                        for sequence in stop
-                        if sequence and sequence in pending
-                    ),
-                    default=-1,
-                )
-                if cutoff >= 0:
-                    if cutoff:
-                        yield pending[:cutoff]
-                    return
-            if retain and len(pending) > retain:
-                yield pending[:-retain]
-                pending = pending[-retain:]
-            elif not retain:
+        try:
+            for chunk in stream:
+                if safety_buffer is not None:
+                    safety_buffer += str(chunk)
+                    if stop:
+                        cutoff = min(
+                            (
+                                safety_buffer.find(sequence)
+                                for sequence in stop
+                                if sequence and sequence in safety_buffer
+                            ),
+                            default=-1,
+                        )
+                        if cutoff >= 0:
+                            safe_text = self._check_safety_output(safety_buffer[:cutoff])
+                            if safe_text:
+                                yield safe_text
+                            return
+                    continue
+                pending += str(chunk)
+                if stop:
+                    cutoff = min(
+                        (
+                            pending.find(sequence)
+                            for sequence in stop
+                            if sequence and sequence in pending
+                        ),
+                        default=-1,
+                    )
+                    if cutoff >= 0:
+                        if cutoff:
+                            yield pending[:cutoff]
+                        return
+                if retain and len(pending) > retain:
+                    yield pending[:-retain]
+                    pending = pending[-retain:]
+                elif not retain:
+                    yield pending
+                    pending = ""
+            if safety_buffer is not None:
+                safe_text = self._check_safety_output(safety_buffer)
+                if safe_text:
+                    yield safe_text
+            elif pending:
                 yield pending
-                pending = ""
-        if pending:
-            yield pending
+        finally:
+            if slo_request is not None:
+                self.slo_scheduler.record_batch_latency((time.perf_counter() - stream_started) * 1000.0)
 
     def _check_safety_output(self, output: str) -> str:
         """Filter generated output and reject content the policy blocks."""
@@ -810,39 +993,7 @@ class Runtime:
         **kwargs: Any,
     ) -> GenerationResponse:
         """Chat completion with a list of messages."""
-        prompt_text = "\n".join(
-            str(message.get("content", ""))
-            for message in messages
-            if isinstance(message, dict)
-        )
-        self._check_safety_prompt(prompt_text)
-        backend = self._load_model(model_id)
-        request = GenerationRequest(
-            model_id=model_id,
-            messages=messages,
-            max_tokens=kwargs.get("max_tokens", self.config.default_max_tokens),
-            temperature=kwargs.get("temperature", self.config.default_temperature),
-            top_p=kwargs.get("top_p", self.config.default_top_p),
-            stream=kwargs.get("stream", False),
-            stop=kwargs.get("stop"),
-        )
-        result = backend.generate(request)
-        metrics = InferenceMetrics(
-            throughput_tps=0.0,
-            ttft_ms=result.metrics.get("ttft_ms", 0.0),
-            kernel_target=self.fingerprint.target_id,
-            backend_name=result.backend_name or backend.name,
-        )
-        return GenerationResponse(
-            text=self._check_safety_output(result.text),
-            usage={
-                "prompt_tokens": result.prompt_tokens,
-                "completion_tokens": result.completion_tokens,
-                "total_tokens": result.prompt_tokens + result.completion_tokens,
-            },
-            metrics=metrics,
-            finish_reason=result.finish_reason,
-        )
+        return self.generate(model_id, messages=messages, **kwargs)
 
     def embed(self, model_id: str, input: list[str]) -> list[list[float]]:
         """Generate embeddings for a list of texts."""
@@ -913,7 +1064,14 @@ class Runtime:
                 reason="TEE is not enabled by the loaded AEG",
             )
         report = AttestationReport(self.tee_manager.get_attestation_report())
-        report["enabled"] = bool(report.get("enclave_initialized", False))
+        # An initialized software shim is not a confidential enclave and must
+        # not be exposed as an enabled attestation service.  Keep the raw
+        # ``enclave_initialized`` field for diagnostics, but gate the public
+        # capability on hardware-backed evidence.
+        report["enabled"] = bool(
+            report.get("enclave_initialized", False)
+            and report.get("hardware_backed", False)
+        )
         report["model_hash"] = model_hash
         report["enclave_measurement"] = (
             report.get("tdx_report_hash") or report.get("snp_report_hash")
@@ -979,7 +1137,24 @@ class Runtime:
             raise ValueError("at least one task weight must be greater than zero")
         normalized = {name: float(value) / total for name, value in weights.items()}
         if task_model_id is not None:
+            aeg_path = self._resolve_aeg_path(task_model_id)
+            if aeg_path is None:
+                raise ModelNotFoundError(f"model {task_model_id!r} was not found", model_id=task_model_id)
+            package = load_aeg_package(aeg_path)
+            task_vectors = package.metadata.get("task_vectors", {})
+            vectors = task_vectors.get("vectors", []) if isinstance(task_vectors, dict) else []
+            available = {str(vector.get("name")) for vector in vectors if isinstance(vector, dict)}
+            if not available:
+                raise AetherRuntimeError(
+                    f"AEG {task_model_id!r} contains no persisted executable task-vector payloads"
+                )
+            unknown = sorted(set(normalized) - available)
+            if unknown:
+                raise ValueError(
+                    f"task weights reference unknown vectors {unknown}; available vectors are {sorted(available)}"
+                )
             if not hasattr(self, "_task_weights_by_model"):
+                self._task_weights_by_model: dict[str, dict[str, float]] = {}
                 self._task_weights_by_model: dict[str, dict[str, float]] = {}
             self._task_weights_by_model[task_model_id] = normalized
         self._task_weights = normalized
@@ -1035,6 +1210,9 @@ class Runtime:
         text that could be mistaken for a successful call.
         """
         mcp_tools = kwargs.pop("mcp_tools", None)
+        max_rounds = int(kwargs.pop("max_tool_rounds", 4))
+        if max_rounds < 0 or max_rounds > 16:
+            raise ValueError("max_tool_rounds must be between 0 and 16")
         if mcp_tools is not None:
             if tools is not None:
                 raise ValueError("provide only one of tools or mcp_tools")
@@ -1043,21 +1221,59 @@ class Runtime:
                 for item in mcp_tools
             ]
         self._init_v4_layers(self._resolve_aeg_path(model_id))
+        allowed_tool_names: set[str] | None = None
         if tools:
             if self.mcp_layer is None:
                 raise AetherRuntimeError("MCP is not enabled by the loaded AEG")
+            allowed_tool_names = set()
             results = []
             for tool in tools:
                 name = tool.get("name")
                 arguments = tool.get("arguments", {})
                 if not isinstance(name, str) or not isinstance(arguments, dict):
                     raise ValueError("each tool request requires string name and object arguments")
+                allowed_tool_names.add(name)
                 result = self.mcp_layer.call_tool(name, arguments)
                 if result.get("isError"):
                     raise AetherRuntimeError(f"MCP tool {name!r} failed: {result}")
                 results.append({"tool": name, "result": result})
             prompt = f"{prompt}\n\nTool results:\n{results}"
-        return self.generate(model_id, prompt, **kwargs)
+        response = self.generate(model_id, prompt, **kwargs)
+        # A model may emit a valid MCP call even when the caller supplied no
+        # explicit arguments. Dispatch that structured call, inject the real
+        # result into a fresh context, and continue generation. This is capped
+        # to prevent an accidentally tool-calling model from looping forever.
+        if self.mcp_layer is not None:
+            tool_calls: list[dict[str, Any]] = []
+            detect_tool_call = getattr(self.mcp_layer, "detect_tool_call", None)
+            if not callable(detect_tool_call):
+                return response
+            for _ in range(max_rounds):
+                detected = detect_tool_call(response.text)
+                if detected is None:
+                    break
+                name = detected.get("tool")
+                arguments = detected.get("arguments", {})
+                if not isinstance(name, str) or not isinstance(arguments, dict):
+                    raise AetherRuntimeError("model emitted an invalid MCP tool call")
+                if allowed_tool_names is not None and name not in allowed_tool_names:
+                    raise AetherRuntimeError(f"model requested unapproved MCP tool {name!r}")
+                result = self.mcp_layer.call_tool(name, arguments)
+                if result.get("isError"):
+                    raise AetherRuntimeError(f"MCP tool {name!r} failed: {result}")
+                tool_calls.append({"name": name, "arguments": arguments})
+                continuation = (
+                    f"{prompt}\n\nModel tool call:\n"
+                    f"{json.dumps({'name': name, 'arguments': arguments}, sort_keys=True)}\n\n"
+                    f"Tool result:\n{json.dumps(result, sort_keys=True)}\n\n"
+                    "Continue the answer using the tool result. Do not emit another "
+                    "tool call unless another external action is required."
+                )
+                response = self.generate(model_id, continuation, **kwargs)
+            if tool_calls:
+                response.metrics.extra["mcp_tool_calls"] = tool_calls
+                response.metrics.extra["mcp_tool_rounds"] = len(tool_calls)
+        return response
 
     # ── v4.0 Runtime Extensions ────────────────────────────────────────────────
 
@@ -1090,6 +1306,44 @@ class Runtime:
                 except (OSError, ValueError) as exc:
                     logger.warning("optional AEG configuration unreadable", path=str(path), error=str(exc))
                     return None
+
+            # R1 P-EAGLE / native MTP speculation.  The loader only enables
+            # this when the AEG contains real, validated MTP blobs; the CPU
+            # backend then performs exact-greedy target verification.
+            mtp_path = root / "speculation" / "mtp_config.json"
+            mtp_key = str(root.resolve())
+            speculation_enabled = self.config.speculative_decoding
+            if (
+                mtp_path.is_file()
+                and mtp_key not in self._peagle_engines
+                and speculation_enabled is not False
+                and str(speculation_enabled).lower() not in {"off", "none", "disabled"}
+            ):
+                try:
+                    from aether.runtime.r1_peagle_engine import PEAGLEEngine
+
+                    try:
+                        import torch
+
+                        mtp_device = "cuda" if torch.cuda.is_available() else "cpu"
+                    except ImportError:
+                        mtp_device = "cpu"
+
+                    loaded_peagle = PEAGLEEngine(
+                        draft_K=min(self.config.speculative_tree_depth, 8),
+                        mode="mtp",
+                        mtp_config_path=str(mtp_path),
+                        device=mtp_device,
+                    )
+                    if not getattr(loaded_peagle, "_mtp_weights", None) or not all(
+                        weight is not None for weight in loaded_peagle._mtp_weights
+                    ):
+                        raise RuntimeError("AEG MTP speculation has no executable weight tensors")
+                    self._peagle_engines[mtp_key] = loaded_peagle
+                    self.peagle_engine = loaded_peagle
+                    logger.info("R1 P-EAGLE MTP engine initialized", heads=len(loaded_peagle._mtp_heads))
+                except Exception as exc:
+                    logger.warning("R1 P-EAGLE MTP init failed; using target decoding", error=str(exc))
 
             # R3 Grammar FSM Engine
             grammar_path = root / "grammar" / "fsm_config.json"
@@ -1161,7 +1415,10 @@ class Runtime:
                     for server in servers:
                         if isinstance(server, dict) and server.get("id"):
                             self.mcp_layer.add_server(
-                                str(server["id"]), str(server.get("transport", "stdio")), server.get("endpoint")
+                                str(server["id"]),
+                                str(server.get("transport", "stdio")),
+                                server.get("endpoint"),
+                                server.get("command"),
                             )
                     logger.info("R6 MCP Integration Layer initialized", servers=len(servers))
                 except Exception as exc:
@@ -1229,7 +1486,10 @@ class Runtime:
                     for server in (mcp_cfg.server_registry if mcp_cfg else []):
                         if server.get("id"):
                             self.mcp_layer.add_server(
-                                server["id"], server.get("transport", "stdio"), server.get("endpoint")
+                                server["id"],
+                                server.get("transport", "stdio"),
+                                server.get("endpoint"),
+                                server.get("command"),
                             )
                     logger.info("R6 MCP Integration Layer initialized")
                 except Exception as exc:
@@ -1437,6 +1697,15 @@ class Runtime:
             raise AetherRuntimeError("base AEG has no packaged tokenizer; merged text generation cannot be portable")
         import shutil
 
+        # AEG metadata may reference immutable payloads outside the graph and
+        # weights trees, most importantly packaged native kernels.  Copy the
+        # complete source artifact first so the merged package remains
+        # self-contained; ``save()`` below then replaces the mutable manifest,
+        # graph, metadata, and quantized weight payloads with their merged
+        # versions.  Copying only the tokenizer would leave a valid-looking
+        # manifest pointing at missing executable artifacts after reload.
+        shutil.copytree(base.root, output_root)
+
         merged = copy.deepcopy(base)
         merged.root = output_root.resolve()
         merged._weight_store = None  # noqa: SLF001 - invalidate copied disk reader
@@ -1449,6 +1718,46 @@ class Runtime:
             "coefficients": coefficients,
             "tensor_count": len(merged_delta),
         }
+        # Persist the actual per-source task deltas so runtime reweighting does
+        # not depend on source files remaining available after compilation.
+        # AEGPackage.save() includes these files in the manifest artifact hash.
+        task_delta_vectors = _compute_task_vectors(base_weights, sources)
+        task_vector_descriptors: list[dict[str, Any]] = []
+        import re
+
+        task_vector_root = output_root / "merging" / "task_vectors"
+        task_vector_root.mkdir(parents=True, exist_ok=True)
+        task_vector_names: set[str] = set()
+        for index, (item, delta) in enumerate(zip(task_vectors, task_delta_vectors)):
+            requested_name = str(item.get("name") or Path(str(item["path"])).stem or f"task_{index}")
+            if requested_name in task_vector_names:
+                raise ValueError(f"duplicate task vector name {requested_name!r}")
+            task_vector_names.add(requested_name)
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", requested_name).strip("._") or f"task_{index}"
+            file_name = f"{index:03d}_{safe_name}.npz"
+            file_path = task_vector_root / file_name
+            arrays: dict[str, Any] = {}
+            tensor_descriptors: list[dict[str, Any]] = []
+            for tensor_index, (tensor_name, values) in enumerate(sorted(delta.items())):
+                key = f"tensor_{tensor_index:06d}"
+                arrays[key] = np.asarray(values, dtype=np.float32)
+                base_entry = entries.get(tensor_name)
+                shape = list(base_entry.shape) if base_entry is not None else [len(values)]
+                tensor_descriptors.append({"name": tensor_name, "key": key, "shape": shape})
+            if not arrays:
+                raise AetherRuntimeError(f"task vector {requested_name!r} has no persisted tensor deltas")
+            np.savez_compressed(file_path, **arrays)
+            task_vector_descriptors.append(
+                {
+                    "name": requested_name,
+                    "path": f"merging/task_vectors/{file_name}",
+                    "tensors": tensor_descriptors,
+                }
+            )
+        merged.metadata["task_vectors"] = {
+            "format": "aether_task_vectors_v1",
+            "vectors": task_vector_descriptors,
+        }
         for name, values in merged_weights.items():
             entry = entries.get(name)
             precision = (entry.precision if entry is not None else base.precision_map.get(name, "BF16"))
@@ -1456,7 +1765,8 @@ class Runtime:
             merged.weights[name] = quantize_tensor(
                 np.asarray(values, dtype=np.float32).reshape(shape), precision
             )
-        shutil.copytree(tokenizer_root, output_root / "tokenizer")
+        # ``copytree(base.root, output_root)`` above already preserved the
+        # tokenizer together with every other immutable package payload.
         merged.save()
         # Reload verifies manifest, payload hashes, graph and weight index.
         verified = load_aeg_package(output_root)
@@ -1502,6 +1812,7 @@ class Runtime:
                     persist_path = str(_Path(self.config.model_cache_dir) / "semantic_cache.json")
                 self._semantic_cache = SemanticRequestCache(
                     similarity_threshold=threshold,
+                    max_entries=int(getattr(self.config, "semantic_cache_size", 100_000)),
                     persist_path=persist_path,
                 )
                 logger.info("R11: SemanticRequestCache initialized")
@@ -1530,13 +1841,46 @@ class Runtime:
                 self._cxl_pool = None
                 logger.warning(f"R12 init failed: {exc}")
 
-    def generate_constrained(
+    def _create_grammar_session(
         self,
         model_id: str,
-        prompt: str,
         grammar: str | None = None,
         schema: dict | None = None,
         regex: str | None = None,
+    ) -> Any:
+        """Validate a persisted tokenizer-aware constraint and create a session."""
+        if sum(value is not None for value in (grammar, schema, regex)) != 1:
+            raise AetherRuntimeError("Provide exactly one of grammar, schema, or regex")
+        backend = self._load_model(model_id)
+        if self.grammar_engine is None:
+            raise AetherRuntimeError(
+                "No trusted tokenizer-aware grammar FSM is loaded; compile the requested constraint with a tokenizer-aware grammar backend first"
+            )
+        source = grammar
+        if schema is not None:
+            source = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+        assert source is not None
+        loaded = getattr(backend, "_models", {}).get(model_id)
+        tokenizer = getattr(loaded, "tokenizer", None)
+        if not self.grammar_engine.matches_compiled_constraint(source, tokenizer=tokenizer):
+            raise AetherRuntimeError(
+                "The requested constraint does not match a trusted tokenizer-aware grammar compiled into this AEG"
+            )
+        if not backend.supports("grammar_constraints"):
+            raise AetherRuntimeError(
+                f"Backend {backend.name!r} does not implement decode-time grammar constraints"
+            )
+        return self.grammar_engine.create_session()
+
+    def generate_constrained(
+        self,
+        model_id: str,
+        prompt: str | None = None,
+        grammar: str | None = None,
+        schema: dict | None = None,
+        regex: str | None = None,
+        *,
+        messages: list[dict[str, str]] | None = None,
         **kwargs: Any,
     ) -> GenerationResponse:
         """Generate text constrained to a grammar, JSON schema, or regex pattern.
@@ -1555,27 +1899,32 @@ class Runtime:
         Returns:
             GenerationResponse with guaranteed valid output.
         """
-        if sum(value is not None for value in (grammar, schema, regex)) != 1:
-            raise AetherRuntimeError("Provide exactly one of grammar, schema, or regex")
-        backend = self._load_model(model_id)
-        if self.grammar_engine is None:
-            raise AetherRuntimeError(
-                "No trusted tokenizer-aware grammar FSM is loaded; compile the requested constraint with a tokenizer-aware grammar backend first"
-            )
-        source = grammar
-        if schema is not None:
-            source = json.dumps(schema, sort_keys=True, separators=(",", ":"))
-        assert source is not None
-        if not self.grammar_engine.matches_compiled_constraint(source):
-            raise AetherRuntimeError(
-                "The requested constraint does not match a trusted tokenizer-aware grammar compiled into this AEG"
-            )
-        if not backend.supports("grammar_constraints"):
-            raise AetherRuntimeError(
-                f"Backend {backend.name!r} does not implement decode-time grammar constraints"
-            )
-        kwargs["grammar_session"] = self.grammar_engine.create_session()
-        return self.generate(model_id, prompt, **kwargs)
+        kwargs["grammar_session"] = self._create_grammar_session(
+            model_id, grammar=grammar, schema=schema, regex=regex
+        )
+        return self.generate(model_id, prompt, messages=messages, **kwargs)
+
+    def generate_constrained_stream(
+        self,
+        model_id: str,
+        prompt: str | None = None,
+        *,
+        messages: list[dict[str, str]] | None = None,
+        grammar: str | None = None,
+        schema: dict | None = None,
+        regex: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Stream tokenizer-constrained output through the real decode path."""
+        kwargs["grammar_session"] = self._create_grammar_session(
+            model_id, grammar=grammar, schema=schema, regex=regex
+        )
+        return self.generate_stream(
+            model_id,
+            prompt,
+            messages=messages,
+            **kwargs,
+        )
 
     def grpo_train_step(
         self,
@@ -1705,10 +2054,16 @@ class Runtime:
         Returns:
             Stats dict with NIKA policy results and transfer metrics.
         """
-        # R10 stats from the KV cache manager's disaggregated transfer layer
-        stats = self.kv_cache.get_transfer_stats() if hasattr(self.kv_cache, "get_transfer_stats") else {}
+        # The CPU manager can measure local tier movements.  Network/RDMA
+        # engines are not installed on this host and must remain explicit
+        # unavailable rather than being represented by synthetic numbers.
+        stats = self.kv_cache.get_transfer_stats()
         return {
-            "enabled": bool(stats),
+            "enabled": False,
+            "network_available": False,
+            "network_backend": None,
+            "fallback_backend": "local_tier_cache",
+            "fallback_active": True,
             "research_basis": "NIKA SCITEPRESS 2026 + NIXL NVIDIA 2026",
             **stats,
         }

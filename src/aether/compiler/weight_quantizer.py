@@ -167,6 +167,11 @@ class GraphWeightQuantizer:
                 stats.skipped_no_weight += 1
                 continue
 
+            # Pass 9's verified mask must affect the payload, not only the
+            # metadata report. A malformed mask fails compilation instead of
+            # being silently ignored.
+            weight = self._apply_pruning_mask(node, weight)
+
             stats.nodes_with_weights += 1
             node_id = getattr(node, "id", "")
             layer_index = getattr(node, "layer_index", None)
@@ -222,6 +227,25 @@ class GraphWeightQuantizer:
         # checkpoint tensors is useful for planning, but it must not become a
         # runnable AEG artifact containing random weights.
         return None
+
+    def _apply_pruning_mask(self, node: Any, weight: np.ndarray) -> np.ndarray:
+        """Apply a real Pass 9 keep-mask before quantization."""
+        attrs = getattr(node, "attributes", {}) or {}
+        pruning_mask = attrs.get("pruning_mask")
+        if pruning_mask is None:
+            return weight
+        raw_mask = getattr(pruning_mask, "mask", None)
+        if raw_mask is None:
+            raise ValueError(
+                f"node {getattr(node, 'id', '<unknown>')} has an invalid pruning mask"
+            )
+        mask = np.asarray(raw_mask, dtype=bool)
+        if tuple(mask.shape) != tuple(weight.shape):
+            raise ValueError(
+                f"pruning mask shape {tuple(mask.shape)} does not match weight shape "
+                f"{tuple(weight.shape)} for node {getattr(node, 'id', '<unknown>')}"
+            )
+        return np.where(mask, weight, 0.0).astype(np.float32, copy=False)
 
     def _infer_weight_shape(self, node: Any) -> tuple[int, ...] | None:
         """Infer a plausible weight shape from node attributes."""

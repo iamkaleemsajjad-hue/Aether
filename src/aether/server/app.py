@@ -13,6 +13,7 @@ from typing import Any
 from aether.runtime import Runtime
 from aether.runtime.config import RuntimeConfig
 from aether.server.routes import create_router
+from aether.core.constants import AETHER_VERSION
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -38,7 +39,7 @@ def create_app(config: RuntimeConfig | None = None) -> Any:
     runtime = Runtime(config)
     app = FastAPI(
         title="Aether Runtime API",
-        version="0.1.0",
+        version=AETHER_VERSION,
         description="Aether Runtime — compile any model, run on any hardware.",
         docs_url="/docs",
         redoc_url="/redoc",
@@ -67,13 +68,18 @@ def create_app(config: RuntimeConfig | None = None) -> Any:
     @app.get("/health", tags=["System"])
     async def health():
         """Health check endpoint."""
-        return {"status": "healthy", "target": runtime.fingerprint.target_id}
+        return {
+            "status": "healthy",
+            "version": AETHER_VERSION,
+            "target": runtime.fingerprint.target_id,
+            "loaded_models": len(runtime._loaded_models),
+        }
 
     @app.get("/", tags=["System"])
     async def root():
         return {
             "service": "Aether Runtime API",
-            "version": "0.1.0",
+            "version": AETHER_VERSION,
             "target": runtime.fingerprint.target_id,
             "docs": "/docs",
         }

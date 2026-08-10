@@ -4,11 +4,41 @@ package aether;
 
 import "google/protobuf/struct.proto";
 
-// The Struct payloads keep the wire contract forward-compatible while the
-// public fields are documented in the Python client.  Responses contain the
-// same normalized data returned by Runtime.generate().
+message GenerateRequest {
+  string model_id = 1;
+  string prompt = 2;
+  optional int32 max_tokens = 3;
+  optional float temperature = 4;
+  optional float top_p = 5;
+  optional int32 top_k = 6;
+  repeated string stop = 7;
+}
+
+message GenerateResponse {
+  string text = 1;
+  int32 prompt_tokens = 2;
+  int32 completion_tokens = 3;
+  int32 total_tokens = 4;
+  string finish_reason = 5;
+  string backend_name = 6;
+  google.protobuf.Struct metrics = 7;
+}
+
+message GenerateChunk {
+  string text = 1;
+  int32 index = 2;
+  bool final = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  string service = 2;
+}
+
 service AetherRuntime {
-  rpc Generate(google.protobuf.Struct) returns (google.protobuf.Struct);
-  rpc GenerateStream(google.protobuf.Struct) returns (stream google.protobuf.Struct);
-  rpc Health(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Generate(GenerateRequest) returns (GenerateResponse);
+  rpc GenerateStream(GenerateRequest) returns (stream GenerateChunk);
+  rpc Health(HealthRequest) returns (HealthResponse);
 }
