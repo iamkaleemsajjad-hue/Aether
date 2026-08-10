@@ -68,6 +68,34 @@ class MDLMDrafterCompilationPass(BasePass):
         if not config.enable_mdlm_drafter:
             return graph, report
 
+        # R9 does not execute an architecture descriptor.  It requires a
+        # trained drafter head (configuration plus real weights) that is
+        # loaded by ``DiffusionSpecEngine.load_from_aeg``.  This compiler pass
+        # currently has no source-model adapter or weight emitter for that
+        # head, so publishing a schedule and marking the pass applied would
+        # create an AEG/3.0 artifact that cannot perform diffusion drafting.
+        # Require a concrete weight bundle supplied by a future ingestion
+        # adapter and fail closed until that adapter exists.
+        # Inspect concrete instance state rather than ``getattr`` on a mock
+        # graph, whose dynamic attributes would otherwise look like weights.
+        graph_state = getattr(graph, "__dict__", {})
+        drafter_weights = (
+            graph_state.get("mdlm_drafter_weights")
+            if isinstance(graph_state, dict)
+            else None
+        )
+        if drafter_weights is None and hasattr(graph, "metadata"):
+            drafter_weights = graph.metadata.get("mdlm_drafter_weights")
+        if drafter_weights is None:
+            report.details = {
+                "reason": "mdlm_drafter_weights_unavailable",
+                "message": (
+                    "Pass 18 requires a real trained MDLM drafter weight bundle; "
+                    "an architecture/schedule descriptor is not executable"
+                ),
+            }
+            return graph, report
+
         try:
             T = config.mdlm_drafter_steps       # denoising steps
             K = config.mdlm_draft_block_size    # tokens per diffusion block

@@ -155,6 +155,35 @@ class TestPyTorchLoader:
         with pytest.raises(IngestionError, match="Failed to load PyTorch shard"):
             PyTorchLoader(tmp_path).load()
 
+    @pytest.mark.skipif(
+        not __import__("importlib").util.find_spec("torch"),
+        reason="torch not installed",
+    )
+    def test_sharded_loader_honors_huggingface_index(self, tmp_path):
+        import json
+        import torch
+
+        torch.save({"embed.weight": torch.ones(4, 4)}, tmp_path / "pytorch_model-00001-of-00002.bin")
+        torch.save({"proj.weight": torch.ones(4, 4)}, tmp_path / "pytorch_model-00002-of-00002.bin")
+        (tmp_path / "optimizer.bin").write_bytes(b"not a model shard")
+        (tmp_path / "pytorch_model.bin.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {},
+                    "weight_map": {
+                        "embed.weight": "pytorch_model-00001-of-00002.bin",
+                        "proj.weight": "pytorch_model-00002-of-00002.bin",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        from aether.compiler.stage1_ingestion.pytorch_loader import PyTorchLoader
+
+        data = PyTorchLoader(tmp_path).load()
+        assert sorted(data["weights"]) == ["embed.weight", "proj.weight"]
+
     def test_flatten_state_dict(self):
         """_flatten_state_dict correctly flattens nested dicts of numpy arrays."""
         from aether.compiler.stage1_ingestion.pytorch_loader import _flatten_state_dict

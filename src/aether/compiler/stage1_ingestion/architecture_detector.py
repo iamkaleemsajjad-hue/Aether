@@ -256,6 +256,16 @@ class ArchitectureDetector:
         num_experts = config.get("num_local_experts", config.get("num_experts", 0))
         num_activated_experts = config.get("num_experts_per_tok", config.get("top_k", 0))
         is_moe = num_experts > 0
+        mtp_declared = config.get(
+            "mtp_heads",
+            config.get("num_mtp_heads", config.get("num_nextn_predict_layers", 0)),
+        )
+        if isinstance(mtp_declared, dict):
+            mtp_declared = mtp_declared.get("n_heads", mtp_declared.get("num_heads", 0))
+        try:
+            mtp_heads = max(0, int(mtp_declared or 0))
+        except (TypeError, ValueError):
+            mtp_heads = 0
 
         return ModelArchitecture(
             family=family,
@@ -270,6 +280,7 @@ class ArchitectureDetector:
             is_moe=is_moe,
             num_experts=num_experts,
             num_activated_experts=num_activated_experts,
+            mtp_heads=mtp_heads,
         )
 
     def _detect_family_from_arch_type(self, arch_type: str) -> str | None:

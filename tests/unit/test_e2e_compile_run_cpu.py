@@ -33,6 +33,7 @@ from aether.core.types import DType, ModelArchitecture, TensorLayout, TensorShap
 from aether.quantization.formats import dequantize_tensor, quantize_tensor
 from aether.runtime.aeg_loader import AEGLoadError, load_engine_from_package, package_is_runnable
 from aether.runtime.cpu_engine import CPUExecutionEngine, KVCache, LayerWeights, ModelWeights
+from aether.runtime.r1_peagle_engine import PEAGLEEngine
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -149,6 +150,40 @@ def _build_aeg_graph(arch: ModelArchitecture, weights: ModelWeights) -> AEGGraph
     return graph
 
 
+def test_cpu_engine_wires_real_peagle_drafts_through_exact_target_verification() -> None:
+    """MTP proposals must be verified by target logits before cache advance."""
+    import torch
+
+    engine = CPUExecutionEngine(_make_model_weights(), num_heads=HEADS, num_kv_heads=KV_HEADS)
+    peagle = PEAGLEEngine(draft_K=2, mode="mtp")
+    peagle._mtp_heads = [
+        {"index": 0, "vocab_size": VOCAB, "hidden_size": HIDDEN},
+        {"index": 1, "vocab_size": VOCAB, "hidden_size": HIDDEN},
+    ]
+    peagle._mtp_weights = [torch.ones((VOCAB, HIDDEN)), torch.ones((VOCAB, HIDDEN))]
+
+    generated = engine.generate(
+        np.asarray([1, 2, 3], dtype=np.int64),
+        max_tokens=4,
+        temperature=0.0,
+        peagle_engine=peagle,
+    )
+
+    assert len(generated) == 4
+    stats = engine.speculative_stats()
+    assert stats["draft_tokens"] >= 2
+    assert 0.0 <= float(stats["acceptance_rate"]) <= 1.0
+
+
+def test_cpu_sampling_applies_nucleus_top_p() -> None:
+    engine = CPUExecutionEngine(_make_model_weights(), num_heads=HEADS, num_kv_heads=KV_HEADS)
+    logits = np.asarray([10.0, 9.0, 0.0, -10.0], dtype=np.float32)
+    rng = np.random.default_rng(3)
+    assert engine._sample(logits, 1.0, 0, 0.70, rng) == 0
+    with pytest.raises(ValueError, match="top_p"):
+        engine._sample(logits, 1.0, 0, 0.0, rng)
+
+
 def _compile_and_save(tmp_path: Path) -> tuple[AEGPackage, ModelWeights]:
     """Full compile → quantize → save cycle. Returns the saved package and
     the original ModelWeights for comparison."""
@@ -179,6 +214,74 @@ def _compile_and_save(tmp_path: Path) -> tuple[AEGPackage, ModelWeights]:
 # ── Tests: weight quantizer ───────────────────────────────────────────────────
 
 class TestGraphWeightQuantizer:
+    def test_real_pruning_mask_changes_quantized_payload(self, tmp_path: Path) -> None:
+        from aether.quantization.pruning import PruningMask
+        from aether.quantization.formats import dequantize_tensor
+
+        arch = _make_architecture()
+        graph = _build_aeg_graph(arch, _make_model_weights())
+        qkv = graph.get_node("layer_0_qkv")
+        original = np.asarray(qkv.get_attribute("weight"), dtype=np.float32)
+        keep = np.zeros_like(original, dtype=bool)
+        qkv.add_attribute(
+            "pruning_mask",
+            PruningMask(
+                mask=keep,
+                pattern="unstructured",
+                metric="magnitude",
+                target_sparsity=1.0,
+                shape=tuple(original.shape),
+            ),
+        )
+        package = AEGPackage.create(tmp_path / "masked.aeg", model_id="m", aether_version="0")
+        package.manifest.architecture = arch  # type: ignore[union-attr]
+
+        GraphWeightQuantizer(block_size=BLOCK_SIZE).quantize(graph, package)
+
+        for name in ("layer_0_q_proj", "layer_0_k_proj", "layer_0_v_proj"):
+            restored = dequantize_tensor(package.weights[name])
+            assert np.count_nonzero(restored) == 0
+
+    def test_pipeline_pruning_mask_reaches_aeg_payload(self, tmp_path: Path) -> None:
+        from aether.compiler.config import CompilerConfig
+        from aether.compiler.stage2_optimizer.optimizer import PruningSparsityPass
+
+        arch = _make_architecture()
+        graph = _build_aeg_graph(arch, _make_model_weights())
+        _, report = PruningSparsityPass().run(graph, arch, CompilerConfig())
+        assert report.details["masks_computed"] > 0
+        assert graph.get_node("layer_0_qkv").get_attribute("pruning_mask") is not None
+
+        package = AEGPackage.create(tmp_path / "pipeline_masked.aeg", model_id="m", aether_version="0")
+        package.manifest.architecture = arch  # type: ignore[union-attr]
+        GraphWeightQuantizer(block_size=BLOCK_SIZE).quantize(graph, package)
+
+        restored = dequantize_tensor(package.weights["layer_0_q_proj"])
+        assert np.count_nonzero(restored) > 0
+        assert np.count_nonzero(restored == 0.0) > 0
+
+    def test_malformed_pruning_mask_fails_closed(self, tmp_path: Path) -> None:
+        from aether.quantization.pruning import PruningMask
+
+        arch = _make_architecture()
+        graph = _build_aeg_graph(arch, _make_model_weights())
+        qkv = graph.get_node("layer_0_qkv")
+        qkv.add_attribute(
+            "pruning_mask",
+            PruningMask(
+                mask=np.ones((2, 2), dtype=bool),
+                pattern="unstructured",
+                metric="magnitude",
+                target_sparsity=0.5,
+                shape=(2, 2),
+            ),
+        )
+        package = AEGPackage.create(tmp_path / "bad_mask.aeg", model_id="m", aether_version="0")
+        package.manifest.architecture = arch  # type: ignore[union-attr]
+
+        with pytest.raises(ValueError, match="pruning mask shape"):
+            GraphWeightQuantizer(block_size=BLOCK_SIZE).quantize(graph, package)
+
     def test_quantizes_all_nodes_with_weights(self, tmp_path: Path) -> None:
         arch = _make_architecture()
         original = _make_model_weights()
@@ -612,6 +715,23 @@ class TestCPUEngineDirectly:
         tokens = engine.generate(np.array([1], dtype=np.int64), max_tokens=10, temperature=0.0)
         assert len(tokens) == 10
 
+    def test_ttt_slots_change_real_forward_logits(self) -> None:
+        engine = self._engine()
+        baseline, _ = engine.forward(np.array([1, 2], dtype=np.int64))
+        slots = [
+            {
+                "A": [0.0] * (HIDDEN * 2),
+                "B": [0.0] * (2 * HIDDEN),
+                "mu": [0.25] * HIDDEN,
+                "sigma": [1.0] * HIDDEN,
+                "momentum_A": [0.0] * (HIDDEN * 2),
+                "momentum_B": [0.0] * (2 * HIDDEN),
+            }
+            for _ in range(N_LAYERS)
+        ]
+        adapted, _ = engine.forward(np.array([1, 2], dtype=np.int64), ttt_slots=slots)
+        assert not np.allclose(baseline, adapted)
+
     def test_generate_applies_grammar_fsm_token_mask(self) -> None:
         engine = self._engine()
 
@@ -637,6 +757,18 @@ class TestCPUEngineDirectly:
         )
         assert tokens == [7, 7, 7, 7]
         assert session.advanced == tokens
+
+        class OneTokenSession(Session):
+            def is_accepting(self) -> bool:
+                return bool(self.advanced)
+
+        accepting_session = OneTokenSession()
+        assert engine.generate(
+            np.array([1], dtype=np.int64),
+            max_tokens=4,
+            temperature=0.0,
+            grammar_session=accepting_session,
+        ) == [7]
 
     def test_generate_stops_at_eos(self) -> None:
         """EOS must stop generation even if max_tokens budget remains."""

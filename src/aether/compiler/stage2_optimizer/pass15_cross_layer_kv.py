@@ -244,6 +244,8 @@ def _count_layers(architecture: Any, graph: Any) -> int:
                 return int(architecture[k])
     elif hasattr(architecture, "num_hidden_layers"):
         return int(architecture.num_hidden_layers)
+    elif hasattr(architecture, "layers"):
+        return int(architecture.layers)
     if hasattr(graph, "n_layers"):
         return int(graph.n_layers)
     return 32

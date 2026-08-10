@@ -130,36 +130,116 @@ class KVCache:
     num_layers: int
     keys: list[np.ndarray | None] = field(default_factory=list)
     values: list[np.ndarray | None] = field(default_factory=list)
+    positions: list[np.ndarray | None] = field(default_factory=list)
+    #: Logical (uncompressed) sequence length.  Stored KV rows may be fewer
+    #: when a verified semantic-KV plan is active, but RoPE and causal masks
+    #: must continue to use the original token positions.
+    logical_length: int = 0
     #: Logits for the final cached position.  This allows a session to append
     #: an empty suffix without recomputing the entire prefix.
     last_logits: np.ndarray | None = None
+    #: Final normalized hidden state for an optional MTP drafter.
+    last_hidden: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not self.keys:
             self.keys = [None] * self.num_layers
             self.values = [None] * self.num_layers
+        if not self.positions:
+            self.positions = [None] * self.num_layers
 
     @property
     def length(self) -> int:
-        """Number of cached positions."""
+        """Logical number of cached positions, including compressed tokens."""
+        return self.logical_length
+
+    @property
+    def stored_length(self) -> int:
+        """Number of physically stored KV rows in the first layer."""
         first = self.keys[0] if self.keys else None
         return 0 if first is None else int(first.shape[0])
 
-    def append(self, layer: int, key: np.ndarray, value: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Append this step's key/value and return the full cached history."""
+    def append(
+        self,
+        layer: int,
+        key: np.ndarray,
+        value: np.ndarray,
+        positions: np.ndarray | None = None,
+        *,
+        update_length: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Append this step's key/value and return values plus token positions.
+
+        ``update_length=False`` is used by the transformer, which appends one
+        layer at a time and advances the shared logical length only after all
+        layers have completed.  This prevents a compressed cache from treating
+        each layer as additional sequence tokens.
+        """
+        key = np.ascontiguousarray(key, dtype=np.float32)
+        value = np.ascontiguousarray(value, dtype=np.float32)
+        if key.shape[0] != value.shape[0]:
+            raise ValueError("KV key/value sequence lengths must match")
+        if positions is None:
+            start = self.logical_length
+            positions = np.arange(start, start + key.shape[0], dtype=np.int64)
+        else:
+            positions = np.ascontiguousarray(positions, dtype=np.int64).reshape(-1)
+            if positions.size != key.shape[0]:
+                raise ValueError("KV position count must match key/value sequence length")
         if self.keys[layer] is None:
             self.keys[layer] = key
             self.values[layer] = value
+            self.positions[layer] = positions
         else:
             self.keys[layer] = np.concatenate([self.keys[layer], key], axis=0)
             self.values[layer] = np.concatenate([self.values[layer], value], axis=0)
-        return self.keys[layer], self.values[layer]
+            existing_positions = self.positions[layer]
+            if existing_positions is None:
+                raise ValueError("KV cache has values without token positions")
+            self.positions[layer] = np.concatenate([existing_positions, positions], axis=0)
+        if update_length:
+            self.logical_length = max(
+                self.logical_length,
+                int(positions[-1]) + 1 if positions.size else self.logical_length,
+            )
+        stored_positions = self.positions[layer]
+        if stored_positions is None:
+            raise ValueError("KV cache append did not produce token positions")
+        return self.keys[layer], self.values[layer], stored_positions
+
+    def replace_layer(
+        self,
+        layer: int,
+        key: np.ndarray,
+        value: np.ndarray,
+        positions: np.ndarray,
+    ) -> None:
+        """Replace one layer with a validated compressed KV representation."""
+        key = np.ascontiguousarray(key, dtype=np.float32)
+        value = np.ascontiguousarray(value, dtype=np.float32)
+        positions = np.ascontiguousarray(positions, dtype=np.int64).reshape(-1)
+        if key.shape[0] != value.shape[0] or key.shape[0] != positions.size:
+            raise ValueError("compressed KV rows and positions must have matching lengths")
+        if positions.size and np.any(np.diff(positions) <= 0):
+            raise ValueError("compressed KV positions must remain strictly increasing")
+        self.keys[layer] = key
+        self.values[layer] = value
+        self.positions[layer] = positions
+
+    def advance(self, token_count: int) -> None:
+        """Advance the shared logical sequence length after a forward pass."""
+        if token_count < 0:
+            raise ValueError("token_count must be non-negative")
+        self.logical_length += int(token_count)
 
     def reset(self) -> None:
         """Drop all cached state."""
         self.keys = [None] * self.num_layers
         self.values = [None] * self.num_layers
+        self.positions = [None] * self.num_layers
+        self.logical_length = 0
         self.last_logits = None
+        self.last_hidden = None
 
 
 class CPUExecutionEngine:
@@ -179,6 +259,11 @@ class CPUExecutionEngine:
         num_heads: int,
         num_kv_heads: int | None = None,
         kernels: NativeCPUKernels | None = None,
+        lora_adapters: dict[str, dict[tuple[int, str], tuple[np.ndarray, np.ndarray, float]]] | None = None,
+        active_lora_adapter: str | None = None,
+        sparse_attention_plan: dict[str, Any] | None = None,
+        semantic_kv_plan: dict[str, Any] | None = None,
+        cross_layer_kv_plan: dict[str, Any] | None = None,
     ) -> None:
         weights.validate()
         self.weights = weights
@@ -195,6 +280,17 @@ class CPUExecutionEngine:
             msg = f"head_dim must be even for RoPE, got {self.head_dim}"
             raise ValueError(msg)
         self.kernels = kernels or get_native_kernels()
+        self.lora_adapters = lora_adapters or {}
+        self.active_lora_adapter = active_lora_adapter
+        self.sparse_attention_plan = sparse_attention_plan
+        self.semantic_kv_plan = self._validate_semantic_kv_plan(semantic_kv_plan)
+        self.cross_layer_kv_plan = self._validate_cross_layer_kv_plan(cross_layer_kv_plan, len(weights.layers))
+        self._speculative_stats = {
+            "draft_tokens": 0,
+            "accepted_tokens": 0,
+            "cycles": 0,
+        }
+        self._validate_lora_adapters()
         self._cos, self._sin = self._build_rope_tables()
 
     # ── Setup ────────────────────────────────────────────────────────────────
@@ -208,6 +304,210 @@ class CPUExecutionEngine:
         angles = np.arange(max_positions, dtype=np.float64)[:, None] * inv_freq[None, :]
         return np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
 
+    def with_task_deltas(self, deltas: dict[str, np.ndarray]) -> "CPUExecutionEngine":
+        """Return a request-local engine with validated task-vector deltas applied.
+
+        The base engine is never mutated, so concurrent requests retain
+        isolated model state.  This is intentionally an explicit copy-on-write
+        operation: a caller can only obtain it after loading authenticated AEG
+        task-vector payloads, and malformed names/shapes fail before decode.
+        """
+        if not deltas:
+            return self
+
+        def updated(name: str, value: np.ndarray) -> np.ndarray:
+            delta = deltas.get(name)
+            if delta is None:
+                return np.array(value, dtype=np.float32, copy=True)
+            candidate = np.asarray(delta, dtype=np.float32)
+            if candidate.shape != value.shape:
+                raise ValueError(
+                    f"task delta {name!r} shape {candidate.shape} does not match base {value.shape}"
+                )
+            return np.ascontiguousarray(value.astype(np.float32) + candidate, dtype=np.float32)
+
+        layers: list[LayerWeights] = []
+        for index, layer in enumerate(self.weights.layers):
+            fields = {
+                field_name: updated(
+                    f"layer_{index}_{field_name}",
+                    getattr(layer, field_name),
+                )
+                for field_name in (
+                    "attention_norm", "q_proj", "k_proj", "v_proj", "o_proj",
+                    "ffn_norm", "gate_proj", "up_proj", "down_proj",
+                )
+            }
+            layers.append(LayerWeights(**fields))
+        weights = ModelWeights(
+            embedding=updated("embedding", self.weights.embedding),
+            layers=layers,
+            final_norm=updated("final_norm", self.weights.final_norm),
+            lm_head=updated("lm_head", self.weights.lm_head),
+            rope_theta=self.weights.rope_theta,
+            norm_eps=self.weights.norm_eps,
+        )
+        return CPUExecutionEngine(
+            weights,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            kernels=self.kernels,
+            lora_adapters=self.lora_adapters,
+            active_lora_adapter=self.active_lora_adapter,
+            sparse_attention_plan=self.sparse_attention_plan,
+            semantic_kv_plan=self.semantic_kv_plan,
+            cross_layer_kv_plan=self.cross_layer_kv_plan,
+        )
+
+    def with_lora_adapter(
+        self,
+        adapters: dict[str, dict[tuple[int, str], tuple[np.ndarray, np.ndarray, float]]],
+        adapter_id: str | None,
+    ) -> "CPUExecutionEngine":
+        """Return an immutable request-local engine with one adapter selected."""
+        if adapter_id is not None and adapter_id not in adapters:
+            raise ValueError(f"unknown compiled LoRA adapter {adapter_id!r}")
+        return CPUExecutionEngine(
+            self.weights,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            kernels=self.kernels,
+            lora_adapters=adapters,
+            active_lora_adapter=adapter_id,
+            sparse_attention_plan=self.sparse_attention_plan,
+            semantic_kv_plan=self.semantic_kv_plan,
+            cross_layer_kv_plan=self.cross_layer_kv_plan,
+        )
+
+    @staticmethod
+    def _validate_semantic_kv_plan(plan: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Validate the persisted Pass 14 plan before enabling compression."""
+        if plan is None:
+            return None
+        if not isinstance(plan, dict) or plan.get("format") != "aether_kv_compression_v1":
+            raise ValueError("semantic KV plan has an unsupported format")
+        layers = plan.get("layers")
+        if not isinstance(layers, list) or not layers:
+            raise ValueError("semantic KV plan must contain layer policies")
+        strategy = str(plan.get("strategy", "chunk"))
+        if strategy not in {"chunk", "hybrid"}:
+            raise ValueError(
+                f"semantic KV strategy {strategy!r} requires tokenizer boundary metadata; "
+                "only chunk and hybrid plans are executable by the CPU cache"
+            )
+        for index, item in enumerate(layers):
+            if not isinstance(item, dict):
+                raise ValueError(f"semantic KV layer {index} must be an object")
+            retention = float(item.get("retention_ratio", -1.0))
+            chunk_size = int(item.get("chunk_size", 0))
+            if not 0.0 < retention <= 1.0 or chunk_size <= 0:
+                raise ValueError(f"invalid semantic KV policy for layer {index}")
+        return plan
+
+    def _semantic_kv_policy(self, layer: int) -> dict[str, Any] | None:
+        if self.semantic_kv_plan is None:
+            return None
+        layers = self.semantic_kv_plan["layers"]
+        if layer >= len(layers):
+            raise ValueError("semantic KV plan has fewer policies than model layers")
+        return layers[layer]
+
+    @staticmethod
+    def _validate_cross_layer_kv_plan(
+        plan: dict[str, Any] | None,
+        num_layers: int,
+    ) -> dict[str, Any] | None:
+        """Validate Pass 15 aliases before they can affect inference."""
+        if plan is None:
+            return None
+        if not isinstance(plan, dict) or plan.get("format") != "aether_cross_layer_kv_v1":
+            raise ValueError("cross-layer KV plan has an unsupported format")
+        if int(plan.get("n_layers", -1)) != num_layers:
+            raise ValueError("cross-layer KV plan layer count does not match the model")
+        groups = plan.get("sharing_groups")
+        if not isinstance(groups, list):
+            raise ValueError("cross-layer KV plan must contain sharing_groups")
+        targets: set[int] = set()
+        for group in groups:
+            if not isinstance(group, dict):
+                raise ValueError("cross-layer KV sharing group must be an object")
+            src = int(group.get("src_layer", -1))
+            shared = group.get("shared_with")
+            if src < 0 or src >= num_layers or not isinstance(shared, list):
+                raise ValueError("invalid cross-layer KV source group")
+            for target_value in shared:
+                target = int(target_value)
+                # The streaming CPU engine can only alias a source whose cache
+                # has already been computed in this forward pass.
+                if target <= src or target >= num_layers or target in targets:
+                    raise ValueError("cross-layer KV targets must have one earlier source layer")
+                targets.add(target)
+        return plan
+
+    def _cross_layer_kv_source(self, layer: int) -> int | None:
+        if self.cross_layer_kv_plan is None:
+            return None
+        for group in self.cross_layer_kv_plan["sharing_groups"]:
+            if layer in group["shared_with"]:
+                return int(group["src_layer"])
+        return None
+
+    def _compress_semantic_kv(
+        self,
+        cache: KVCache,
+        layer: int,
+        key: np.ndarray,
+        value: np.ndarray,
+        positions: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Apply the real Pass 14 chunk compressor while preserving positions."""
+        policy = self._semantic_kv_policy(layer)
+        if policy is None or float(policy["retention_ratio"]) >= 1.0 or key.shape[0] < 2:
+            return key, value, positions
+        from aether.compiler.stage2_optimizer.pass14_semantic_kv_compression import chunk_kv_compress
+
+        _compressed_keys, _compressed_values, retained = chunk_kv_compress(
+            # The pass operates on one vector per token.  For grouped-query
+            # attention, cluster the mean key across KV heads, then retain the
+            # same rows for every head so the cache remains shape-aligned.
+            key.mean(axis=1).tolist(),
+            value.mean(axis=1).tolist(),
+            retention_ratio=float(policy["retention_ratio"]),
+            chunk_size=int(policy["chunk_size"]),
+        )
+        # The newest token is always required for the next decode step's
+        # causal self-attention.  The representative policy may otherwise
+        # choose the first row of a merged chunk and drop this position.
+        if retained and retained[-1] != len(positions) - 1:
+            retained = sorted(set(retained) | {len(positions) - 1})
+        if not retained or len(retained) >= len(positions):
+            return key, value, positions
+        retained_positions = positions[np.asarray(retained, dtype=np.int64)]
+        return (
+            key[np.asarray(retained, dtype=np.int64)],
+            value[np.asarray(retained, dtype=np.int64)],
+            retained_positions,
+        )
+
+    def _validate_lora_adapters(self) -> None:
+        """Validate adapter targets against the actual compiled model shapes."""
+        for adapter_id, targets in self.lora_adapters.items():
+            for (layer_index, projection), (a, b, scale) in targets.items():
+                if layer_index < 0 or layer_index >= len(self.weights.layers):
+                    raise ValueError(f"LoRA adapter {adapter_id!r} references invalid layer {layer_index}")
+                if not hasattr(self.weights.layers[layer_index], projection):
+                    raise ValueError(f"LoRA adapter {adapter_id!r} references unknown projection {projection!r}")
+                base = np.asarray(getattr(self.weights.layers[layer_index], projection))
+                A = np.asarray(a)
+                B = np.asarray(b)
+                if A.ndim != 2 or B.ndim != 2 or A.shape[1] != base.shape[1] or B.shape[0] != base.shape[0] or A.shape[0] != B.shape[1]:
+                    raise ValueError(
+                        f"LoRA adapter {adapter_id!r} target layer {layer_index} {projection} "
+                        f"does not match base shape {base.shape}: A={A.shape}, B={B.shape}"
+                    )
+                if not np.isfinite(float(scale)) or float(scale) < 0:
+                    raise ValueError(f"LoRA adapter {adapter_id!r} has invalid scale")
+
     def _ensure_rope_capacity(self, required: int) -> None:
         """Grow the RoPE tables when a sequence runs past the precomputed range."""
         if required <= self._cos.shape[0]:
@@ -216,9 +516,43 @@ class CPUExecutionEngine:
 
     # ── Primitives ───────────────────────────────────────────────────────────
 
-    def _linear(self, x: np.ndarray, weight: np.ndarray) -> np.ndarray:
-        """Apply ``y = x @ W.T`` for a ``(out, in)`` weight matrix."""
-        return self.kernels.sgemm(np.ascontiguousarray(x, dtype=np.float32), weight.T)
+    def _linear(
+        self,
+        x: np.ndarray,
+        weight: np.ndarray,
+        target: tuple[int, str] | None = None,
+    ) -> np.ndarray:
+        """Apply a base linear projection and the selected real LoRA delta."""
+        x32 = np.ascontiguousarray(x, dtype=np.float32)
+        output = self.kernels.sgemm(x32, weight.T)
+        if self.active_lora_adapter is None or target is None:
+            return output
+        adapter = self.lora_adapters.get(self.active_lora_adapter)
+        if adapter is None or target not in adapter:
+            return output
+        A, B, scale = adapter[target]
+        delta = self.kernels.sgemm(
+            self.kernels.sgemm(x32, np.asarray(A, dtype=np.float32).T),
+            np.asarray(B, dtype=np.float32).T,
+        )
+        return np.ascontiguousarray(output + delta * np.float32(scale), dtype=np.float32)
+
+    def _apply_ttt_slot(self, hidden: np.ndarray, slot: dict[str, Any] | None) -> np.ndarray:
+        """Apply one request-local R5 fast-weight slot to normalized states."""
+        if slot is None:
+            return hidden
+        width = self.weights.hidden_size
+        try:
+            mu = np.asarray(slot["mu"], dtype=np.float32).reshape(width)
+            sigma = np.asarray(slot["sigma"], dtype=np.float32).reshape(width)
+            adapted = (hidden - mu) * sigma
+            a = np.asarray(slot["A"], dtype=np.float32).reshape(width, -1)
+            b = np.asarray(slot["B"], dtype=np.float32).reshape(a.shape[1], width)
+        except (KeyError, ValueError) as exc:
+            raise ValueError("invalid R5 TTT slot dimensions") from exc
+        if np.any(a) or np.any(b):
+            adapted = adapted + (adapted @ a) @ b
+        return np.ascontiguousarray(adapted, dtype=np.float32)
 
     def _attention(
         self,
@@ -226,6 +560,8 @@ class CPUExecutionEngine:
         keys: np.ndarray,
         values: np.ndarray,
         causal_offset: int,
+        key_positions: np.ndarray | None = None,
+        query_positions: np.ndarray | None = None,
     ) -> np.ndarray:
         """Scaled dot-product attention with causal masking and GQA broadcast.
 
@@ -240,6 +576,14 @@ class CPUExecutionEngine:
         """
         seq_len = query.shape[0]
         total = keys.shape[0]
+        if key_positions is None:
+            key_positions = np.arange(total, dtype=np.int64)
+        if query_positions is None:
+            query_positions = np.arange(seq_len, dtype=np.int64) + causal_offset
+        key_positions = np.asarray(key_positions, dtype=np.int64).reshape(-1)
+        query_positions = np.asarray(query_positions, dtype=np.int64).reshape(-1)
+        if key_positions.size != total or query_positions.size != seq_len:
+            raise ValueError("attention position metadata does not match KV/query shapes")
         scale = 1.0 / np.sqrt(self.head_dim)
         repeats = self.num_heads // self.num_kv_heads
 
@@ -252,20 +596,104 @@ class CPUExecutionEngine:
         k = np.ascontiguousarray(keys_full.transpose(1, 2, 0), dtype=np.float32)
         scores = np.matmul(q, k) * scale
 
-        # Causal mask: query position i may attend to key positions <= i + offset.
-        positions = np.arange(total)[None, :]
-        allowed = positions <= (np.arange(seq_len)[:, None] + causal_offset)
-        scores = np.where(allowed[None, :, :], scores, np.float32(-np.inf))
+        # Causal mask uses original token positions, not compressed row indices.
+        allowed = key_positions[None, :] <= query_positions[:, None]
+        sparse_allowed = self._sparse_allowed_mask(
+            seq_len=seq_len,
+            total=total,
+            causal_offset=causal_offset,
+            heads=scores.shape[0],
+            key_positions=key_positions,
+            query_positions=query_positions,
+        )
+        if sparse_allowed is not None:
+            allowed = allowed[None, :, :] & sparse_allowed
+        else:
+            allowed = allowed[None, :, :]
+        scores = np.where(allowed, scores, np.float32(-np.inf))
 
         weights = self.kernels.softmax(scores.reshape(-1, total)).reshape(scores.shape)
         v = np.ascontiguousarray(values_full.transpose(1, 0, 2), dtype=np.float32)
         context = np.matmul(weights, v)
         return context.transpose(1, 0, 2)
 
+    def _sparse_allowed_mask(
+        self,
+        *,
+        seq_len: int,
+        total: int,
+        causal_offset: int,
+        heads: int,
+        key_positions: np.ndarray | None = None,
+        query_positions: np.ndarray | None = None,
+    ) -> np.ndarray | None:
+        """Build the actual per-head mask described by the persisted Pass 8 plan."""
+        plan = self.sparse_attention_plan
+        if not isinstance(plan, dict) or not bool(plan.get("enabled")):
+            return None
+        patterns = plan.get("patterns")
+        if not isinstance(patterns, list) or len(patterns) != heads:
+            raise ValueError("sparse attention plan must contain one pattern per attention head")
+        mask = np.zeros((heads, seq_len, total), dtype=bool)
+        if key_positions is None:
+            key_positions = np.arange(total, dtype=np.int64)
+        if query_positions is None:
+            query_positions = np.arange(seq_len, dtype=np.int64) + causal_offset
+        for head, descriptor in enumerate(patterns):
+            if not isinstance(descriptor, dict):
+                raise ValueError("sparse attention pattern must be an object")
+            pattern = descriptor.get("pattern", descriptor.get("pattern_type"))
+            if pattern == "dense":
+                mask[head, :, :] = True
+            elif pattern == "a_shape":
+                window = int(descriptor.get("local_window", descriptor.get("local_window_size", 128)))
+                sinks = int(descriptor.get("sink_tokens", descriptor.get("num_sink_tokens", 16)))
+                if window < 0 or sinks < 0:
+                    raise ValueError("sparse attention window and sink count must be non-negative")
+                for row, position in enumerate(query_positions):
+                    low = max(0, int(position) - window)
+                    mask[head, row, :] = (key_positions >= low) & (key_positions <= int(position))
+                    mask[head, row, key_positions < min(sinks, total)] = True
+            elif pattern == "vertical_slash":
+                width = int(descriptor.get("slash_width", descriptor.get("local_window", 64)))
+                stride = int(descriptor.get("stride", 0))
+                if width <= 0 or stride < 0:
+                    raise ValueError("invalid vertical-slash sparse attention parameters")
+                half = max(0, width // 2)
+                for row, position in enumerate(query_positions):
+                    center = int(position) - stride
+                    low = max(0, center - half)
+                    high = min(int(position) + 1, center + half + 1)
+                    mask[head, row, :] = (key_positions >= low) & (key_positions < high)
+                    exact = np.where(key_positions == int(position))[0]
+                    if exact.size:
+                        mask[head, row, int(exact[-1])] = True
+            elif pattern == "block_sparse":
+                block = int(descriptor.get("block_size", descriptor.get("local_window", 64)))
+                stride = int(descriptor.get("block_stride") or descriptor.get("stride") or 128)
+                if block <= 0 or stride <= 0:
+                    raise ValueError("invalid block-sparse attention parameters")
+                for row, position in enumerate(query_positions):
+                    block_start = (int(position) // stride) * stride
+                    for start in range(0, block_start + 1, stride):
+                        low = max(0, start)
+                        high = min(int(position) + 1, start + block)
+                        mask[head, row, :] |= (key_positions >= low) & (key_positions < high)
+                    exact = np.where(key_positions == int(position))[0]
+                    if exact.size:
+                        mask[head, row, int(exact[-1])] = True
+            else:
+                raise ValueError(f"unknown sparse attention pattern {pattern!r}")
+        return mask
+
     # ── Forward ──────────────────────────────────────────────────────────────
 
     def forward(
-        self, token_ids: np.ndarray, cache: KVCache | None = None
+        self,
+        token_ids: np.ndarray,
+        cache: KVCache | None = None,
+        ttt_slots: list[dict[str, Any]] | None = None,
+        adapter_id: str | None = None,
     ) -> tuple[np.ndarray, KVCache]:
         """Run the transformer over ``token_ids``.
 
@@ -278,6 +706,8 @@ class CPUExecutionEngine:
             Tuple of ``(logits, cache)`` where logits has shape
             ``(seq, vocab_size)``.
         """
+        if adapter_id is not None and adapter_id != self.active_lora_adapter:
+            raise ValueError("adapter_id must match the request-local engine selection")
         ids = np.ascontiguousarray(token_ids, dtype=np.int64).reshape(-1)
         if ids.size == 0:
             msg = "forward() requires at least one token"
@@ -299,28 +729,77 @@ class CPUExecutionEngine:
         for index, layer in enumerate(self.weights.layers):
             # ── Attention block ──
             normed = self.kernels.rmsnorm(hidden, layer.attention_norm, self.weights.norm_eps)
-            q = self._linear(normed, layer.q_proj).reshape(seq_len, self.num_heads, self.head_dim)
-            k = self._linear(normed, layer.k_proj).reshape(seq_len, self.num_kv_heads, self.head_dim)
-            v = self._linear(normed, layer.v_proj).reshape(seq_len, self.num_kv_heads, self.head_dim)
-
+            if ttt_slots is not None:
+                normed = self._apply_ttt_slot(
+                    normed, ttt_slots[index] if index < len(ttt_slots) else None
+                )
+            q = self._linear(normed, layer.q_proj, (index, "q_proj")).reshape(seq_len, self.num_heads, self.head_dim)
             q = self.kernels.rope(q, self._cos, self._sin, position_offset=past)
-            k = self.kernels.rope(k, self._cos, self._sin, position_offset=past)
 
-            keys, values = cache.append(index, k, v)
-            context = self._attention(q, keys, values, causal_offset=past)
+            shared_source = self._cross_layer_kv_source(index)
+            if shared_source is not None:
+                source_keys = cache.keys[shared_source]
+                source_values = cache.values[shared_source]
+                source_positions = cache.positions[shared_source]
+                if source_keys is None or source_values is None or source_positions is None:
+                    raise ValueError(
+                        f"cross-layer KV source {shared_source} has no computed cache"
+                    )
+                # Keep the exact ndarray objects: this is physical pointer
+                # sharing, not a copied approximation of the source cache.
+                keys, values, key_positions = source_keys, source_values, source_positions
+            else:
+                k = self._linear(normed, layer.k_proj, (index, "k_proj")).reshape(
+                    seq_len, self.num_kv_heads, self.head_dim
+                )
+                v = self._linear(normed, layer.v_proj, (index, "v_proj")).reshape(
+                    seq_len, self.num_kv_heads, self.head_dim
+                )
+                k = self.kernels.rope(k, self._cos, self._sin, position_offset=past)
+                keys, values, key_positions = cache.append(
+                    index,
+                    k,
+                    v,
+                    positions=np.arange(past, past + seq_len, dtype=np.int64),
+                    update_length=False,
+                )
+            context = self._attention(
+                q,
+                keys,
+                values,
+                causal_offset=past,
+                key_positions=key_positions,
+                query_positions=np.arange(past, past + seq_len, dtype=np.int64),
+            )
+            compressed_keys, compressed_values, compressed_positions = self._compress_semantic_kv(
+                cache, index, keys, values, key_positions
+            )
+            if self._semantic_kv_policy(index) is not None and shared_source is None:
+                cache.replace_layer(
+                    index,
+                    compressed_keys,
+                    compressed_values,
+                    compressed_positions,
+                )
+            elif shared_source is not None:
+                cache.keys[index] = cache.keys[shared_source]
+                cache.values[index] = cache.values[shared_source]
+                cache.positions[index] = cache.positions[shared_source]
             attention_out = self._linear(
-                context.reshape(seq_len, self.num_heads * self.head_dim), layer.o_proj
+                context.reshape(seq_len, self.num_heads * self.head_dim), layer.o_proj, (index, "o_proj")
             )
             hidden = hidden + attention_out
 
             # ── FFN block ──
             normed = self.kernels.rmsnorm(hidden, layer.ffn_norm, self.weights.norm_eps)
-            gate = self._linear(normed, layer.gate_proj)
-            up = self._linear(normed, layer.up_proj)
-            hidden = hidden + self._linear(self.kernels.swiglu(gate, up), layer.down_proj)
+            gate = self._linear(normed, layer.gate_proj, (index, "gate_proj"))
+            up = self._linear(normed, layer.up_proj, (index, "up_proj"))
+            hidden = hidden + self._linear(self.kernels.swiglu(gate, up), layer.down_proj, (index, "down_proj"))
 
         hidden = self.kernels.rmsnorm(hidden, self.weights.final_norm, self.weights.norm_eps)
+        cache.last_hidden = np.asarray(hidden[-1], dtype=np.float32).copy()
         logits = self._linear(hidden, self.weights.lm_head)
+        cache.advance(seq_len)
         cache.last_logits = np.asarray(logits[-1], dtype=np.float32).copy()
         return logits, cache
 
@@ -330,9 +809,13 @@ class CPUExecutionEngine:
         max_tokens: int = 16,
         temperature: float = 0.0,
         top_k: int = 0,
+        top_p: float = 1.0,
         eos_token_id: int | None = None,
         seed: int | None = None,
         grammar_session: Any | None = None,
+        ttt_slots: list[dict[str, Any]] | None = None,
+        adapter_id: str | None = None,
+        peagle_engine: Any | None = None,
     ) -> list[int]:
         """Autoregressively generate token ids.
 
@@ -352,9 +835,13 @@ class CPUExecutionEngine:
             max_tokens=max_tokens,
             temperature=temperature,
             top_k=top_k,
+            top_p=top_p,
             eos_token_id=eos_token_id,
             seed=seed,
             grammar_session=grammar_session,
+            ttt_slots=ttt_slots,
+            adapter_id=adapter_id,
+            peagle_engine=peagle_engine,
         )
         return generated
 
@@ -364,10 +851,14 @@ class CPUExecutionEngine:
         max_tokens: int = 16,
         temperature: float = 0.0,
         top_k: int = 0,
+        top_p: float = 1.0,
         eos_token_id: int | None = None,
         seed: int | None = None,
         grammar_session: Any | None = None,
         cache: KVCache | None = None,
+        ttt_slots: list[dict[str, Any]] | None = None,
+        adapter_id: str | None = None,
+        peagle_engine: Any | None = None,
     ) -> tuple[list[int], KVCache]:
         """Generate tokens while accepting and returning an incremental KV cache.
 
@@ -388,11 +879,15 @@ class CPUExecutionEngine:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_k=top_k,
+                top_p=top_p,
                 eos_token_id=eos_token_id,
                 seed=seed,
                 grammar_session=grammar_session,
                 cache=cache,
                 cache_callback=remember,
+                ttt_slots=ttt_slots,
+                adapter_id=adapter_id,
+                peagle_engine=peagle_engine,
             )
         )
         if final_cache[0] is None:
@@ -405,11 +900,15 @@ class CPUExecutionEngine:
         max_tokens: int = 16,
         temperature: float = 0.0,
         top_k: int = 0,
+        top_p: float = 1.0,
         eos_token_id: int | None = None,
         seed: int | None = None,
         grammar_session: Any | None = None,
         cache: KVCache | None = None,
         cache_callback: Any | None = None,
+        ttt_slots: list[dict[str, Any]] | None = None,
+        adapter_id: str | None = None,
+        peagle_engine: Any | None = None,
     ) -> Any:
         """Yield generated token IDs as they are produced.
 
@@ -424,15 +923,69 @@ class CPUExecutionEngine:
         if cache is None:
             if ids.size == 0:
                 raise ValueError("generate_iter() requires prompt tokens for a new cache")
-            logits, cache = self.forward(ids)
+            logits, cache = self.forward(ids, ttt_slots=ttt_slots, adapter_id=adapter_id)
         elif ids.size:
-            logits, cache = self.forward(ids, cache)
+            logits, cache = self.forward(ids, cache, ttt_slots=ttt_slots, adapter_id=adapter_id)
         elif cache.last_logits is not None:
             logits = cache.last_logits.reshape(1, -1)
         else:
             raise ValueError("provided KV cache has no logits for an empty prompt suffix")
 
-        for _ in range(max(0, max_tokens)):
+        context_tokens = ids.tolist()
+        generated_count = 0
+        while generated_count < max(0, max_tokens):
+            # Compiled MTP heads are connected to the real target engine only
+            # for exact greedy decoding.  Each proposed token is verified by
+            # the target argmax before it is emitted and the KV cache is
+            # advanced with the verified token.  Sampling and grammar modes
+            # retain the ordinary one-token path because their acceptance
+            # semantics are different.
+            if (
+                peagle_engine is not None
+                and temperature <= 0.0
+                and grammar_session is None
+                and cache.last_hidden is not None
+                and not getattr(peagle_engine, "should_disable_speculation", lambda: False)()
+            ):
+                remaining = max(0, max_tokens - generated_count)
+                try:
+                    proposals = peagle_engine.draft_tokens(
+                        cache.last_hidden,
+                        context_tokens,
+                        limit=min(remaining, getattr(peagle_engine, "draft_K", remaining)),
+                    )
+                except Exception:
+                    # An unusable or stale draft artifact must never fabricate
+                    # output or fail an otherwise valid target model.  Fall
+                    # back to ordinary target decoding for this cycle.
+                    proposals = []
+                if proposals:
+                    accepted = 0
+                    for proposal in proposals:
+                        target_logits = np.asarray(logits[-1], dtype=np.float32)
+                        target_token = self.kernels.argmax(target_logits)
+                        next_token = int(proposal) if int(proposal) == target_token else target_token
+                        if int(proposal) == target_token:
+                            accepted += 1
+                        yield next_token
+                        generated_count += 1
+                        context_tokens.append(next_token)
+                        self._speculative_stats["draft_tokens"] += 1
+                        self._speculative_stats["accepted_tokens"] += int(int(proposal) == target_token)
+                        if eos_token_id is not None and next_token == eos_token_id:
+                            generated_count = max_tokens
+                            break
+                        logits, cache = self.forward(
+                            np.array([next_token], dtype=np.int64),
+                            cache,
+                            ttt_slots=ttt_slots,
+                            adapter_id=adapter_id,
+                        )
+                        if generated_count >= max_tokens:
+                            break
+                    self._speculative_stats["cycles"] += 1
+                    continue
+
             next_logits = np.asarray(logits[-1], dtype=np.float32).copy()
             if grammar_session is not None:
                 mask = grammar_session.get_token_mask()
@@ -446,21 +999,45 @@ class CPUExecutionEngine:
                 if not np.any(allowed):
                     raise ValueError("Grammar FSM has no valid next token")
                 next_logits[~allowed] = -np.inf
-            next_token = self._sample(next_logits, temperature, top_k, rng)
+            next_token = self._sample(next_logits, temperature, top_k, top_p, rng)
             if grammar_session is not None and grammar_session.advance(next_token) < 0:
                 raise ValueError("The CPU engine produced a token rejected by the grammar FSM")
             yield next_token
+            generated_count += 1
+            context_tokens.append(next_token)
+            if grammar_session is not None and getattr(grammar_session, "is_accepting", lambda: False)():
+                break
             if eos_token_id is not None and next_token == eos_token_id:
                 break
-            logits, cache = self.forward(np.array([next_token], dtype=np.int64), cache)
+            logits, cache = self.forward(
+                np.array([next_token], dtype=np.int64), cache, ttt_slots=ttt_slots, adapter_id=adapter_id
+            )
 
         if cache_callback is not None:
             cache_callback(cache)
 
+    def speculative_stats(self) -> dict[str, int | float]:
+        """Return measured exact-greedy MTP verification counters."""
+        draft = int(self._speculative_stats["draft_tokens"])
+        accepted = int(self._speculative_stats["accepted_tokens"])
+        return {
+            "draft_tokens": draft,
+            "accepted_tokens": accepted,
+            "cycles": int(self._speculative_stats["cycles"]),
+            "acceptance_rate": accepted / max(1, draft),
+        }
+
     def _sample(
-        self, logits: np.ndarray, temperature: float, top_k: int, rng: np.random.Generator
+        self,
+        logits: np.ndarray,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        rng: np.random.Generator,
     ) -> int:
         """Choose the next token from a logit vector."""
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError(f"top_p must be in (0, 1], got {top_p}")
         if temperature <= 0.0:
             return self.kernels.argmax(logits)
         scaled = logits.astype(np.float32) / np.float32(temperature)
@@ -468,6 +1045,17 @@ class CPUExecutionEngine:
             k = min(top_k, scaled.size)
             cutoff = np.partition(scaled, -k)[-k]
             scaled = np.where(scaled < cutoff, np.float32(-np.inf), scaled)
+        if top_p < 1.0:
+            order = np.argsort(scaled)[::-1]
+            ordered = scaled[order]
+            probabilities = self.kernels.softmax(ordered.reshape(1, -1)).reshape(-1)
+            cumulative = np.cumsum(probabilities)
+            keep = cumulative <= np.float32(top_p)
+            # Always retain the first token crossing the threshold.
+            crossing = int(np.searchsorted(cumulative, top_p, side="right"))
+            if crossing < keep.size:
+                keep[crossing] = True
+            scaled = np.where(np.isin(np.arange(scaled.size), order[keep]), scaled, np.float32(-np.inf))
         probabilities = self.kernels.softmax(scaled.reshape(1, -1)).reshape(-1)
         # Renormalise: softmax over a masked vector can drift by a few ulps.
         probabilities = probabilities / probabilities.sum()

@@ -149,6 +149,9 @@ class RuntimeConfig:
     Higher = more conservative (only very close prompts hit cache).
     Default 0.92 balances hit rate vs accuracy."""
 
+    semantic_cache_size: int = 100_000
+    """Maximum number of entries retained by the R11 semantic request cache."""
+
     cxl_pool_size_gb: float = 0.0
     """CXL rack-scale KV pool size in GB (R12). Set to 0 to disable.
     Requires CXL 3.0 hardware or emulated mode (file-backed mmap).
@@ -199,6 +202,10 @@ class RuntimeConfig:
             raise RuntimeConfigError(msg)
         if self.reasoning_budget < 0:
             raise RuntimeConfigError("reasoning_budget must be non-negative")
+        if not 0.0 <= self.semantic_cache_threshold <= 1.0:
+            raise RuntimeConfigError("semantic_cache_threshold must be between 0 and 1")
+        if self.semantic_cache_size < 1:
+            raise RuntimeConfigError("semantic_cache_size must be at least 1")
         if self.scheduler not in ("continuous_batching", "slo_aware"):
             raise RuntimeConfigError("scheduler must be 'continuous_batching' or 'slo_aware'")
         if self.multi_agent_kv_mode not in ("relay", "kvcomm", "droidspeak", "swarm"):
@@ -251,6 +258,7 @@ class RuntimeConfig:
             "tee_mode": self.tee_mode,
             "vocab_size": self.vocab_size,
             "semantic_cache_threshold": self.semantic_cache_threshold,
+            "semantic_cache_size": self.semantic_cache_size,
             "cxl_pool_size_gb": self.cxl_pool_size_gb,
             "enable_diffusion_spec": self.enable_diffusion_spec,
             "enable_semantic_cache": self.enable_semantic_cache,
@@ -301,6 +309,7 @@ class RuntimeConfig:
             tee_mode=data.get("tee_mode", "auto"),
             vocab_size=data.get("vocab_size", 128000),
             semantic_cache_threshold=data.get("semantic_cache_threshold", 0.92),
+            semantic_cache_size=data.get("semantic_cache_size", 100_000),
             cxl_pool_size_gb=data.get("cxl_pool_size_gb", 0.0),
             enable_diffusion_spec=data.get("enable_diffusion_spec", True),
             enable_semantic_cache=data.get("enable_semantic_cache", True),

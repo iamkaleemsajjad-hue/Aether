@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import math
+import struct
 import threading
 import time
 from collections import deque
@@ -123,12 +124,24 @@ class PEAGLEEngine:
             return
         try:
             config = json.loads(p.read_text(encoding="utf-8"))
-            self._mtp_heads = config.get("heads", [])
+            if config.get("format") != "aether_mtp_v1":
+                raise ValueError("unsupported MTP configuration format")
+            heads = config.get("heads")
+            if not isinstance(heads, list) or not heads:
+                raise ValueError("MTP configuration must contain a non-empty heads list")
+            if int(config.get("n_heads", len(heads))) != len(heads):
+                raise ValueError("MTP configuration head count mismatch")
+            if any(not isinstance(head, dict) for head in heads):
+                raise ValueError("MTP head descriptors must be objects")
+            self._mtp_heads = heads
             self._mtp_weights = []
             # Try loading weight blobs from <dir>/mtp_head_{i}.bin
             aeg_dir = p.parent
             for i, head in enumerate(self._mtp_heads):
-                blob_path = aeg_dir / f"mtp_head_{i}.bin"
+                blob_name = head.get("blob_file", f"mtp_head_{i}.bin")
+                if not isinstance(blob_name, str) or Path(blob_name).name != blob_name:
+                    raise ValueError(f"invalid MTP blob filename for head {i}")
+                blob_path = aeg_dir / blob_name
                 weight = self._load_weight_blob(blob_path, head)
                 self._mtp_weights.append(weight)
             logger.info(
@@ -148,6 +161,16 @@ class PEAGLEEngine:
             vocab_size = head_info.get("vocab_size", _DEFAULT_VOCAB)
             hidden_size = head_info.get("hidden_size", 0)
             raw = blob_path.read_bytes()
+            # Pass 10 writes a 64-byte AETHER_MTP_v1 header before the BF16
+            # payload.  Validate it before decoding so a malformed artifact
+            # cannot be treated as a valid drafter.
+            if len(raw) >= 64 and raw[:16].rstrip(b"\x00") == b"AETHER_MTP_v1":
+                header_index, header_vocab, header_hidden = struct.unpack_from("<III", raw, 16)
+                if int(header_index) != int(head_info.get("index", 0)):
+                    raise ValueError("MTP blob index disagrees with its descriptor")
+                if header_vocab != vocab_size or header_hidden != hidden_size:
+                    raise ValueError("MTP blob dimensions disagree with its descriptor")
+                raw = raw[64:]
             if hidden_size > 0 and len(raw) == vocab_size * hidden_size * 2:
                 # BF16 blob: reshape to [vocab, hidden]
                 t = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16)
@@ -272,6 +295,31 @@ class PEAGLEEngine:
             )
 
         return draft_tokens[: self.draft_K], draft_log_probs[: self.draft_K]
+
+    def draft_tokens(
+        self,
+        hidden_state: Any,
+        context_tokens: list[int],
+        *,
+        limit: int | None = None,
+    ) -> list[int]:
+        """Return real MTP draft tokens for a target-runtime verification loop.
+
+        This public boundary is intentionally separate from :meth:`propose`:
+        the compiled CPU engine performs exact greedy verification while it
+        advances its own KV cache, so the target logits and cache cannot drift
+        from the emitted tokens.
+        """
+        count = self.draft_K if limit is None else max(0, min(self.draft_K, int(limit)))
+        if count == 0:
+            return []
+        original = self.draft_K
+        try:
+            self.draft_K = count
+            tokens, _ = self._draft(self._to_tensor(hidden_state), context_tokens)
+            return [int(token) for token in tokens]
+        finally:
+            self.draft_K = original
 
     def _mtp_head_forward(
         self, hidden: Any, head_info: dict, weight: Any

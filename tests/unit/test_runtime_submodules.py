@@ -31,6 +31,58 @@ class TestExecutor:
         result = executor.dispatch(ctx, "aeg.embedding", {"vocab_size": 100, "hidden_size": 64}, {})
         assert result is not None
 
+    def test_reference_ops_compute_concrete_values(self) -> None:
+        import numpy as np
+
+        from aether.core.types import HardwareTarget
+        from aether.runtime.executor import ExecutionContext
+
+        executor = Executor()
+        ctx = ExecutionContext(
+            request_id="test-values",
+            model_id="test-model",
+            target=HardwareTarget.CPU_AVX512,
+            precision="FP32",
+        )
+        layout = TensorLayout.from_dict(
+            {"shape": {"dims": [2, 2]}, "dtype": "fp32", "layout": "dense"}
+        )
+        left = executor._allocate("left", layout, value=np.asarray([[1.0, 2.0], [3.0, 4.0]]))
+        right = executor._allocate("right", layout, value=np.asarray([[5.0, 6.0], [7.0, 8.0]]))
+        indices = executor._allocate(
+            "indices",
+            TensorLayout.from_dict(
+                {"shape": {"dims": [2]}, "dtype": "int32", "layout": "dense"}
+            ),
+            value=np.asarray([0, 1], dtype=np.int32),
+        )
+
+        embedded = executor.dispatch(
+            ctx,
+            "aeg.embedding",
+            {"weight": np.asarray([[10.0, 11.0], [12.0, 13.0]])},
+            {"indices": indices},
+        )
+        linear = executor.dispatch(
+            ctx,
+            "aeg.linear",
+            {"weight": np.asarray([[2.0, 0.0], [0.0, 3.0]]), "bias": np.asarray([1.0, -1.0])},
+            {"left": left},
+        )
+        added = executor.dispatch(ctx, "aeg.add", {}, {"left": left, "right": right})
+        multiplied = executor.dispatch(ctx, "aeg.mul", {}, {"left": left, "right": right})
+        product = executor.dispatch(ctx, "aeg.matmul", {}, {"left": left, "right": right})
+        probabilities = executor.dispatch(ctx, "aeg.softmax", {}, {"left": left})
+        activated = executor.dispatch(ctx, "aeg.silu", {}, {"left": left})
+
+        np.testing.assert_allclose(embedded.value, [[10.0, 11.0], [12.0, 13.0]])
+        np.testing.assert_allclose(linear.value, [[3.0, 5.0], [7.0, 11.0]])
+        np.testing.assert_allclose(added.value, [[6.0, 8.0], [10.0, 12.0]])
+        np.testing.assert_allclose(multiplied.value, [[5.0, 12.0], [21.0, 32.0]])
+        np.testing.assert_allclose(product.value, [[19.0, 22.0], [43.0, 50.0]])
+        np.testing.assert_allclose(np.sum(probabilities.value, axis=-1), [1.0, 1.0])
+        np.testing.assert_allclose(activated.value, np.asarray(left.value) / (1.0 + np.exp(-left.value)))
+
     def test_session_context_manager(self) -> None:
         executor = Executor()
         with executor.session("req-1", "test-model") as ctx:

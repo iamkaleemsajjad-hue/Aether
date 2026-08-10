@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from aether.compiler.config import CompilerConfig
@@ -93,6 +94,50 @@ class TestPass10MTPHead:
         if report.status == "ok":
             artifact = tmp_path / "speculation" / "mtp_config.json"
             assert artifact.exists(), "mtp_config.json not written"
+
+    def test_real_declared_head_tensor_is_compiled(self, tmp_path):
+        p = self._import()
+
+        class Node:
+            id = "mtp_head_0"
+            name = "mtp_head_0"
+            attributes = {"weight": np.arange(24, dtype=np.float32).reshape(8, 3)}
+
+        class Graph:
+            nodes = {"mtp_head_0": Node()}
+            metadata = {}
+            output_dir = str(tmp_path)
+
+        _, report = p.run(Graph(), _make_arch(hidden=3, vocab=8), _make_config(enable_mtp_head=True))
+        assert report.status == "applied"
+        assert report.details["mtp_head_count"] == 1
+        assert (tmp_path / "speculation" / "mtp_head_0.bin").is_file()
+
+    def test_compiled_blob_reloads_into_real_peagle_projection(self, tmp_path):
+        p = self._import()
+
+        class Node:
+            id = "mtp_head_0"
+            name = "mtp_head_0"
+            attributes = {"weight": np.arange(24, dtype=np.float32).reshape(8, 3)}
+
+        class Graph:
+            nodes = {"mtp_head_0": Node()}
+            metadata = {}
+            output_dir = str(tmp_path)
+
+        _, report = p.run(Graph(), _make_arch(hidden=3, vocab=8), _make_config(enable_mtp_head=True))
+        assert report.status == "applied"
+        from aether.runtime.r1_peagle_engine import PEAGLEEngine
+
+        peagle = PEAGLEEngine(
+            draft_K=1,
+            mode="mtp",
+            mtp_config_path=str(tmp_path / "speculation" / "mtp_config.json"),
+        )
+        assert len(peagle._mtp_weights) == 1
+        assert peagle._mtp_weights[0] is not None
+        assert len(peagle.draft_tokens(np.ones(3, dtype=np.float32), [])) == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -311,11 +356,13 @@ class TestPass17TEE:
     def test_artifact_written(self, tmp_path):
         p = self._import()
         cfg = _make_config(enable_tee=True, tee_backend="nvidia_cc", tee_attest_endpoint=None)
-        p.run(_make_graph(output_dir=str(tmp_path)), _make_arch(), cfg)
+        _, report = p.run(_make_graph(output_dir=str(tmp_path)), _make_arch(), cfg)
         tee_cfg = tmp_path / "security" / "tee_config.json"
         hash_manifest = tmp_path / "security" / "weight_hash_manifest.json"
-        assert tee_cfg.exists()
-        assert hash_manifest.exists()
+        assert report.status == "skipped"
+        assert report.details["reason"] == "tee_backend_artifacts_unavailable"
+        assert not tee_cfg.exists()
+        assert not hash_manifest.exists()
 
     def test_all_backends_accepted(self):
         from aether.compiler.stage2_optimizer.pass17_tee_wrapping import _SUPPORTED_TEE_BACKENDS
@@ -369,9 +416,11 @@ class TestPass18MDLM:
         p, _ = self._import()
         g = _make_graph(output_dir=str(tmp_path))
         cfg = _make_config(enable_mdlm_drafter=True, mdlm_drafter_steps=5, mdlm_draft_block_size=4)
-        p.run(g, _make_arch(), cfg)
+        _, report = p.run(g, _make_arch(), cfg)
         schedule = tmp_path / "diffusion" / "schedule.json"
-        assert schedule.exists()
+        assert report.status == "skipped"
+        assert report.details["reason"] == "mdlm_drafter_weights_unavailable"
+        assert not schedule.exists()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -449,6 +498,16 @@ class TestPass20VideoCompression:
         _, report = p.run(_make_graph(), vlm_arch, cfg)
         if report.status == "ok":
             assert report.details["token_reduction_pct"] > 0
+
+    def test_max_video_frames_is_persisted(self, tmp_path):
+        p, _ = self._import()
+        graph = _make_graph(output_dir=str(tmp_path))
+        vlm_arch = {"architectures": ["LLaVAForConditionalGeneration"], "vision_model": {}}
+        cfg = _make_config(enable_video_compression=True, max_video_frames=48)
+        _, report = p.run(graph, vlm_arch, cfg)
+        assert report.status == "applied"
+        plan = json.loads((tmp_path / "graph" / "video_compression_plan.json").read_text())
+        assert plan["max_frames"] == 48
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

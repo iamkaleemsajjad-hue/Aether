@@ -580,7 +580,8 @@ class Pass9PruningSparsity:
         if weights:
             layer_masks = self._prune_weights(weights, method, sparsity)
         else:
-            # Structure-only: plan masks from graph metadata
+            # Structure-only compilation cannot compute a tensor mask. Keep a
+            # plan-only artifact and do not invent achieved sparsity.
             layer_masks = self._plan_masks_from_graph(graph, method, sparsity)
 
         total_sparsity = (
@@ -663,25 +664,11 @@ class Pass9PruningSparsity:
         self, graph: Any, method: str, sparsity: float
     ) -> list[LayerSparsityMask]:
         """
-        Plan sparsity masks from graph structure (no real weights available).
-        Used during structure-only compilation passes.
+        A structure-only pass cannot produce concrete tensor masks. The actual
+        compiler pipeline computes them after ingestion attaches real weights;
+        returning no masks here prevents fabricated shapes and speedups.
         """
-        num_layers = self._get_num_layers(graph)
-        masks = []
-        semi = (method == PruningMethod.WANDA_24)
-        actual = 0.5 if semi else sparsity  # 2:4 = exactly 50%
-
-        for layer_idx in range(num_layers):
-            for tensor_name in ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj"]:
-                masks.append(LayerSparsityMask(
-                    layer_name=f"model.layers.{layer_idx}.{tensor_name}.weight",
-                    shape=(4096, 4096),  # placeholder
-                    method=method,
-                    sparsity_ratio=sparsity,
-                    is_semi_structured=semi,
-                    actual_sparsity=actual,
-                ))
-        return masks
+        return []
 
     def _get_num_layers(self, graph: Any) -> int:
         if hasattr(graph, "num_layers"):
@@ -691,7 +678,7 @@ class Pass9PruningSparsity:
         return int(self.model_config.get("num_hidden_layers", 32))
 
     def _estimate_throughput(self, target: str, sparsity: float) -> float:
-        """Estimate throughput multiplier based on target and achieved sparsity."""
+        """Estimate throughput from measured sparsity; zero means baseline."""
         if target == SparsityTarget.SEMI_24:
             # 2:4 Sparse Tensor Core: theoretical 2x, practical ~1.8x with overhead
             return round(min(2.5, 1.0 + 1.8 * sparsity), 2)
@@ -716,5 +703,6 @@ class Pass9PruningSparsity:
         graph.metadata["sparsity_target"]   = manifest.target
         graph.metadata["global_sparsity"]   = manifest.global_sparsity
         graph.metadata["throughput_multiplier"] = manifest.estimated_throughput_multiplier
+        graph.metadata["sparsity_plan_only"] = not bool(manifest.layer_masks)
 
 

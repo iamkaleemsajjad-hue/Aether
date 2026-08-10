@@ -130,7 +130,7 @@ class VideoTokenCompressionPass(BasePass):
 
             # Infer visual token dimensions.
             tokens_per_frame = _infer_tokens_per_frame(architecture)
-            n_frames_typical = 16  # typical video clip for benchmarking
+            n_frames_typical = max(1, int(config.max_video_frames))
 
             # Compute token budget.
             raw_tokens = tokens_per_frame * n_frames_typical
@@ -155,6 +155,7 @@ class VideoTokenCompressionPass(BasePass):
                     retention_ratio=retention_ratio,
                     tokens_per_frame=tokens_per_frame,
                     compressed_tokens_per_frame=int(tokens_per_frame * retention_ratio),
+                    max_frames=n_frames_typical,
                 )
 
             elapsed = time.perf_counter() - start
@@ -258,6 +259,7 @@ def _write_video_plan(
     retention_ratio: float,
     tokens_per_frame: int,
     compressed_tokens_per_frame: int,
+    max_frames: int,
 ) -> None:
     plan_dir = output_dir / "graph"
     plan_dir.mkdir(parents=True, exist_ok=True)
@@ -267,6 +269,7 @@ def _write_video_plan(
         "retention_ratio": retention_ratio,
         "tokens_per_frame_raw": tokens_per_frame,
         "tokens_per_frame_compressed": compressed_tokens_per_frame,
+        "max_frames": max_frames,
         "compression_ratio": round(tokens_per_frame / max(1, compressed_tokens_per_frame), 2),
     }
     (plan_dir / "video_compression_plan.json").write_text(

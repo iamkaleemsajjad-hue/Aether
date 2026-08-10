@@ -195,6 +195,39 @@ class TestOTLPExporter:
         assert config["endpoint"] == "http://collector:4318/v1/traces"
         assert config["protocol"] == "http/json"
 
+    def test_export_to_http_endpoint(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+
+        from aether.observability.otel import AetherTracer, OTLPExporter
+
+        received: list[bytes] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                received.append(self.rfile.read(int(self.headers["Content-Length"])))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            tracer = AetherTracer()
+            tracer.trace_request("req-http", 4, 2, 1.0, 3.0, "local")
+            status = OTLPExporter(
+                f"http://127.0.0.1:{server.server_port}/v1/traces"
+            ).export_to_endpoint(tracer)
+            assert status == 200
+            assert received and b"resourceSpans" in received[0]
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+
 
 # ---------------------------------------------------------------------------
 # CI/CD Eval Pipeline
@@ -231,6 +264,64 @@ class TestBenchmarkRunner:
         benchmarks = {r.benchmark for r in results}
         assert "hellaswag" in benchmarks
         assert "mmlu" in benchmarks
+
+
+class TestDatasetBenchmarkEvaluator:
+    def test_standard_local_formats_measure_choices_and_math(self, tmp_path):
+        from aether.observability.ci_pipeline import DatasetBenchmarkEvaluator
+
+        hellaswag = tmp_path / "hellaswag.jsonl"
+        hellaswag.write_text(
+            '{"ctx":"The sky is","endings":["blue","square"],"label":0}\n',
+            encoding="utf-8",
+        )
+        mmlu = tmp_path / "mmlu_test.csv"
+        mmlu.write_text(
+            "question,A,B,C,D,answer\nWhat is 2+2?,3,4,5,6,B\n",
+            encoding="utf-8",
+        )
+        gsm = tmp_path / "gsm8k.jsonl"
+        gsm.write_text(
+            '{"question":"What is 40+2?","answer":"work\\n#### 42"}\n',
+            encoding="utf-8",
+        )
+
+        def generate_fn(*, prompt, benchmark, max_tokens):
+            return {
+                "hellaswag": "A",
+                "mmlu": "B",
+                "gsm8k": "The result is 42.\n#### 42",
+            }[benchmark]
+
+        evaluator = DatasetBenchmarkEvaluator(
+            {"hellaswag": hellaswag, "mmlu": mmlu, "gsm8k": gsm},
+            generate_fn,
+        )
+        assert evaluator("hellaswag", {"metric": "accuracy"}).score == 1.0
+        assert evaluator("mmlu", {"metric": "accuracy"}).score == 1.0
+        assert evaluator("gsm8k", {"metric": "exact_match"}).score == 1.0
+
+    def test_humaneval_requires_explicit_execution_and_runs_local_fixture(self, tmp_path):
+        from aether.core.exceptions import BenchmarkError
+        from aether.observability.ci_pipeline import DatasetBenchmarkEvaluator
+
+        dataset = tmp_path / "humaneval.json"
+        dataset.write_text(
+            '[{"prompt":"def add(a, b):\\n    ","entry_point":"add",'
+            '"test":"def check(candidate):\\n    assert candidate(2, 3) == 5"}]',
+            encoding="utf-8",
+        )
+        callback = lambda **kwargs: "return a + b"
+        guarded = DatasetBenchmarkEvaluator({"humaneval": dataset}, callback)
+        with pytest.raises(BenchmarkError, match="allow_code_execution"):
+            guarded("humaneval", {"metric": "pass@1"})
+
+        enabled = DatasetBenchmarkEvaluator(
+            {"humaneval": dataset}, callback, allow_code_execution=True
+        )
+        result = enabled("humaneval", {"metric": "pass@1"})
+        assert result.num_correct == 1
+        assert result.score == 1.0
 
 
 class TestCIEvalPipeline:

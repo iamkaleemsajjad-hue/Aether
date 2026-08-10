@@ -93,7 +93,20 @@ class MCPToolRegistry:
     def lookup(self, tool_name: str) -> tuple[dict | None, str | None]:
         """Look up a tool schema and its server ID."""
         with self._lock:
-            return self._tools.get(tool_name), self._server_map.get(tool_name)
+            schema = self._tools.get(tool_name)
+            server = self._server_map.get(tool_name)
+            if schema is not None:
+                return schema, server
+            # REST and MCP clients commonly address tools as
+            # ``server_name/tool_name``. Resolve the qualified form while
+            # retaining the server identity for isolation checks.
+            if "/" in tool_name:
+                server_name, unqualified = tool_name.split("/", 1)
+                schema = self._tools.get(unqualified)
+                server = self._server_map.get(unqualified)
+                if schema is not None and server == server_name:
+                    return schema, server
+            return None, None
 
     def all_tools(self) -> list[dict]:
         """Return all registered tool schemas."""
@@ -117,11 +130,13 @@ class MCPClient:
         server_id: str,
         transport: str = "stdio",
         endpoint: str | None = None,
+        command: str | None = None,
         timeout_s: float = 30.0,
     ) -> None:
         self.server_id = server_id
         self.transport = transport
         self.endpoint = endpoint
+        self.command = command
         self.timeout_s = timeout_s
         self._connected = False
         self._call_count = 0
@@ -140,10 +155,11 @@ class MCPClient:
         """
         try:
             if self.transport == "stdio":
-                if not self.server_id:
-                    raise ValueError("stdio MCP transport requires server_id as the executable command")
+                command = self.command or self.server_id
+                if not command:
+                    raise ValueError("stdio MCP transport requires a server command")
                 self._process = subprocess.Popen(
-                    shlex.split(self.server_id, posix=False), stdin=subprocess.PIPE,
+                    shlex.split(command, posix=False), stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
                 )
             elif self.transport in {"http", "ws"} and not self.endpoint:
@@ -315,6 +331,7 @@ class MCPIntegrationLayer:
         server_id: str,
         transport: str = "stdio",
         endpoint: str | None = None,
+        command: str | None = None,
     ) -> bool:
         """Connect to an MCP server and register its tools.
 
@@ -330,6 +347,7 @@ class MCPIntegrationLayer:
             server_id=server_id,
             transport=transport,
             endpoint=endpoint,
+            command=command,
             timeout_s=self.timeout_s,
         )
         if not client.connect():
@@ -360,7 +378,7 @@ class MCPIntegrationLayer:
         Returns:
             Tool result dict.
         """
-        _, server_id = self._registry.lookup(tool_name)
+        schema, server_id = self._registry.lookup(tool_name)
         if server_id is None:
             logger.warning("R6: Tool %r not found in registry.", tool_name)
             self._total_errors += 1
@@ -368,6 +386,37 @@ class MCPIntegrationLayer:
                 "content": [{"type": "text", "text": f"Tool {tool_name!r} not found."}],
                 "isError": True,
             }
+
+        input_schema = None
+        if isinstance(schema, dict):
+            input_schema = (
+                schema.get("inputSchema")
+                or schema.get("input_schema")
+                or schema.get("parameters")
+            )
+        if input_schema is not None:
+            if not isinstance(input_schema, dict):
+                self._total_errors += 1
+                return {
+                    "content": [{"type": "text", "text": "MCP tool schema is malformed."}],
+                    "isError": True,
+                }
+            try:
+                from jsonschema import Draft202012Validator
+
+                errors = sorted(Draft202012Validator(input_schema).iter_errors(arguments), key=str)
+            except Exception as exc:  # noqa: BLE001 - schema errors fail closed
+                self._total_errors += 1
+                return {
+                    "content": [{"type": "text", "text": f"MCP tool arguments failed schema validation: {exc}"}],
+                    "isError": True,
+                }
+            if errors:
+                self._total_errors += 1
+                return {
+                    "content": [{"type": "text", "text": f"MCP tool arguments failed schema validation: {errors[0].message}"}],
+                    "isError": True,
+                }
 
         with self._lock:
             client = self._clients.get(server_id)
@@ -449,6 +498,10 @@ class MCPIntegrationLayer:
     @property
     def tool_count(self) -> int:
         return self._registry.tool_count()
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        """Return the authenticated, schema-bearing tools visible to R6."""
+        return self._registry.all_tools()
 
     @property
     def connected_servers(self) -> list[str]:

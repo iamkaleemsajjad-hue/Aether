@@ -37,12 +37,17 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from aether.compiler.config import CompilerConfig
 from aether.compiler.report import PassReport
 from aether.compiler.stage2_optimizer.base_pass import BasePass
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+_TTT_SLOT_MAGIC = b"AETHER_TTT_SLOT1"
+_TTT_SLOT_HEADER = struct.Struct("<16sIIII")
 
 
 class TTTFastWeightInjectionPass(BasePass):
@@ -109,6 +114,13 @@ class TTTFastWeightInjectionPass(BasePass):
                 + hidden_size * rank * 2    # momentum_A (BF16)
                 + rank * hidden_size * 2    # momentum_B (BF16)
             )
+            # Persist all fields as little-endian float32 so the slot payload
+            # has one portable, verifiable representation.
+            bytes_per_slot = (
+                2 * hidden_size * rank * 4
+                + 2 * hidden_size * 4
+                + 2 * hidden_size * rank * 4
+            )
             total_bytes = bytes_per_slot * n_layers
 
             # Inject TTT opcode into each layer node.
@@ -125,6 +137,7 @@ class TTTFastWeightInjectionPass(BasePass):
                     rank=rank,
                     learning_rate=lr,
                     bytes_per_slot=bytes_per_slot,
+                    slots=n_layers,
                 )
 
             elapsed = time.perf_counter() - start
@@ -230,10 +243,30 @@ def _write_ttt_config(
     rank: int,
     learning_rate: float,
     bytes_per_slot: int,
+    slots: int,
 ) -> None:
-    """Write TTT config JSON to .aeg/ttt/."""
+    """Write a validated TTT config and initialized slot payloads."""
     ttt_dir = output_dir / "ttt"
     ttt_dir.mkdir(parents=True, exist_ok=True)
+
+    slot_descriptors = []
+    for i in range(slots):
+        slot_file = f"slot_{i}.bin"
+        _write_ttt_slot(ttt_dir / slot_file, i, hidden_size, rank)
+        slot_descriptors.append(
+            {
+                "layer_index": i,
+                "slot_file": slot_file,
+                "a_shape": [hidden_size, rank],
+                "b_shape": [rank, hidden_size],
+                "mu_shape": [hidden_size],
+                "sigma_shape": [hidden_size],
+                "momentum_a_shape": [hidden_size, rank],
+                "momentum_b_shape": [rank, hidden_size],
+                "dtype": "float32",
+                "bytes": _TTT_SLOT_HEADER.size + bytes_per_slot,
+            }
+        )
 
     config = {
         "format": "aether_ttt_v1",
@@ -244,21 +277,35 @@ def _write_ttt_config(
         "learning_rate": learning_rate,
         "bytes_per_slot": bytes_per_slot,
         "total_slot_bytes": bytes_per_slot * n_layers,
-        "slots": [
-            {
-                "layer_index": i,
-                "slot_file": f"slot_{i}.bin",
-                "a_shape": [hidden_size, rank],
-                "b_shape": [rank, hidden_size],
-                "mu_shape": [hidden_size],
-                "sigma_shape": [hidden_size],
-            }
-            for i in range(n_layers)
-        ],
+        "slot_header_bytes": _TTT_SLOT_HEADER.size,
+        "slot_dtype": "float32",
+        "slots": slot_descriptors,
     }
     (ttt_dir / "fast_weight_config.json").write_text(
         json.dumps(config, indent=2), encoding="utf-8"
     )
     logger.debug("Wrote TTT config: %s", ttt_dir / "fast_weight_config.json")
+
+
+def _write_ttt_slot(path: Path, layer_index: int, hidden_size: int, rank: int) -> None:
+    """Write one deterministic initialized fast-weight slot."""
+    a = np.zeros(hidden_size * rank, dtype="<f4")
+    b = np.zeros(rank * hidden_size, dtype="<f4")
+    mu = np.zeros(hidden_size, dtype="<f4")
+    sigma = np.ones(hidden_size, dtype="<f4")
+    momentum_a = np.zeros(hidden_size * rank, dtype="<f4")
+    momentum_b = np.zeros(rank * hidden_size, dtype="<f4")
+    payload = b"".join(
+        value.tobytes(order="C")
+        for value in (a, b, mu, sigma, momentum_a, momentum_b)
+    )
+    header = _TTT_SLOT_HEADER.pack(
+        _TTT_SLOT_MAGIC,
+        int(layer_index),
+        int(hidden_size),
+        int(rank),
+        len(payload) // 4,
+    )
+    path.write_bytes(header + payload)
 
 

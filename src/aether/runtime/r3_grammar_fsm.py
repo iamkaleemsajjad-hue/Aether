@@ -36,6 +36,7 @@ Research basis:
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import struct
 import threading
@@ -150,21 +151,64 @@ class GrammarFSMEngine:
         with self._lock:
             return list(self._grammars.keys())
 
-    def matches_compiled_constraint(self, source: str, grammar_id: str = "default") -> bool:
-        """Check that a request matches a trusted, tokenizer-aware compiled FSA."""
-        import hashlib
-
+    def matches_compiled_constraint(
+        self,
+        source: str,
+        grammar_id: str = "default",
+        tokenizer: Any | None = None,
+    ) -> bool:
+        """Check source and tokenizer identity against the trusted FSA."""
         with self._lock:
             metadata = self._grammar_metadata.get(grammar_id)
         expected = str(metadata.get("schema_hash", "")) if metadata else ""
         if not metadata or metadata.get("tokenizer_aware") is not True:
             return False
         actual = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
-        return bool(expected) and expected == actual
+        if not expected or expected != actual:
+            return False
+        expected_tokenizer = metadata.get("tokenizer_fingerprint")
+        if expected_tokenizer:
+            if tokenizer is None:
+                return False
+            try:
+                actual_tokenizer = _tokenizer_fingerprint(tokenizer)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("R3: could not fingerprint runtime tokenizer: %s", exc)
+                return False
+            if actual_tokenizer != expected_tokenizer:
+                return False
+        return True
 
     @property
     def stats(self) -> "_FSMStats":
         return self._stats
+
+
+def _tokenizer_fingerprint(tokenizer: Any) -> str:
+    """Return the stable vocabulary identity used by Pass 11.
+
+    The compiler fingerprints decoded token text in token-id order.  Runtime
+    verification must use the same representation so an AEG cannot apply a
+    token mask to a different vocabulary merely because the vocabulary sizes
+    happen to match.
+    """
+    try:
+        vocab_size = int(len(tokenizer))
+    except Exception:
+        vocab_size = int(tokenizer.get_vocab_size())
+    decoded: list[str] = []
+    for token_id in range(vocab_size):
+        try:
+            text = tokenizer.decode(
+                [token_id],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        except TypeError:
+            text = tokenizer.decode([token_id], skip_special_tokens=False)
+        decoded.append(str(text))
+    payload = json.dumps(decoded, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 class _FSMSession:

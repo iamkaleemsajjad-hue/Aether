@@ -311,6 +311,14 @@ class IngestionPipeline:
         """
         import re
 
+        normalized = name.lower().replace(".", "_")
+        mtp_match = re.search(
+            r"(?:^|_)(?:mtp_head|mtp_heads|mtp_lm_head|mtp_lm_heads|lmtp_head|linear_mtp)_?(\d+)(?:_|$)",
+            normalized,
+        )
+        if mtp_match:
+            return None, f"mtp_head_{int(mtp_match.group(1))}"
+
         tokens = [t for t in re.split(r"[._]", name.lower()) if t]
         layer_index: int | None = None
         component: str | None = None
@@ -821,6 +829,27 @@ class IngestionPipeline:
         )
         graph.add_node(lm_head_node)
         graph.add_edge(AEGGraphEdge(source=final_norm_node.id, target=lm_head_node.id))
+
+        # Materialize declared native MTP classifier heads so their real
+        # checkpoint tensors can be bound and Pass 10 can emit executable
+        # speculation blobs.
+        mtp_heads = int(getattr(architecture, "mtp_heads", 0) or 0)
+        for head_index in range(mtp_heads):
+            mtp_node = AEGGraphNode(
+                id=f"mtp_head_{head_index}",
+                node_type=AEGGraphNodeType.OPERATION,
+                name=f"mtp_head_{head_index}",
+                op_type="mtp_head",
+                inputs=[final_norm_node.id],
+                attributes={
+                    "head_index": head_index,
+                    "vocab_size": v,
+                    "hidden_size": h,
+                },
+                precision=None,
+            )
+            graph.add_node(mtp_node)
+            graph.add_edge(AEGGraphEdge(source=final_norm_node.id, target=mtp_node.id))
 
         # ── Output ──
         output_node = AEGGraphNode(

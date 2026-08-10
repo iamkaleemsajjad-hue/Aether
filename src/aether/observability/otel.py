@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import statistics
 import time
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -302,6 +304,38 @@ class OTLPExporter:
         payload = tracer.export_otlp_json()
         out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return out
+
+    def export_to_endpoint(
+        self,
+        tracer: AetherTracer,
+        *,
+        timeout_s: float = 5.0,
+        headers: dict[str, str] | None = None,
+    ) -> int:
+        """POST the OTLP/HTTP JSON payload to a collector.
+
+        The exporter intentionally uses the standard library so the CPU-only
+        package does not acquire an optional telemetry dependency. A non-2xx
+        response and transport failure are surfaced to the caller; telemetry
+        is never reported as exported merely because a request was attempted.
+        """
+        if timeout_s <= 0:
+            raise ValueError("timeout_s must be positive")
+        payload = json.dumps(tracer.export_otlp_json()).encode("utf-8")
+        request_headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if headers:
+            request_headers.update({str(key): str(value) for key, value in headers.items()})
+        request = Request(self.endpoint, data=payload, headers=request_headers, method="POST")
+        try:
+            with urlopen(request, timeout=timeout_s) as response:  # noqa: S310 - endpoint is explicit configuration
+                status = int(response.status)
+                if not 200 <= status < 300:
+                    raise RuntimeError(f"OTLP collector returned HTTP {status}")
+                return status
+        except HTTPError as exc:
+            raise RuntimeError(f"OTLP collector returned HTTP {exc.code}") from exc
+        except URLError as exc:
+            raise ConnectionError(f"could not export OTLP trace to {self.endpoint}: {exc.reason}") from exc
 
     def export_config(self) -> dict[str, Any]:
         """Return the OTLP exporter configuration dict for the AEG manifest."""

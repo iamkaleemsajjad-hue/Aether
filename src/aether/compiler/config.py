@@ -385,6 +385,20 @@ class CompilerConfig:
     seal_weights: bool = False
     additional_targets: list[str] = field(default_factory=list)
 
+    # v5 public SDK spellings.  These are translated to the internal pass
+    # fields below so the documented API does not silently discard options.
+    mdlm_denoising_steps: int | None = None
+    sub2bit_mode: str | None = None
+    sub2bit_targets: list[str] = field(default_factory=list)
+    video_compression_strategy: str | None = None
+    max_video_frames: int = 256
+    enable_loramoe: bool | None = None
+    loramoe_num_experts: int = 8
+    enable_lora_plus: bool | None = None
+    enable_molf: bool | None = None
+    compile_rlvr_verifier: bool | None = None
+    rlvr_domain: str | None = None
+
     def __post_init__(self) -> None:
         """Validate the configuration."""
         if self.enable_mtp_compilation is not None:
@@ -413,6 +427,34 @@ class CompilerConfig:
             self.tee_backend = self.tee_mode
         if self.additional_targets:
             self.targets = list(dict.fromkeys([*self.targets, *self.additional_targets]))
+        if self.mdlm_denoising_steps is not None:
+            self.mdlm_drafter_steps = self.mdlm_denoising_steps
+        if self.sub2bit_mode is not None:
+            self.sub2bit_method = {
+                "ternary": "bitnet",
+                "nanoq": "nanoquant",
+            }.get(self.sub2bit_mode, self.sub2bit_mode)
+        if self.sub2bit_targets:
+            self.targets = list(dict.fromkeys([*self.targets, *self.sub2bit_targets]))
+        if self.video_compression_strategy is not None:
+            self.video_compression_backend = {
+                "streaming_tom": "streamingtom",
+            }.get(self.video_compression_strategy, self.video_compression_strategy)
+        if self.enable_loramoe:
+            self.enable_advanced_peft = True
+        if self.enable_lora_plus is not None:
+            self.enable_advanced_peft = self.enable_advanced_peft or self.enable_lora_plus
+            if self.enable_lora_plus is False:
+                self.peft_lora_plus_lambda = 1.0
+        if self.enable_molf:
+            raise CompilerConfigError(
+                "enable_molf is not supported by the current PEFT compiler; refusing a no-op option"
+            )
+        if self.compile_rlvr_verifier is not None:
+            self.enable_rlvr_verifier = self.compile_rlvr_verifier
+        if self.rlvr_domain is not None:
+            domain_to_verifier = {"math": "sympy", "code": "pytest"}
+            self.rlvr_verifier_type = domain_to_verifier.get(self.rlvr_domain, self.rlvr_domain)
         self.validate()
 
     def validate(self) -> None:
@@ -438,6 +480,26 @@ class CompilerConfig:
         if self.reasoning_budget_tokens < 1:
             msg = f"reasoning_budget_tokens must be >= 1, got {self.reasoning_budget_tokens}"
             raise CompilerConfigError(msg)
+        if self.mdlm_drafter_steps < 1 or self.mdlm_drafter_steps > 64:
+            raise CompilerConfigError("mdlm denoising steps must be between 1 and 64")
+        if self.mdlm_draft_block_size < 2 or self.mdlm_draft_block_size > 64:
+            raise CompilerConfigError("mdlm draft block size must be between 2 and 64")
+        if self.sub2bit_method not in ("bitnet", "btc_llm", "nanoquant"):
+            raise CompilerConfigError(
+                f"Unknown sub2bit_method: {self.sub2bit_method}. "
+                "Supported: bitnet, btc_llm, nanoquant"
+            )
+        if not 0.0 < self.video_compression_ratio <= 1.0:
+            raise CompilerConfigError("video_compression_ratio must be in (0, 1]")
+        if self.max_video_frames < 1:
+            raise CompilerConfigError("max_video_frames must be at least 1")
+        if self.loramoe_num_experts < 1:
+            raise CompilerConfigError("loramoe_num_experts must be at least 1")
+        if self.rlvr_verifier_type not in ("sympy", "pytest", "llm_judge", "human"):
+            raise CompilerConfigError(
+                f"Unknown rlvr_verifier_type: {self.rlvr_verifier_type}. "
+                "Supported: sympy, pytest, llm_judge, human"
+            )
         if not 0.0 <= self.pruning_target_sparsity < 1.0:
             msg = f"pruning_target_sparsity must be in [0, 1), got {self.pruning_target_sparsity}"
             raise CompilerConfigError(msg)

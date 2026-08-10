@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from aether.core.exceptions import RuntimeError as AetherRuntimeError
-from aether.core.types import HardwareTarget, TensorLayout
+from aether.core.types import DType, HardwareTarget, TensorLayout, TensorShape
 from aether.runtime.config import RuntimeConfig
 from aether.runtime.hardware import HardwareDetector
 from aether.utils.logging import get_logger
@@ -50,6 +50,7 @@ class Allocation:
     layout: TensorLayout
     device: str
     ptr: int | None = None
+    value: Any | None = None
 
     @property
     def size_bytes(self) -> int:
@@ -85,37 +86,47 @@ class Executor:
         self._ops["aeg.softmax"] = self._op_softmax
         self._ops["aeg.silu"] = self._op_silu
 
-    def _allocate(self, name: str, layout: TensorLayout, device: str = "cpu") -> Allocation:
+    def _allocate(
+        self,
+        name: str,
+        layout: TensorLayout,
+        device: str = "cpu",
+        value: Any | None = None,
+    ) -> Allocation:
         """Create a managed allocation."""
-        allocation = Allocation(name=name, layout=layout, device=device)
+        allocation = Allocation(name=name, layout=layout, device=device, value=value)
         self._allocations[name] = allocation
         return allocation
 
     def _lookup_tensor(self, name: str) -> Any:
         """Return a concrete tensor value for an allocation name.
 
-        In the real runtime this would interface with backend buffers. Here we
-        return a numpy array placeholder for symbolic execution.
+        In the native runtime this would interface with backend buffers. The
+        reference executor carries concrete CPU values when available and
+        returns ``None`` for shape-only allocations instead of fabricating a
+        zero tensor that could be mistaken for a real result.
         """
-        import numpy as np
-
         allocation = self._allocations.get(name)
         if allocation is None:
             msg = f"Allocation '{name}' not found"
             raise AetherRuntimeError(msg)
-        shape = tuple(d if d is not None else 1 for d in allocation.layout.shape.dims)
-        dtype = np.float32
-        if allocation.layout.dtype.value == "bf16":
-            dtype = np.float32
-        elif allocation.layout.dtype.value in ("fp16", "float16"):
-            dtype = np.float16
-        elif allocation.layout.dtype.value == "fp8":
-            dtype = np.float32
-        elif allocation.layout.dtype.value == "int8":
-            dtype = np.int8
-        elif allocation.layout.dtype.value == "int4":
-            dtype = np.int8
-        return np.zeros(shape, dtype=dtype)
+        return allocation.value
+
+    @staticmethod
+    def _layout_for_value(value: Any) -> TensorLayout:
+        """Build a concrete FP32 layout for a reference-interpreter value."""
+        import numpy as np
+
+        array = np.asarray(value)
+        return TensorLayout(
+            shape=TensorShape.from_list([int(dimension) for dimension in array.shape]),
+            dtype=DType.FP32,
+        )
+
+    @staticmethod
+    def _values(inputs: dict[str, Allocation]) -> list[Any]:
+        """Return concrete input values, ignoring shape-only allocations."""
+        return [allocation.value for allocation in inputs.values() if allocation.value is not None]
 
     def _op_embedding(self, ctx: ExecutionContext, attrs: dict[str, Any], inputs: dict[str, Allocation]) -> Allocation:
         import numpy as np
@@ -130,7 +141,13 @@ class Executor:
                 "layout": "dense",
             }
         )
-        result = self._allocate("emb_out", layout)
+        value = None
+        concrete = self._values(inputs)
+        weight = attrs.get("weight")
+        if concrete and weight is not None:
+            value = np.asarray(weight)[np.asarray(concrete[0], dtype=np.int64)]
+            layout = self._layout_for_value(value)
+        result = self._allocate("emb_out", layout, value=value)
         self.profiler.record(
             OpProfile(
                 op_name="embedding",
@@ -155,7 +172,18 @@ class Executor:
                 "layout": "dense",
             }
         )
-        result = self._allocate("linear_out", layout)
+        value = None
+        concrete = self._values(inputs)
+        weight = attrs.get("weight")
+        bias = attrs.get("bias")
+        if weight is None and len(concrete) >= 2:
+            weight, concrete = concrete[1], concrete[:1]
+        if concrete and weight is not None:
+            value = np.matmul(np.asarray(concrete[0]), np.asarray(weight).T)
+            if bias is not None:
+                value = value + np.asarray(bias)
+            layout = self._layout_for_value(value)
+        result = self._allocate("linear_out", layout, value=value)
         self.profiler.record(
             OpProfile(
                 op_name="linear",
@@ -177,7 +205,16 @@ class Executor:
                 "layout": "dense",
             }
         )
-        result = self._allocate("norm_out", layout)
+        value = None
+        concrete = self._values(inputs)
+        if concrete:
+            import numpy as np
+
+            tensor = np.asarray(concrete[0], dtype=np.float32)
+            epsilon = float(attrs.get("epsilon", 1e-5))
+            value = tensor / np.sqrt(np.mean(np.square(tensor), axis=-1, keepdims=True) + epsilon)
+            layout = self._layout_for_value(value)
+        result = self._allocate("norm_out", layout, value=value)
         self.profiler.record(
             OpProfile(
                 op_name="rms_norm",
@@ -198,7 +235,22 @@ class Executor:
                 "layout": "dense",
             }
         )
-        result = self._allocate("attn_out", layout)
+        value = None
+        concrete = self._values(inputs)
+        if len(concrete) >= 3:
+            import numpy as np
+
+            query, key, value_tensor = (
+                np.asarray(item, dtype=np.float32) for item in concrete[:3]
+            )
+            scale = float(attrs.get("scale", query.shape[-1] ** -0.5))
+            scores = np.matmul(query, np.swapaxes(key, -1, -2)) * scale
+            scores -= np.max(scores, axis=-1, keepdims=True)
+            probabilities = np.exp(scores)
+            probabilities /= np.sum(probabilities, axis=-1, keepdims=True)
+            value = np.matmul(probabilities, value_tensor)
+            layout = self._layout_for_value(value)
+        result = self._allocate("attn_out", layout, value=value)
         self.profiler.record(
             OpProfile(
                 op_name="attention",
@@ -220,7 +272,14 @@ class Executor:
                 "layout": "dense",
             }
         )
-        result = self._allocate("matmul_out", layout)
+        value = None
+        concrete = self._values(inputs)
+        if len(concrete) >= 2:
+            import numpy as np
+
+            value = np.matmul(np.asarray(concrete[0]), np.asarray(concrete[1]))
+            layout = self._layout_for_value(value)
+        result = self._allocate("matmul_out", layout, value=value)
         self.profiler.record(
             OpProfile(
                 op_name="matmul",
@@ -237,7 +296,16 @@ class Executor:
             msg = "Add op requires at least one input"
             raise AetherRuntimeError(msg)
         first = next(iter(inputs.values()))
-        result = self._allocate("add_out", first.layout)
+        value = None
+        concrete = self._values(inputs)
+        if concrete:
+            import numpy as np
+
+            value = np.asarray(concrete[0])
+            for item in concrete[1:]:
+                value = np.add(value, item)
+            layout = self._layout_for_value(value)
+        result = self._allocate("add_out", layout, value=value)
         self.profiler.record(
             OpProfile(
                 op_name="add",
@@ -254,7 +322,16 @@ class Executor:
             msg = "Mul op requires at least one input"
             raise AetherRuntimeError(msg)
         first = next(iter(inputs.values()))
-        result = self._allocate("mul_out", first.layout)
+        value = None
+        concrete = self._values(inputs)
+        if concrete:
+            import numpy as np
+
+            value = np.asarray(concrete[0])
+            for item in concrete[1:]:
+                value = np.multiply(value, item)
+            layout = self._layout_for_value(value)
+        result = self._allocate("mul_out", layout, value=value)
         self.profiler.record(
             OpProfile(
                 op_name="mul",
@@ -271,7 +348,17 @@ class Executor:
             msg = "Softmax op requires input"
             raise AetherRuntimeError(msg)
         first = next(iter(inputs.values()))
-        result = self._allocate("softmax_out", first.layout)
+        value = None
+        concrete = self._values(inputs)
+        if concrete:
+            import numpy as np
+
+            tensor = np.asarray(concrete[0], dtype=np.float32)
+            shifted = tensor - np.max(tensor, axis=-1, keepdims=True)
+            exponent = np.exp(shifted)
+            value = exponent / np.sum(exponent, axis=-1, keepdims=True)
+            layout = self._layout_for_value(value)
+        result = self._allocate("softmax_out", layout, value=value)
         self.profiler.record(
             OpProfile(
                 op_name="softmax",
@@ -288,7 +375,15 @@ class Executor:
             msg = "SiLU op requires input"
             raise AetherRuntimeError(msg)
         first = next(iter(inputs.values()))
-        result = self._allocate("silu_out", first.layout)
+        value = None
+        concrete = self._values(inputs)
+        if concrete:
+            import numpy as np
+
+            tensor = np.asarray(concrete[0], dtype=np.float32)
+            value = tensor / (1.0 + np.exp(-tensor))
+            layout = self._layout_for_value(value)
+        result = self._allocate("silu_out", layout, value=value)
         self.profiler.record(
             OpProfile(
                 op_name="silu",
@@ -325,6 +420,19 @@ class Executor:
         inference flows through the active backend plugin.
         """
         outputs: dict[str, Allocation] = {}
+        for name, value in inputs.items():
+            if isinstance(value, Allocation):
+                self._allocations[name] = value
+                continue
+            try:
+                import numpy as np
+
+                concrete = np.asarray(value)
+                self._allocate(name, self._layout_for_value(concrete), value=concrete)
+            except (TypeError, ValueError) as exc:
+                raise AetherRuntimeError(
+                    f"Graph input {name!r} is not a concrete tensor value"
+                ) from exc
         if not hasattr(graph, "functions"):
             return outputs
         for func in graph.functions:

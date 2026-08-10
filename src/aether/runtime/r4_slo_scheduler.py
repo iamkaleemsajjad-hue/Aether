@@ -117,6 +117,7 @@ class SLOScheduler:
         max_new_tokens: int,
         slo_tier: SLOTier | str = SLOTier.BALANCED,
         metadata: dict | None = None,
+        ttft_deadline_ms: float | None = None,
     ) -> ScheduledRequest:
         """Submit a new request to the scheduler.
 
@@ -135,7 +136,13 @@ class SLOScheduler:
 
         now = time.monotonic()
         tier_priority = self._TIER_PRIORITY[slo_tier]
-        ttft_deadline = now + self._DEFAULT_TTFT_DEADLINES[slo_tier]
+        if ttft_deadline_ms is not None and ttft_deadline_ms <= 0:
+            raise ValueError("ttft_deadline_ms must be positive when provided")
+        ttft_deadline = now + (
+            float(ttft_deadline_ms) / 1000.0
+            if ttft_deadline_ms is not None
+            else self._DEFAULT_TTFT_DEADLINES[slo_tier]
+        )
 
         # MLFQ: adjust priority based on queue load.
         if self.scheduling_algo == "mlfq":

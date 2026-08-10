@@ -23,6 +23,7 @@ from typing import Any
 
 import numpy as np
 
+from aether.core.exceptions import RuntimeError as AetherRuntimeError
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -151,15 +152,24 @@ class FeatureExtrapolator:
         hidden_size: int,
         vocab_size: int,
         fusion_layers: tuple[int, ...],
+        output_projection: np.ndarray | None = None,
     ) -> None:
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.fusion_layers = fusion_layers
-        # Stable random projection for vocabulary expansion (seeded for reproducibility)
-        rng = np.random.default_rng(seed=42)
-        self._proj = rng.standard_normal((hidden_size, min(vocab_size, 8192))).astype(
-            np.float32
-        ) * (1.0 / math.sqrt(hidden_size))
+        if output_projection is None:
+            self._proj = None
+        else:
+            projection = np.asarray(output_projection, dtype=np.float32)
+            expected = (hidden_size, vocab_size)
+            if projection.shape != expected:
+                raise ValueError(
+                    f"EAGLE output projection must have shape {expected}, "
+                    f"got {tuple(projection.shape)}"
+                )
+            if not np.isfinite(projection).all():
+                raise ValueError("EAGLE output projection contains non-finite values")
+            self._proj = np.ascontiguousarray(projection)
 
     def extrapolate(
         self,
@@ -178,28 +188,30 @@ class FeatureExtrapolator:
         Returns:
             Logit array of shape (vocab_size,).
         """
+        if self._proj is None:
+            raise AetherRuntimeError(
+                "EAGLE-3 draft projection weights are unavailable; refusing synthetic logits"
+            )
+        if not hidden_states:
+            raise AetherRuntimeError(
+                "EAGLE-3 requires target hidden states; refusing token-ID synthetic features"
+            )
+
         if hidden_states:
             # Fuse by averaging layer features
-            fused = np.mean(
-                np.stack([h.ravel()[:self.hidden_size] for h in hidden_states], axis=0),
-                axis=0,
-            ).astype(np.float32)
-        else:
-            # Fallback: deterministic embedding from token ID
-            seed = last_token_id & 0xFFFFFFFF
-            rng = np.random.default_rng(seed=seed)
-            fused = rng.standard_normal(self.hidden_size).astype(np.float32)
+            vectors = []
+            for hidden in hidden_states:
+                vector = np.asarray(hidden, dtype=np.float32).ravel()
+                if vector.size < self.hidden_size:
+                    raise AetherRuntimeError(
+                        f"EAGLE-3 hidden state has {vector.size} values; "
+                        f"requires at least {self.hidden_size}"
+                    )
+                vectors.append(vector[: self.hidden_size])
+            fused = np.mean(np.stack(vectors, axis=0), axis=0).astype(np.float32)
 
         # Project to vocabulary
-        proj_dim = self._proj.shape[1]
-        logits_partial = fused[:self.hidden_size] @ self._proj   # (proj_dim,)
-
-        # Tile/expand to full vocab
-        if proj_dim < self.vocab_size:
-            repeats = (self.vocab_size + proj_dim - 1) // proj_dim
-            logits = np.tile(logits_partial, repeats)[:self.vocab_size]
-        else:
-            logits = logits_partial[:self.vocab_size]
+        logits = fused[: self.hidden_size] @ self._proj
 
         # Add token-locality bias: tokens near last_token_id are more likely
         indices = np.arange(self.vocab_size)
@@ -243,6 +255,7 @@ class EAGLE3Engine:
         plan: EAGLE3Plan,
         hidden_size: int = 4096,
         vocab_size: int = 32000,
+        output_projection: np.ndarray | None = None,
     ) -> None:
         self.plan = plan
         self.hidden_size = hidden_size
@@ -251,7 +264,9 @@ class EAGLE3Engine:
             hidden_size=hidden_size,
             vocab_size=vocab_size,
             fusion_layers=plan.fusion_layers,
+            output_projection=output_projection,
         )
+        self._last_hidden_states: list[np.ndarray] = []
         # Running statistics
         self._accepted_total: int = 0
         self._proposed_total: int = 0
@@ -278,6 +293,7 @@ class EAGLE3Engine:
             return []
         last_token = prefix_tokens[-1]
         states = hidden_states or []
+        self._last_hidden_states = [np.asarray(state, dtype=np.float32) for state in states]
 
         # Root: propose branching_factor candidates from the last prefix token
         root_logits = self._extrapolator.extrapolate(states, last_token, temperature)
@@ -371,7 +387,7 @@ class EAGLE3Engine:
                 # Self-verify: use extrapolator as target proxy
                 parent_token = node.parent.token_id if node.parent else (draft_roots[0].token_id if draft_roots else 0)
                 target_logits = self._extrapolator.extrapolate(
-                    [], parent_token, temperature * 1.05  # slight entropy shift
+                    self._last_hidden_states, parent_token, temperature * 1.05
                 )
 
             target_probs = self._logits_to_probs(target_logits, temperature)
@@ -439,7 +455,7 @@ class EAGLE3Engine:
     def should_use_speculation(self) -> bool:
         """Return True if acceptance rate is above the plan's floor."""
         if self._proposed_total == 0:
-            return True  # Optimistic until we have data
+            return False
         return self.acceptance_rate() >= self.plan.acceptance_floor
 
     def stats(self) -> dict[str, Any]:

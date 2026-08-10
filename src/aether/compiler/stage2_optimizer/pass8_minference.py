@@ -11,7 +11,7 @@ Three sparse patterns are detected per attention head:
   3. Block-Sparse  — fixed-size attention blocks with gaps
 
 This pass:
-  1. Analyzes synthetic calibration attention maps to classify each head
+  1. Analyzes supplied calibration attention maps to classify each head
   2. Emits .aeg/graph/attention_head_patterns.json with per-head assignments
   3. Annotates the AEG-IR graph with minference_attention ops
   4. Estimates FLOP savings vs dense attention
@@ -164,21 +164,17 @@ class MInferenceProfile:
 
 class AttentionPatternClassifier:
     """
-    Classifies per-head sparse attention patterns from simulated attention maps.
+    Classifies per-head sparse attention patterns from real attention maps.
 
-    In production, this would run on real calibration data. Here we use
-    deterministic synthetic maps based on head index to produce realistic
-    pattern assignments that match MInference paper distributions:
-      ~40% A-shape, ~35% vertical-slash, ~15% block-sparse, ~10% dense.
+    The caller is responsible for producing maps from a calibration forward
+    pass. This class only computes pattern scores; it never fabricates model
+    behavior from layer/head indices.
     """
 
     # Thresholds for pattern detection
     LOCAL_DENSITY_THRESHOLD = 0.3    # high local density → A-shape
     DIAGONAL_SCORE_THRESHOLD = 0.25  # high diagonal score → vertical-slash
     BLOCK_SCORE_THRESHOLD = 0.20     # block structure → block-sparse
-
-    def __init__(self, rng_seed: int = 42) -> None:
-        self._rng = np.random.default_rng(rng_seed)
 
     def classify_head(
         self,
@@ -187,17 +183,30 @@ class AttentionPatternClassifier:
         num_layers: int,
         num_heads: int,
         seq_len: int = 4096,
+        attention_map: np.ndarray | None = None,
     ) -> HeadPattern:
         """
         Classify the sparse attention pattern for a single head.
 
-        Uses a synthetic attention map to compute pattern scores and
-        select the best-fit sparse pattern type.
+        Uses a supplied calibration attention map to compute pattern scores.
         """
-        # Generate a synthetic attention map representative of this head's behavior
-        attn_map = self._synthetic_attention_map(
-            layer_idx, head_idx, num_layers, num_heads, seq_len
-        )
+        if attention_map is None:
+            raise ValueError(
+                "MInference classification requires a real calibration attention map"
+            )
+        attn_map = np.asarray(attention_map, dtype=np.float32)
+        if attn_map.ndim != 2 or attn_map.shape[0] != attn_map.shape[1]:
+            raise ValueError(
+                f"attention calibration map must be square 2-D, got {tuple(attn_map.shape)}"
+            )
+        if attn_map.shape[0] < 2 or not np.isfinite(attn_map).all():
+            raise ValueError("attention calibration map must be finite and non-empty")
+        if np.any(attn_map < 0.0):
+            raise ValueError("attention calibration map cannot contain negative values")
+        row_sums = attn_map.sum(axis=1, keepdims=True)
+        if np.any(row_sums <= 0.0):
+            raise ValueError("attention calibration map must have positive row mass")
+        attn_map = attn_map / row_sums
 
         # Compute pattern scores
         local_score    = self._local_window_density(attn_map)
@@ -246,64 +255,6 @@ class AttentionPatternClassifier:
                 pattern_type=SparsePattern.DENSE,
                 sparsity_ratio=0.0,
             )
-
-    def _synthetic_attention_map(
-        self,
-        layer_idx: int,
-        head_idx: int,
-        num_layers: int,
-        num_heads: int,
-        seq_len: int,
-        vis_len: int = 64,  # downsampled for efficiency
-    ) -> np.ndarray:
-        """
-        Generate a synthetic attention map for pattern detection.
-
-        Different heads exhibit different patterns based on their position
-        in the network — this is empirically observed in MInference paper.
-        """
-        rng = np.random.default_rng(layer_idx * 1000 + head_idx)
-        attn = np.zeros((vis_len, vis_len), dtype=np.float32)
-
-        # Normalized position in network
-        layer_frac = layer_idx / max(1, num_layers - 1)
-        head_frac  = head_idx  / max(1, num_heads - 1)
-
-        # Early layers: strong local patterns (A-shape)
-        if layer_frac < 0.33:
-            local_win = max(4, int(vis_len * 0.15))
-            for i in range(vis_len):
-                lo = max(0, i - local_win)
-                attn[i, lo:i+1] += rng.random(i + 1 - lo) * 0.6
-            # Sink tokens (global)
-            attn[:, :2] += 0.4
-
-        # Middle layers: diagonal / vertical-slash patterns
-        elif layer_frac < 0.66:
-            slash_offset = int(head_frac * vis_len * 0.3)
-            slash_width  = max(2, int(vis_len * 0.08))
-            for i in range(vis_len):
-                for d in range(-slash_width, slash_width + 1):
-                    j = i - slash_offset + d
-                    if 0 <= j < vis_len and j <= i:
-                        attn[i, j] += 0.5 + rng.random() * 0.3
-
-        # Late layers: block-sparse
-        else:
-            bsz = max(4, vis_len // 8)
-            for bi in range(0, vis_len, bsz * 2):
-                for bj in range(0, vis_len, bsz * 2):
-                    if bj <= bi:
-                        attn[bi:bi+bsz, bj:bj+bsz] += rng.random((
-                            min(bsz, vis_len - bi),
-                            min(bsz, vis_len - bj),
-                        )) * 0.5
-
-        # Causal mask
-        attn = np.tril(attn)
-        # Normalize rows
-        row_sums = attn.sum(axis=1, keepdims=True) + 1e-9
-        return (attn / row_sums).astype(np.float32)
 
     def _local_window_density(self, attn: np.ndarray, window: int = 8) -> float:
         """Fraction of attention mass in a local diagonal window."""
@@ -468,17 +419,27 @@ class Pass8MInference:
         model_config: dict[str, Any] | None = None,
         model_id: str = "",
         rng_seed: int = 42,
+        calibration_attention_maps: dict[tuple[int, int], np.ndarray] | None = None,
     ) -> None:
         self.model_config = model_config or {}
         self.model_id = model_id
-        self._classifier = AttentionPatternClassifier(rng_seed=rng_seed)
+        # ``rng_seed`` is retained for source compatibility with older callers;
+        # classification is now entirely data-driven and does not use it.
+        del rng_seed
+        self._classifier = AttentionPatternClassifier()
+        self._calibration_attention_maps = calibration_attention_maps
         self._profile: MInferenceProfile | None = None
 
     @property
     def profile(self) -> MInferenceProfile | None:
         return self._profile
 
-    def run(self, graph: Any, aeg_dir: str | Path | None = None) -> Any:
+    def run(
+        self,
+        graph: Any,
+        aeg_dir: str | Path | None = None,
+        calibration_attention_maps: dict[tuple[int, int], np.ndarray] | None = None,
+    ) -> Any:
         """Execute Pass 8 on the AEG-IR graph."""
         context_length = int(self.model_config.get(
             "max_position_embeddings",
@@ -488,6 +449,20 @@ class Pass8MInference:
             logger.debug(
                 "Pass 8: context_length=%d < %d — skipping MInference",
                 context_length, self.MIN_CONTEXT_LENGTH
+            )
+            return graph
+
+        maps = calibration_attention_maps or self._calibration_attention_maps
+        if not maps:
+            self._profile = None
+            if hasattr(graph, "metadata"):
+                graph.metadata["minference_enabled"] = False
+                graph.metadata["minference_reason"] = (
+                    "real calibration attention maps are required"
+                )
+            logger.warning(
+                "Pass 8 skipped: real calibration attention maps were not supplied",
+                model_id=self.model_id,
             )
             return graph
 
@@ -508,9 +483,16 @@ class Pass8MInference:
         patterns = []
         for layer_idx in range(num_layers):
             for head_idx in range(num_heads):
+                attention_map = maps.get((layer_idx, head_idx))
+                if attention_map is None:
+                    raise ValueError(
+                        "MInference calibration maps must include every "
+                        f"layer/head pair; missing ({layer_idx}, {head_idx})"
+                    )
                 p = self._classifier.classify_head(
                     layer_idx, head_idx, num_layers, num_heads,
-                    seq_len=min(context_length, 4096)
+                    seq_len=min(context_length, 4096),
+                    attention_map=attention_map,
                 )
                 patterns.append(p)
 

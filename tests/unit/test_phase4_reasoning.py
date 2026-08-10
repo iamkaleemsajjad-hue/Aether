@@ -617,6 +617,13 @@ class TestInferenceComputeController:
         ctrl = InferenceComputeController()
         assert ctrl.get_max_tokens("simple") < ctrl.get_max_tokens("very_hard")
 
+    def test_reasoning_search_requires_model_callbacks(self):
+        from aether.runtime.compute_controller import InferenceComputeController
+
+        ctrl = InferenceComputeController()
+        with pytest.raises(RuntimeError, match="model-backed expand_fn"):
+            ctrl.run("hard problem", complexity_class="very_hard")
+
 
 # ---------------------------------------------------------------------------
 # RAG Pipeline Tests
@@ -706,18 +713,40 @@ class TestRAGPipeline:
 # ---------------------------------------------------------------------------
 
 class TestMultiModalDispatcher:
-    def test_preprocess_image(self):
+    @staticmethod
+    def _loaded_tiny_dispatcher(**kwargs):
         from aether.inference.multimodal import MultiModalGraphDispatcher, VLMConfig
-        dispatcher = MultiModalGraphDispatcher(VLMConfig.llava_15())
+
+        cfg = VLMConfig(
+            image_size=28,
+            patch_size=14,
+            num_image_tokens=4,
+            connector_hidden_dim=8,
+            **kwargs,
+        )
+        projection = np.ones((3 * cfg.patch_size * cfg.patch_size, 8), np.float32)
+        connector = (
+            np.eye(8, dtype=np.float32),
+            np.eye(8, dtype=np.float32),
+        )
+        return MultiModalGraphDispatcher(
+            cfg,
+            patch_projection=projection,
+            connector_weights=connector,
+        )
+
+    def test_preprocess_image(self):
+        dispatcher = self._loaded_tiny_dispatcher()
         img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
         result = dispatcher.process_image(img.astype(np.float32))
         assert "visual_embeddings" in result
         assert result["num_visual_tokens"] > 0
 
     def test_dynamic_tiling_produces_multiple_tiles(self):
-        from aether.inference.multimodal import MultiModalGraphDispatcher, VLMConfig
-        cfg = VLMConfig.internvl2()
-        dispatcher = MultiModalGraphDispatcher(cfg)
+        dispatcher = self._loaded_tiny_dispatcher(
+            dynamic_resolution=True,
+            max_tiles=4,
+        )
         img = np.random.randn(1024, 1024, 3).astype(np.float32)
         result = dispatcher.process_image(img)
         assert result["num_tiles"] > 1
@@ -755,6 +784,15 @@ class TestMultiModalDispatcher:
         d = MultiModalGraphDispatcher()
         cfg = d.detect_vlm_architecture({"architectures": ["LlamaForCausalLM"]})
         assert cfg is None
+
+    def test_missing_vlm_weights_fail_closed(self):
+        from aether.inference.multimodal import MultiModalGraphDispatcher, VLMConfig
+
+        dispatcher = MultiModalGraphDispatcher(
+            VLMConfig(image_size=28, patch_size=14, connector_hidden_dim=8)
+        )
+        with pytest.raises(RuntimeError, match="requires loaded ViT and connector weights"):
+            dispatcher.process_image(np.zeros((28, 28, 3), dtype=np.float32))
 
     def test_save_to_aeg(self, tmp_path):
         from aether.inference.multimodal import MultiModalGraphDispatcher

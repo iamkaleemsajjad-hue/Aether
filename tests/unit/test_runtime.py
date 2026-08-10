@@ -39,6 +39,15 @@ class TestKVCacheManager:
         cache.evict_to_tier(str(block.block_id), MemoryTier.L2_CPU_DRAM)
         assert block.tier == MemoryTier.L2_CPU_DRAM
 
+    def test_transfer_stats_measure_real_tier_movement(self) -> None:
+        cache = KVCacheManager(dtype="fp8")
+        block = cache.allocate_block(layer_index=0, token_start=0, token_count=16)
+        assert cache.evict_to_tier(str(block.block_id), MemoryTier.L2_CPU_DRAM)
+        stats = cache.get_transfer_stats()
+        assert stats["local_tier_transfers"] == 1
+        assert stats["transferred_tokens"] == 16
+        assert stats["transfers_by_route"]["L1_GPU_HBM->L2_CPU_DRAM"] == 1
+
     def test_hit_rate(self) -> None:
         cache = KVCacheManager(dtype="fp8")
         cache.allocate_block(layer_index=0, token_start=0, token_count=16, prefix_hash="abc")

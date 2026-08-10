@@ -30,6 +30,7 @@ Performance targets (from XGrammar paper):
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -125,6 +126,23 @@ class GrammarConstraintCompilerPass(BasePass):
             compiler = GrammarFSACompiler(backend=backend)
             fsa = compiler.compile(schema=schema, grammar_type=grammar_type, vocab_size=vocab_size)
 
+            # A character/byte FSA is not safe to apply directly to model
+            # token IDs.  When the local source contains a tokenizer, remap
+            # every tokenizer token through the character FSA and persist the
+            # resulting token-level transitions.  If no local tokenizer is
+            # available, retain the legacy diagnostic artifact but mark it as
+            # non-production so Runtime rejects it rather than silently
+            # enforcing the wrong vocabulary.
+            tokenizer = _load_local_tokenizer(graph)
+            tokenizer_aware = False
+            tokenizer_fingerprint: str | None = None
+            if tokenizer is not None:
+                try:
+                    fsa, tokenizer_fingerprint = _remap_fsa_to_tokenizer(fsa, tokenizer)
+                    tokenizer_aware = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Pass 11: tokenizer-aware remap failed: %s", exc)
+
             # Validate the FSA.
             n_states = fsa.n_states
             n_transitions = fsa.n_transitions
@@ -145,6 +163,8 @@ class GrammarConstraintCompilerPass(BasePass):
                     grammar_type=grammar_type,
                     schema_hash=schema_hash,
                     backend=backend,
+                    tokenizer_aware=tokenizer_aware,
+                    tokenizer_fingerprint=tokenizer_fingerprint,
                 )
 
             # Annotate graph with grammar constraint node.
@@ -160,6 +180,8 @@ class GrammarConstraintCompilerPass(BasePass):
                 "fsa_transitions": n_transitions,
                 "vocab_size": vocab_size,
                 "schema_hash": schema_hash,
+                "tokenizer_aware": tokenizer_aware,
+                "tokenizer_fingerprint": tokenizer_fingerprint,
                 "estimated_mask_lookup_us": fsa.estimated_mask_lookup_us,
             }
             logger.info(
@@ -372,6 +394,9 @@ class GrammarFSACompiler:
         """Approximate EBNF → FSA: parse production rules and convert to NFA."""
         try:
             rules = _parse_ebnf_rules(grammar)
+            literal_fsa = _build_literal_ebnf_fsa(rules, vocab_size)
+            if literal_fsa is not None:
+                return literal_fsa
             nfa = _ebnf_rules_to_nfa(rules)
             return _nfa_to_dfa(nfa, vocab_size)
         except Exception as exc:  # noqa: BLE001
@@ -766,6 +791,61 @@ def _ebnf_rules_to_nfa(rules: dict[str, str]) -> _NFA:
     return _NFA(start, end)
 
 
+def _build_literal_ebnf_fsa(
+    rules: dict[str, str], vocab_size: int
+) -> FiniteStateAutomaton | None:
+    """Build a correct character trie for literal-only EBNF productions.
+
+    The previous generic NFA approximation only examined transitions attached
+    to the NFA start state and could therefore emit an empty one-state FSA for
+    a valid production such as ``root ::= "hello"``.  Literal productions are
+    common for constrained output and can be represented exactly as a trie;
+    complex productions continue through the existing approximation.
+    """
+    literals: list[str] = []
+    for body in rules.values():
+        literal_matches = list(re.finditer(r'("(?:\\.|[^"\\])*")', body))
+        remainder = re.sub(r'("(?:\\.|[^"\\])*")', "", body)
+        remainder = re.sub(r"[|()\s]+", "", remainder)
+        if remainder:
+            return None
+        for match in literal_matches:
+            try:
+                literal = ast.literal_eval(match.group(1))
+            except (SyntaxError, ValueError):
+                continue
+            if isinstance(literal, str) and literal:
+                literals.append(literal)
+    if not literals:
+        return None
+
+    transitions: dict[tuple[int, int], int] = {}
+    accepting: set[int] = set()
+    next_state = 1
+    for literal in dict.fromkeys(literals):
+        state = 0
+        for character in literal:
+            key = (state, ord(character))
+            target = transitions.get(key)
+            if target is None:
+                target = next_state
+                next_state += 1
+                transitions[key] = target
+            state = target
+        accepting.add(state)
+    states = list(range(next_state))
+    return FiniteStateAutomaton(
+        n_states=next_state,
+        n_transitions=len(transitions),
+        vocab_size=vocab_size,
+        initial_state=0,
+        accepting_states=accepting,
+        transitions=transitions,
+        token_masks=_build_token_masks_from_transitions(transitions, states, vocab_size),
+        estimated_mask_lookup_us=2.0,
+    )
+
+
 # ── Utility helpers ───────────────────────────────────────────────────────────
 
 
@@ -844,12 +924,115 @@ def _infer_vocab_size(architecture: Any, graph: Any) -> int:
 _FSA_MAGIC = b"AETHER_FSA_v1\x00\x00\x00"
 
 
+def _load_local_tokenizer(graph: Any) -> Any | None:
+    """Load the source tokenizer without contacting a model registry."""
+    metadata = getattr(graph, "metadata", {})
+    source_path = metadata.get("source_model_path") if isinstance(metadata, dict) else None
+    if not source_path:
+        return None
+    source = Path(str(source_path))
+    if not source.exists() or not source.is_dir():
+        return None
+    tokenizer_file = source / "tokenizer.json"
+    if tokenizer_file.is_file():
+        try:
+            from tokenizers import Tokenizer
+
+            return Tokenizer.from_file(str(tokenizer_file))
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Pass 11: tokenizer.json could not be loaded at %s: %s", tokenizer_file, exc)
+    try:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(
+            str(source), local_files_only=True, trust_remote_code=False
+        )
+    except Exception as exc:  # noqa: BLE001 - absence is a safe unsupported path
+        logger.info("Pass 11: local tokenizer unavailable at %s: %s", source, exc)
+        return None
+
+
+def _tokenizer_token_text(tokenizer: Any, token_id: int) -> str:
+    """Decode one token to the exact text consumed by the character FSA."""
+    try:
+        text = tokenizer.decode(
+            [token_id],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        text = tokenizer.decode([token_id], skip_special_tokens=False)
+    if not isinstance(text, str):
+        raise TypeError(f"tokenizer.decode returned {type(text).__name__}")
+    return text
+
+
+def _remap_fsa_to_tokenizer(
+    fsa: FiniteStateAutomaton, tokenizer: Any
+) -> tuple[FiniteStateAutomaton, str]:
+    """Convert character transitions into exact tokenizer-token transitions."""
+    import hashlib
+
+    try:
+        tokenizer_size = int(len(tokenizer))
+    except Exception:
+        try:
+            tokenizer_size = int(tokenizer.get_vocab_size())
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("tokenizer does not expose a finite vocabulary size") from exc
+    if tokenizer_size <= 0:
+        raise ValueError("tokenizer vocabulary is empty")
+
+    transitions: dict[tuple[int, int], int] = {}
+    vocabulary: list[str] = []
+    for token_id in range(tokenizer_size):
+        vocabulary.append(_tokenizer_token_text(tokenizer, token_id))
+    for state in range(fsa.n_states):
+        for token_id, token_text in enumerate(vocabulary):
+            if not token_text:
+                continue
+            next_state = state
+            valid = True
+            for character in token_text:
+                next_state = fsa.transitions.get((next_state, ord(character)), -1)
+                if next_state < 0:
+                    valid = False
+                    break
+            if valid:
+                transitions[(state, token_id)] = next_state
+
+    if not transitions:
+        raise ValueError("grammar has no valid transitions in the source tokenizer vocabulary")
+
+    masks = _build_token_masks_from_transitions(
+        transitions, list(range(fsa.n_states)), tokenizer_size
+    )
+    fingerprint = hashlib.sha256(
+        json.dumps(vocabulary, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    return (
+        FiniteStateAutomaton(
+            n_states=fsa.n_states,
+            n_transitions=len(transitions),
+            vocab_size=tokenizer_size,
+            initial_state=fsa.initial_state,
+            accepting_states=set(fsa.accepting_states),
+            transitions=transitions,
+            token_masks=masks,
+            estimated_mask_lookup_us=fsa.estimated_mask_lookup_us,
+        ),
+        fingerprint,
+    )
+
+
 def _write_fsa_blobs(
     output_dir: Path,
     fsa: FiniteStateAutomaton,
     grammar_type: str,
     schema_hash: str,
     backend: str,
+    tokenizer_aware: bool = False,
+    tokenizer_fingerprint: str | None = None,
 ) -> None:
     """Write FSA binary blob and JSON config to .aeg/grammar/."""
     grammar_dir = output_dir / "grammar"
@@ -906,10 +1089,8 @@ def _write_fsa_blobs(
         "n_accepting_states": n_accepting,
         "mask_bytes_per_state": mask_bytes_per_state,
         "estimated_mask_lookup_us": fsa.estimated_mask_lookup_us,
-        # The built-in compiler operates on character-code approximations and
-        # does not have access to the source tokenizer.  Runtime must not treat
-        # its masks as production-safe token constraints.
-        "tokenizer_aware": False,
+        "tokenizer_aware": tokenizer_aware,
+        "tokenizer_fingerprint": tokenizer_fingerprint,
         "blob_file": "fsm.bin",
     }
     (grammar_dir / "fsm_config.json").write_text(
