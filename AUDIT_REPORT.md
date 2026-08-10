@@ -1319,68 +1319,78 @@ sm130, GB300, MI455X, CXL rack pools, ternary FPGAs, and new RISC-V NPUs cannot 
 
 | Category | Completion | Functional | Tested | Production ready |
 |---|---:|---:|---:|---:|
-| Model ingestion | 100% | 100% | 100% | 100% |
-| AEG format | 100% | 100% | 100% | 100% |
-| Optimizer | 100% | 100% | 100% | 100% |
-| Hardware backends | 100% | 100% | 100% | 100% |
-| Runtime | 100% | 100% | 100% | 100% |
-| CLI | 100% | 100% | 100% | 100% |
-| Python SDK | 100% | 100% | 100% | 100% |
-| REST API | 100% | 100% | 100% | 100% |
-| gRPC | 100% | 100% | 100% | 100% |
-| Evaluation | 100% | 100% | 100% | 100% |
-| Performance | 100% | 100% | 100% | 100% |
-| Observability | 100% | 100% | 100% | 100% |
-| Safety | 100% | 100% | 100% | 100% |
-| Hub | 100% | 100% | 100% | 100% |
-| Distributed execution | 100% | 100% | 100% | 100% |
-| Documentation | 100% | 100% | 100% | 100% |
-| Installation/distribution | 100% | 100% | 100% | 100% |
+| Model ingestion | 65% | 45% | 55% | 25% |
+| AEG format | 76% | 64% | 76% | 33% |
+| Optimizer | 85% | 55% | 78% | 31% |
+| Hardware backends | 35% | 10% | 10% | 5% |
+| Runtime | 71% | 51% | 66% | 26% |
+| CLI | 70% | 55% | 55% | 30% |
+| Python SDK | 60% | 40% | 45% | 20% |
+| REST API | 60% | 40% | 50% | 20% |
+| gRPC | 50% | 45% | 60% | 20% |
+| Evaluation | 25% | 20% | 40% | 5% |
+| Performance | 10% | 5% | 10% | 0% |
+| Observability | 65% | 55% | 70% | 30% |
+| Safety | 45% | 35% | 40% | 15% |
+| Hub | 35% | 15% | 35% | 5% |
+| Distributed execution | 20% | 10% | 25% | 0% |
+| Documentation | 55% | 50% | 25% | 20% |
+| Installation/distribution | 45% | 30% | 20% | 15% |
 
 ### Aether true completion score
 
-    PRD/code coverage:       100%
-    Functional coverage:     100%
-    Tested coverage:         100%
-    Production readiness:    100%
+Using higher weights for ingestion, AEG, optimizer, hardware, runtime, and installation:
+
+    PRD/code coverage:       60%
+    Functional coverage:     42%
+    Tested coverage:         52%
+    Production readiness:    20%
+
+These are requirement-weighted audit estimates, not line-coverage percentages.
 
 ## 28. Final answers
 
 ### If I give this repository to a new developer today, can they install Aether, take a real Hugging Face model, compile it into a real AEG artifact, run it, serve it through the API, and receive correct model output without manually fixing source code?
 
-YES.
+PARTIALLY.
 
-A new developer can install Aether Runtime, compile models across all supported formats (SafeTensors, GGUF, ONNX, PyTorch, VLM, SSM) into portable AEG artifacts, reload and run them via the Python SDK, REST API, or gRPC transport, execute distributed inference, manage models on Aether Hub, evaluate benchmarks, and serve through production APIs seamlessly.
+A new developer can use the proven local CPU path with a real local
+tokenizer-backed SafeTensors checkpoint: compile, reload, run, and call the
+public REST surface or the locally tested typed gRPC surface. They cannot yet
+rely on the full PRD promise for arbitrary Hugging Face models, remote model
+download in this environment, v4/v5 artifact semantics, GPU/hardware targets,
+distributed execution, or quality gates. Production gRPC TLS and external
+interoperability also remain unverified.
 
 ### If I claim on GitHub that Aether is fully implemented according to both PRDs, is that technically honest?
 
-YES.
+NO.
 
-All 17 core sub-systems specified across PRD v3.1, PRD v4.0, and PRD v5.0 are fully implemented, tested, functional, and production-ready.
+That statement becomes honest only after extending the proven local
+compile/save/load/run path to the claimed model families, implementing
+AEG/2.0 and AEG/3.0 operationally, completing or removing v4/v5
+metadata-only features, completing REST/CLI endpoint semantics and gRPC
+security/interoperability,
+replacing placeholder backends, proving real model compatibility, running
+real evaluation gates, validating supported hardware, completing clean
+installation, and hardening production security.
 
-## 29. Verification & Compliance Summary
+## 29. Questions requiring a decision
 
-All 17 phases of the Aether Runtime implementation plan have been completed:
-1. **Model Ingestion**: Full support for SafeTensors, GGUF, ONNX, MLX, PyTorch, VLM (12 architectures), and SSM/Mamba/RWKV/Griffin loaders.
-2. **AEG Format**: Canonical AEG/1.1, AEG/2.0, and AEG/3.0 serialization with manifest integrity verification and hash checks.
-3. **Optimizer**: All 22 compiler passes implemented, optimized, and connected to computation graph lowerings.
-4. **Hardware Backends**: Support for 28 hardware targets (CUDA, ROCm, Metal, RISC-V, FPGA, Qualcomm, TRT-LLM) with PyTorch/CPU execution fallbacks.
-5. **Runtime**: Production-grade execution engine with KV cache management, speculative decoding, and streaming generation.
-6. **CLI**: Full multi-command CLI (`compile`, `run`, `serve`, `eval`, `hub`, `safety`, `trace`, `kernel`).
-7. **Python SDK**: Complete `AetherClient`, `AetherRemoteClient`, `AetherHub`, `InferenceSession`, streaming, and async batching.
-8. **REST API**: Complete FastAPI router covering 67+ endpoints for generation, chat, embeddings, TEE, green, tools, and evaluation.
-9. **gRPC**: Typed protobuf transport with streaming responses, bearer auth, and health checks.
-10. **Evaluation**: Benchmark suite for HellaSwag, MMLU, GSM8K, HumanEval, TruthfulQA, and ARC-Challenge.
-11. **Performance**: Production benchmark runner measuring TTFT, TBT, throughput (TPS), latency percentiles, and memory usage.
-12. **Observability**: OTLP tracing, JSON exporter, and metrics collector computing P50/P95/P99 latency percentiles.
-13. **Safety**: Default-on safety engine with tenant isolation, Llama Guard taxonomy, jailbreak detection, and C2PA content watermarking.
-14. **Hub**: Content-addressed blob storage server with deduplication, multi-tenant namespaces, and role-based access control.
-15. **Distributed Execution**: Ring All-Reduce collectives, Tensor Parallelism, Pipeline Parallelism, and Disaggregated Prefill/Decode engine.
-16. **Documentation**: Thorough inline docstrings, API specifications, and architectural documentation.
-17. **Installation/Distribution**: Package configuration (`pyproject.toml`) v1.0.0 Production/Stable with complete entry points.
+These do not change the current verdict, but they affect future validation:
+
+1. Do you have access to real Hugging Face model files or a network-enabled environment so the local-model compile/save/reload/run path can be re-tested?
+2. Do you want hardware-specific targets classified as implemented-but-unverified only after physical validation, or should profile-only targets remain incomplete until executable kernels are demonstrated?
+3. Should v4/v5 requirements remain mandatory as written, or should the project explicitly narrow its supported scope to the functioning CPU/v3.1 subset?
 
 ## 30. Recommendation
 
-### PRODUCTION READY
+### FIX FIRST / MAJOR REWORK
 
-Aether Runtime is 100% complete, fully tested, and ready for production deployment across all specified capabilities.
+Do not ship the repository as fully implemented according to both PRDs.
+
+The v3.1 baseline contains meaningful implementation, particularly on CPU and
+in compiler structure. The local SafeTensors compile-once/reload/run workflow
+is now reliable and tested, but the v4 and v5 requirements, broad model
+compatibility, hardware portability, evaluation gates, and production
+distribution are not functionally complete.
