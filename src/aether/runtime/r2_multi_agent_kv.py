@@ -233,12 +233,32 @@ class MultiAgentKVCoordinator:
 
             self._stats.sessions_released += 1
 
-    def update_shared_kv(self, block_id: str, kv_data: Any) -> None:
-        """Update the KV data for an existing shared block (e.g., after computation)."""
+    def update_shared_kv(
+        self,
+        block_id: str,
+        kv_data: Any,
+        *,
+        seq_len: int | None = None,
+    ) -> None:
+        """Publish computed prefix KV into an existing shared block."""
         with self._lock:
             if block_id in self._shared_blocks:
-                self._shared_blocks[block_id].kv_data = kv_data
-                self._shared_blocks[block_id].last_access_ts = time.time()
+                block = self._shared_blocks[block_id]
+                block.kv_data = kv_data
+                if seq_len is not None:
+                    if seq_len < 0:
+                        raise ValueError("shared KV sequence length must be non-negative")
+                    block.seq_len = int(seq_len)
+                block.last_access_ts = time.time()
+
+    def get_shared_kv(self, block_id: str) -> tuple[Any, int]:
+        """Return a shared prefix cache and its token length without copying it."""
+        with self._lock:
+            block = self._shared_blocks.get(block_id)
+            if block is None:
+                return None, 0
+            block.last_access_ts = time.time()
+            return block.kv_data, block.seq_len
 
     def hash_prefix(self, prefix_text: str) -> str:
         """Compute a stable hash for a text prefix string.

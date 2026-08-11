@@ -569,6 +569,50 @@ def test_agentic_session_reuses_real_cpu_aeg_kv_prefix(
 
 
 @pytest.mark.integration
+def test_multi_agent_session_reuses_real_shared_cpu_prefix_kv(
+    tmp_path: Path, tiny_local_safetensors_model: Path
+) -> None:
+    """R2 publishes one real prefix cache and clones it for divergent agents."""
+    artifact = tmp_path / "multi-agent.aeg"
+    Compiler(
+        CompilerConfig(
+            targets=["cpu_avx512"],
+            overwrite=True,
+            calibration_tokens=8,
+            cache_dir=str(tmp_path / "cache"),
+        )
+    ).compile(str(tiny_local_safetensors_model), output_path=artifact)
+    runtime = Runtime(
+        RuntimeConfig(
+            hf_offline=True,
+            default_max_tokens=2,
+            enable_semantic_cache=False,
+        )
+    )
+
+    async def exercise() -> tuple[dict[str, object], dict[str, object]]:
+        async with runtime.multi_agent_session(
+            [str(artifact)],
+            coordination="relay",
+            shared_prefix="Shared system context",
+        ) as session:
+            first_agent = await session.spawn_agent(
+                str(artifact), context="Shared system context"
+            )
+            second_agent = await session.spawn_agent(
+                str(artifact), context="Shared system context"
+            )
+            first = await first_agent.generate("first branch", temperature=0.0)
+            second = await second_agent.generate("second branch", temperature=0.0)
+            return first.metrics.to_dict(), second.metrics.to_dict()
+
+    first_metrics, second_metrics = asyncio.run(exercise())
+    assert first_metrics["multi_agent_kv_reuse"] is False
+    assert second_metrics["multi_agent_kv_reuse"] is True
+    assert int(second_metrics["multi_agent_kv_reused_tokens"]) > 0
+
+
+@pytest.mark.integration
 def test_enabled_optimizer_artifacts_are_persisted(tmp_path: Path) -> None:
     """Enabled passes must leave files in the saved AEG, not only reports."""
     source = tmp_path / "tiny-llama"

@@ -185,3 +185,78 @@ class ABRolloutController:
             "assignment": "sha256_stable_bucket",
             "rollback_on": ["eval_gate_failure", "quality_drift_alert", "safety_alert"],
         }
+
+
+# ---------------------------------------------------------------------------
+# QualityGate — score-threshold API (wraps EvalGate)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class QualityGateResult:
+    """Result of a QualityGate evaluation."""
+
+    benchmark: str
+    score: float
+    threshold: float
+    blocked: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "benchmark": self.benchmark,
+            "score": round(self.score, 6),
+            "threshold": self.threshold,
+            "blocked": self.blocked,
+        }
+
+
+class QualityGate:
+    """Score-threshold quality gate.
+
+    Blocks a model when its benchmark score falls below the configured
+    threshold.  Provides a simpler interface than EvalGate for cases where
+    there is no separate baseline measurement.
+
+    Usage::
+
+        gate = QualityGate(threshold=0.70)
+        result = evaluator.run()           # EvalResult from evaluators
+        if gate.should_block(result):
+            raise ValueError("Quality gate blocked rollout")
+    """
+
+    def __init__(self, threshold: float = 0.70, benchmark: str | None = None) -> None:
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be between 0 and 1")
+        self.threshold = threshold
+        self.benchmark = benchmark
+
+    def should_block(self, result: Any) -> bool:
+        """Return True if the result fails to meet the quality threshold.
+
+        Args:
+            result: Any object with a ``score`` attribute (e.g.,
+                    aether.observability.evaluators.EvalResult).
+        """
+        score = float(getattr(result, "score", 0.0))
+        return score < self.threshold
+
+    def evaluate(self, result: Any) -> QualityGateResult:
+        """Return a structured gate decision."""
+        score = float(getattr(result, "score", 0.0))
+        benchmark = getattr(result, "benchmark", self.benchmark or "unknown")
+        blocked = score < self.threshold
+        return QualityGateResult(
+            benchmark=benchmark,
+            score=score,
+            threshold=self.threshold,
+            blocked=blocked,
+        )
+
+    def manifest(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "threshold": self.threshold,
+            "benchmark": self.benchmark,
+            "action": "block_rollout_on_failure",
+        }
+

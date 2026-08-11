@@ -152,6 +152,18 @@ class TestR2MultiAgentKV:
         c.release_session("s1")
         assert "s1" not in c._sessions
 
+    def test_publish_and_read_executable_shared_prefix_cache(self):
+        c = self._make()
+        prefix_hash = c.hash_prefix("shared system prompt")
+        c.create_agent_session("s1", prefix_hash=prefix_hash)
+        cache = object()
+        c.update_shared_kv(prefix_hash, cache, seq_len=7)
+        loaded, seq_len = c.get_shared_kv(prefix_hash)
+        assert loaded is cache
+        assert seq_len == 7
+        with pytest.raises(ValueError, match="non-negative"):
+            c.update_shared_kv(prefix_hash, cache, seq_len=-1)
+
     def test_lru_eviction(self):
         from aether.runtime.r2_multi_agent_kv import MultiAgentKVCoordinator
         c = MultiAgentKVCoordinator(max_shared_blocks=3)
@@ -308,15 +320,24 @@ class TestR5TTTEngine:
         assert isinstance(loss, float)
         assert loss >= 0.0
 
-    def test_loss_decreases_after_steps(self):
+    def test_loss_decreases_and_adapter_updates(self):
         e = self._make()
         e.begin_request("req1")
         h = [[0.5] * 8] * 10
-        losses = []
-        for _ in range(10):
-            losses.append(e.adapt("req1", h, layer_idx=0))
-        # Loss should generally decrease (not necessarily monotone due to simplicity).
-        assert losses[-1] <= losses[0] * 2 or True  # Loose check.
+        before = list(e.get_fast_weights("req1", 0)["B"])
+        losses = [e.adapt("req1", h, layer_idx=0) for _ in range(10)]
+        after = e.get_fast_weights("req1", 0)["B"]
+        assert any(a != b for a, b in zip(before, after))
+        assert losses[-1] < losses[0]
+
+    def test_invalid_hidden_shape_and_layer_fail_closed(self):
+        e = self._make()
+        with pytest.raises(ValueError, match="hidden_states"):
+            e.adapt("req1", [], layer_idx=0)
+        with pytest.raises(ValueError, match="width 8"):
+            e.adapt("req1", [[1.0, 2.0]], layer_idx=0)
+        with pytest.raises(IndexError, match="layer_idx"):
+            e.adapt("req1", [[0.5] * 8], layer_idx=2)
 
     def test_weights_reset_stateless(self):
         e = self._make()

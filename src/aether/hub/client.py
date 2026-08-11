@@ -106,10 +106,12 @@ class HubClient:
         hub_url: str = DEFAULT_HUB_URL,
         auth_token: str | None = None,
         timeout_s: int = 30,
+        allow_local_cache: bool = False,
     ) -> None:
         self.hub_url = hub_url.rstrip("/")
         self.auth_token = auth_token
         self.timeout_s = timeout_s
+        self.allow_local_cache = allow_local_cache
         self._local_cache: dict[str, HubManifest] = {}
         self._local_packages: dict[str, bytes] = {}
         logger.info("Hub client initialized", hub_url=self.hub_url, auth=auth_token is not None)
@@ -155,7 +157,7 @@ class HubClient:
                     expected_hash = resp.headers.get("X-Content-Hash")
                     if expected_hash and self._content_hash(raw) != expected_hash:
                         raise HubError(
-                            f"Hub artifact hash mismatch for {model_id!r}: "
+                            f"Hub response hash mismatch for {path!r}: "
                             f"expected {expected_hash}, got {self._content_hash(raw)}"
                         )
                     if not raw:
@@ -189,7 +191,7 @@ class HubClient:
 
         # All retries exhausted — return None to trigger local fallback
         logger.warning("Hub unreachable after %d attempts: %s", HUB_RETRY_ATTEMPTS, last_exc)
-        return {}
+        raise HubError(f"Hub unreachable: {last_exc}", url=url) from last_exc
 
     def _is_hub_available(self) -> bool:
         """Return True if the Hub health endpoint responds."""
@@ -229,8 +231,10 @@ class HubClient:
                 return result or {"status": "ok", "source": "server"}
             except Exception as exc:
                 logger.debug("Hub login validation failed: %s", exc)
-        logger.info("Hub login stored locally (Hub offline)")
-        return {"status": "ok", "message": "Token stored locally"}
+        if self.allow_local_cache:
+            logger.info("Hub login stored locally (Hub offline)")
+            return {"status": "ok", "message": "Token stored locally", "source": "local_cache"}
+        raise HubError("Hub is unavailable; token was not validated", url=self.hub_url)
 
     def logout(self) -> dict[str, Any]:
         """Clear the authentication token."""
@@ -256,7 +260,10 @@ class HubClient:
             except HubError:
                 pass
 
-        # Local cache fallback
+        if not self.allow_local_cache:
+            return []
+
+        # Explicit local cache mode.
         query_lower = query.lower()
         results = [
             m for m in self._local_cache.values()
@@ -432,7 +439,7 @@ class HubClient:
                     return [HubManifest.from_dict(m) for m in data["models"]]
             except HubError:
                 pass
-        return list(self._local_cache.values())
+        return list(self._local_cache.values()) if self.allow_local_cache else []
 
     def get_manifest(self, model_id: str) -> HubManifest | None:
         """Get the manifest for a specific model (remote then local)."""
@@ -444,7 +451,7 @@ class HubClient:
                     return HubManifest.from_dict(data)
             except HubError:
                 pass
-        return self._local_cache.get(model_id)
+        return self._local_cache.get(model_id) if self.allow_local_cache else None
 
     def delete(self, model_id: str) -> dict[str, Any]:
         """Delete a model from the Hub (requires auth)."""

@@ -101,20 +101,34 @@ untrusted model pickle as a fallback.
         return self._load_single_file(path)
 
     def _load_single_file(self, path: Path) -> dict[str, Any]:
-        """Load a single .pt / .pth / .bin file."""
+        """Load a single .pt / .pth / .bin file.
+
+        TorchScript archives (ZIP-format JIT) require ``torch.jit.load``; plain
+        PyTorch checkpoints use ``torch.load(weights_only=True)`` to avoid
+        executing untrusted pickle payloads.
+
+        Distinguish: both formats use ZIP (PK header), so we try the safe path
+        first and fall back to ``torch.jit.load`` only when the error message
+        indicates a TorchScript archive (the canonical PyTorch error text).
+        """
         import torch
 
         try:
             checkpoint = torch.load(str(path), map_location="cpu", weights_only=True)
         except TypeError as exc:
-            # Falling back to ordinary torch.load would execute arbitrary
-            # pickle code from an untrusted model file.  Aether's compiler
-            # boundary is weights-only by default; old Torch versions must
-            # upgrade rather than silently weakening this security contract.
+            # Old Torch without weights_only parameter — security boundary
             raise IngestionError(
                 "safe PyTorch checkpoint loading requires torch.load(weights_only=True); "
                 "upgrade PyTorch instead of enabling unsafe pickle execution"
             ) from exc
+        except RuntimeError as exc:
+            # Distinguish TorchScript archives: PyTorch raises RuntimeError with
+            # a specific message when weights_only=True is incompatible with JIT.
+            err_str = str(exc).lower()
+            if "torchscript" in err_str or "weights_only" in err_str:
+                return self._load_torchscript(path)
+            msg = f"Failed to load PyTorch checkpoint {path}: {exc}"
+            raise IngestionError(msg) from exc
         except Exception as exc:
             msg = f"Failed to load PyTorch checkpoint {path}: {exc}"
             raise IngestionError(msg) from exc
@@ -131,6 +145,49 @@ untrusted model pickle as a fallback.
             "tensors": weights,
             "keys": sorted(weights.keys()),
             "format": fmt,
+        }
+
+    def _load_torchscript(self, path: Path) -> dict[str, Any]:
+        """Load a TorchScript archive and extract its weight tensors as numpy arrays.
+
+        TorchScript archives require ``torch.jit.load`` rather than
+        ``torch.load(weights_only=True)``.  Named parameters and buffers are
+        extracted and converted to float32 numpy arrays, matching the same
+        convention as ``_extract_weights``.
+        """
+        import torch
+
+        try:
+            module = torch.jit.load(str(path), map_location="cpu")
+        except Exception as exc:
+            msg = f"Failed to load TorchScript archive {path}: {exc}"
+            raise IngestionError(msg) from exc
+
+        weights: dict[str, Any] = {}
+        try:
+            for name, tensor in module.named_parameters():
+                arr = _tensor_to_numpy(tensor.detach().cpu())
+                if arr is not None:
+                    weights[name] = arr
+            for name, tensor in module.named_buffers():
+                if name not in weights:
+                    arr = _tensor_to_numpy(tensor.detach().cpu())
+                    if arr is not None:
+                        weights[name] = arr
+        except Exception as exc:
+            msg = f"Failed to extract weights from TorchScript module {path}: {exc}"
+            raise IngestionError(msg) from exc
+
+        logger.info(
+            "Loaded TorchScript archive",
+            path=str(path),
+            tensors=len(weights),
+        )
+        return {
+            "weights": weights,
+            "tensors": weights,
+            "keys": sorted(weights.keys()),
+            "format": "full_model",  # TorchScript is a full model, not a bare state dict
         }
 
     def _load_sharded(self, directory: Path) -> dict[str, Any]:

@@ -2,16 +2,9 @@
 Aether Runtime — Complete Hardware Backend Implementations.
 
 Provides production-grade backend implementations for all hardware targets.
-For hardware that is not available in the current environment (CUDA, ROCm,
-Metal, etc.), implementations use a CPU simulation layer that:
-  1. Faithfully implements every API contract and protocol
-  2. Executes real computation via PyTorch/NumPy
-  3. Reports accurate capability information
-  4. Fails closed with informative errors for hardware-specific features
-
-This is the same approach used by LLVM's soft backends, QEMU, and other
-cross-compilation toolchains: the code is real and correct, it just runs
-on a different execution substrate.
+Vendor backends report availability only when the matching runtime is present.
+CPU reference execution remains available through the normal CPU/Torch backend;
+it is not reported as CUDA, ROCm, Metal, FPGA, or QNN production support.
 
 Research basis:
   - NVIDIA CUDA Programming Guide (2024)
@@ -49,8 +42,7 @@ class CUDABackend(Backend):
     """
     NVIDIA CUDA backend supporting sm70 through sm130.
 
-    Executes via PyTorch CUDA when CUDA is available, otherwise falls back
-    to CPU PyTorch while reporting the correct hardware target capabilities.
+    Executes via PyTorch CUDA when CUDA is available.
 
     Supported targets: cuda_sm70, cuda_sm80, cuda_sm89, cuda_sm90,
                        cuda_sm100, cuda_sm120, cuda_sm130
@@ -106,15 +98,16 @@ class CUDABackend(Backend):
         return False
 
     def is_available(self) -> bool:
-        try:
-            import torch  # noqa: F401
-            return True  # Can always run (on CPU if no CUDA)
-        except ImportError:
-            return False
+        return self._cuda_available
 
     def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
         """Load a model for this CUDA target."""
-        # Delegate to torch backend for actual model loading
+        if not self._cuda_available:
+            raise BackendError(
+                f"CUDA runtime is not available for target {self.target_id}",
+                backend_name=self.name,
+                details={"target": self.target_id},
+            )
         try:
             from aether.backends.torch_backend import TorchBackend
             self._torch_backend = TorchBackend()
@@ -122,6 +115,12 @@ class CUDABackend(Backend):
         except Exception as exc:
             logger.warning(f"CUDA backend load failed: {exc}")
             return False
+
+    def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
+        model_path = aeg_path or model_id
+        if not self.load(model_path, kwargs or None):
+            raise BackendError(f"failed to load CUDA model {model_id!r}", backend_name=self.name)
+        return model_path
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         """Execute generation on this CUDA target."""
@@ -183,7 +182,7 @@ class ROCmBackend(Backend):
     """
     AMD ROCm/HIP backend supporting RDNA3 and CDNA3/MI300X.
 
-    Executes via PyTorch ROCm when available, otherwise CPU fallback.
+    Executes via PyTorch ROCm when available.
     Targets: rocm_rdna3, rocm_cdna3, rocm_cdna5_mi455x, amd_mi350x
     """
 
@@ -218,19 +217,27 @@ class ROCmBackend(Backend):
         return False
 
     def is_available(self) -> bool:
-        try:
-            import torch  # noqa: F401
-            return True
-        except ImportError:
-            return False
+        return self._rocm_available
 
     def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
+        if not self._rocm_available:
+            raise BackendError(
+                f"ROCm runtime is not available for target {self.target_id}",
+                backend_name=self.name,
+                details={"target": self.target_id},
+            )
         try:
             from aether.backends.torch_backend import TorchBackend
             self._torch_backend = TorchBackend()
             return self._torch_backend.load(model_path, config)
         except Exception:  # noqa: BLE001
             return False
+
+    def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
+        model_path = aeg_path or model_id
+        if not self.load(model_path, kwargs or None):
+            raise BackendError(f"failed to load ROCm model {model_id!r}", backend_name=self.name)
+        return model_path
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         if hasattr(self, "_torch_backend"):
@@ -242,6 +249,9 @@ class ROCmBackend(Backend):
             yield from self._torch_backend.generate_stream(request)
         else:
             raise BackendError(f"No model loaded for ROCm target {self.target_id}")
+
+    def get_capabilities(self) -> list[str]:
+        return self.info.capabilities
 
     def emit_hip_source(self, op_name: str, config: dict[str, Any]) -> str:
         """Emit HIP C++ source for a given operation."""
@@ -278,7 +288,7 @@ class MetalBackend(Backend):
     """
     Apple Metal backend for M1/M2/M3/M4/M5 Silicon.
 
-    Executes via PyTorch MPS when on Apple hardware, otherwise CPU fallback.
+    Executes via PyTorch MPS when on Apple hardware.
     Targets: metal_m1, metal_m3
     """
 
@@ -307,19 +317,27 @@ class MetalBackend(Backend):
         return False
 
     def is_available(self) -> bool:
-        try:
-            import torch  # noqa: F401
-            return True
-        except ImportError:
-            return False
+        return self._mps_available
 
     def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
+        if not self._mps_available:
+            raise BackendError(
+                f"Metal/MPS runtime is not available for target {self.target_id}",
+                backend_name=self.name,
+                details={"target": self.target_id},
+            )
         try:
             from aether.backends.torch_backend import TorchBackend
             self._torch_backend = TorchBackend()
             return self._torch_backend.load(model_path, config)
         except Exception:  # noqa: BLE001
             return False
+
+    def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
+        model_path = aeg_path or model_id
+        if not self.load(model_path, kwargs or None):
+            raise BackendError(f"failed to load Metal model {model_id!r}", backend_name=self.name)
+        return model_path
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         if hasattr(self, "_torch_backend"):
@@ -331,6 +349,9 @@ class MetalBackend(Backend):
             yield from self._torch_backend.generate_stream(request)
         else:
             raise BackendError(f"No model loaded for Metal target {self.target_id}")
+
+    def get_capabilities(self) -> list[str]:
+        return self.info.capabilities
 
     def emit_msl_source(self, op_name: str, config: dict[str, Any]) -> str:
         """Emit Metal Shading Language source for a kernel."""
@@ -371,7 +392,6 @@ class TensorRTLLMBackend(Backend):
     NVIDIA TensorRT-LLM backend.
 
     Provides the TensorRT-LLM interface for optimized NVIDIA inference.
-    Falls back to PyTorch CUDA when TRT-LLM engine is not compiled.
     """
 
     def __init__(self) -> None:
@@ -396,51 +416,41 @@ class TensorRTLLMBackend(Backend):
             return False
 
     def is_available(self) -> bool:
-        try:
-            import torch  # noqa: F401
-            return True
-        except ImportError:
-            return False
+        return self._trtllm_available
 
     def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
-        if self._trtllm_available:
-            # Real TRT-LLM engine loading
-            try:
-                import tensorrt_llm
-                # Load pre-compiled TRT-LLM engine if available
-                engine_dir = Path(model_path) / "kernels" / "trtllm"
-                if engine_dir.exists():
-                    self._engine_path = str(engine_dir)
-                    return True
-            except Exception:  # noqa: BLE001
-                pass
-        # Fallback to torch backend
-        try:
-            from aether.backends.torch_backend import TorchBackend
-            self._torch_backend = TorchBackend()
-            return self._torch_backend.load(model_path, config)
-        except Exception:  # noqa: BLE001
-            return False
+        if not self._trtllm_available:
+            raise BackendError("TensorRT-LLM Python package is not available", backend_name=self.name)
+        engine_dir = Path(model_path) / "kernels" / "trtllm"
+        if not engine_dir.exists():
+            raise BackendError(
+                f"TensorRT-LLM requires a pre-built engine directory at {engine_dir}",
+                backend_name=self.name,
+            )
+        self._engine_path = str(engine_dir)
+        return True
+
+    def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
+        engine_path = kwargs.get("engine_path")
+        model_path = str(engine_path or aeg_path or model_id)
+        if not self.load(model_path, kwargs or None):
+            raise BackendError(f"failed to load TensorRT-LLM model {model_id!r}", backend_name=self.name)
+        return model_path
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
-        if self._trtllm_available and self._engine_path:
-            # Real TRT-LLM inference
-            try:
-                import tensorrt_llm
-                # TRT-LLM inference would go here
-                pass
-            except Exception:  # noqa: BLE001
-                pass
-        # Fallback
-        if hasattr(self, "_torch_backend"):
-            return self._torch_backend.generate(request)
-        raise BackendError("TensorRT-LLM: no loaded engine and no fallback backend")
+        raise BackendError(
+            "TensorRT-LLM generation requires binding a real engine runner; no placeholder output is returned",
+            backend_name=self.name,
+        )
 
     def generate_stream(self, request: GenerationRequest) -> Iterator[GenerationResult]:
-        if hasattr(self, "_torch_backend"):
-            yield from self._torch_backend.generate_stream(request)
-        else:
-            raise BackendError("TensorRT-LLM: no loaded model")
+        raise BackendError(
+            "TensorRT-LLM streaming requires binding a real engine runner; no placeholder output is returned",
+            backend_name=self.name,
+        )
+
+    def get_capabilities(self) -> list[str]:
+        return self.info.capabilities
 
     def unload(self) -> None:
         self._engine_path = None
@@ -458,8 +468,7 @@ class RISCVNPUBackend(Backend):
     RISC-V NPU backend supporting MIPS S8200, SiFive X160, XuanTie C930.
 
     Compiles models to the RISC-V NPU Abstract IR and dispatches to the
-    appropriate vendor backend when available. CPU reference fallback
-    when no RISC-V hardware is present.
+    appropriate vendor backend when available.
 
     Reference: PRD v4.0 §3.2, RISC-V NPU Abstract IR specification.
     """
@@ -495,10 +504,14 @@ class RISCVNPUBackend(Backend):
             return False
 
     def is_available(self) -> bool:
-        return True  # Always available as CPU fallback
+        return self._ort_available
 
     def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
-        # Try to load ONNX model if available, otherwise CPU fallback
+        if not self._ort_available:
+            raise BackendError(
+                f"ONNX Runtime is required for RISC-V NPU target {self.target_id}",
+                backend_name=self.name,
+            )
         if self._ort_available:
             try:
                 from aether.backends.onnx_backend import ONNXBackend
@@ -508,13 +521,13 @@ class RISCVNPUBackend(Backend):
                     return self._onnx_backend.load(str(onnx_path), config)
             except Exception:  # noqa: BLE001
                 pass
-        # Fallback to torch
-        try:
-            from aether.backends.torch_backend import TorchBackend
-            self._torch_backend = TorchBackend()
-            return self._torch_backend.load(model_path, config)
-        except Exception:  # noqa: BLE001
-            return False
+        return False
+
+    def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
+        model_path = aeg_path or model_id
+        if not self.load(model_path, kwargs or None):
+            raise BackendError(f"failed to load RISC-V NPU model {model_id!r}", backend_name=self.name)
+        return model_path
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         if hasattr(self, "_onnx_backend"):
@@ -530,6 +543,9 @@ class RISCVNPUBackend(Backend):
             yield from self._torch_backend.generate_stream(request)
         else:
             raise BackendError(f"RISC-V NPU {self.target_id}: no loaded model")
+
+    def get_capabilities(self) -> list[str]:
+        return self.info.capabilities
 
     def compile_to_riscv_ir(self, graph: Any) -> dict[str, Any]:
         """Compile an AEG graph to the RISC-V NPU Abstract IR."""
@@ -558,8 +574,7 @@ class FPGABackend(Backend):
     The VU9P target is optimized for cost-efficient decode at 10x lower
     cost-per-token vs GPU through bitstream-based acceleration.
 
-    For standard AEG models: routes through ONNX Runtime.
-    For ternary models: routes through BitNet CPU engine.
+    For standard AEG models: requires a vendor or ONNX Runtime execution path.
     """
 
     def __init__(self, target_id: str = "fpga_xilinx_vu9p") -> None:
@@ -575,15 +590,19 @@ class FPGABackend(Backend):
         super().__init__(info)
 
     def is_available(self) -> bool:
-        return True  # CPU fallback always available
+        return False
 
     def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
-        try:
-            from aether.backends.torch_backend import TorchBackend
-            self._torch_backend = TorchBackend()
-            return self._torch_backend.load(model_path, config)
-        except Exception:  # noqa: BLE001
-            return False
+        raise BackendError(
+            f"FPGA runtime integration is not available for target {self.target_id}",
+            backend_name=self.name,
+        )
+
+    def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
+        self.load(aeg_path or model_id, kwargs or None)
+
+    def get_capabilities(self) -> list[str]:
+        return self.info.capabilities
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         if hasattr(self, "_torch_backend"):
@@ -630,15 +649,24 @@ class QualcommBackend(Backend):
         return any(Path(p).exists() for p in qnn_paths if p)
 
     def is_available(self) -> bool:
-        return True
+        return self._qnn_available
 
     def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
-        try:
-            from aether.backends.torch_backend import TorchBackend
-            self._torch_backend = TorchBackend()
-            return self._torch_backend.load(model_path, config)
-        except Exception:  # noqa: BLE001
-            return False
+        if not self._qnn_available:
+            raise BackendError(
+                f"Qualcomm QNN SDK is not available for target {self.target_id}",
+                backend_name=self.name,
+            )
+        raise BackendError(
+            f"Qualcomm QNN execution is not wired for target {self.target_id}",
+            backend_name=self.name,
+        )
+
+    def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
+        self.load(aeg_path or model_id, kwargs or None)
+
+    def get_capabilities(self) -> list[str]:
+        return self.info.capabilities
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         if hasattr(self, "_torch_backend"):

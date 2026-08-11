@@ -332,7 +332,7 @@ class AetherClient:
         if self._runtime is not None:
             return
         from aether.runtime import Runtime
-        self._runtime = Runtime.load(str(self.model_path))
+        self._runtime = Runtime()
         if self._enable_safety:
             try:
                 from aether.safety.production_safety import get_safety_engine
@@ -340,29 +340,6 @@ class AetherClient:
             except Exception:  # noqa: BLE001
                 pass
         logger.info(f"AetherClient loaded model: {self.model_path}")
-
-    def _make_fake_runtime(self) -> Any:
-        """
-        Create a minimal runtime stub for offline use without a real compiled model.
-        Used when no runtime is available but the SDK interface is needed.
-        """
-        class _FakeRuntime:
-            def generate(self, prompt: str, **kwargs: Any) -> Any:
-                class _Resp:
-                    text = f"[Stub response for: {prompt[:50]}...]"
-                    usage = type("U", (), {"prompt_tokens": 10, "completion_tokens": 20})()
-                    finish_reason = "stop"
-                    metrics = type("M", (), {
-                        "backend_name": "stub",
-                        "hardware_target": "cpu",
-                        "ttft_ms": 0.0,
-                        "total_ms": 0.0,
-                        "tokens_per_second": 0.0,
-                        "cache_hit": False,
-                        "spec_accept_rate": None,
-                    })()
-                return _Resp()
-        return _FakeRuntime()
 
     def generate(
         self,
@@ -411,14 +388,14 @@ class AetherClient:
                     model=self._model_id,
                 )
 
-        try:
-            self._ensure_loaded()
-            runtime = self._runtime
-        except Exception:  # noqa: BLE001
-            runtime = self._make_fake_runtime()
+        self._ensure_loaded()
+        runtime = self._runtime
+        if runtime is None:
+            raise RuntimeError(f"Aether runtime failed to load model: {self.model_path}")
 
         t_start = time.perf_counter()
         response = runtime.generate(
+            str(self.model_path),
             prompt,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -442,9 +419,15 @@ class AetherClient:
         )
 
         usage_raw = getattr(response, "usage", None)
+        if isinstance(usage_raw, dict):
+            prompt_tokens = int(usage_raw.get("prompt_tokens", 0))
+            completion_tokens = int(usage_raw.get("completion_tokens", 0))
+        else:
+            prompt_tokens = getattr(usage_raw, "prompt_tokens", 0) if usage_raw else 0
+            completion_tokens = getattr(usage_raw, "completion_tokens", 0) if usage_raw else 0
         usage = TokenUsage(
-            prompt_tokens=getattr(usage_raw, "prompt_tokens", 0) if usage_raw else 0,
-            completion_tokens=getattr(usage_raw, "completion_tokens", 0) if usage_raw else 0,
+            prompt_tokens=int(prompt_tokens),
+            completion_tokens=int(completion_tokens),
         )
 
         output_text = response.text
@@ -481,26 +464,18 @@ class AetherClient:
             for token in client.stream("Tell me about AI"):
                 print(token, end="", flush=True)
         """
-        try:
-            self._ensure_loaded()
-            runtime = self._runtime
-            if hasattr(runtime, "stream"):
-                yield from runtime.stream(
-                    prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop or [],
-                )
-                return
-        except Exception:  # noqa: BLE001
-            pass
-
-        # Fallback: generate in full and simulate streaming
-        response = self.generate(prompt, max_tokens=max_tokens, temperature=temperature)
-        words = response.text.split(" ")
-        for i, word in enumerate(words):
-            yield word + (" " if i < len(words) - 1 else "")
+        self._ensure_loaded()
+        runtime = self._runtime
+        if runtime is None or not hasattr(runtime, "generate_stream"):
+            raise RuntimeError(f"Aether runtime does not support streaming for model: {self.model_path}")
+        yield from runtime.generate_stream(
+            str(self.model_path),
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop or [],
+        )
 
     async def astream(
         self,
@@ -637,24 +612,13 @@ class AetherClient:
         if isinstance(text, list):
             return [self.embed(t, model=model) for t in text]  # type: ignore[return-value]
 
-        try:
-            self._ensure_loaded()
-            if hasattr(self._runtime, "embed"):
-                embedding_vec = self._runtime.embed(text)
-            else:
-                # Fallback: simple hash-based deterministic embedding for testing
-                import hashlib
-                import struct
-                dim = 768
-                h = hashlib.sha256(text.encode()).digest()
-                embedding_vec = []
-                for i in range(0, dim * 4, 4):
-                    idx = i % len(h)
-                    val = struct.unpack("f", h[idx:idx+4] if idx+4 <= len(h) else (h[idx:] + h[:4-len(h)+idx]))[0]
-                    embedding_vec.append(val)
-                embedding_vec = embedding_vec[:dim]
-        except Exception:  # noqa: BLE001
-            embedding_vec = [0.0] * 768
+        self._ensure_loaded()
+        if self._runtime is None or not hasattr(self._runtime, "embed"):
+            raise RuntimeError(f"Aether runtime does not support embeddings for model: {self.model_path}")
+        embedding_result = self._runtime.embed(str(self.model_path), [text])
+        if not embedding_result or not isinstance(embedding_result[0], list):
+            raise RuntimeError(f"Aether runtime returned no embedding for model: {self.model_path}")
+        embedding_vec = embedding_result[0]
 
         return EmbeddingResponse(
             embedding=embedding_vec,

@@ -289,6 +289,33 @@ def test_tensorrt_backend_never_returns_placeholder_output() -> None:
         TensorRTLLMBackend().generate(GenerationRequest(model_id="model", prompt="hello"))
 
 
+def test_sdk_never_returns_stub_response_for_missing_model(tmp_path: Path) -> None:
+    from aether.sdk import AetherClient
+
+    client = AetherClient(tmp_path / "missing-model.aeg", enable_safety=False)
+
+    with pytest.raises(Exception, match="missing-model|does not exist|failed to load"):
+        client.generate("hello")
+
+
+def test_sdk_stream_never_simulates_tokens_for_missing_model(tmp_path: Path) -> None:
+    from aether.sdk import AetherClient
+
+    client = AetherClient(tmp_path / "missing-model.aeg", enable_safety=False)
+
+    with pytest.raises(Exception, match="missing-model|does not exist|failed to load"):
+        list(client.stream("hello"))
+
+
+def test_sdk_embed_never_returns_hash_or_zero_fallback_for_missing_model(tmp_path: Path) -> None:
+    from aether.sdk import AetherClient
+
+    client = AetherClient(tmp_path / "missing-model.aeg", enable_safety=False)
+
+    with pytest.raises(Exception, match="missing-model|does not exist|failed to load"):
+        client.embed("hello")
+
+
 def test_runtime_eval_gate_never_treats_nonempty_text_as_quality() -> None:
     from aether.runtime.runtime import Runtime
 
