@@ -232,6 +232,18 @@ class KVCache:
             raise ValueError("token_count must be non-negative")
         self.logical_length += int(token_count)
 
+    def clone(self) -> "KVCache":
+        """Copy cache state so multiple requests can safely diverge from a prefix."""
+        return KVCache(
+            num_layers=self.num_layers,
+            keys=[None if value is None else value.copy() for value in self.keys],
+            values=[None if value is None else value.copy() for value in self.values],
+            positions=[None if value is None else value.copy() for value in self.positions],
+            logical_length=self.logical_length,
+            last_logits=None if self.last_logits is None else self.last_logits.copy(),
+            last_hidden=None if self.last_hidden is None else self.last_hidden.copy(),
+        )
+
     def reset(self) -> None:
         """Drop all cached state."""
         self.keys = [None] * self.num_layers

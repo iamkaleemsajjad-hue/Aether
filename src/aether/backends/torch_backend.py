@@ -381,13 +381,68 @@ class TorchBackend(Backend):
             session_id = request.extra.get("aether_kv_session_id")
             cache_session_id = None if ttt_state is not None else session_id
             reused_tokens = 0
-            cached_state = (
-                handle.session_caches.get(cache_session_id)
-                if isinstance(cache_session_id, str)
-                else None
-            )
+            multi_agent_reused_tokens = 0
             cache = None
             suffix = prompt_ids
+
+            # R2 is connected to normal compiled-CPU generation through an
+            # explicit shared-prefix boundary. The coordinator owns one
+            # immutable prefix cache; each agent clones it before appending its
+            # private suffix, so divergent requests cannot corrupt one another.
+            coordinator = request.extra.get("multi_agent_kv_coordinator")
+            prefix_text = request.extra.get("multi_agent_prefix")
+            prefix_hash = request.extra.get("multi_agent_prefix_hash")
+            if (
+                ttt_state is None
+                and coordinator is not None
+                and isinstance(prefix_text, str)
+                and prefix_text
+                and isinstance(prefix_hash, str)
+                and prefix_hash
+            ):
+                import numpy as np
+
+                if coordinator.hash_prefix(prefix_text) != prefix_hash:
+                    raise BackendError(
+                        "R2 multi-agent prefix hash does not match its text",
+                        backend_name=self.name,
+                    )
+                prefix_encoded = handle.tokenizer(prefix_text, return_tensors="np")
+                prefix_ids = np.asarray(prefix_encoded["input_ids"][0], dtype=np.int64)
+                candidate = np.asarray(prompt_ids, dtype=np.int64)
+                if (
+                    prefix_ids.size == 0
+                    or candidate.size < prefix_ids.size
+                    or not np.array_equal(candidate[: prefix_ids.size], prefix_ids)
+                ):
+                    raise BackendError(
+                        "R2 multi-agent prefix is not an exact token prefix of the request",
+                        backend_name=self.name,
+                    )
+                shared_cache, shared_length = coordinator.get_shared_kv(prefix_hash)
+                if shared_cache is None:
+                    _prefix_logits, shared_cache = execution_engine.forward(prefix_ids)
+                    coordinator.update_shared_kv(
+                        prefix_hash,
+                        shared_cache,
+                        seq_len=int(prefix_ids.size),
+                    )
+                    shared_length = int(prefix_ids.size)
+                else:
+                    multi_agent_reused_tokens = int(shared_length)
+                if int(shared_length) != int(prefix_ids.size):
+                    raise BackendError(
+                        "R2 shared KV length does not match the tokenized prefix",
+                        backend_name=self.name,
+                    )
+                cache = shared_cache.clone()
+                suffix = candidate[prefix_ids.size :]
+
+            cached_state = (
+                handle.session_caches.get(cache_session_id)
+                if cache is None and isinstance(cache_session_id, str)
+                else None
+            )
             if cached_state is not None:
                 import numpy as np
 
@@ -472,6 +527,8 @@ class TorchBackend(Backend):
                     "device": "cpu",
                     "kv_reuse": reused_tokens > 0,
                     "kv_reused_tokens": reused_tokens,
+                    "multi_agent_kv_reuse": multi_agent_reused_tokens > 0,
+                    "multi_agent_kv_reused_tokens": multi_agent_reused_tokens,
                     **(
                         {"ttt_adaptation_loss": ttt_state[3]}
                         if ttt_state is not None

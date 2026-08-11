@@ -89,7 +89,8 @@
       "Bash(grep -o -a -E '\"[^\"]{0,120}\\(denied|Denied|not allowed|blocked by|Blocked|deny list|Deny list|denylist\\)[^\"]{0,120}\"' workbench.desktop.main.js)",
       "Bash(grep -r -a -o -E '.{0,50}\\(secureModeEnabled|cascadeAutoExecutionPolicy|terminalAutoExecutionPolicy|cascadeDeniedCommands|enableTerminalSandbox\\).{0,120}' \"Local Storage\" User/globalStorage/state.vscdb)",
       "Bash(perl -0777 -ne 'while\\(/defaultValue:KA\\\\.terminalDeniedCommands/g\\){ print substr\\($_, pos\\($_\\)-700, 900\\), \"\\\\n=====\\\\n\"; }' workbench.desktop.main.js)",
-      "Bash(perl -0777 -ne 'while\\(/ENABLE_TERMINAL_SANDBOX,\\\\{/g\\){ print substr\\($_, pos\\($_\\)-30, 700\\), \"\\\\n=====\\\\n\"; }' workbench.desktop.main.js)"
+      "Bash(perl -0777 -ne 'while\\(/ENABLE_TERMINAL_SANDBOX,\\\\{/g\\){ print substr\\($_, pos\\($_\\)-30, 700\\), \"\\\\n=====\\\\n\"; }' workbench.desktop.main.js)",
+      "Bash(python -m pytest --collect-only -q)"
     ]
   }
 }

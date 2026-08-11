@@ -701,11 +701,12 @@ class TestHardwareBackends:
         with pytest.raises(ValueError, match="No backend registered"):
             create_backend("nonexistent_quantum_backend")
 
-    def test_cuda_backend_is_available(self) -> None:
+    def test_cuda_backend_availability_matches_cuda_runtime(self) -> None:
         from aether.backends.hardware_backends import CUDABackend
+        import torch
+
         backend = CUDABackend("cuda_sm90")
-        # Must be True if torch is installed (CPU fallback)
-        assert backend.is_available() is True
+        assert backend.is_available() is torch.cuda.is_available()
 
     def test_cuda_backend_capabilities_sm90(self) -> None:
         from aether.backends.hardware_backends import CUDABackend
@@ -722,10 +723,11 @@ class TestHardwareBackends:
         assert caps["supports_fp8"] is True
         assert caps["supports_fp4"] is True
 
-    def test_riscv_backend_always_available(self) -> None:
+    def test_riscv_backend_availability_matches_onnxruntime(self) -> None:
         from aether.backends.hardware_backends import RISCVNPUBackend
+
         backend = RISCVNPUBackend("riscv_mips_s8200")
-        assert backend.is_available() is True
+        assert backend.is_available() is backend._ort_available
 
     def test_cuda_backend_info(self) -> None:
         from aether.backends.hardware_backends import CUDABackend

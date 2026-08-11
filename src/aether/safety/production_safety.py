@@ -122,7 +122,7 @@ class JailbreakDetector:
         # Many-shot jailbreaking
         (r"(human:\s*|assistant:\s*){5,}", 0.70, HarmCategory.JAILBREAK),  # Fake conversation injection
         # Harmful content requests
-        (r"\bhow\s+to\s+(make|build|create|synthesize|produce)\s+(a\s+)?(bomb|explosive|weapon|nerve\s+agent|poison)\b", 0.95, HarmCategory.ILLEGAL_WEAPONS),
+        (r"\bhow\s+to\s+(make|build|create|synthesize|produce)\s+(a\s+)?(bomb|explosive[s]?|weapon[s]?|nerve\s+agent|poison)\b", 0.95, HarmCategory.ILLEGAL_WEAPONS),
         (r"\bhow\s+to\s+(synthesize|produce|manufacture)\s+(meth|fentanyl|heroin|cocaine)\b", 0.90, HarmCategory.ILLEGAL_DRUGS),
         (r"\bhow\s+to\s+(hack|exploit|attack|breach)\s+(a\s+)?(server|database|account|network|website)\b", 0.80, HarmCategory.CYBER_ATTACK),
         (r"\bgenerate\s+(nude|explicit|sexual)\s+(image|content|photo)\s+(of\s+)?(a\s+)?(child|minor|kid)\b", 1.00, HarmCategory.CHILD_EXPLOITATION),

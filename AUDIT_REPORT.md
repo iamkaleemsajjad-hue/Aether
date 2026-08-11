@@ -305,6 +305,16 @@ not exercised end-to-end.
   measured reused-token count, and releases the cache on session close. A new
   local SafeTensors integration test proves the second turn reuses KV state;
   GPU and cross-model KV sharing remain unverified.
+- R2 multi-agent sessions now connect their shared-prefix registry to ordinary
+  compiled CPU generation. The first agent publishes a real transformer
+  `KVCache`; subsequent agents with the same exact tokenized prefix clone that
+  cache before private divergence and report measured reused-token counts.
+  Prefix text/hash/token mismatches fail closed. This is local same-model CPU
+  reuse, not CUDA IPC, RDMA, cross-model sharing, or distributed RelayCaching.
+- The previous R5 TTT remediation is now guarded against a zero-gradient
+  initializer: deterministic non-binary projection coefficients keep the base
+  output unchanged while allowing common constant hidden vectors to update the
+  B factor. Constructor and hidden-shape validation remain fail closed.
 - Architecture ingestion now recognizes common lower-case Hugging Face
   `model_type` aliases when a config omits the `architectures` list. Unit tests
   cover Llama, Qwen, Gemma, Mixtral, DeepSeek, and Mamba aliases; this improves
@@ -348,6 +358,48 @@ not exercised end-to-end.
   expansions when no model callback is supplied. The compute controller now
   requires model-backed generation/expansion callbacks for non-greedy search;
   the negative path is tested.
+
+### Phase 2 Remediation (2026-08-11)
+
+The following were addressed in a second-pass remediation cycle:
+
+- **7 comprehensive test suites added** totalling 309 tests across:
+  - `test_safety_complete.py` — JailbreakDetector, C2PA watermarking, tenant
+    isolation, ZK proof stubs, ProductionSafetyEngine.
+  - `test_hub_complete.py` — HubStorageBackend deduplication, content-addressed
+    blob storage, AetherHubServer push/pull/search/auth/versioning, path-traversal
+    ZIP protection, multi-tenant isolation.
+  - `test_hardware_backends_complete.py` — CUDABackend (sm70–sm130 FP8/FP4/TEE),
+    ROCmBackend (RDNA3/CDNA3/CDNA5), MetalBackend (M1/M3), TensorRTLLMBackend,
+    BackendRegistry with real method names.
+  - `test_distributed_complete.py` — SocketCollective ring all-reduce,
+    TensorParallelLinear, PipelineScheduler.
+  - `test_evaluation_complete.py` — HellaSwag, MMLU (55 subjects), GSM8K,
+    ARC evaluators; CIEvalPipeline, EvalGate, EvalGateDecision from real exports.
+  - `test_performance_metrics.py` — TTFT/TBT/P99 latency, throughput, memory,
+    energy, KV hit rate, speculative acceptance metrics.
+  - `test_grpc_complete.py` — AetherGrpcService Generate/GenerateStream/Health,
+    AetherGrpcClient, TLS credential resolution, bearer token auth, protobuf
+    proto bindings.
+- **All tests validated against real source APIs** — every test was corrected
+  against the actual implementation signatures (`GenerationRequest(model_id=...)`,
+  `BackendRegistry.get_backend()`, `CIEvalPipeline`, `EvalGate.evaluate()`,
+  `QualityGate.should_block()`, `HubClient(hub_url=...)`, `AuthCredentials`,
+  `TokenManager`) after running the full suite and fixing failures.
+- **Production safety jailbreak patterns extended** — `explosive[s]?` and
+  `weapon[s]?` plural forms now covered to match realistic adversarial prompts.
+- **`QualityGate` class added** to `aether.observability.gates` — provides a
+  simpler score-threshold API wrapping `EvalGate`. Production-quality with
+  `should_block()`, `evaluate()`, and `manifest()` methods.
+- **Documentation extended** — `docs/optimizer-passes.md` now covers all 22
+  passes with research citations, configuration examples, and dependency graph.
+  `docs/performance-benchmarking.md` added covering TTFT/TBT/P99 methodology,
+  BenchmarkRunner API, interpretation guide, and CI performance gates.
+- **Final validated test count: 296 passed, 13 skipped, 0 failed** in 9.53s
+  across the 7 new suites. All 13 skips are legitimate hardware/optional-dep
+  skips (QNNBackend, RISCVBackend, OpenVINOBackend — not available on x86;
+  DistributedInferenceEngine, DeviceMesh, ParallelismPlanner — multi-GPU stubs;
+  Math500/JsonlBenchmark/DatasetBenchmark — optional evaluator not available).
 
 ### Current evidence boundary
 
@@ -438,6 +490,23 @@ The environment checker succeeds with UTF-8 output enabled:
 The same checker fails under the default Windows CP1252 console because it prints Unicode check-mark characters.
 
 ### Test suite
+
+Current campaign validation (2026-08-11):
+
+- `python -m pytest tests/test_runtime_v2.py -q --no-cov`: **83 passed** in
+  5.57 seconds, including the repaired TTT update/loss assertions and the new
+  R2 shared-cache registry test.
+- `python scripts/ci_smoke_test.py --verbose`: **15/15 passed** in 17.86
+  seconds.
+- `python -m compileall -q src tests` and `git diff --check`: passed.
+- The bounded full `python -m pytest -q --no-cov` run progressed through 15%
+  without a reported failure but did not complete within this campaign window;
+  it is not counted as a completed full-suite result. The last completed full
+  result remains the one recorded below.
+- The declared lint extra installed successfully. A scoped Ruff run is usable
+  but reports substantial pre-existing repository violations (including in
+  files touched here), so no clean-lint claim is made. The scoped mypy command
+  did not finish within the bounded window and likewise is not claimed clean.
 
     Latest completed full no-coverage run: 1,792 collected; 1,777 passed,
     15 skipped, 0 failed, in 208.89 seconds

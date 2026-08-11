@@ -63,6 +63,10 @@ class TTTFastWeightEngine:
         session_scoped: bool = False,
         ttt_config_path: str | None = None,
     ) -> None:
+        if n_layers <= 0 or hidden_size <= 0 or rank <= 0:
+            raise ValueError("n_layers, hidden_size, and rank must be positive")
+        if not math.isfinite(learning_rate) or learning_rate <= 0:
+            raise ValueError("learning_rate must be a positive finite value")
         self.n_layers = n_layers
         self.hidden_size = hidden_size
         self.rank = rank
@@ -82,10 +86,24 @@ class TTTFastWeightEngine:
             self._load_config(ttt_config_path)
 
     def _init_slot(self, hidden_size: int, rank: int) -> dict[str, list[float]]:
-        """Initialize a fast-weight slot with zero A, zero B, unit LayerNorm."""
+        """Initialize a trainable low-rank slot deterministically.
+
+        Initializing both LoRA factors to zero makes every gradient zero.  A is
+        therefore a fixed, deterministic signed projection while B starts at
+        zero, preserving the base model output until the first adaptation step.
+        """
+        scale = 1.0 / math.sqrt(max(1, hidden_size))
+        # Use deterministic non-binary coefficients. A simple alternating-sign
+        # matrix annihilates common constant hidden vectors, leaving B's first
+        # gradient exactly zero and making adaptation a no-op.
+        a_values = [
+            scale * (((row * 131 + col * 17) % 7) - 3) / 3.0
+            for row in range(hidden_size)
+            for col in range(rank)
+        ]
         return {
-            "A": [0.0] * (hidden_size * rank),       # LoRA A matrix (flattened)
-            "B": [0.0] * (rank * hidden_size),        # LoRA B matrix (flattened)
+            "A": a_values,                              # H × R projection
+            "B": [0.0] * (rank * hidden_size),         # R × H output adapter
             "mu": [0.0] * hidden_size,                 # LayerNorm shift
             "sigma": [1.0] * hidden_size,              # LayerNorm scale (init to 1)
             "momentum_A": [0.0] * (hidden_size * rank),
@@ -216,17 +234,24 @@ class TTTFastWeightEngine:
                 self.begin_request(request_id)
             weights = self._active_weights[request_id]
 
-        layers_to_adapt = range(self.n_layers) if layer_idx < 0 else [layer_idx]
+        if not hidden_states:
+            raise ValueError("hidden_states must contain at least one vector")
+        if any(len(vector) != self.hidden_size for vector in hidden_states):
+            raise ValueError(
+                f"every hidden-state vector must have width {self.hidden_size}"
+            )
+        if layer_idx >= self.n_layers or layer_idx < -1:
+            raise IndexError(f"layer_idx {layer_idx} is outside [0, {self.n_layers})")
+
+        layers_to_adapt = list(range(self.n_layers)) if layer_idx < 0 else [layer_idx]
         total_loss = 0.0
 
         for l_idx in layers_to_adapt:
-            if l_idx >= len(weights):
-                continue
             slot = weights[l_idx]
             loss = self._gradient_step(slot, hidden_states)
             total_loss += loss
 
-        avg_loss = total_loss / max(1, len(list(layers_to_adapt)))
+        avg_loss = total_loss / len(layers_to_adapt)
         self._stats.total_adapt_steps += 1
         self._stats.total_adapt_time_ms += (time.perf_counter() - start) * 1000
 
@@ -290,16 +315,22 @@ class TTTFastWeightEngine:
         residual = [BAh[j] - h_mean[j] for j in range(H)]
         loss = sum(r * r for r in residual) / H
 
-        # Gradient step on A and B (simplified outer product).
-        for j in range(H):
-            for k in range(R):
-                grad_A = 2.0 / H * residual[j] * Ah[k]
-                slot["A"][j * R + k] -= lr * grad_A
-
+        # Exact gradients for y = B(Ah).  Updating B first would leak the new
+        # value into grad_A, so both gradients are computed from snapshots.
+        grad_b = [0.0] * (R * H)
+        grad_a = [0.0] * (H * R)
+        scale = 2.0 / H
         for k in range(R):
+            backprop_k = sum(residual[j] * B[k * H + j] for j in range(H))
+            for i in range(H):
+                grad_a[i * R + k] = scale * h_mean[i] * backprop_k
             for j in range(H):
-                grad_B = 2.0 / H * Ah[k] * residual[j]
-                slot["B"][k * H + j] -= lr * grad_B
+                grad_b[k * H + j] = scale * Ah[k] * residual[j]
+
+        for index, gradient in enumerate(grad_a):
+            slot["A"][index] -= lr * gradient
+        for index, gradient in enumerate(grad_b):
+            slot["B"][index] -= lr * gradient
 
         return loss
 

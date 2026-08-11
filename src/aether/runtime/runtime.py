@@ -163,6 +163,10 @@ class _MultiAgentAgent:
         if not isinstance(prompt, str) or not prompt:
             raise ValueError("agent prompt must be a non-empty string")
         full_prompt = f"{self.context}\n\n{prompt}" if self.context else prompt
+        if self.context and self.prefix_hash:
+            kwargs.setdefault("multi_agent_kv_coordinator", self._session._coordinator)
+            kwargs.setdefault("multi_agent_prefix", f"{self.context}\n\n")
+            kwargs.setdefault("multi_agent_prefix_hash", self.prefix_hash)
         return self._runtime.generate(self.model_id, full_prompt, **kwargs)
 
 
