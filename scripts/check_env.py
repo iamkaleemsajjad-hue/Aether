@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import platform
@@ -22,6 +23,10 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+# Force UTF-8 output on Windows to avoid CP1252 UnicodeEncodeError with ✓/✗
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf-8-sig"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 
 # ── Minimum versions ─────────────────────────────────────────────────────────
@@ -194,7 +199,7 @@ def _tick(ok: bool, warn: bool = False) -> str:
 def _print_report(report: EnvReport, strict: bool) -> None:
     print(f"\n{BOLD}Aether Runtime — Environment Check{RESET}")
     print("=" * 50)
-    print(f"Python  {report.python_version}  {'✓' if report.python_ok else '✗'}")
+    print(f"Python  {report.python_version}  {_tick(report.python_ok)}")
     print(f"OS      {report.platform}")
     print()
 
