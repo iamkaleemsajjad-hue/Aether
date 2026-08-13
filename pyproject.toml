@@ -192,7 +192,9 @@ pruning_sparsity = "aether.compiler.stage2_optimizer.pass9_pruning_sparsity:Prun
 [project.entry-points."aether.ingestion.loaders"]
 vlm = "aether.compiler.stage1_ingestion.vlm_loader:VLMLoader"
 ssm = "aether.compiler.stage1_ingestion.ssm_loader:SSMLoader"
-video = "aether.compiler.stage1_ingestion.vlm_loader:VideoModelLoader"
+video = "aether.compiler.stage1_ingestion.video_loader:VideoModelLoader"
+mla = "aether.compiler.stage1_ingestion.mla_loader:MLALoader"
+moe = "aether.compiler.stage1_ingestion.moe_loader:MoELoader"
 
 [project.entry-points."aether.backends.hardware"]
 cuda = "aether.backends.hardware_backends:CUDABackend"

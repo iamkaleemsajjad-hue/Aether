@@ -193,6 +193,35 @@ class ArchitectureDetector:
                 name = name[len(normalized_prefix):]
         return name
 
+    def _detect_family_from_arch_type(self, arch_type: str) -> str | None:
+        """Map GGUF/config architecture type to family."""
+        arch_lower = arch_type.lower()
+
+        # Common model type aliases
+        family_mapping = {
+            "llama": "llama_family",
+            "qwen": "qwen_family", "qwen2": "qwen_family",
+            "gemma": "gemma_family", "gemma2": "gemma_family",
+            "mistral": "mistral_family",
+            "mixtral": "moe_family",
+            "deepseek": "deepseek_family", "deepseek_v2": "deepseek_family",
+            "phi": "phi_family", "phi3": "phi_family",
+            "mamba": "hybrid_ssm_family",
+            "jamba": "hybrid_ssm_family",
+            "rwkv": "hybrid_ssm_family",
+            "falcon": "falcon_family",
+            "bloom": "bloom_family",
+            "gpt2": "gpt_family", "gpt_neox": "gpt_family",
+            "opt": "opt_family",
+            "stablelm": "stablelm_family",
+        }
+
+        for key, family in family_mapping.items():
+            if key in arch_lower:
+                return family
+
+        return None
+
     def _spec_to_architecture(self, model: str, spec: dict[str, Any]) -> ModelArchitecture:
         """Convert a known spec to a ModelArchitecture."""
         architecture_model = ModelArchitecture(

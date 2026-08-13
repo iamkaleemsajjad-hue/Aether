@@ -345,10 +345,10 @@ class TestDisaggregatedImports:
 
     def test_distributed_inference_engine_importable(self):
         """The distributed inference engine should be importable."""
-        try:
-            from aether.parallelism.distributed import DistributedInferenceEngine
-        except ImportError:
-            pytest.skip("DistributedInferenceEngine not yet implemented")
+        from aether.parallelism.distributed import DistributedInferenceEngine
+        engine = DistributedInferenceEngine(world_size=1, rank=0)
+        assert engine is not None
+        assert engine.world_size == 1
 
 
 # ---------------------------------------------------------------------------
@@ -399,28 +399,24 @@ class TestMultiProcessDistributed:
 
 class TestParallelismPlanner:
     def test_sharding_plan_importable(self):
-        try:
-            from aether.parallelism.planner import ParallelismPlanner
-            from aether.core.types import ModelArchitecture
-            # ParallelismPlanner requires a ModelArchitecture argument
-            arch = ModelArchitecture(
-                family="llama",
-                num_layers=32,
-                hidden_size=4096,
-                num_attention_heads=32,
-                num_kv_heads=8,
-                intermediate_size=11008,
-                vocab_size=32000,
-            )
-            planner = ParallelismPlanner(architecture=arch)
-            assert planner is not None
-        except (ImportError, Exception):
-            pytest.skip("ParallelismPlanner or ModelArchitecture not importable")
+        from aether.parallelism.planner import ParallelismPlanner
+        from aether.core.types import ModelArchitecture
+        arch = ModelArchitecture(
+            family="llama",
+            params_billion=7.0,
+            layers=32,
+            hidden_size=4096,
+            num_attention_heads=32,
+            num_kv_heads=8,
+            intermediate_size=11008,
+            vocab_size=32000,
+        )
+        planner = ParallelismPlanner(architecture=arch)
+        assert planner is not None
 
     def test_mesh_importable(self):
-        try:
-            from aether.parallelism.mesh import DeviceMesh
-            mesh = DeviceMesh(world_size=4, tp_degree=2, pp_degree=2)
-            assert mesh is not None
-        except (ImportError, Exception):
-            pytest.skip("DeviceMesh not importable or mesh config not supported")
+        from aether.parallelism.mesh import DeviceMesh
+        # DeviceMesh takes a shape tuple: (tp_degree, pp_degree)
+        mesh = DeviceMesh(shape=(2, 2))
+        assert mesh is not None
+        assert mesh.shape == (2, 2)
