@@ -74,27 +74,160 @@ class IngestionPipeline:
         format_type = self._detect_format(model)
         logger.info(f"Ingesting model {model} (format: {format_type})")
 
-        if format_type == "safetensors":
-            graph = self._ingest_safetensors(model, architecture)
-        elif format_type == "gguf":
-            graph = self._ingest_gguf(model, architecture)
-        elif format_type == "onnx":
-            graph = self._ingest_onnx(model, architecture)
-        elif format_type == "mlx":
-            graph = self._ingest_mlx(model, architecture)
-        elif format_type == "pytorch":
-            graph = self._ingest_pytorch(model, architecture)
-        elif format_type == "auto":
-            graph = self._ingest_auto(model, architecture)
-        else:
-            msg = f"Unsupported model format: {format_type}"
-            raise UnsupportedFormatError(msg)
+        # --- Specialised sub-loaders (run before generic format dispatch) ---
+        # These produce a richer graph than the generic architecture builder.
+        graph = self._try_specialised_loader(model, architecture, format_type)
+        if graph is None:
+            # Generic format dispatch
+            if format_type == "safetensors":
+                graph = self._ingest_safetensors(model, architecture)
+            elif format_type == "gguf":
+                graph = self._ingest_gguf(model, architecture)
+            elif format_type == "onnx":
+                graph = self._ingest_onnx(model, architecture)
+            elif format_type == "mlx":
+                graph = self._ingest_mlx(model, architecture)
+            elif format_type == "pytorch":
+                graph = self._ingest_pytorch(model, architecture)
+            elif format_type == "auto":
+                graph = self._ingest_auto(model, architecture)
+            else:
+                msg = f"Unsupported model format: {format_type}"
+                raise UnsupportedFormatError(msg)
         local_path = Path(model)
         if local_path.exists() and (
             local_path.is_dir() or local_path.suffix.lower() in {".gguf", ".ggml"}
         ):
             graph.set_metadata("source_model_path", str(local_path.resolve()))
             graph.set_metadata("source_format", format_type)
+        return graph
+
+    def _try_specialised_loader(
+        self,
+        model: str,
+        architecture: ModelArchitecture,
+        format_type: str,
+    ) -> "AEGGraph | None":
+        """Attempt to load using a specialised sub-loader.
+
+        Returns a populated AEGGraph when a specialised loader succeeds, or
+        None to fall through to the generic format dispatch.  All failures are
+        caught and logged so the caller can fall back gracefully.
+        """
+        path = Path(model)
+
+        # Load config.json to detect specialised architectures
+        config: dict[str, Any] = {}
+        config_path = (path / "config.json") if path.is_dir() else None
+        if config_path and config_path.is_file():
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        arch_family = (getattr(architecture, "family", "") or "").lower()
+        model_type = (config.get("model_type") or arch_family).lower()
+
+        # --- MLA (DeepSeek V2/V3/R1) ---
+        if "deepseek" in model_type or "kv_lora_rank" in config:
+            try:
+                from aether.compiler.stage1_ingestion.mla_loader import MLALoader
+                if path.exists():
+                    result = MLALoader(path).load()
+                    graph = self._wrap_specialised_result(result, architecture)
+                    logger.info("Ingested via MLALoader (DeepSeek MLA)")
+                    return graph
+            except Exception as exc:
+                logger.warning(f"MLALoader failed, falling back: {exc}")
+
+        # --- MoE (Mixtral, Qwen MoE, Jamba, DBRX, OLMoE) ---
+        moe_keys = {"num_local_experts", "n_routed_experts", "moe_layer_frequency"}
+        if moe_keys & set(config.keys()) or getattr(architecture, "is_moe", False):
+            try:
+                from aether.compiler.stage1_ingestion.moe_loader import MoELoader
+                if path.exists():
+                    result = MoELoader(path).load()
+                    graph = self._wrap_specialised_result(result, architecture)
+                    logger.info("Ingested via MoELoader")
+                    return graph
+            except Exception as exc:
+                logger.warning(f"MoELoader failed, falling back: {exc}")
+
+        # --- Video models ---
+        video_keys = {"max_frames", "video_config", "num_video_query_token"}
+        if (video_keys & set(config.keys())
+                or any(k in model_type for k in ("video_llama", "videochat", "llava_video"))):
+            try:
+                from aether.compiler.stage1_ingestion.video_loader import VideoModelLoader
+                if path.exists():
+                    result = VideoModelLoader(path).load()
+                    graph = self._wrap_specialised_result(result, architecture)
+                    logger.info("Ingested via VideoModelLoader")
+                    return graph
+            except Exception as exc:
+                logger.warning(f"VideoModelLoader failed, falling back: {exc}")
+
+        # --- VLM (LLaVA, Qwen-VL, InternVL, PaliGemma, etc.) ---
+        vlm_types = {"llava", "qwen2_vl", "internvl", "paligemma", "phi3_v", "pixtral"}
+        has_vision_config = "vision_config" in config or "visual_config" in config
+        if any(vt in model_type for vt in vlm_types) or has_vision_config:
+            try:
+                from aether.compiler.stage1_ingestion.vlm_loader import VLMLoader
+                if path.exists():
+                    result = VLMLoader(path).load()
+                    graph = self._wrap_specialised_result(result, architecture)
+                    logger.info("Ingested via VLMLoader")
+                    return graph
+            except Exception as exc:
+                logger.warning(f"VLMLoader failed, falling back: {exc}")
+
+        # --- SSM / Mamba / Jamba ---
+        ssm_types = {"mamba", "jamba", "rwkv", "retnet", "ssm"}
+        if any(st in model_type for st in ssm_types):
+            try:
+                from aether.compiler.stage1_ingestion.ssm_loader import SSMLoader
+                if path.exists():
+                    result = SSMLoader(path).load()
+                    graph = self._wrap_specialised_result(result, architecture)
+                    logger.info("Ingested via SSMLoader")
+                    return graph
+            except Exception as exc:
+                logger.warning(f"SSMLoader failed, falling back: {exc}")
+
+        return None  # No specialised loader matched — use generic dispatch
+
+    def _wrap_specialised_result(
+        self,
+        result: dict[str, Any],
+        architecture: ModelArchitecture,
+    ) -> AEGGraph:
+        """Convert a specialised loader result dict into an AEGGraph.
+
+        If the result already contains an AEGGraph (keyed ``"graph"``), it is
+        returned directly after attaching architecture metadata.  Otherwise a
+        skeleton AEGGraph is built from the result weights.
+        """
+        if "graph" in result and isinstance(result["graph"], AEGGraph):
+            graph = result["graph"]
+        else:
+            # Fallback: construct a generic architecture graph
+            graph = AEGGraph(
+                name=f"{getattr(architecture, 'family', 'model')}",
+                architecture=architecture,
+            )
+            self._build_architecture_graph(graph, architecture)
+            # Attach weights if present
+            if "weights" in result:
+                self._attach_weight_dict(graph, result["weights"])
+
+        # Record specialised loader metadata
+        if hasattr(graph, "set_metadata"):
+            if "architecture" in result:
+                loader_arch = result["architecture"]
+                graph.set_metadata("specialised_loader_arch", str(type(loader_arch).__name__))
+            if "format" in result:
+                graph.set_metadata("specialised_loader_format", result["format"])
+
         return graph
 
     def _detect_format(self, model: str) -> str:

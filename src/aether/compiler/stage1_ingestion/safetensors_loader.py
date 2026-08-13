@@ -107,5 +107,109 @@ class SafeTensorsLoader:
             return json.loads(config_path.read_text())
         return {}
 
+    def validate_weights(self) -> dict[str, Any]:
+        """Validate loaded weights for completeness and integrity.
+
+        Returns:
+            Validation report with warnings and errors.
+        """
+        report = {
+            "valid": True,
+            "warnings": [],
+            "errors": [],
+            "missing_keys": [],
+            "unexpected_keys": [],
+            "shape_mismatches": [],
+        }
+
+        if not self._tensors:
+            report["valid"] = False
+            report["errors"].append("No tensors loaded")
+            return report
+
+        # Load config to validate against expected architecture
+        config = self.load_config()
+        if not config:
+            report["warnings"].append("No config.json found - skipping architecture validation")
+            return report
+
+        # Expected tensor patterns for common architectures
+        expected_patterns = self._get_expected_tensor_patterns(config)
+
+        # Check for missing critical tensors
+        loaded_keys = set(self._tensors.keys())
+        for pattern_type, patterns in expected_patterns.items():
+            found = any(any(p in key for p in patterns) for key in loaded_keys)
+            if not found and pattern_type in ["embed", "lm_head"]:
+                report["errors"].append(f"Missing critical tensors: {pattern_type}")
+                report["valid"] = False
+
+        # Validate tensor shapes against config
+        num_layers = config.get("num_hidden_layers", config.get("num_layers", 0))
+        if num_layers > 0:
+            layer_count = sum(1 for key in loaded_keys if ".layers." in key or ".h." in key)
+            expected_keys_per_layer = 8  # typical: attn.q,k,v,o + mlp.gate,up,down + norm
+            actual_layers = layer_count // expected_keys_per_layer
+            if actual_layers < num_layers * 0.9:  # Allow 10% tolerance
+                report["warnings"].append(
+                    f"Expected {num_layers} layers but found ~{actual_layers} based on tensor count"
+                )
+
+        # Check for NaN or Inf values in a sample of tensors
+        import torch
+        sample_keys = list(loaded_keys)[:10]  # Check first 10 tensors
+        for key in sample_keys:
+            tensor = self._tensors[key]
+            if torch.isnan(tensor).any():
+                report["errors"].append(f"NaN values detected in {key}")
+                report["valid"] = False
+            if torch.isinf(tensor).any():
+                report["warnings"].append(f"Inf values detected in {key}")
+
+        logger.info("Weight validation complete", valid=report["valid"],
+                   warnings=len(report["warnings"]), errors=len(report["errors"]))
+        return report
+
+    def _get_expected_tensor_patterns(self, config: dict[str, Any]) -> dict[str, list[str]]:
+        """Get expected tensor key patterns based on model architecture."""
+        patterns = {
+            "embed": ["embed_tokens", "wte", "token_embed", "word_embeddings"],
+            "lm_head": ["lm_head", "output", "embed_out"],
+            "attention": ["attn.q_proj", "attn.k_proj", "attn.v_proj", "self_attn.q_proj",
+                         "attention.query", "attention.key", "attention.value"],
+            "mlp": ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
+                   "ffn.gate", "ffn.up", "ffn.down", "mlp.fc1", "mlp.fc2"],
+            "norm": ["norm", "ln_", "layernorm", "rms_norm"],
+        }
+
+        # Add MoE patterns if applicable
+        if config.get("num_local_experts", 0) > 0 or config.get("num_experts", 0) > 0:
+            patterns["moe"] = ["experts.", "expert_", "router", "gate"]
+
+        return patterns
+
+    def compute_sha256(self) -> str:
+        """Compute SHA-256 hash of all loaded weights for integrity checking.
+
+        Returns:
+            Hex string of SHA-256 hash.
+        """
+        import hashlib
+        import torch
+
+        hasher = hashlib.sha256()
+
+        # Sort keys for deterministic hashing
+        for key in sorted(self._tensors.keys()):
+            tensor = self._tensors[key]
+            # Hash tensor metadata
+            hasher.update(key.encode('utf-8'))
+            hasher.update(str(tensor.shape).encode('utf-8'))
+            hasher.update(str(tensor.dtype).encode('utf-8'))
+            # Hash tensor data
+            hasher.update(tensor.cpu().numpy().tobytes())
+
+        return hasher.hexdigest()
+
     def __repr__(self) -> str:
         return f"SafeTensorsLoader({self.model_path}, tensors={len(self._tensors)})"

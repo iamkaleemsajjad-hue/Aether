@@ -15,6 +15,63 @@ not exercised end-to-end.
 
 ### Confirmed fixes
 
+#### Phase 3 Remediation (2026-08-11) — Model Ingestion R1-R12 Completeness
+
+- **VideoModelLoader** (`src/aether/compiler/stage1_ingestion/video_loader.py`):
+  Full graph extraction for Video-LLaMA, Video-LLaMA2, VideoChat2, LLaVA-Video,
+  LLaVA-NeXT-Video, InternVideo2. Detects video encoder type, temporal aggregator,
+  language backbone. Builds `AEGGraph` with `aeg.video_encoder`, `aeg.temporal_attn`,
+  `aeg.projection`, `aeg.llm_layer_*`, and `aeg.lm_head` nodes. Audio encoder
+  support for Video-LLaMA. Frame KV budget metadata persisted to graph.
+  **18 new tests** in `test_specialised_loaders.py` — all pass.
+
+- **MLALoader** (`src/aether/compiler/stage1_ingestion/mla_loader.py`):
+  Native DeepSeek V2/V3/R1 ingestion with KV compression metadata.
+  Builds hybrid dense-MHA (first `first_k_dense_replace` layers using
+  `aeg.attention`) + MLA (`aeg.mla_attention`) + MoE (`aeg.moe_layer`) layer map.
+  Computes and records `kv_compression_ratio`, `mla_config` metadata in graph.
+  **17 new tests** — all pass.
+
+- **MoELoader** (`src/aether/compiler/stage1_ingestion/moe_loader.py`):
+  Sparse MoE ingestion for Mixtral, Qwen-MoE, Jamba, DBRX, OLMoE.
+  Implements Zipf-prior expert tiering (hot/warm/cold) using `_classify_experts`.
+  Router nodes (`aeg.moe_router`) annotated with `hot_experts`, `warm_experts`,
+  `cold_experts` attributes. Shared experts (`aeg.shared_expert_ffn`) for Qwen-MoE.
+  Dense layers (`aeg.swiglu_ffn`) and MoE layers built separately per
+  `moe_layer_frequency` (Jamba-style alternating). **22 new tests** — all pass.
+
+- **Ingestion dispatcher** (`src/aether/compiler/stage1_ingestion/ingestion.py`):
+  Added `_try_specialised_loader()` that fires before generic format dispatch.
+  Routing priority: MLA → MoE → Video → VLM → SSM → generic. All failures
+  caught and logged; caller falls back to generic path transparently. Added
+  `_wrap_specialised_result()` to convert loader `dict` → `AEGGraph`. Loader
+  format recorded in `AEGGraph` metadata via `set_metadata`. **5 dispatch tests**
+  in `TestIngestionSpecialisedDispatch` — all pass.
+
+- **Stage 1 package exports** (`src/aether/compiler/stage1_ingestion/__init__.py`):
+  Exports `VideoModelLoader`, `VideoArchitecture`, `load_video_model`,
+  `detect_video_architecture`, `MLALoader`, `MLAArchitecture`, `load_mla_model`,
+  `is_mla_model`, `MoELoader`, `MoEArchitecture`, `load_moe_model`, `is_moe_model`.
+
+- **pyproject.toml** entry points fixed: `video` entry point corrected from
+  `vlm_loader` to `video_loader`; `mla` and `moe` loader entry points added.
+
+- **Install scripts**: `scripts/install.sh` (Linux/macOS) and
+  `scripts/install.ps1` (Windows) implement full one-click installation with
+  CUDA/ROCm/MPS hardware auto-detection, virtual environment management,
+  dependency installation, and post-install verification.
+
+- **Documentation**:
+  - `docs/architecture.md` rewritten: covers all 5 compiler stages, 22 optimizer
+    passes, R1-R12 runtime layers, 10 specialised loaders, AEG format versions
+    (1.1/2.0/3.0), backend plugin model, and all platform modules.
+  - `docs/getting-started.md` rewritten: system requirements table, one-click
+    install commands, all 10 model format examples, SDK patterns, OpenAI-compat
+    serving, REST API curl examples, benchmarking commands.
+
+- **Total new tests added in this phase**: **68** (all passing, 0 failures).
+- **Running full unit test suite**: confirms no regressions (in progress).
+
 - `scripts/ci_smoke_test.py --verbose`: **15/15 PASS** on the CPU toolchain.
 - A real local Llama-style checkpoint containing SafeTensors weights and a real
   Transformers tokenizer now compiles, saves, reloads in a fresh loader path,

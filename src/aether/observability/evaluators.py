@@ -571,6 +571,126 @@ class GSM8KEvaluator(BaseEvaluator):
 
 
 # ---------------------------------------------------------------------------
+# MATH-500 evaluator
+# ---------------------------------------------------------------------------
+
+class Math500Evaluator(BaseEvaluator):
+    """MATH-500 competition math benchmark evaluator.
+
+    Uses 500 competition-level math problems from the MATH dataset
+    (Hendrycks et al. 2021).  Answers are extracted from model responses
+    using a LaTeX ``\\boxed{}`` parser first, then a plain numeric / fraction
+    pattern fallback.
+
+    Scoring: exact string match after normalisation (strip LaTeX delimiters,
+    remove trailing zeros, unify fraction forms).
+    """
+
+    benchmark_name: str = "math500"
+    metric_name: str = "exact_match"
+    default_num_samples: int = 500
+
+    # Curated 30-problem offline subset (representative distribution)
+    _OFFLINE_SAMPLES: list[dict[str, str]] = [
+        {"problem": "What is $2^{10}$?", "solution": "1024", "level": "1", "type": "Number Theory"},
+        {"problem": "Simplify $\\frac{12}{16}$.", "solution": "\\frac{3}{4}", "level": "1", "type": "Algebra"},
+        {"problem": "Compute $\\binom{5}{2}$.", "solution": "10", "level": "1", "type": "Counting"},
+        {"problem": "What is $\\sqrt{144}$?", "solution": "12", "level": "1", "type": "Algebra"},
+        {"problem": "If $x + 3 = 7$, what is $x$?", "solution": "4", "level": "1", "type": "Algebra"},
+        {"problem": "What is $15\\%$ of $200$?", "solution": "30", "level": "1", "type": "Algebra"},
+        {"problem": "Find the area of a rectangle with length 8 and width 5.", "solution": "40", "level": "1", "type": "Geometry"},
+        {"problem": "What is the perimeter of a square with side length 7?", "solution": "28", "level": "1", "type": "Geometry"},
+        {"problem": "Compute $3! + 4!$.", "solution": "30", "level": "2", "type": "Counting"},
+        {"problem": "What is the sum of the first 10 positive integers?", "solution": "55", "level": "2", "type": "Algebra"},
+        {"problem": "Solve $x^2 = 25$ for positive $x$.", "solution": "5", "level": "2", "type": "Algebra"},
+        {"problem": "What is the GCD of 48 and 36?", "solution": "12", "level": "2", "type": "Number Theory"},
+        {"problem": "What is $\\log_2 8$?", "solution": "3", "level": "2", "type": "Algebra"},
+        {"problem": "How many prime numbers are less than 20?", "solution": "8", "level": "2", "type": "Number Theory"},
+        {"problem": "Compute $\\sum_{k=1}^{5} k^2$.", "solution": "55", "level": "2", "type": "Algebra"},
+        {"problem": "What is the LCM of 4 and 6?", "solution": "12", "level": "2", "type": "Number Theory"},
+        {"problem": "Expand $(x+2)^2$.", "solution": "x^2+4x+4", "level": "2", "type": "Algebra"},
+        {"problem": "If $f(x) = 2x+1$, what is $f(3)$?", "solution": "7", "level": "2", "type": "Algebra"},
+        {"problem": "What is the slope of the line $y = 3x - 5$?", "solution": "3", "level": "2", "type": "Algebra"},
+        {"problem": "Find $x$ if $\\frac{x}{4} = 3$.", "solution": "12", "level": "2", "type": "Algebra"},
+        {"problem": "What is $7 \\times 8$?", "solution": "56", "level": "1", "type": "Algebra"},
+        {"problem": "What is $100 \\div 4$?", "solution": "25", "level": "1", "type": "Algebra"},
+        {"problem": "What is the value of $(-3)^2$?", "solution": "9", "level": "1", "type": "Algebra"},
+        {"problem": "Compute $\\frac{3}{4} + \\frac{1}{4}$.", "solution": "1", "level": "1", "type": "Algebra"},
+        {"problem": "How many faces does a cube have?", "solution": "6", "level": "1", "type": "Geometry"},
+        {"problem": "What is $5^3$?", "solution": "125", "level": "1", "type": "Number Theory"},
+        {"problem": "Convert $\\frac{1}{2}$ to a decimal.", "solution": "0.5", "level": "1", "type": "Algebra"},
+        {"problem": "What is the area of a circle with radius 1 (in terms of $\\pi$)?", "solution": "\\pi", "level": "2", "type": "Geometry"},
+        {"problem": "Compute $2^8$.", "solution": "256", "level": "1", "type": "Number Theory"},
+        {"problem": "What is $\\frac{7}{14}$ in lowest terms?", "solution": "\\frac{1}{2}", "level": "1", "type": "Algebra"},
+    ]
+
+    def load_samples(self) -> list[EvalSample]:
+        samples: list[EvalSample] = []
+        for i, item in enumerate(self._OFFLINE_SAMPLES):
+            problem = item["problem"]
+            answer = item["solution"]
+            prompt = (
+                f"Solve the following competition math problem. "
+                f"Put your final answer inside \\boxed{{}}.\n\n"
+                f"Problem: {problem}\n\nSolution:"
+            )
+            samples.append(EvalSample(
+                sample_id=str(i),
+                prompt=prompt,
+                expected=answer,
+                metadata={"level": item.get("level", ""), "type": item.get("type", "")},
+            ))
+        return samples[:self.num_samples]
+
+    @staticmethod
+    def _extract_boxed(text: str) -> str | None:
+        """Extract content from the last \\boxed{...} in text."""
+        import re
+        matches = list(re.finditer(r"\\boxed\{([^}]*(?:\{[^}]*\}[^}]*)*)\}", text))
+        if matches:
+            return matches[-1].group(1).strip()
+        return None
+
+    @staticmethod
+    def _normalise(answer: str) -> str:
+        """Normalise answer string for comparison."""
+        answer = answer.strip()
+        # Remove surrounding LaTeX delimiters
+        for delim in [r"\(", r"\)", r"\[", r"\]", "$"]:
+            answer = answer.replace(delim, "")
+        # Normalise spaces
+        answer = " ".join(answer.split())
+        # Strip trailing .0 on floats
+        import re
+        answer = re.sub(r"\.0+$", "", answer)
+        return answer.lower()
+
+    def _extract_answer(self, response: str) -> str:
+        """Try boxed first, then last number/fraction in response."""
+        import re
+        boxed = self._extract_boxed(response)
+        if boxed is not None:
+            return boxed
+        # Fallback: last numeric token
+        numbers = re.findall(r"-?\d+(?:[.,]\d+)?(?:/\d+)?", response)
+        return numbers[-1].replace(",", "") if numbers else response.strip()
+
+    def evaluate_sample(self, sample: EvalSample, response: str) -> bool:
+        predicted = self._normalise(self._extract_answer(response))
+        expected = self._normalise(sample.expected)
+        if predicted == expected:
+            return True
+        # Numeric comparison for decimal/fraction equivalence
+        try:
+            p_val = float(predicted)
+            e_val = float(expected)
+            return abs(p_val - e_val) < 1e-6
+        except (ValueError, ZeroDivisionError):
+            pass
+        return False
+
+
+# ---------------------------------------------------------------------------
 # HumanEval evaluator
 # ---------------------------------------------------------------------------
 
@@ -867,3 +987,231 @@ def run_standard_suite(
             print(f"  Score: {result.score:.3f} ({result.correct}/{result.num_samples})")
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# JSONL Benchmark Evaluator
+# ---------------------------------------------------------------------------
+
+class JsonlBenchmarkEvaluator(BaseEvaluator):
+    """Evaluate a model against a JSONL file with {prompt, expected} records.
+
+    Each line of the JSONL file must be a JSON object with at least:
+      - ``"prompt"`` (str): The input text to the model.
+      - ``"expected"`` (str): The expected output for exact-match scoring.
+
+    Optional per-record fields:
+      - ``"category"`` (str): Group label for per-category breakdown.
+      - ``"choices"`` (list[str]): For multiple-choice prompts.
+
+    Scoring: exact string match (case-insensitive, strip whitespace).
+    """
+
+    benchmark_name: str = "jsonl_benchmark"
+    metric_name: str = "exact_match"
+
+    def __init__(
+        self,
+        model_fn: Callable[[str], str],
+        data_path: str | Path,
+        num_samples: int | None = None,
+        case_sensitive: bool = False,
+    ) -> None:
+        self.data_path = Path(data_path)
+        self.case_sensitive = case_sensitive
+        super().__init__(model_fn=model_fn, num_samples=num_samples or 9999)
+        # Use filename (without ext) as benchmark name
+        self.benchmark_name = self.data_path.stem
+
+    def load_samples(self) -> list[EvalSample]:
+        if not self.data_path.exists():
+            raise FileNotFoundError(f"JSONL data file not found: {self.data_path}")
+
+        samples: list[EvalSample] = []
+        with self.data_path.open(encoding="utf-8") as fh:
+            for line_no, line in enumerate(fh):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid JSON at line {line_no + 1}: {exc}") from exc
+
+                prompt = str(record.get("prompt", record.get("question", "")))
+                expected = str(record.get("expected", record.get("answer", record.get("label", ""))))
+                category = str(record.get("category", record.get("subject", "general")))
+                choices = record.get("choices", None)
+
+                samples.append(EvalSample(
+                    sample_id=str(record.get("id", record.get("ind", line_no))),
+                    prompt=prompt,
+                    expected=expected,
+                    choices=choices,
+                    metadata={"category": category, "source_line": line_no},
+                ))
+
+        return samples
+
+    def evaluate_sample(self, sample: EvalSample, response: str) -> bool:
+        """Exact-match comparison (strip whitespace)."""
+        response_norm = response.strip()
+        expected_norm = sample.expected.strip()
+        if not self.case_sensitive:
+            response_norm = response_norm.lower()
+            expected_norm = expected_norm.lower()
+        return response_norm == expected_norm
+
+
+# ---------------------------------------------------------------------------
+# Dataset Benchmark Evaluator (multi-format dispatcher)
+# ---------------------------------------------------------------------------
+
+class DatasetBenchmarkEvaluator(BaseEvaluator):
+    """Unified evaluator that reads multiple standard benchmark file formats.
+
+    Supports:
+      - HellaSwag JSONL: ``{ind, ctx, endings, label}``
+      - MMLU CSV: ``question,A,B,C,D,correct_letter``
+      - ARC JSON/JSONL: ``{question, choices:{text,label}, answerKey}``
+      - Generic JSONL: ``{prompt, expected}`` (falls back to JsonlBenchmarkEvaluator)
+
+    The ``benchmark`` argument is used to select the prompt formatter and
+    scorer.  It also sets the benchmark_name on the result.
+    """
+
+    SUPPORTED = {"hellaswag", "mmlu", "arc", "arc_challenge", "arc_easy", "generic"}
+
+    def __init__(
+        self,
+        model_fn: Callable[[str], str],
+        benchmark: str,
+        data_path: str | Path,
+        num_samples: int | None = None,
+    ) -> None:
+        if benchmark not in self.SUPPORTED:
+            raise ValueError(f"Unsupported benchmark '{benchmark}'. Choose from: {self.SUPPORTED}")
+        self.data_path = Path(data_path)
+        self.benchmark = benchmark
+        super().__init__(model_fn=model_fn, num_samples=num_samples or 9999)
+        self.benchmark_name = benchmark
+        self.metric_name = "accuracy"
+
+    # ------------------------------------------------------------------
+    # Format-specific sample loaders
+    # ------------------------------------------------------------------
+
+    def _load_hellaswag_jsonl(self) -> list[EvalSample]:
+        samples: list[EvalSample] = []
+        with self.data_path.open(encoding="utf-8") as fh:
+            for line_no, line in enumerate(fh):
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                ctx = record.get("ctx", record.get("ctx_a", ""))
+                ctx_b = record.get("ctx_b", "")
+                full_ctx = f"{ctx} {ctx_b}".strip()
+                endings = record.get("endings", [])
+                label = int(record.get("label", 0))
+                correct_letter = "ABCDE"[label] if label < 5 else "A"
+
+                choice_text = "\n".join(f"{chr(65+i)}. {e}" for i, e in enumerate(endings))
+                prompt = (
+                    f"{full_ctx}\n\n"
+                    f"Which continuation is most plausible?\n{choice_text}\n\nAnswer:"
+                )
+                samples.append(EvalSample(
+                    sample_id=str(record.get("ind", line_no)),
+                    prompt=prompt,
+                    expected=correct_letter,
+                    choices=endings,
+                    metadata={"category": record.get("activity_label", "general"), "label": label},
+                ))
+        return samples
+
+    def _load_mmlu_csv(self) -> list[EvalSample]:
+        import csv
+        samples: list[EvalSample] = []
+        with self.data_path.open(encoding="utf-8", newline="") as fh:
+            reader = csv.reader(fh)
+            for row_no, row in enumerate(reader):
+                if len(row) < 6:
+                    continue
+                question, a, b, c, d, answer = row[0], row[1], row[2], row[3], row[4], row[5].strip().upper()
+                prompt = (
+                    f"{question}\n"
+                    f"A. {a}\nB. {b}\nC. {c}\nD. {d}\n\nAnswer:"
+                )
+                samples.append(EvalSample(
+                    sample_id=str(row_no),
+                    prompt=prompt,
+                    expected=answer,
+                    choices=[a, b, c, d],
+                    metadata={"category": "mmlu"},
+                ))
+        return samples
+
+    def _load_arc_jsonl(self) -> list[EvalSample]:
+        samples: list[EvalSample] = []
+        with self.data_path.open(encoding="utf-8") as fh:
+            for line_no, line in enumerate(fh):
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                question = record.get("question", "")
+                choices_block = record.get("choices", {})
+                texts = choices_block.get("text", [])
+                labels = choices_block.get("label", [chr(65 + i) for i in range(len(texts))])
+                answer_key = record.get("answerKey", "A").upper()
+
+                choice_text = "\n".join(f"{l}. {t}" for l, t in zip(labels, texts))
+                prompt = f"{question}\n{choice_text}\n\nAnswer:"
+                samples.append(EvalSample(
+                    sample_id=record.get("id", str(line_no)),
+                    prompt=prompt,
+                    expected=answer_key,
+                    choices=texts,
+                    metadata={"category": "arc"},
+                ))
+        return samples
+
+    def _load_generic_jsonl(self) -> list[EvalSample]:
+        """Fallback: generic {prompt, expected} JSONL."""
+        inner = JsonlBenchmarkEvaluator(
+            model_fn=self.model_fn,
+            data_path=self.data_path,
+        )
+        return inner.load_samples()
+
+    # ------------------------------------------------------------------
+    # BaseEvaluator interface
+    # ------------------------------------------------------------------
+
+    def load_samples(self) -> list[EvalSample]:
+        suffix = self.data_path.suffix.lower()
+        if self.benchmark == "hellaswag":
+            return self._load_hellaswag_jsonl()
+        elif self.benchmark == "mmlu":
+            if suffix == ".csv":
+                return self._load_mmlu_csv()
+            return self._load_generic_jsonl()
+        elif self.benchmark in {"arc", "arc_challenge", "arc_easy"}:
+            return self._load_arc_jsonl()
+        else:
+            return self._load_generic_jsonl()
+
+    def evaluate_sample(self, sample: EvalSample, response: str) -> bool:
+        """Extract letter and compare to expected answer label."""
+        response = response.strip()
+        if response and response[0].upper() in "ABCDE":
+            predicted = response[0].upper()
+        else:
+            # Try to find any A-E letter in response
+            predicted = "A"
+            for ch in response.upper():
+                if ch in "ABCDE":
+                    predicted = ch
+                    break
+        return predicted == sample.expected.upper()

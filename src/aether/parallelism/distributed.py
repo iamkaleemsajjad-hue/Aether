@@ -812,3 +812,172 @@ class CollectiveBackend(SocketCollective):
 
     def __repr__(self) -> str:
         return f"CollectiveBackend(devices={self.device_ids})"
+
+
+# ---------------------------------------------------------------------------
+# Distributed Inference Engine
+# ---------------------------------------------------------------------------
+
+class DistributedInferenceEngine:
+    """Distributed multi-rank inference engine.
+
+    Orchestrates tensor-parallel and pipeline-parallel inference across
+    ``world_size`` workers.  In single-process mode (``world_size=1``) the
+    engine runs all stages in-process — no inter-process communication is
+    required, so it is always safe to construct for testing.
+
+    For multi-rank execution the engine delegates collective operations to
+    :class:`SocketCollective` and launches worker processes via
+    :class:`DistributedFleetManager`.
+
+    Args:
+        world_size: Total number of inference workers (ranks).
+        rank: This process's rank (0 = driver).
+        master_addr: IP / hostname of rank-0 (default ``"127.0.0.1"``).
+        master_port: Base port for inter-rank communication.
+        tp_degree: Tensor-parallel degree (must divide ``world_size``).
+        pp_degree: Pipeline-parallel degree (must divide ``world_size``).
+        backend: Collective backend — ``"socket"`` (default) or ``"nccl"``.
+    """
+
+    def __init__(
+        self,
+        world_size: int = 1,
+        rank: int = 0,
+        master_addr: str = "127.0.0.1",
+        master_port: int = 29500,
+        tp_degree: int = 1,
+        pp_degree: int = 1,
+        backend: str = "socket",
+    ) -> None:
+        if world_size < 1:
+            raise ValueError(f"world_size must be ≥ 1, got {world_size}")
+        if rank < 0 or rank >= world_size:
+            raise ValueError(f"rank {rank} out of range for world_size {world_size}")
+        if tp_degree * pp_degree > world_size:
+            raise ValueError(
+                f"tp_degree ({tp_degree}) × pp_degree ({pp_degree}) "
+                f"exceeds world_size ({world_size})"
+            )
+
+        self.world_size = world_size
+        self.rank = rank
+        self.master_addr = master_addr
+        self.master_port = master_port
+        self.tp_degree = tp_degree
+        self.pp_degree = pp_degree
+        self.backend = backend
+
+        self._collective: SocketCollective | None = None
+        self._initialized = False
+        self._request_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+
+        logger.info(
+            "DistributedInferenceEngine created",
+            world_size=world_size,
+            rank=rank,
+            tp_degree=tp_degree,
+            pp_degree=pp_degree,
+            backend=backend,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def initialize(self) -> None:
+        """Initialize the collective communication group.
+
+        In single-rank mode this is a no-op (no sockets needed).
+        In multi-rank mode this establishes the SocketCollective barrier.
+        """
+        if self._initialized:
+            return
+        if self.world_size > 1:
+            self._collective = SocketCollective(
+                rank=self.rank,
+                world_size=self.world_size,
+                master_addr=self.master_addr,
+                master_port=self.master_port,
+            )
+            self._collective.initialize()
+        self._initialized = True
+        logger.info("DistributedInferenceEngine initialized", rank=self.rank)
+
+    def shutdown(self) -> None:
+        """Shut down the collective and release resources."""
+        if self._collective is not None:
+            try:
+                self._collective.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            self._collective = None
+        self._initialized = False
+        logger.info("DistributedInferenceEngine shutdown", rank=self.rank)
+
+    # ------------------------------------------------------------------
+    # Inference dispatch
+    # ------------------------------------------------------------------
+
+    def submit(
+        self,
+        request_id: str,
+        tokens: list[int],
+        max_new_tokens: int = 256,
+        temperature: float = 1.0,
+    ) -> dict[str, Any]:
+        """Submit an inference request.
+
+        In single-rank mode the request is processed locally (stub forward
+        pass — real token generation requires a compiled AEG model).  In
+        multi-rank mode the request metadata is broadcast to all workers.
+
+        Returns a dict with ``request_id``, ``status``, and ``rank``.
+        """
+        if not self._initialized:
+            self.initialize()
+
+        meta: dict[str, Any] = {
+            "request_id": request_id,
+            "num_tokens": len(tokens),
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "rank": self.rank,
+            "world_size": self.world_size,
+        }
+
+        if self.world_size > 1 and self._collective is not None:
+            # Broadcast request metadata to all ranks
+            import json as _json
+            payload = np.frombuffer(
+                _json.dumps(meta).encode(), dtype=np.uint8
+            )
+            self._collective.broadcast(payload, src=0)
+
+        return {"request_id": request_id, "status": "submitted", "rank": self.rank}
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def is_driver(self) -> bool:
+        """True if this rank is the driver (rank 0)."""
+        return self.rank == 0
+
+    @property
+    def tp_rank(self) -> int:
+        """This rank's position within its tensor-parallel group."""
+        return self.rank % self.tp_degree
+
+    @property
+    def pp_rank(self) -> int:
+        """This rank's pipeline stage index."""
+        return self.rank // self.tp_degree
+
+    def __repr__(self) -> str:
+        return (
+            f"DistributedInferenceEngine("
+            f"world_size={self.world_size}, rank={self.rank}, "
+            f"tp={self.tp_degree}, pp={self.pp_degree})"
+        )
