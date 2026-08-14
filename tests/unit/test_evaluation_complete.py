@@ -535,3 +535,134 @@ class TestCIPipelineIntegration:
         # May still fail due to missing required benchmarks — check failing only contains those
         for failing in decision.failing_benchmarks:
             assert failing != "mmlu"  # mmlu should not be failing
+
+
+# ===========================================================================
+# WinoGrandeEvaluator Tests
+# ===========================================================================
+
+class TestWinoGrandeEvaluator:
+    """Tests for WinoGrandeEvaluator (commonsense NLI sentence completion)."""
+
+    def _make(self, num_samples: int = 5):
+        from aether.observability.evaluators import WinoGrandeEvaluator
+        return WinoGrandeEvaluator(model_fn=lambda p: "1", num_samples=num_samples)
+
+    def test_instantiation(self):
+        ev = self._make()
+        assert ev.benchmark_name == "WinoGrande"
+
+    def test_sample_count(self):
+        ev = self._make(num_samples=10)
+        samples = ev._build_samples()
+        assert len(samples) == 10
+
+    def test_sample_fields_present(self):
+        ev = self._make()
+        for s in ev._build_samples():
+            assert s.prompt
+            assert s.expected in ("1", "2")
+            assert s.choices and len(s.choices) == 2
+
+    def test_prompt_contains_blank(self):
+        ev = self._make()
+        for s in ev._build_samples():
+            assert "___" in s.prompt
+
+    def test_prompt_contains_options(self):
+        ev = self._make()
+        for s in ev._build_samples():
+            assert "Option 1:" in s.prompt
+            assert "Option 2:" in s.prompt
+
+    def test_grade_option1_correct(self):
+        from aether.observability.evaluators import WinoGrandeEvaluator
+        ev = WinoGrandeEvaluator(model_fn=lambda p: "1", num_samples=5)
+        samples = ev._build_samples()
+        # Find a sample with expected == "1"
+        target = next(s for s in samples if s.expected == "1")
+        assert ev.evaluate_sample(target, "1") is True
+        assert ev.evaluate_sample(target, "2") is False
+
+    def test_grade_option2_correct(self):
+        from aether.observability.evaluators import WinoGrandeEvaluator
+        ev = WinoGrandeEvaluator(model_fn=lambda p: "2", num_samples=20)
+        samples = ev._build_samples()
+        # Find a sample with expected == "2"
+        target = next(s for s in samples if s.expected == "2")
+        assert ev.evaluate_sample(target, "2") is True
+        assert ev.evaluate_sample(target, "1") is False
+
+    def test_in_registry(self):
+        from aether.observability.evaluators import EVALUATOR_REGISTRY
+        assert "winogrande" in EVALUATOR_REGISTRY
+
+    def test_create_evaluator_factory(self):
+        from aether.observability.evaluators import create_evaluator
+        ev = create_evaluator("winogrande", model_fn=lambda p: "1", num_samples=3)
+        assert ev.benchmark_name == "WinoGrande"
+
+
+# ===========================================================================
+# AIMEEvaluator Tests
+# ===========================================================================
+
+class TestAIMEEvaluator:
+    """Tests for AIMEEvaluator (AIME competition math, integer 0-999 answers)."""
+
+    def _make(self, response: str = "5"):
+        from aether.observability.evaluators import AIMEEvaluator
+        return AIMEEvaluator(model_fn=lambda p: response, num_samples=5)
+
+    def test_instantiation(self):
+        ev = self._make()
+        assert ev.benchmark_name == "AIME"
+
+    def test_sample_count(self):
+        ev = self._make()
+        samples = ev._build_samples()
+        assert len(samples) == 5
+
+    def test_sample_fields_present(self):
+        ev = self._make()
+        for s in ev._build_samples():
+            assert s.prompt
+            assert s.expected.isdigit()
+
+    def test_prompt_contains_problem(self):
+        ev = self._make()
+        for s in ev._build_samples():
+            assert "0-999" in s.prompt or "integer" in s.prompt.lower()
+
+    def test_grade_correct_integer(self):
+        from aether.observability.evaluators import AIMEEvaluator
+        ev = AIMEEvaluator(model_fn=lambda p: "5", num_samples=15)
+        samples = ev._build_samples()
+        # aime_2024_I_1 has answer "5"
+        target = next(s for s in samples if s.expected == "5")
+        assert ev._grade("5", "5") is True
+        assert ev._grade("the answer is 5", "5") is True
+        assert ev._grade("answer: 5.", "5") is True
+
+    def test_grade_wrong_integer(self):
+        ev = self._make()
+        assert ev._grade("7", "5") is False
+
+    def test_grade_no_integer(self):
+        ev = self._make()
+        assert ev._grade("I don't know", "5") is False
+
+    def test_grade_takes_last_integer(self):
+        """Should extract the last integer found in the response."""
+        ev = self._make()
+        # "first I thought 3, but the answer is 5"
+        assert ev._grade("first I thought 3 but the answer is 5", "5") is True
+
+    def test_in_registry(self):
+        from aether.observability.evaluators import EVALUATOR_REGISTRY
+        assert "aime" in EVALUATOR_REGISTRY
+
+    def test_create_evaluator_factory(self):
+        from aether.observability.evaluators import create_evaluator
+        ev = create_evaluator("aime", model_fn=lambda p: "42", num_samples=3)
+        assert ev.benchmark_name == "AIME"

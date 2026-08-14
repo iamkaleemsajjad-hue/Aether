@@ -95,7 +95,9 @@
       "Bash(python -m pytest tests/ --collect-only -q)",
       "Bash(python scripts/complete_all_components.py --phase all)",
       "Bash(python -m pytest tests/unit/test_safetensors_loader_complete.py -v --tb=short)",
-      "Bash(python -m pytest tests/unit/test_safetensors_loader_complete.py::TestSafeTensorsLoaderBasic::test_single_file_loading -xvs)"
+      "Bash(python -m pytest tests/unit/test_safetensors_loader_complete.py::TestSafeTensorsLoaderBasic::test_single_file_loading -xvs)",
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(python -m pytest tests/unit/ -v --tb=short)"
     ]
   }
 }

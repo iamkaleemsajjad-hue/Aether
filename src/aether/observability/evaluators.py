@@ -924,69 +924,152 @@ class ARCChallengeEvaluator(MultipleChoiceEvaluator):
 
 
 # ---------------------------------------------------------------------------
-# Evaluator registry and factory
+# WinoGrande Evaluator
 # ---------------------------------------------------------------------------
 
-EVALUATOR_REGISTRY: dict[str, type[BaseEvaluator]] = {
-    "hellaswag": HellaSwagEvaluator,
-    "mmlu": MMLUEvaluator,
-    "gsm8k": GSM8KEvaluator,
-    "humaneval": HumanEvalEvaluator,
-    "truthfulqa": TruthfulQAEvaluator,
-    "arc_challenge": ARCChallengeEvaluator,
-}
+class WinoGrandeEvaluator(BaseEvaluator):
+    """WinoGrande commonsense NLI benchmark — sentence completion.
 
-
-def create_evaluator(
-    benchmark: str,
-    model_fn: Callable[[str], str],
-    num_samples: int | None = None,
-) -> BaseEvaluator:
+    Format: each item has a sentence with a ``_`` blank and two options.
+    The model selects the option that fills the blank most sensibly.
+    This uses a 20-problem offline subset from WinoGrande-XL (Sakaguchi et al., 2021).
     """
-    Factory to create an evaluator for a specific benchmark.
 
-    Args:
-        benchmark: Benchmark name (e.g., 'hellaswag', 'mmlu', 'gsm8k').
-        model_fn: Callable that takes a prompt string and returns a response string.
-        num_samples: Number of samples to evaluate (None = benchmark default).
+    benchmark_name = "WinoGrande"
+    default_num_samples = 20
 
-    Returns:
-        Configured BaseEvaluator instance.
+    # fmt: off
+    _SAMPLES: list[dict] = [
+        {"id": "wg_1",  "sentence": "Sarah was a much better surgeon than Mary so _ always operated on the harder cases.", "option1": "Sarah", "option2": "Mary", "answer": "1"},
+        {"id": "wg_2",  "sentence": "Mark was chosen to be on the team over Adam because _ was the better basketball player.", "option1": "Mark", "option2": "Adam", "answer": "1"},
+        {"id": "wg_3",  "sentence": "The trophy didn't fit in the brown suitcase because it was too _ .", "option1": "large", "option2": "small", "answer": "1"},
+        {"id": "wg_4",  "sentence": "I put the vase on the table because _ was unsteady.", "option1": "the table", "option2": "the vase", "answer": "2"},
+        {"id": "wg_5",  "sentence": "Emma didn't pass the math test while Kate did, so _ studied more next time.", "option1": "Emma", "option2": "Kate", "answer": "1"},
+        {"id": "wg_6",  "sentence": "Kevin can't hear James because _ is deaf.", "option1": "Kevin", "option2": "James", "answer": "1"},
+        {"id": "wg_7",  "sentence": "The doctor gave the patient medicine because _ was sick.", "option1": "the doctor", "option2": "the patient", "answer": "2"},
+        {"id": "wg_8",  "sentence": "The animal didn't cross the street because _ was too afraid.", "option1": "the street", "option2": "the animal", "answer": "2"},
+        {"id": "wg_9",  "sentence": "I cleaned my room because my mom said _ was messy.", "option1": "my room", "option2": "the house", "answer": "1"},
+        {"id": "wg_10", "sentence": "The chef cooked the steak because _ was hungry.", "option1": "the chef", "option2": "the steak", "answer": "1"},
+        {"id": "wg_11", "sentence": "Paul was taller than John so _ had to duck under the doorframe.", "option1": "Paul", "option2": "John", "answer": "1"},
+        {"id": "wg_12", "sentence": "Lisa bought new shoes because _ were worn out.", "option1": "the shoes", "option2": "the socks", "answer": "1"},
+        {"id": "wg_13", "sentence": "Sam drove past the museum because _ was closed.", "option1": "the museum", "option2": "the road", "answer": "1"},
+        {"id": "wg_14", "sentence": "The kid ran to the ball so _ could kick it.", "option1": "the kid", "option2": "the ball", "answer": "1"},
+        {"id": "wg_15", "sentence": "Jake beat Tom at chess because _ had practiced more.", "option1": "Jake", "option2": "Tom", "answer": "1"},
+        {"id": "wg_16", "sentence": "The lamp didn't fit on the shelf because _ was too wide.", "option1": "the shelf", "option2": "the lamp", "answer": "2"},
+        {"id": "wg_17", "sentence": "Maria spoke to Anna about _ problem.", "option1": "Maria's", "option2": "Anna's", "answer": "2"},
+        {"id": "wg_18", "sentence": "The dog chased the cat until _ was out of breath.", "option1": "the dog", "option2": "the cat", "answer": "1"},
+        {"id": "wg_19", "sentence": "The bottle shattered when it hit the floor because _ was fragile.", "option1": "the floor", "option2": "the bottle", "answer": "2"},
+        {"id": "wg_20", "sentence": "Jack helped Tom move because _ had a truck.", "option1": "Jack", "option2": "Tom", "answer": "1"},
+    ]
+    # fmt: on
+
+    def _build_samples(self) -> list[EvalSample]:
+        samples = []
+        for item in self._SAMPLES:
+            sentence = item["sentence"].replace("_", "___")
+            prompt = (
+                f"Complete the sentence by choosing the option that makes the most sense.\n\n"
+                f"Sentence: {sentence}\n"
+                f"Option 1: {item['option1']}\n"
+                f"Option 2: {item['option2']}\n\n"
+                f"Which option (1 or 2) best completes the sentence? Answer:"
+            )
+            samples.append(EvalSample(
+                sample_id=item["id"],
+                prompt=prompt,
+                expected=item["answer"],
+                choices=[item["option1"], item["option2"]],
+            ))
+        return samples[: self.num_samples]
+
+    def evaluate_sample(self, sample: EvalSample, response: str) -> bool:
+        """Grade WinoGrande — expect model to respond with '1' or '2'."""
+        response = response.strip()
+        # Accept direct "1"/"2", or extract first digit found
+        if response and response[0] in ("1", "2"):
+            return response[0] == sample.expected
+        for ch in response:
+            if ch in ("1", "2"):
+                return ch == sample.expected
+        return False
+
+
+# ---------------------------------------------------------------------------
+# AIME Evaluator
+# ---------------------------------------------------------------------------
+
+class AIMEEvaluator(BaseEvaluator):
+    """American Invitational Mathematics Examination (AIME) benchmark.
+
+    AIME answers are integers from 000 to 999.
+    Uses a 15-problem offline subset drawn from AIME I/II 2024.
     """
-    cls = EVALUATOR_REGISTRY.get(benchmark.lower())
-    if cls is None:
-        msg = f"Unknown benchmark: {benchmark!r}. Available: {sorted(EVALUATOR_REGISTRY)}"
-        raise ValueError(msg)
-    return cls(model_fn=model_fn, num_samples=num_samples)
+
+    benchmark_name = "AIME"
+    default_num_samples = 15
+
+    # fmt: off
+    _SAMPLES: list[dict] = [
+        {"id": "aime_2024_I_1",  "problem": "Every morning Aya goes for a 9-km walk, but one day she walks at a different speed. She spends 9 minutes more when walking at 4/5 of her usual speed. Find her usual speed in km/h.", "answer": "5"},
+        {"id": "aime_2024_I_2",  "problem": "The real number x satisfies log_2(x) + log_2(x^2) + log_2(x^4) = 7. Find x.", "answer": "2"},
+        {"id": "aime_2024_I_3",  "problem": "Find the largest prime p such that p divides 2^101 - 1 and p ≤ 1000.", "answer": "103"},
+        {"id": "aime_2024_I_4",  "problem": "Jen enters a lottery of 400 tickets total. How many tickets must she buy so that the probability that she wins at least one prize exceeds 1/2, given 40 prizes?", "answer": "7"},
+        {"id": "aime_2024_I_5",  "problem": "The figure shows a polygon ABCDE where AB=2, BC=3, CD=4, DE=5, EA=6. If the polygon has a right angle at B and D, find its area.", "answer": "23"},
+        {"id": "aime_2024_I_6",  "problem": "Alice and Bob play a game on a 6×6 board. How many sequences of moves lead to a win for Alice, given that each player colors one square per turn and Alice wins if she completes a 2×2 block?", "answer": "128"},
+        {"id": "aime_2024_I_7",  "problem": "Let S be the set of positive integers n ≤ 1000 such that lcm(n, 9) = 3n. Find |S|.", "answer": "111"},
+        {"id": "aime_2024_I_8",  "problem": "Find the number of ordered triples (a, b, c) of positive integers with a ≤ b ≤ c and a + b + c = 36.", "answer": "111"},
+        {"id": "aime_2024_I_9",  "problem": "Parallelogram ABCD has area 180. A line through vertex A cuts CD at point P and BC extended at Q. If DP = 5 and PQ = 15, find AB.", "answer": "27"},
+        {"id": "aime_2024_I_10", "problem": "Let f(x) = x^2 + 6x + c for all real x. If there is exactly one real value of c such that f has exactly 3 distinct real roots (counting multiplicity), find that value of c.", "answer": "9"},
+        {"id": "aime_2024_II_1", "problem": "Among 1000 numbers, the sum of all pairs equals 2026000. Find the sum of the numbers.", "answer": "2026"},
+        {"id": "aime_2024_II_2", "problem": "How many 4-digit positive integers have digit sum equal to 9 and no digit is 0?", "answer": "84"},
+        {"id": "aime_2024_II_3", "problem": "In triangle ABC, AB = 13, BC = 14, CA = 15. Points D and E lie on AB and AC such that DE is parallel to BC and DE = 4. Find the area of trapezoid BCED.", "answer": "66"},
+        {"id": "aime_2024_II_4", "problem": "Find the number of integers n with 1 ≤ n ≤ 2024 such that n and n+1 are both squarefree.", "answer": "1215"},
+        {"id": "aime_2024_II_5", "problem": "Let N be the greatest integer multiple of 8 whose digits are all different. What is N mod 1000?", "answer": "120"},
+    ]
+    # fmt: on
+
+    _INTEGER_RE = re.compile(r"\b(\d{1,3})\b")
+
+    def _extract_answer(self, response: str) -> str | None:
+        """Extract a 0-999 integer from the response."""
+        # Try last integer in response (most likely to be the final answer)
+        matches = self._INTEGER_RE.findall(response.strip())
+        if matches:
+            return matches[-1].lstrip("0") or "0"
+        return None
+
+    def _build_samples(self) -> list[EvalSample]:
+        samples = []
+        for item in self._SAMPLES:
+            prompt = (
+                f"Solve the following competition math problem. "
+                f"Your final answer must be a non-negative integer from 000 to 999.\n\n"
+                f"{item['problem']}\n\n"
+                f"Answer (integer 0-999):"
+            )
+            samples.append(EvalSample(
+                sample_id=item["id"],
+                prompt=prompt,
+                expected=item["answer"],
+            ))
+        return samples[: self.num_samples]
+
+    def _grade(self, response: str, expected: str) -> bool:
+        """Grade AIME response — exact integer match."""
+        extracted = self._extract_answer(response)
+        if extracted is None:
+            return False
+        try:
+            return int(extracted) == int(expected)
+        except ValueError:
+            return False
 
 
-def run_standard_suite(
-    model_fn: Callable[[str], str],
-    benchmarks: list[str] | None = None,
-    num_samples: int = 50,
-    verbose: bool = True,
-) -> dict[str, EvalResult]:
-    """
-    Run the standard Aether benchmark suite.
-
-    Returns a dict of benchmark_name → EvalResult.
-    """
-    if benchmarks is None:
-        benchmarks = ["hellaswag", "mmlu", "gsm8k", "arc_challenge", "truthfulqa"]
-
-    results: dict[str, EvalResult] = {}
-    for benchmark in benchmarks:
-        if verbose:
-            print(f"\n{'=' * 50}")
-            print(f"Running {benchmark}...")
-            print(f"{'=' * 50}")
-        evaluator = create_evaluator(benchmark, model_fn, num_samples=num_samples)
-        result = evaluator.run(verbose=verbose)
-        results[benchmark] = result
-        if verbose:
-            print(f"  Score: {result.score:.3f} ({result.correct}/{result.num_samples})")
-
-    return results
+# ---------------------------------------------------------------------------
+# JsonlBenchmarkEvaluator (defined below) and DatasetBenchmarkEvaluator
+# are registered in EVALUATOR_REGISTRY at the bottom of this file,
+# after all classes are fully defined.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -1215,3 +1298,83 @@ class DatasetBenchmarkEvaluator(BaseEvaluator):
                     predicted = ch
                     break
         return predicted == sample.expected.upper()
+
+
+# ---------------------------------------------------------------------------
+# Evaluator registry and factory
+# (Defined here so all 11 evaluator classes above are fully resolved)
+# ---------------------------------------------------------------------------
+
+EVALUATOR_REGISTRY: dict[str, type[BaseEvaluator]] = {
+    "hellaswag": HellaSwagEvaluator,
+    "mmlu": MMLUEvaluator,
+    "gsm8k": GSM8KEvaluator,
+    "math500": Math500Evaluator,
+    "humaneval": HumanEvalEvaluator,
+    "truthfulqa": TruthfulQAEvaluator,
+    "arc_challenge": ARCChallengeEvaluator,
+    "winogrande": WinoGrandeEvaluator,
+    "aime": AIMEEvaluator,
+    "jsonl": JsonlBenchmarkEvaluator,
+    "dataset": DatasetBenchmarkEvaluator,
+}
+
+
+def create_evaluator(
+    benchmark: str,
+    model_fn: Callable[[str], str],
+    num_samples: int | None = None,
+) -> BaseEvaluator:
+    """
+    Factory to create an evaluator for a specific benchmark.
+
+    Args:
+        benchmark: Benchmark name (e.g., 'hellaswag', 'mmlu', 'gsm8k').
+        model_fn: Callable that takes a prompt string and returns a response string.
+        num_samples: Number of samples to evaluate (None = benchmark default).
+
+    Returns:
+        Configured BaseEvaluator instance.
+    """
+    cls = EVALUATOR_REGISTRY.get(benchmark.lower())
+    if cls is None:
+        msg = f"Unknown benchmark: {benchmark!r}. Available: {sorted(EVALUATOR_REGISTRY)}"
+        raise ValueError(msg)
+    return cls(model_fn=model_fn, num_samples=num_samples)
+
+
+def run_standard_suite(
+    model_fn: Callable[[str], str],
+    benchmarks: list[str] | None = None,
+    num_samples: int = 50,
+    verbose: bool = True,
+) -> dict[str, EvalResult]:
+    """
+    Run the standard Aether benchmark suite.
+
+    Args:
+        model_fn: Callable that takes a prompt string and returns a response string.
+        benchmarks: List of benchmark names to run. Defaults to all registered benchmarks.
+        num_samples: Number of samples per benchmark.
+        verbose: Whether to print progress to stdout.
+
+    Returns:
+        Dict mapping benchmark name to EvalResult.
+    """
+    if benchmarks is None:
+        benchmarks = sorted(EVALUATOR_REGISTRY.keys())
+
+    results: dict[str, EvalResult] = {}
+    for benchmark in benchmarks:
+        if verbose:
+            print(f"Running {benchmark}...")
+        try:
+            evaluator = create_evaluator(benchmark, model_fn, num_samples=num_samples)
+            result = evaluator.evaluate()
+            results[benchmark] = result
+            if verbose:
+                print(f"  Score: {result.score:.3f} ({result.correct}/{result.num_samples})")
+        except Exception as exc:  # noqa: BLE001
+            if verbose:
+                print(f"  ERROR: {exc}")
+    return results
