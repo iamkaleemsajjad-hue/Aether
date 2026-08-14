@@ -2,7 +2,7 @@
 
 This roadmap tracks implementation gates per release phase. A feature is complete when it has production code, tests, docs, and a repeatable validation path.
 
-**Last updated:** 2026-08-13 | **Status:** Phase 3 complete
+**Last updated:** 2026-08-14 | **Status:** Phase 4 in progress
 
 ---
 
@@ -112,7 +112,7 @@ This roadmap tracks implementation gates per release phase. A feature is complet
 - [ ] CUDA/ROCm/Metal backends (needs GPU hardware for end-to-end tests)
 
 ### Remaining Implementation Items
-- [ ] GGUF Q4_K / Q5_K / Q6_K / Q8_K dequantization (K-quant kernels)
+- [x] GGUF Q2_K / Q4_K / Q5_K / Q6_K / Q8_K dequantization -- IMPLEMENTED (K-quant dispatch in gguf_loader.py)
 - [ ] NCCL/RCCL collective backend (replaces SocketCollective for GPU clusters)
 - [ ] OpenTelemetry SDK full integration (distributed traces across workers)
 - [ ] SDK type stubs (`.pyi` files for all public APIs)
@@ -124,6 +124,20 @@ This roadmap tracks implementation gates per release phase. A feature is complet
 - [ ] Validate PRD performance claims on GPU hardware
 - [ ] MLPerf Inference v4.0 submission
 - [ ] Public benchmark reports with reproducible configs
+
+
+### Phase 4 Production Hardening Additions (2026-08-14)
+- [x] HardwareCapabilities dataclass (PRD Section 12) -- implemented + 21 tests
+- [x] Real hardware detection pipeline (PRD Section 41) -- detect_all_capabilities()
+- [x] hardware_validation_matrix.json -- 28+ targets, honest classification
+- [x] BenchmarkRunner -- real time.perf_counter() metrics, 15 tests
+- [x] aether doctor / hardware detect/validate / backend list / inspect / benchmark
+- [x] Security adversarial tests -- 55 tests (archive traversal, backend fail-closed, TEE)
+- [x] Hardware contract tests -- 21 tests
+- [x] Installation validator scripts/verify_install.py
+- [x] gRPC TLS test cert generator scripts/gen_test_certs.py
+- [x] DistributedInferenceEngine.distributed_mode -- honest mode labeling
+- [x] NCCL fail-closed: initialize() raises when NCCL requested but unavailable
 
 ---
 

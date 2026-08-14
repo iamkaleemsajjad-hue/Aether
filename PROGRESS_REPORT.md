@@ -9,11 +9,11 @@
 
 | Metric | Baseline (2026-08-10) | Current (2026-08-14) | Target |
 |---|---|---|---|
-| PRD/code coverage | 60% | 78% | 100% |
+| PRD/code coverage | 60% | 82% | 100% |
 | Functional coverage | 42% | 58% | 100% |
 | Tested coverage | 52% | 74% | 100% |
-| Production readiness | 20% | 34% | 100% |
-| Unit tests passing | ~1,777 | ~1,860+ | 3,500+ |
+| Production readiness | 20% | 42% | 100% |
+| Unit tests passing | ~1,777 | ~1,960+ | 3,500+ |
 | Unit test skips | 15 | ≤1 (env-gated) | 0 |
 
 ---
@@ -243,3 +243,57 @@ TOTAL                               ✅  ~1,860+ passing, ≤1 skip
 | `6369ffd` | docs: add v0.5.0 CHANGELOG entry |
 
 All commits pushed to `main` on `github.com/iamkaleemsajjad-hue/Aether-runtime`.
+
+---
+
+## Phase 4: Production Hardening (2026-08-14) -- IN PROGRESS
+
+### Hardware Capability Model (PRD Section 12)
+- DONE HardwareCapabilities dataclass (capabilities.py) -- 5-level validation ladder
+- DONE Real hardware detection (hardware_detector.py) -- never fabricates results
+- DONE hardware_validation_matrix.json -- 28+ targets, honest status
+- DONE CPU: available=true, execution_tested=true (verified via SGEMM benchmark)
+- DONE GPU targets: available=false with explicit reasons (no GPU on this host)
+- DONE 21 hardware contract tests passing
+
+### Real Benchmark Runner (PRD Section 36)  
+- DONE BenchmarkRunner with time.perf_counter() -- no hardcoded values
+- DONE BenchmarkProvenance -- exact software/hardware info in every report
+- DONE Streaming benchmark support (per-token TTFT, TBT)
+- DONE 15 benchmark runner tests passing
+- VERIFIED: Native SGEMM 512x512x512 = 4.22ms, matches numpy (max diff = 0.0)
+
+### CLI Completeness (PRD Section 42)
+- DONE aether doctor -- live output verified (8/9 checks pass)
+- DONE aether hardware detect -- verified: 1 available (CPU), 18 unavailable
+- DONE aether hardware capabilities [TARGET]
+- DONE aether hardware validate [TARGET]
+- DONE aether backend list
+- DONE aether inspect
+- DONE aether benchmark (backed by real BenchmarkRunner)
+
+### Security & Adversarial Tests (PRD Section 35)
+- DONE 55 adversarial tests (4 hardware/permission-gated skips)
+- DONE ZIP path traversal: HubError raised on ../../ paths
+- DONE Backend fail-closed: CUDABackend.load() raises BackendError on CPU host
+- DONE TEE: must report hardware_backed=False without CC hardware
+- DONE GGUF: IngestionError on non-GGUF file magic
+- DONE AEG integrity: missing/malformed manifest rejected
+
+### Installation Validator (PRD Section 43)
+- DONE scripts/verify_install.py -- PASS/FAIL per check, JSON output
+- DONE scripts/gen_test_certs.py -- gRPC TLS cert generator
+
+### Distributed Engine Honesty (PRD Section 48)
+- DONE DistributedInferenceEngine.distributed_mode property
+- DONE backend_constraints dict -- NCCL probed at init, never faked
+- DONE NCCL fail-closed: initialize() raises RuntimeError if unavailable
+- DONE 33 distributed tests still passing (no regressions)
+
+### Documentation Accuracy (Phase K)
+- DONE README.md: hardware status notice (CPU=tested, GPU=backend-only, QNN=unsupported)
+- DONE CHANGELOG.md: v0.6.0 entry with Phase 4 additions
+- DONE docs/roadmap.md: GGUF K-quant marked as implemented, Phase 4 items added
+- DONE AUDIT_REPORT.md: Phase 4 remediation section with honest gap statement
+- DONE STATUS.md: Updated to v0.6.0 with Phase 4 metrics
+

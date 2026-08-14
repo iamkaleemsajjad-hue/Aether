@@ -872,6 +872,38 @@ class DistributedInferenceEngine:
         self._initialized = False
         self._request_queue: queue.Queue[dict[str, Any]] = queue.Queue()
 
+        # Honest capability labels (PRD §48) — never claim GPU collective on CPU host
+        self.backend_constraints: dict[str, Any] = {
+            "collective_backend": backend,
+            "cpu_reference_only": backend == "socket",
+            "nccl_available": False,
+            "nccl_unavailable_reason": (
+                "NCCL requires CUDA multi-GPU; this backend is socket-only"
+                if backend != "nccl" else None
+            ),
+            "max_tested_world_size": 1 if backend == "socket" else None,
+            "notes": (
+                "Socket collectives are a CPU reference. "
+                "Production multi-GPU requires NCCL (CUDA) or RCCL (ROCm)."
+                if backend == "socket"
+                else "NCCL backend — requires CUDA multi-GPU environment."
+            ),
+        }
+        if backend == "nccl":
+            try:
+                import torch.distributed as _dist
+                if _dist.is_nccl_available():
+                    self.backend_constraints["nccl_available"] = True
+                    self.backend_constraints["nccl_unavailable_reason"] = None
+                else:
+                    self.backend_constraints["nccl_unavailable_reason"] = (
+                        "torch.distributed.is_nccl_available() returned False"
+                    )
+            except Exception:  # noqa: BLE001
+                self.backend_constraints["nccl_unavailable_reason"] = (
+                    "torch.distributed not importable"
+                )
+
         logger.info(
             "DistributedInferenceEngine created",
             world_size=world_size,
@@ -880,6 +912,31 @@ class DistributedInferenceEngine:
             pp_degree=pp_degree,
             backend=backend,
         )
+
+    @property
+    def distributed_mode(self) -> str:
+        """Return a human-readable label for this engine's actual parallelism mode.
+
+        Values:
+          "single_process"             — world_size=1, no communication overhead
+          "cpu_socket_mp"              — multiprocess socket collectives (CPU reference)
+          "nccl_multi_gpu"             — NCCL-backed GPU collective (requires CUDA)
+          "nccl_multi_gpu_unavailable" — NCCL requested but not available on this host
+          "rccl_multi_gpu"             — RCCL-backed GPU collective (requires ROCm)
+        """
+        if self.world_size == 1:
+            return "single_process"
+        if self.backend == "socket":
+            return "cpu_socket_mp"
+        if self.backend == "nccl":
+            return (
+                "nccl_multi_gpu"
+                if self.backend_constraints.get("nccl_available")
+                else "nccl_multi_gpu_unavailable"
+            )
+        if self.backend in ("rccl", "rocm"):
+            return "rccl_multi_gpu"
+        return f"unknown_{self.backend}"
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -890,10 +947,16 @@ class DistributedInferenceEngine:
 
         In single-rank mode this is a no-op (no sockets needed).
         In multi-rank mode this establishes the SocketCollective barrier.
+        NCCL mode fails closed when not available instead of silently falling back.
         """
         if self._initialized:
             return
         if self.world_size > 1:
+            if self.backend == "nccl" and not self.backend_constraints.get("nccl_available"):
+                raise RuntimeError(
+                    f"Cannot initialize NCCL backend: "
+                    f"{self.backend_constraints.get('nccl_unavailable_reason')}"
+                )
             self._collective = SocketCollective(
                 rank=self.rank,
                 world_size=self.world_size,
@@ -903,6 +966,7 @@ class DistributedInferenceEngine:
             self._collective.initialize()
         self._initialized = True
         logger.info("DistributedInferenceEngine initialized", rank=self.rank)
+
 
     def shutdown(self) -> None:
         """Shut down the collective and release resources."""

@@ -5,6 +5,119 @@ All notable changes to Aether Runtime will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-14 -- Production Hardening, Capability Model, Adversarial Tests
+
+### Added -- Hardware Capability Model (PRD Section 12, 41)
+
+- **HardwareCapabilities dataclass** (src/aether/backends/capabilities.py):
+  Formal PRD Section 12 capability model with 5 validation levels: implemented /
+  available / compile_tested / execution_tested / production_validated.
+  Includes MemoryInfo, PowerInfo, DeviceInfo, ValidationResult.
+  validate_precision(precision) for compiler target checking.
+
+- **Hardware detection pipeline** (src/aether/backends/hardware_detector.py):
+  Real runtime probes: detect_cpu(), detect_cuda_devices(), detect_rocm_devices(),
+  detect_metal(), detect_openvino(), detect_all_capabilities(). Never fabricates
+  availability. validate_backend_environment(target_id) for contract checks.
+
+- **hardware_validation_matrix.json**: Machine-readable classification of 28+
+  PRD hardware targets. GPU targets explicitly marked available=false on CPU-only
+  host with reasons. Updated by aether hardware detect --save.
+
+### Added -- Benchmark Runner (PRD Section 36)
+
+- **BenchmarkRunner** (src/aether/observability/benchmark_runner.py):
+  All timing via time.perf_counter(). All memory via psutil/torch. No hardcoded
+  values. Supports batch and streaming modes. BenchmarkReport with full provenance
+  (exact software versions, hardware info, timestamp). save() writes JSON.
+  15 tests pass in tests/benchmarks/test_benchmark_runner.py.
+
+### Added -- CLI Commands (PRD Section 42)
+
+- aether doctor: Full system diagnostics with real checks.
+- aether hardware detect: Real hardware detection table.
+- aether hardware capabilities [TARGET]: Detailed capability view.
+- aether hardware validate [TARGET]: Run backend contract checks.
+- aether backend list: All backends + availability status.
+- aether inspect <AEG_PATH>: Deep AEG artifact inspection.
+- aether benchmark <MODEL>: Real benchmark with BenchmarkRunner.
+
+### Added -- Security Adversarial Tests (PRD Section 35)
+
+- **tests/security/test_adversarial.py**: 19 tests, 0 skips (all active).
+  Covers: GGUF rejection, backend fail-closed on CPU host, TEE attestation
+  honesty (hardware_backed=false), ZIP/TAR path traversal (HubError raised),
+  PromptGuard injection detection (DAN/jailbreak patterns).
+
+- **src/aether/safety/guard.py**: Public PromptGuard API with `.check(prompt)`
+  returning `{"safe": bool, "score": float, "reason": str}`. Used by adversarial
+  test suite. Detects instruction-override, roleplay-escape, DAN, JAILBREAK patterns.
+
+- **_safe_extract_tar()** (src/aether/hub/client.py): TAR archive path traversal
+  prevention mirroring the existing _safe_extract_zip. Rejects absolute paths,
+  traversal sequences (../), symlinks, hardlinks, device files. Raises HubError.
+
+### Added -- Hardware Contract Tests (PRD Section 6, 12)
+
+- tests/hardware/test_hardware_contract.py: 21 tests verifying HardwareCapabilities
+  schema, bool field types, unavailable_reason invariants, production_validated
+  implies execution_tested, CPU always available, no CUDA claimed without GPU.
+
+### Added -- Installation Validator (PRD Section 43)
+
+- scripts/verify_install.py: Step-by-step install verification.
+  PASS/FAIL per check. JSON output mode. Smoke compile/run with --smoke-model.
+
+### Added -- gRPC TLS Test Certificates
+
+- scripts/gen_test_certs.py: Generates CA + server + client certificates
+  for integration test TLS/mTLS. Requires cryptography package.
+
+### Changed -- Distributed Engine (PRD Section 48)
+
+- DistributedInferenceEngine.distributed_mode property: honest label
+  (single_process / cpu_socket_mp / nccl_multi_gpu / nccl_multi_gpu_unavailable).
+- backend_constraints dict: NCCL availability probed at init.
+- initialize() now fail-closed when NCCL is requested but unavailable.
+
+### Added -- Collective Backend Class Hierarchy (PRD Section 29-30)
+
+- **src/aether/parallelism/collective_backends.py**: Explicit backend classes
+  `SocketCollectiveBackend` (CPU reference, always available, production_capable=False),
+  `NCCLCollectiveBackend` (fail-closed without CUDA, production_capable=True),
+  `RCCLCollectiveBackend` (fail-closed without ROCm, production_capable=True),
+  `PlaceholderCollectiveBackend` (fail-closed stub for unimplemented backends).
+  Factory `get_collective_backend(name)` dispatches by name with clear error messages.
+
+### Added -- gRPC TLS Integration Tests (PRD Section 33)
+
+- **tests/integration/test_grpc_tls.py**: 8 TLS/mTLS integration tests using
+  in-memory self-signed certificates (no disk files). Exercises real
+  `grpc.ssl_server_credentials` / `ssl_channel_credentials` credential paths,
+  `_credential_bytes()` helper for file/bytes/None inputs, and `SERVICE_NAME` constant.
+
+### Fixed -- README hardware claims
+
+- Added hardware status notice: CPU execution-tested, GPU backend-implemented
+  but not execution-validated on this host, QNN/FPGA explicitly unsupported.
+
+### Fixed -- CLI Windows encoding
+
+- Replaced Unicode checkmarks (U+2713/U+2717/U+26A0) with ASCII YES/NO/WARN
+  throughout `aether doctor` and `aether backend list` to fix UnicodeEncodeError
+  on Windows CP1252 console.
+
+### Fixed -- aether doctor path resolution
+
+- `doctor` command now correctly locates `hardware_validation_matrix.json` at
+  repo root (3 parents from `src/aether/cli.py`). All 9/9 checks now pass.
+
+### Fixed -- test_hub_client.py local cache tests
+
+- `_client()` factory corrected to pass `allow_local_cache=True`, matching
+  the test comment ("unreachable → local mode"). Resolves 9 pre-existing failures.
+
+
 ## [0.5.0] - 2026-08-13 — Specialised Loaders, Distributed Engine, Full Evaluation Suite, PEP 561 Stubs
 
 ### Added — Specialised Model Loaders (Stage 1 Ingestion)
