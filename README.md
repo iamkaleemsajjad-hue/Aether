@@ -25,34 +25,51 @@ Aether Runtime is a production-grade ML compiler, inference engine, and deployme
 ## Architecture
 
 ```
-   [HuggingFace Model]
-          |
-   [Aether Compiler]  9 optimization passes
-          |
-   [AEG Package v3.1]
-     /    |    |    \
-  CUDA  Metal ROCm  CPU
- SM90+  M1-M4 MI300X AVX-512
+   [HuggingFace Model / GGUF / ONNX / SafeTensors]
+                    |
+   ┌────────────────────────────────────┐
+   │     Aether Compiler (5 Stages)     │
+   │  Stage 1: Specialised Ingestion    │
+   │  Stage 2: 22 Optimizer Passes      │
+   │  Stage 3: Multi-target Kernel Gen  │
+   │  Stage 4: Kernel Cache & Hub       │
+   │  Stage 5: AEG Packaging            │
+   └────────────────────────────────────┘
+                    |
+         [AEG Package v3.0]
+          /    |    |    \
+        CUDA  Metal ROCm  CPU
+       SM90+ M1-M5 MI300X AVX-512
+                    |
+   ┌────────────────────────────────────┐
+   │   Aether Runtime (R1-R12 Layers)   │
+   │  R1: Dynamic Precision   R7: Green │
+   │  R2: Multi-Agent KV      R8: TEE   │
+   │  R3: Grammar FSM         R9: MDLM  │
+   │  R4: SLO Scheduler      R10: RDMA  │
+   │  R5: TTT Engine         R11: Cache │
+   │  R6: MCP Tools          R12: CXL   │
+   └────────────────────────────────────┘
 ```
 
-The compiler produces a **portable AEG artifact** that is loaded by the runtime engine. The engine selects pre-compiled kernels for the detected hardware at load time — zero recompilation, zero configuration.
+The compiler produces a **portable AEG artifact** loaded by the runtime. The engine selects pre-compiled kernels for the detected hardware at load time — zero recompilation, zero configuration.
 
 ---
 
-## AEG Package Format v3.1
+## AEG Package Format v3.0
 
 ```
 model.aeg/
-  FORMAT_VERSION                  # AEG/1.1
+  FORMAT_VERSION                  # AEG/3.0 (v5.0 passes)
   manifest.json                   # Top-level manifest with section hashes
   graph/
     computation_graph.aeg-ir      # Portable IR (target-agnostic)
     attention_head_patterns.json  # MInference sparse patterns (Pass 8)
   weights/
-    precision_map.json            # Per-layer FP8/FP4/INT4 assignments
+    precision_map.json            # Per-layer FP8/FP4/INT4/ternary assignments
     sparsity_masks.json           # Wanda 2:4 masks (Pass 9)
   adapters/
-    manifest.json                 # LoRA multi-slot (8 concurrent, bgmv)
+    manifest.json                 # LoRA/DoRA/VeRA/LoRAMoE multi-slot (8 concurrent)
   kernels/
     cuda_sm90/                    # H100 kernels
     cuda_sm100/                   # B200 FP4-native kernels
