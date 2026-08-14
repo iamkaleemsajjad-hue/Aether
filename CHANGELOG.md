@@ -5,7 +5,109 @@ All notable changes to Aether Runtime will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-13 — Specialised Loaders, Distributed Engine, Full Evaluation Suite, PEP 561 Stubs
+
+### Added — Specialised Model Loaders (Stage 1 Ingestion)
+
+- **`VideoModelLoader`** (`src/aether/compiler/stage1_ingestion/video_loader.py`):
+  Full graph extraction for Video-LLaMA/2, VideoChat2, LLaVA-Video, LLaVA-NeXT-Video,
+  InternVideo2. Detects video encoder type, temporal aggregator, language backbone.
+  Builds AEGGraph with video encoder/temporal attention/projection/LLM/LM-head nodes.
+  Audio encoder support (Video-LLaMA). Frame KV budget metadata in graph.
+
+- **`MLALoader`** (`src/aether/compiler/stage1_ingestion/mla_loader.py`):
+  Native DeepSeek V2/V3/R1 ingestion with KV compression metadata.
+  Hybrid dense-MHA + MLA + MoE layer map. Records `kv_compression_ratio` (~5.3×),
+  `mla_config`, `c_kv_dim` in graph attributes.
+
+- **`MoELoader`** (`src/aether/compiler/stage1_ingestion/moe_loader.py`):
+  Sparse MoE ingestion for Mixtral, Qwen-MoE, Jamba, DBRX, OLMoE.
+  Zipf-prior expert tiering (hot/warm/cold). Router nodes with `hot_experts`,
+  `warm_experts`, `cold_experts`. Shared expert FFN for Qwen-MoE. Jamba-style
+  alternating dense/MoE layers.
+
+- **Ingestion dispatcher** (`_try_specialised_loader` in `ingestion.py`):
+  Fires before generic format dispatch. Routing: MLA → MoE → Video → VLM → SSM → generic.
+  All failures logged; transparently falls back to generic path.
+
+- **Stage 1 exports** (`stage1_ingestion/__init__.py`):
+  All new loaders, architectures, and helper functions exported.
+
+- **pyproject.toml entry points**: `mla` and `moe` loader entry points added;
+  `video` entry point corrected from `vlm_loader` to `video_loader`.
+
+### Added — Distributed Execution
+
+- **`DistributedInferenceEngine`** (`src/aether/parallelism/distributed.py`):
+  Multi-rank tensor/pipeline parallel inference orchestrator.
+  `world_size`, `rank`, `tp_rank`, `pp_rank`, `is_driver` properties.
+  `initialize()`, `submit()`, `shutdown()` lifecycle. Single-rank is no-op (no sockets).
+  All 3 previously-skipped distributed tests now pass (33/33 total).
+
+### Added — Evaluation System
+
+- **`Math500Evaluator`**: MATH-500 competition math benchmark with `\boxed{}` answer
+  extraction (LaTeX parser + numeric fallback), normalisation, and exact-match scoring.
+
+- **`JsonlBenchmarkEvaluator`**: Any JSONL file with `prompt`/`expected` fields.
+
+- **`DatasetBenchmarkEvaluator`**: Multi-format dispatcher for HellaSwag, MMLU, ARC, JSONL.
+
+- All 6 previously-skipped evaluation tests now pass (74/74 total).
+
+### Added — Type Annotations (PEP 561)
+
+- **`src/aether/py.typed`**: PEP 561 marker, enables mypy/pyright inline type checks.
+
+- **`src/aether/__init__.pyi`**: Complete type stubs for all public SDK classes:
+  `Runtime`, `Compiler`, `CompilerConfig`, `RuntimeConfig`, `AEGPackage`,
+  `GenerationResponse`, `StreamChunk`, `GenerationMetrics`, `QualityReport`,
+  `CompilationPlan`. Full IDE autocompletion for SDK users.
+
+### Added — Documentation
+
+- **`docs/api-reference.md`** (rewrite): Python SDK, REST API (67 endpoints),
+  OpenAI-compat client, CLI reference, gRPC proto + Python client, advanced usage.
+
+- **`docs/roadmap.md`** (rewrite): Accurate phase tracking, all completed items
+  checked, hardware-gated items flagged, test coverage summary table.
+
+- **`docs/architecture.md`** (rewrite): R1-R12 runtime layers, all 22 optimizer
+  passes, 10 specialised loaders, AEG 1.1/2.0/3.0 formats, all platform modules.
+
+- **`docs/getting-started.md`** (rewrite): System requirements, one-click install,
+  all 10 format examples, SDK patterns, REST/CLI/benchmark recipes.
+
+### Added — Install Scripts
+
+- **`scripts/install.sh`**: Linux/macOS one-click installer with CUDA/ROCm/MPS detection.
+- **`scripts/install.ps1`**: Windows one-click installer with CUDA detection.
+
+### Fixed
+
+- **`scripts/check_env.py`**: Fixed `UnicodeEncodeError` on Windows CP1252 terminals
+  (✓/✗ characters). Added `io.TextIOWrapper` UTF-8 reconfiguration at startup.
+
+- **`pyproject.toml`**: Fixed duplicate `[tool.hatch.build.targets.wheel]` section
+  that caused TOML parse error. Merged into single clean entry with PEP 561
+  `[tool.setuptools.package-data]` configuration.
+
+- **`tests/unit/test_distributed_complete.py`**: Fixed 3 skipped tests to use correct
+  API signatures: `DeviceMesh(shape=...)`, `ModelArchitecture(layers=..., params_billion=...)`,
+  `DistributedInferenceEngine(world_size=..., rank=...)`.
+
+### Tests
+
+- `tests/unit/test_specialised_loaders.py` — 68 new tests (VideoModelLoader/MLALoader/MoELoader)
+- `tests/unit/test_safetensors_loader_complete.py` — new safetensors coverage
+- Evaluation tests: Math500/JsonlBenchmarkEvaluator/DatasetBenchmarkEvaluator
+- Distributed tests: DistributedInferenceEngine (3 previously-skipped now pass)
+- **Total passing unit tests: ~1,860+ (≤1 skip: network test, env-gated)**
+
+---
+
 ## [0.4.0] - 2026-08-07 — Hardware Targets, RISC-V NPU IR, AEG Format 2.0, API v4.0
+
 
 ### Added — Hardware Profiles (PRD §3)
 
