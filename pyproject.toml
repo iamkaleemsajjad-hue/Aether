@@ -223,9 +223,16 @@ evaluators = "aether.observability.evaluators:EVALUATOR_REGISTRY"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aether"]
+include = [
+    "/src/aether",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# PEP 561: include py.typed marker and .pyi stubs in the wheel
+[tool.setuptools.package-data]
+aether = ["py.typed", "*.pyi"]
 
 [tool.hatch.build.targets.sdist]
 include = [
