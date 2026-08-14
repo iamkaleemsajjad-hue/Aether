@@ -42,7 +42,8 @@ class TestHubManifest:
 
 class TestHubClientLocalCache:
     def _client(self) -> HubClient:
-        return HubClient(hub_url="http://localhost:9999")  # unreachable → local mode
+        return HubClient(hub_url="http://localhost:9999", allow_local_cache=True)  # unreachable → local mode
+
 
     def test_login_stores_token(self):
         client = self._client()

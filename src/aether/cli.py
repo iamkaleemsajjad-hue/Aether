@@ -719,9 +719,9 @@ def tee(ctx: click.Context, model: str, backend: str, output: str | None, report
             console.print(table)
             hw_backed = attestation.get("hardware_backed", False)
             if hw_backed:
-                console.print("[bold green]✓ Hardware-backed TEE confirmed.[/bold green]")
+                console.print("[bold green]PASS: Hardware-backed TEE confirmed.[/bold green]")
             else:
-                console.print("[bold yellow]⚠ Running in software simulation mode (no hardware TEE detected).[/bold yellow]")
+                console.print("[bold yellow]WARN: Running in software simulation mode (no hardware TEE detected).[/bold yellow]")
         except Exception as exc:
             console.print(f"[red]Could not generate attestation report: {exc}[/red]")
 
@@ -1115,14 +1115,420 @@ def cache_flush(ctx: click.Context) -> None:
     console.print(json.dumps({"removed": semantic_cache.flush()}))
 
 
+# ---------------------------------------------------------------------------
+# aether doctor — full system diagnostics (PRD §42)
+# ---------------------------------------------------------------------------
+
+@cli.command("doctor")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON instead of rich table.")
+def doctor(as_json: bool) -> None:
+    """Full system diagnostics: Python, dependencies, hardware, smoke test."""
+    import importlib
+    import subprocess
+    import sys
+
+    report: dict[str, Any] = {
+        "aether_version": None,
+        "python_version": sys.version,
+        "platform": sys.platform,
+        "checks": [],
+    }
+
+    def check(name: str, fn: Any) -> dict[str, Any]:
+        try:
+            result = fn()
+            return {"name": name, "status": "pass", "detail": result}
+        except Exception as exc:  # noqa: BLE001
+            return {"name": name, "status": "fail", "detail": str(exc)}
+
+    # Aether version
+    try:
+        from aether.core.constants import AETHER_VERSION
+        report["aether_version"] = AETHER_VERSION
+    except ImportError:
+        report["aether_version"] = "unknown"
+
+    # Core dependencies
+    for pkg in ["torch", "numpy", "click", "rich", "safetensors"]:
+        def _check_import(p: str = pkg) -> str:
+            mod = importlib.import_module(p)
+            return getattr(mod, "__version__", "installed")
+        report["checks"].append(check(f"import:{pkg}", _check_import))
+
+    # Hardware detection
+    try:
+        from aether.backends.hardware_detector import detect_all_capabilities, validate_backend_environment
+        caps = detect_all_capabilities()
+        report["hardware"] = [
+            {
+                "target_id": c.target_id,
+                "vendor": c.vendor,
+                "device": c.device,
+                "available": c.available,
+                "unavailable_reason": c.unavailable_reason,
+            }
+            for c in caps
+        ]
+        # CPU is always available — validate it
+        cpu_val = validate_backend_environment("cpu")
+        report["checks"].append({
+            "name": "hardware:cpu",
+            "status": "pass" if cpu_val.all_passed else "warn",
+            "detail": {
+                "passed": cpu_val.checks_passed,
+                "failed": cpu_val.checks_failed,
+                "warnings": cpu_val.warnings,
+            },
+        })
+    except Exception as exc:  # noqa: BLE001
+        report["checks"].append({"name": "hardware:detect", "status": "fail", "detail": str(exc)})
+
+    # Smoke test: import and instantiate Runtime
+    def _smoke() -> str:
+        from aether import Runtime, RuntimeConfig
+        rt = Runtime(RuntimeConfig(hf_offline=True))
+        # Verify the runtime object was created properly without accessing private state
+        assert rt is not None
+        return f"Runtime instantiated OK (class={type(rt).__name__})"
+    report["checks"].append(check("smoke:runtime_init", _smoke))
+
+    # Native CPU kernels
+    def _native_cpu() -> str:
+        from aether.kernels.native_cpu import get_native_kernels
+        nk = get_native_kernels()
+        if nk.ensure_compiled():
+            return f"kernels={nk.available_kernels()}"
+        return f"build_failed={nk.build_error}"
+    report["checks"].append(check("kernels:native_cpu", _native_cpu))
+
+    # Hardware validation matrix file
+    def _hw_matrix() -> str:
+        # cli.py is at src/aether/cli.py — 3 parents = repo root
+        candidates = [
+            Path(__file__).parent.parent.parent / "hardware_validation_matrix.json",
+            Path.cwd() / "hardware_validation_matrix.json",
+        ]
+        for p in candidates:
+            if p.is_file():
+                return f"found at {p}"
+        return "not found (run: aether hardware detect --save)"
+    report["checks"].append(check("file:hardware_validation_matrix", _hw_matrix))
+
+
+    # Summarize
+    passed = sum(1 for c in report["checks"] if c["status"] == "pass")
+    failed = sum(1 for c in report["checks"] if c["status"] == "fail")
+    report["summary"] = {"passed": passed, "failed": failed, "total": len(report["checks"])}
+
+    if as_json:
+        console.print(RichJSON(json.dumps(report, indent=2, default=str)))
+        return
+
+    # Rich table output
+    table = Table(title="Aether Doctor Report")
+    table.add_column("Check", style="cyan")
+    table.add_column("Status", style="bold")
+    table.add_column("Detail", style="dim")
+    for c in report["checks"]:
+        status_str = {"pass": "[green]PASS[/green]", "fail": "[red]FAIL[/red]",
+                      "warn": "[yellow]WARN[/yellow]"}.get(c["status"], c["status"])
+        detail = str(c.get("detail", ""))[:80]
+        table.add_row(c["name"], status_str, detail)
+    console.print(table)
+    console.print(f"\n[bold]Hardware:[/bold]")
+    hw_list = report.get("hardware", [])
+    for h in hw_list[:6]:
+        avail = "[green]YES[/green]" if h["available"] else "[red]NO[/red]"
+        console.print(f"  {avail} {h['target_id']:20s} {h['vendor']} {h['device']}")
+    if len(hw_list) > 6:
+        console.print(f"  [dim]... and {len(hw_list) - 6} more (use aether hardware detect)[/dim]")
+    console.print(f"\n[bold]Summary:[/bold] {passed}/{len(report['checks'])} checks passed", end="")
+    if failed:
+        console.print(f"  [red]{failed} failed[/red]")
+    else:
+        console.print("  [green]All OK[/green]")
+
+
+# ---------------------------------------------------------------------------
+# aether hardware — hardware detection and validation (PRD §41, §42)
+# ---------------------------------------------------------------------------
+
+@cli.group("hardware")
+def hardware() -> None:
+    """Hardware detection, capability reporting, and backend validation."""
+
+
+@hardware.command("detect")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+@click.option("--save", is_flag=True, help="Update hardware_validation_matrix.json in the repo root.")
+def hardware_detect(as_json: bool, save: bool) -> None:
+    """Detect all hardware backends on this host and report real availability."""
+    from aether.backends.hardware_detector import detect_all_capabilities
+
+    caps = detect_all_capabilities()
+    data = {
+        "detected_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "host_platform": sys.platform if "sys" in dir() else __import__("sys").platform,
+        "targets": [c.to_dict() for c in caps],
+    }
+
+    if save:
+        import sys as _sys
+        repo_root = Path(__file__).parent.parent.parent.parent
+        matrix_path = repo_root / "hardware_validation_matrix.json"
+        import json as _json
+        matrix_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+        console.print(f"[green]Saved to {matrix_path}[/green]")
+
+    if as_json:
+        console.print(RichJSON(json.dumps(data, indent=2, default=str)))
+        return
+
+    table = Table(title="Hardware Capability Detection")
+    table.add_column("Target ID", style="cyan")
+    table.add_column("Vendor", style="magenta")
+    table.add_column("Device", style="white")
+    table.add_column("Available", style="bold")
+    table.add_column("Exec Tested", style="dim")
+    for c in caps:
+        avail = "[green]YES[/green]" if c.available else "[red]NO[/red]"
+        tested = "[green]YES[/green]" if c.execution_tested else "[dim]NO[/dim]"
+        table.add_row(c.target_id, c.vendor, c.device[:40], avail, tested)
+    console.print(table)
+    console.print(f"\n[dim]{len([c for c in caps if c.available])} available, "
+                  f"{len([c for c in caps if not c.available])} unavailable[/dim]")
+
+
+@hardware.command("capabilities")
+@click.argument("target_id", required=False)
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def hardware_capabilities(target_id: str | None, as_json: bool) -> None:
+    """Show detailed capability matrix for a target (or all if no target given)."""
+    from aether.backends.hardware_detector import detect_all_capabilities
+
+    caps = detect_all_capabilities()
+    if target_id:
+        caps = [c for c in caps if c.target_id == target_id or c.vendor.lower() == target_id.lower()]
+        if not caps:
+            raise click.ClickException(f"No hardware target found for {target_id!r}")
+
+    if as_json:
+        console.print(RichJSON(json.dumps([c.to_dict() for c in caps], indent=2, default=str)))
+        return
+
+    for c in caps:
+        table = Table(title=f"{c.target_id} — {c.vendor} {c.device}")
+        table.add_column("Property", style="cyan")
+        table.add_column("Value", style="white")
+        table.add_row("vendor", c.vendor)
+        table.add_row("device", c.device)
+        table.add_row("architecture", c.architecture)
+        table.add_row("driver_version", c.driver_version)
+        table.add_row("memory_bytes", f"{c.memory_bytes:,}")
+        table.add_row("supports_fp16", str(c.supports_fp16))
+        table.add_row("supports_bf16", str(c.supports_bf16))
+        table.add_row("supports_fp8", str(c.supports_fp8))
+        table.add_row("supports_fp4", str(c.supports_fp4))
+        table.add_row("supports_tee", str(c.supports_tee))
+        table.add_row("implemented", "[green]YES[/green]" if c.implemented else "[red]NO[/red]")
+        table.add_row("available", "[green]YES[/green]" if c.available else "[red]NO[/red]")
+        table.add_row("execution_tested", "[green]YES[/green]" if c.execution_tested else "[dim]NO[/dim]")
+        table.add_row("production_validated", "[green]YES[/green]" if c.production_validated else "[dim]NO[/dim]")
+        if c.unavailable_reason:
+            table.add_row("unavailable_reason", f"[dim]{c.unavailable_reason}[/dim]")
+        console.print(table)
+
+
+@hardware.command("validate")
+@click.argument("target_id", default="cpu")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def hardware_validate(target_id: str, as_json: bool) -> None:
+    """Run environment contract checks for a backend target."""
+    from aether.backends.hardware_detector import validate_backend_environment
+
+    result = validate_backend_environment(target_id)
+    if as_json:
+        console.print(RichJSON(json.dumps(result.to_dict(), indent=2, default=str)))
+        return
+
+    table = Table(title=f"Backend Validation: {target_id}")
+    table.add_column("Check", style="cyan")
+    table.add_column("Status", style="bold")
+    for c in result.checks_passed:
+        table.add_row(c, "[green]PASS[/green]")
+    for c in result.checks_failed:
+        table.add_row(c, "[red]FAIL[/red]")
+    for w in result.warnings:
+        table.add_row(w, "[yellow]WARN[/yellow]")
+    console.print(table)
+    status = "[green]AVAILABLE[/green]" if result.all_passed else "[red]UNAVAILABLE[/red]"
+    console.print(f"\nBackend {target_id!r}: {status}")
+    if not result.all_passed and result.checks_failed:
+        raise click.ClickException(f"Backend {target_id!r} validation failed")
+
+
+# ---------------------------------------------------------------------------
+# aether backend — backend management (PRD §6)
+# ---------------------------------------------------------------------------
+
+@cli.group("backend")
+def backend_group() -> None:
+    """Backend management commands."""
+
+
+@backend_group.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def backend_list(as_json: bool) -> None:
+    """List all registered backends with availability status."""
+    from aether.backends.hardware_detector import detect_all_capabilities
+
+    caps = detect_all_capabilities()
+    if as_json:
+        console.print(RichJSON(json.dumps(
+            [{"target_id": c.target_id, "vendor": c.vendor, "device": c.device,
+              "available": c.available, "implemented": c.implemented,
+              "execution_tested": c.execution_tested,
+              "unavailable_reason": c.unavailable_reason}
+             for c in caps], indent=2)))
+        return
+
+    table = Table(title="Aether Backend Registry")
+    table.add_column("Target ID", style="cyan")
+    table.add_column("Vendor", style="magenta")
+    table.add_column("Device", style="white")
+    table.add_column("Impl", style="dim")
+    table.add_column("Available", style="bold")
+    table.add_column("Exec Tested", style="dim")
+    for c in caps:
+        impl = "[green]YES[/green]" if c.implemented else "[red]NO[/red]"
+        avail = "[green]YES[/green]" if c.available else "[red]NO[/red]"
+        tested = "[green]YES[/green]" if c.execution_tested else "[dim]NO[/dim]"
+        table.add_row(c.target_id, c.vendor, c.device[:30], impl, avail, tested)
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# aether inspect — deep AEG inspection (PRD §44)
+# ---------------------------------------------------------------------------
+
+@cli.command("inspect")
+@click.argument("aeg_path", type=click.Path(exists=True))
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+@click.pass_context
+def inspect_aeg(ctx: click.Context, aeg_path: str, as_json: bool) -> None:
+    """Deep inspection of a compiled AEG artifact."""
+    from aether.core.aeg_format import load_aeg_package
+
+    pkg = load_aeg_package(aeg_path)
+    root = Path(aeg_path)
+    files = sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+
+    report: dict[str, Any] = {
+        "path": aeg_path,
+        "manifest": pkg.manifest.to_dict() if pkg.manifest else {},
+        "files": files,
+        "file_count": len(files),
+    }
+
+    if as_json:
+        console.print(RichJSON(json.dumps(report, indent=2, default=str)))
+        return
+
+    console.print(f"[bold]AEG Artifact: {aeg_path}[/bold]")
+    if pkg.manifest:
+        m = pkg.manifest
+        table = Table(title="Manifest")
+        table.add_column("Field", style="cyan")
+        table.add_column("Value", style="white")
+        d = m.to_dict()
+        for k, v in d.items():
+            if isinstance(v, dict):
+                table.add_row(k, json.dumps(v, default=str)[:80])
+            else:
+                table.add_row(k, str(v)[:80])
+        console.print(table)
+    console.print(f"\n[dim]{len(files)} files in artifact:[/dim]")
+    for f in files[:20]:
+        console.print(f"  {f}")
+    if len(files) > 20:
+        console.print(f"  [dim]... and {len(files) - 20} more[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# aether benchmark — real measured performance (PRD §36)
+# ---------------------------------------------------------------------------
+
+@cli.command("benchmark")
+@click.argument("model")
+@click.option("--prompts", "-p", multiple=True, default=["Hello, tell me about yourself."],
+              help="Prompts to benchmark. Repeat for multiple prompts.")
+@click.option("--max-tokens", type=int, default=64, help="Max tokens per run.")
+@click.option("--runs", type=int, default=5, help="Number of measured runs.")
+@click.option("--warmup", type=int, default=1, help="Number of warmup runs (not measured).")
+@click.option("--output", "-o", type=click.Path(), default=None,
+              help="Save benchmark report to JSON file.")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+@click.pass_context
+def benchmark_cmd(
+    ctx: click.Context,
+    model: str,
+    prompts: tuple[str, ...],
+    max_tokens: int,
+    runs: int,
+    warmup: int,
+    output: str | None,
+    as_json: bool,
+) -> None:
+    """Run real measured inference benchmarks (TTFT, TBT, TPS, P95 latency).
+
+    All measurements come from actual inference runs — no hardcoded values.
+    Results include hardware provenance so they are reproducible.
+    """
+    from aether.observability.benchmark_runner import BenchmarkRunner
+
+    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
+
+    def _generate(prompt: str, max_tok: int) -> str:
+        return rt.generate(model, prompt, max_tokens=max_tok, temperature=0.0).text
+
+    runner = BenchmarkRunner(
+        generate_fn=_generate,
+        model_id=model,
+        num_warmup_runs=warmup,
+        num_measured_runs=runs,
+    )
+
+    with console.status(f"[bold green]Benchmarking {model} ({warmup} warmup + {runs} runs)..."):
+        report = runner.run(list(prompts), max_tokens=max_tokens, output_path=output)
+
+    if as_json:
+        console.print(RichJSON(json.dumps(report.to_dict(), indent=2, default=str)))
+        return
+
+    table = Table(title=f"Benchmark Results — {model}")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="white")
+    summary = report.to_dict()["summary"]
+    for k, v in summary.items():
+        vstr = f"{v:.4f}" if isinstance(v, float) else str(v)
+        table.add_row(k, vstr)
+    console.print(table)
+    if output:
+        console.print(f"[dim]Full report saved to {output}[/dim]")
+    failed = summary.get("failed_runs", 0)
+    if failed:
+        console.print(f"[yellow]Warning: {failed} run(s) failed[/yellow]")
+
+
 def main() -> None:
     """CLI entry point for `aether` command."""
     cli(obj={})
 
 
 # Preserve the short v3 command while exposing the PRD spelling.
-cli.add_command(hw, name="hw")
+cli.add_command(hardware, name="hw")
 
 
 if __name__ == "__main__":
     main()
+

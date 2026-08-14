@@ -16,6 +16,7 @@ import hashlib
 import io
 import json
 import math
+import tarfile
 import time
 import urllib.error
 import urllib.parse
@@ -48,6 +49,31 @@ def _safe_extract_zip(archive: zipfile.ZipFile, destination: Path) -> None:
         # ZIP symlinks encode a Unix symlink mode in the external attributes.
         if ((info.external_attr >> 16) & 0o170000) == 0o120000:
             raise HubError(f"symlink archive members are not permitted: {info.filename!r}")
+    archive.extractall(root)
+
+
+def _safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
+    """Extract a TAR archive without allowing path traversal, absolute paths, or symlinks."""
+    root = destination.resolve()
+    for member in archive.getmembers():
+        # Reject absolute paths
+        if member.name.startswith("/") or member.name.startswith("\\"):
+            raise HubError(f"unsafe archive member (absolute path): {member.name!r}")
+        # Reject path traversal
+        normalized = member.name.replace("\\", "/")
+        candidate = (root / normalized).resolve()
+        try:
+            inside = candidate == root or candidate.is_relative_to(root)
+        except AttributeError:  # Python 3.8 compat
+            inside = str(candidate).startswith(str(root)) or candidate == root
+        if not inside:
+            raise HubError(f"unsafe archive member (path traversal): {member.name!r}")
+        # Reject symlinks and hardlinks
+        if member.issym() or member.islnk():
+            raise HubError(f"symlink/hardlink archive members are not permitted: {member.name!r}")
+        # Reject device files
+        if member.isdev():
+            raise HubError(f"device file archive members are not permitted: {member.name!r}")
     archive.extractall(root)
 
 

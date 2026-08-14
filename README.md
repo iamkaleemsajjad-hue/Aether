@@ -4,6 +4,13 @@
 
 Aether Runtime is a production-grade ML compiler, inference engine, and deployment platform for large language models. It compiles any HuggingFace-compatible model into an **AEG (Aether Executable Graph)** package — a portable, self-contained artifact that runs on NVIDIA GPUs (Hopper/Ada/Blackwell), AMD MI300X, Apple Silicon, Intel NPUs, Qualcomm AI 100, and CPU AVX-512 with zero code changes.
 
+
+> **Hardware Status** - See [hardware_validation_matrix.json](hardware_validation_matrix.json) for the authoritative availability classification.
+> - CPU (x86_64) - Fully implemented and execution-tested end-to-end on this platform
+> - CUDA / ROCm / Metal - Backend architecture implemented; execution validation requires physical GPU hardware  
+> - Qualcomm QNN / FPGA - Explicitly unsupported (no SDK integration)
+> - Run \ether hardware detect\ to see availability on your host
+
 ---
 
 ## Table of Contents
