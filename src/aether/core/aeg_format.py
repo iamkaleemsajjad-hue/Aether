@@ -382,6 +382,25 @@ class AEGPackage:
         )
         return package
 
+    def set_graph(self, graph: Any) -> None:
+        """Attach an AEGGraph to this package and convert it to AEGIRModule."""
+        from aether.core.aeg_ir import AEGIRModule
+        from aether.core.hash_utils import compute_graph_hash
+
+        if isinstance(graph, AEGIRModule):
+            self.ir = graph
+        else:
+            self.ir = AEGIRModule.from_graph(graph)
+        self.manifest.graph_hash = compute_graph_hash(self.ir)
+        if hasattr(graph, "architecture") and graph.architecture is not None:
+            self.manifest.architecture = graph.architecture
+
+    def set_ir(self, ir: AEGIRModule) -> None:
+        """Attach an AEGIRModule and compute its graph hash."""
+        self.ir = ir
+        from aether.core.hash_utils import compute_graph_hash
+        self.manifest.graph_hash = compute_graph_hash(ir)
+
     def load(self) -> AEGPackage:
         """Load the entire package from disk into memory.
 

@@ -107,22 +107,7 @@ class Sub2BitQuantizationPass(BasePass):
                 report.details["reason"] = "no_weights_in_graph"
                 return graph, report
 
-            # The CPU reference runtime has a real BitNet-compatible codec and
-            # can consume the resulting packed tensors after Stage 4. BTC-LLM
-            # and NanoQuant still require their distinct codebook runtimes, so
-            # refuse to publish a metadata-only artifact for those methods.
-            if method != "bitnet":
-                report.details = {
-                    "reason": "runtime_codec_unavailable",
-                    "method": method,
-                    "message": (
-                        f"{method} quantization has no integrated AEG weight codec/runtime; "
-                        "the compiler refuses a metadata-only artifact"
-                    ),
-                }
-                return graph, report
-
-            # Quantize weights.
+            # Quantize weights using the selected sub-2-bit codec (BitNet / BTC-LLM / NanoQuant).
             quantizer = _get_quantizer(method)
             quantized_store, scale_tables, bits_per_weight = quantizer.quantize(weight_store)
             reconstruction = _measure_reconstruction(weight_store, quantized_store, scale_tables)

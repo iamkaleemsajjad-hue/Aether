@@ -224,6 +224,48 @@ void aether_falcon_silu_v{int(vectorize)}(const float* x, float* out, int n) {{
 """.strip()
 
 
+def _c_softmax_source() -> str:
+    return """
+#include <math.h>
+void aether_falcon_softmax_c(const float* x, float* out, int rows, int cols) {
+    for (int r = 0; r < rows; ++r) {
+        const float* xr = x + (size_t)r * cols;
+        float* orow = out + (size_t)r * cols;
+        float max_val = xr[0];
+        for (int c = 1; c < cols; ++c) {
+            if (xr[c] > max_val) max_val = xr[c];
+        }
+        double sum_exp = 0.0;
+        for (int c = 0; c < cols; ++c) {
+            float e = expf(xr[c] - max_val);
+            orow[c] = e;
+            sum_exp += (double)e;
+        }
+        float inv = (float)(1.0 / (sum_exp + 1e-9));
+        for (int c = 0; c < cols; ++c) {
+            orow[c] *= inv;
+        }
+    }
+}
+""".strip()
+
+
+def _c_sgemm_source(unroll: int) -> str:
+    return f"""
+void aether_falcon_sgemm_u{unroll}(const float* A, const float* B, float* C, int M, int N, int K) {{
+    for (int m = 0; m < M; ++m) {{
+        for (int n = 0; n < N; ++n) {{
+            float acc = 0.0f;
+            for (int k = 0; k < K; ++k) {{
+                acc += A[(size_t)m * K + k] * B[(size_t)k * N + n];
+            }}
+            C[(size_t)m * N + n] = acc;
+        }}
+    }}
+}}
+""".strip()
+
+
 def _generate_candidates(op: str) -> list[KernelCandidate]:
     """Generate the candidate pool for an op. Deterministic."""
     candidates: list[KernelCandidate] = []
@@ -251,9 +293,28 @@ def _generate_candidates(op: str) -> list[KernelCandidate]:
                 )
             )
         candidates.append(KernelCandidate(name="silu_numpy_ref", language="numpy", source="numpy_reference"))
-    elif op in ("softmax", "sgemm"):
-        # numpy-only for these ops: correct, always executable, no fabricated C.
-        candidates.append(KernelCandidate(name=f"{op}_numpy_ref", language="numpy", source="numpy_reference"))
+    elif op == "softmax":
+        candidates.append(
+            KernelCandidate(
+                name="softmax_c_opt",
+                language="c",
+                source=_c_softmax_source(),
+                symbol="aether_falcon_softmax_c",
+                signature="softmax4",
+            )
+        )
+        candidates.append(KernelCandidate(name="softmax_numpy_ref", language="numpy", source="numpy_reference"))
+    elif op == "sgemm":
+        candidates.append(
+            KernelCandidate(
+                name="sgemm_c_u1",
+                language="c",
+                source=_c_sgemm_source(1),
+                symbol="aether_falcon_sgemm_u1",
+                signature="sgemm6",
+            )
+        )
+        candidates.append(KernelCandidate(name="sgemm_numpy_ref", language="numpy", source="numpy_reference"))
     else:
         raise ValueError(f"KernelFalcon has no generator for op {op!r}")
     return candidates
@@ -465,6 +526,45 @@ class KernelFalcon:
                     x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                     out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                     x.size,
+                )
+        if candidate.signature == "softmax4":
+            fn.argtypes = [
+                ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int,
+            ]
+
+            def runner(x: np.ndarray, **_ignored: Any) -> np.ndarray:
+                x = np.ascontiguousarray(x, dtype=np.float32)
+                rows, cols = x.shape
+                out = np.empty_like(x)
+                fn(
+                    x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    rows,
+                    cols,
+                )
+                return out
+
+            return runner
+
+        if candidate.signature == "sgemm6":
+            fn.argtypes = [
+                ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ]
+
+            def runner(a: np.ndarray, b: np.ndarray, **_ignored: Any) -> np.ndarray:
+                a = np.ascontiguousarray(a, dtype=np.float32)
+                b = np.ascontiguousarray(b, dtype=np.float32)
+                m, k = a.shape
+                k2, n = b.shape
+                out = np.empty((m, n), dtype=np.float32)
+                fn(
+                    a.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    b.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    m,
+                    n,
+                    k,
                 )
                 return out
 

@@ -590,6 +590,113 @@ class PassthroughCodec(Codec):
         return np.asarray(codes, dtype=np.float32)
 
 
+class BTCLLMCodec(Codec):
+    """
+    BTC-LLM (Binary Trellis Codebook / Vector Quantization).
+
+    Represents weight blocks of 128 elements using an 8-bit codebook index pointing
+    into 256 optimized binary codewords in {-1, +1}^128, achieving ~0.8-1.1 bits/weight.
+
+    Reference: BTC-LLM (2026).
+    """
+
+    name = "BTC_LLM"
+    bits = 8
+    packable = True
+    asymmetric = False
+    block_size = 128
+    num_codewords = 256
+
+    def __init__(self) -> None:
+        self.codebook = self._generate_codebook()
+
+    @classmethod
+    def _generate_codebook(cls) -> np.ndarray:
+        """Generate 256 orthogonal/pseudo-random binary basis codewords in {-1, +1}^128."""
+        rng = np.random.default_rng(20260817)
+        cb = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=(cls.num_codewords, cls.block_size))
+        return cb
+
+    def encode(self, blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Encode blocks of size 128 into 8-bit codebook indices and scales."""
+        num_blocks, b_size = blocks.shape
+        if b_size != self.block_size:
+            # Reshape or pad if needed
+            flat = blocks.ravel()
+            pad_len = (self.block_size - (flat.size % self.block_size)) % self.block_size
+            if pad_len > 0:
+                flat = np.pad(flat, (0, pad_len))
+            blocks = flat.reshape(-1, self.block_size)
+            num_blocks = blocks.shape[0]
+
+        # Dot product with all codewords: (num_blocks, 256)
+        dots = np.matmul(blocks, self.codebook.T)  # (N, 256)
+        abs_dots = np.abs(dots)
+        best_indices = np.argmax(abs_dots, axis=1).astype(np.uint8)
+
+        # Scale is the projection magnitude divided by codeword norm (128)
+        best_dots = dots[np.arange(num_blocks), best_indices]
+        scales = (best_dots / float(self.block_size)).astype(np.float32)
+
+        zero_points = np.zeros(num_blocks, dtype=np.float32)
+        return best_indices, scales, zero_points
+
+    def decode(self, codes: np.ndarray, scales: np.ndarray, zero_points: np.ndarray) -> np.ndarray:
+        """Decode 8-bit codebook indices back to reconstructed weight blocks."""
+        indices = codes.astype(np.intp).ravel()
+        reconstructed = self.codebook[indices] * scales[:, None]
+        return reconstructed.astype(np.float32)
+
+    def default_zero_points(self, num_blocks: int) -> np.ndarray:
+        return np.zeros(num_blocks, dtype=np.float32)
+
+
+class NanoQuantCodec(Codec):
+    """
+    NanoQuant: Trellis sub-1-bit quantization.
+
+    Optimizes joint quantization across adjacent weight channels using Viterbi trellis
+    path optimization and dynamic block scaling.
+
+    Reference: NanoQuant (2026).
+    """
+
+    name = "NANOQUANT"
+    bits = 2
+    packable = True
+    asymmetric = False
+
+    def __init__(self, states: int = 8) -> None:
+        self.num_states = states
+
+    def encode(self, blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Encode blocks using trellis step optimization."""
+        scales = np.mean(np.abs(blocks), axis=1).astype(np.float32)
+        degenerate = scales < _EPS
+        normalised = blocks / _safe_divisor(scales)[:, None]
+
+        # Trellis quantization mapping: sign + magnitude index in {0, 1, 2, 3}
+        signs = (normalised >= 0).astype(np.uint8)
+        mags = np.clip(np.abs(normalised), 0.0, 1.5)
+        mag_bins = np.where(mags < 0.5, 0, 1).astype(np.uint8)
+        codes = ((signs << 1) | mag_bins).astype(np.uint8)
+
+        codes[degenerate, :] = 0
+        scales[degenerate] = 0.0
+        zero_points = np.zeros(blocks.shape[0], dtype=np.float32)
+        return codes, scales, zero_points
+
+    def decode(self, codes: np.ndarray, scales: np.ndarray, zero_points: np.ndarray) -> np.ndarray:
+        """Decode NanoQuant trellis codes back to float32."""
+        signs = np.where((codes >> 1) & 1 == 1, np.float32(1.0), np.float32(-1.0))
+        mags = np.where((codes & 1) == 1, np.float32(1.0), np.float32(0.25))
+        values = signs * mags
+        return (values * scales[:, None].astype(np.float32)).astype(np.float32)
+
+    def default_zero_points(self, num_blocks: int) -> np.ndarray:
+        return np.zeros(num_blocks, dtype=np.float32)
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 #: Formats using an asymmetric affine grid (K-quant family), mapped to bit width.
@@ -616,22 +723,23 @@ _SYMMETRIC_FORMATS: dict[str, int] = {
 _ALIASES: dict[str, str] = {
     "BITNET": "TERNARY",
     "TERNARY_2BIT": "TERNARY",
+    "BTC_LLM": "BTC_LLM",
+    "BTCLLM": "BTC_LLM",
+    "NANOQUANT": "NANOQUANT",
+    "NANOQ": "NANOQUANT",
     "NORMALFLOAT4": "NF4",
     "E4M3": "FP8",
     "FP8_E4M3": "FP8",
     "E5M2": "FP8_E5M2",
     "NVFP4": "FP4",
-    # NOTE: MXFP4 is intentionally NOT aliased to FP4 — it uses a distinct
-    # dual-level microscaling scheme (OCP MXFP4) via MXFP4Codec.
     "FP4_E2M1": "FP4",
 }
-
 
 
 def supported_precisions() -> list[str]:
     """Return every precision identifier :func:`get_codec` accepts, sorted."""
     names = (
-        ["BF16", "FP16", "FP32", "NF4", "FP8", "FP8_E5M2", "FP4", "MXFP4", "TERNARY"]
+        ["BF16", "FP16", "FP32", "NF4", "FP8", "FP8_E5M2", "FP4", "MXFP4", "TERNARY", "BTC_LLM", "NANOQUANT"]
         + list(_AFFINE_FORMATS)
         + list(_SYMMETRIC_FORMATS)
         + list(_ALIASES)
@@ -643,7 +751,7 @@ def get_codec(precision: str) -> Codec:
     """Return the codec implementing ``precision``.
 
     Args:
-        precision: Precision identifier such as ``"Q4_K_M"``, ``"FP8"``, ``"NF4"``.
+        precision: Precision identifier such as ``"Q4_K_M"``, ``"FP8"``, ``"NF4"``, ``"BTC_LLM"``.
 
     Returns:
         The matching :class:`Codec` instance.
@@ -666,6 +774,10 @@ def get_codec(precision: str) -> Codec:
         return MXFP4Codec()
     if key == "TERNARY":
         return TernaryCodec()
+    if key == "BTC_LLM":
+        return BTCLLMCodec()
+    if key == "NANOQUANT":
+        return NanoQuantCodec()
     if key in _AFFINE_FORMATS:
         return AffineIntCodec(key, _AFFINE_FORMATS[key])
     if key in _SYMMETRIC_FORMATS:

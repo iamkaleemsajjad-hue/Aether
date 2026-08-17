@@ -130,6 +130,35 @@ class KernelEmitter:
         require their vendor compiler/runtime and therefore fail closed here;
         returning a :class:`KernelPlan` is not equivalent to generating code.
         """
+        if self.target_id.startswith("cuda_"):
+            from aether.kernels.native_cuda import get_native_cuda_kernels
+            cuda_native = get_native_cuda_kernels(self.target_id)
+            if not cuda_native._toolchain:
+                raise KernelError(
+                    f"CUDA compiler (nvcc) not available for target {self.target_id!r}",
+                    details={"target_id": self.target_id},
+                )
+            if not cuda_native.compile() or cuda_native._library_path is None:
+                raise KernelError(
+                    f"CUDA kernel compilation failed for target {self.target_id!r}: {cuda_native._build_error or 'unknown error'}",
+                    details={"target_id": self.target_id},
+                )
+            dest = cuda_native._library_path
+            if output_path is not None:
+                dest = Path(output_path)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if dest.resolve() != cuda_native._library_path.resolve():
+                    shutil.copy2(cuda_native._library_path, dest)
+            digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+            return KernelArtifact(
+                target_id=self.target_id,
+                kernel_name=op_name,
+                artifact_path=dest,
+                sha256=digest,
+                symbols=("launch_" + op_name.replace("aeg.", ""),),
+                backend="native_cuda",
+            )
+
         if not self.target_id.startswith("cpu_"):
             raise KernelError(
                 f"executable kernel generation is not implemented for target {self.target_id!r}; "
