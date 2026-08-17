@@ -1024,6 +1024,9 @@ class ModelArchitecture:
     is_moe: bool = False
     """Whether this is a Mixture-of-Experts model."""
 
+    is_encoder: bool = False
+    """Whether this is an encoder-only architecture (e.g. BERT, RoBERTa)."""
+
     num_experts: int = 0
     """Total number of experts (MoE only)."""
 
@@ -1085,6 +1088,7 @@ class ModelArchitecture:
             "norm_eps": self.norm_eps,
             "rope_theta": self.rope_theta,
             "is_moe": self.is_moe,
+            "is_encoder": self.is_encoder,
             "num_experts": self.num_experts,
             "num_activated_experts": self.num_activated_experts,
             "mtp_heads": self.mtp_heads,
@@ -1109,6 +1113,7 @@ class ModelArchitecture:
             norm_eps=data.get("norm_eps", 1e-5),
             rope_theta=data.get("rope_theta", 10000.0),
             is_moe=data.get("is_moe", False),
+            is_encoder=data.get("is_encoder", False),
             num_experts=data.get("num_experts", 0),
             num_activated_experts=data.get("num_activated_experts", 0),
             mtp_heads=data.get("mtp_heads", 0),

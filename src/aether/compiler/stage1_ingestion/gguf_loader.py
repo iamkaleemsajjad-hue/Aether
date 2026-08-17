@@ -434,33 +434,83 @@ def _dequant_q3_k(raw: bytes, num_elems: int) -> np.ndarray:
     return result
 
 
-# Map from GGML type to dequantization function
-_DEQUANT_FN: dict[int, Any] = {
-    _GGML_TYPE_F16:  lambda raw, n: _dequant_f16(raw),
-    _GGML_TYPE_BF16: lambda raw, n: _dequant_bf16(raw),
-    _GGML_TYPE_F32:  lambda raw, n: np.frombuffer(raw, dtype=np.float32).copy(),
-    _GGML_TYPE_Q8_0: _dequant_q8_0,
-    _GGML_TYPE_Q4_0: _dequant_q4_0,
-    _GGML_TYPE_Q4_K: _dequant_q4_k,
-    _GGML_TYPE_Q6_K: _dequant_q6_k,
-    _GGML_TYPE_Q2_K: _dequant_q2_k,
-    _GGML_TYPE_Q3_K: _dequant_q3_k,
-}
+def _dequant_q4_1(raw: bytes, num_elems: int) -> np.ndarray:
+    """Q4_1 — faithful transcription of dequantize_row_q4_1 (ggml-quanta.c)."""
+    _require_multiple(num_elems, 32, "Q4_1")
+    n_blocks = num_elems // 32
+    result = np.empty(num_elems, dtype=np.float32)
+    for i in range(n_blocks):
+        base = i * 20
+        d = float(np.frombuffer(raw[base:base+2], dtype=np.float16)[0])
+        m = float(np.frombuffer(raw[base+2:base+4], dtype=np.float16)[0])
+        packed = np.frombuffer(raw[base+4:base+20], dtype=np.uint8)
+        block = np.empty(32, dtype=np.float32)
+        block[0:16] = (packed & 0x0F).astype(np.float32)
+        block[16:32] = (packed >> 4).astype(np.float32)
+        result[i*32:(i+1)*32] = block * d + m
+    return result
+
+
+def _dequant_q5_0(raw: bytes, num_elems: int) -> np.ndarray:
+    """Q5_0 — faithful transcription of dequantize_row_q5_0 (ggml-quanta.c)."""
+    _require_multiple(num_elems, 32, "Q5_0")
+    n_blocks = num_elems // 32
+    result = np.empty(num_elems, dtype=np.float32)
+    for i in range(n_blocks):
+        base = i * 22
+        d = float(np.frombuffer(raw[base:base+2], dtype=np.float16)[0])
+        qh = int(struct.unpack_from("<I", raw, base + 2)[0])
+        qs = np.frombuffer(raw[base+6:base+22], dtype=np.uint8)
+        block = np.empty(32, dtype=np.float32)
+        for j in range(16):
+            lo = int(qs[j]) & 0x0F
+            hi = (qh >> j) & 1
+            block[j] = float(lo | (hi << 4)) - 16.0
+            lo2 = int(qs[j]) >> 4
+            hi2 = (qh >> (j + 16)) & 1
+            block[j + 16] = float(lo2 | (hi2 << 4)) - 16.0
+        result[i*32:(i+1)*32] = block * d
+    return result
+
+
+def _dequant_q5_1(raw: bytes, num_elems: int) -> np.ndarray:
+    """Q5_1 — faithful transcription of dequantize_row_q5_1 (ggml-quanta.c)."""
+    _require_multiple(num_elems, 32, "Q5_1")
+    n_blocks = num_elems // 32
+    result = np.empty(num_elems, dtype=np.float32)
+    for i in range(n_blocks):
+        base = i * 24
+        d = float(np.frombuffer(raw[base:base+2], dtype=np.float16)[0])
+        m = float(np.frombuffer(raw[base+2:base+4], dtype=np.float16)[0])
+        qh = int(struct.unpack_from("<I", raw, base + 4)[0])
+        qs = np.frombuffer(raw[base+8:base+24], dtype=np.uint8)
+        block = np.empty(32, dtype=np.float32)
+        for j in range(16):
+            lo = int(qs[j]) & 0x0F
+            hi = (qh >> j) & 1
+            block[j] = float(lo | (hi << 4))
+            lo2 = int(qs[j]) >> 4
+            hi2 = (qh >> (j + 16)) & 1
+            block[j + 16] = float(lo2 | (hi2 << 4))
+        result[i*32:(i+1)*32] = block * d + m
+    return result
+
+
+def _dequant_q8_k(raw: bytes, num_elems: int) -> np.ndarray:
+    """Q8_K — faithful transcription of dequantize_row_q8_K (ggml-quanta.c)."""
+    _require_multiple(num_elems, 256, "Q8_K")
+    n_blocks = num_elems // 256
+    result = np.empty(num_elems, dtype=np.float32)
+    for i in range(n_blocks):
+        base = i * 292
+        d = float(struct.unpack_from("<f", raw, base)[0])
+        qs = np.frombuffer(raw[base+4:base+260], dtype=np.int8).astype(np.float32)
+        result[i*256:(i+1)*256] = qs * d
+    return result
 
 
 def _dequant_q5_k(raw: bytes, num_elems: int) -> np.ndarray:
-    """Q5_K — faithful transcription of ``dequantize_row_q5_K`` (ggml-quanta.c).
-
-    Block layout (176 bytes, 256 elements):
-      [0:2]     d       f16  super-block scale
-      [2:4]     dmin    f16  super-block min scale
-      [4:16]    scales  12 bytes  8 × (6-bit scale + 6-bit min), get_scale_min_k4 packed
-      [16:48]    qh      32 bytes  high bits (u1=1, u2=2 masks shift by ×4 per group)
-      [48:176]   qs      128 bytes 4-bit quants (lo nibbles of bytes j..j+31 form
-                  sub-block 2g, high nibbles form sub-block 2g+1)
-
-    value = d * scale[sub] * (nibble + (qh_bit ? 16 : 0)) - dmin * min[sub]
-    """
+    """Q5_K — faithful transcription of dequantize_row_q5_K (ggml-quanta.c)."""
     _require_multiple(num_elems, 256, "Q5_K")
     n_blocks = num_elems // 256
     raw_arr = np.frombuffer(raw, dtype=np.uint8, count=176 * n_blocks)
@@ -476,14 +526,12 @@ def _dequant_q5_k(raw: bytes, num_elems: int) -> np.ndarray:
         is_ = 0
         qpos = 0
         u1, u2 = 1, 2
-        for g in range(4):  # four 64-element groups per super-block
+        for g in range(4):
             sc, m = _get_scale_min_k4(is_, scales)
             d1, m1 = d * sc, dmin * m
             sc, m = _get_scale_min_k4(is_ + 1, scales)
             d2, m2 = d * sc, dmin * m
             chunk = qs[qpos:qpos + 32].astype(np.float32)
-            # qh covers the same 32 bytes for every group; the u1/u2 masks
-            # walk through its bits instead of advancing the pointer.
             hi1 = np.where((qh[:32] & u1) != 0, 16.0, 0.0)
             hi2 = np.where((qh[:32] & u2) != 0, 16.0, 0.0)
             result[base + g * 64:base + g * 64 + 32] = d1 * (chunk % 16.0 + hi1) - m1
@@ -495,8 +543,23 @@ def _dequant_q5_k(raw: bytes, num_elems: int) -> np.ndarray:
     return result
 
 
-# Update dequant dispatch table with Q5_K
-_DEQUANT_FN[_GGML_TYPE_Q5_K] = _dequant_q5_k
+# Map from GGML type to dequantization function
+_DEQUANT_FN: dict[int, Any] = {
+    _GGML_TYPE_F16:  lambda raw, n: _dequant_f16(raw),
+    _GGML_TYPE_BF16: lambda raw, n: _dequant_bf16(raw),
+    _GGML_TYPE_F32:  lambda raw, n: np.frombuffer(raw, dtype=np.float32).copy(),
+    _GGML_TYPE_Q8_0: _dequant_q8_0,
+    _GGML_TYPE_Q4_0: _dequant_q4_0,
+    _GGML_TYPE_Q4_1: _dequant_q4_1,
+    _GGML_TYPE_Q5_0: _dequant_q5_0,
+    _GGML_TYPE_Q5_1: _dequant_q5_1,
+    _GGML_TYPE_Q4_K: _dequant_q4_k,
+    _GGML_TYPE_Q5_K: _dequant_q5_k,
+    _GGML_TYPE_Q6_K: _dequant_q6_k,
+    _GGML_TYPE_Q8_K: _dequant_q8_k,
+    _GGML_TYPE_Q2_K: _dequant_q2_k,
+    _GGML_TYPE_Q3_K: _dequant_q3_k,
+}
 
 
 _GGML_TYPE_NAMES: dict[int, str] = {

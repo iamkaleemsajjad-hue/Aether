@@ -50,9 +50,13 @@ def _authorize(context: Any, token: str | None) -> None:
     """Enforce the configured bearer token before decoding request content."""
     if not token:
         return
+    import hmac
+
     metadata = dict(context.invocation_metadata())
     supplied = metadata.get("authorization", "")
-    if supplied != f"Bearer {token}":
+    # Constant-time comparison: a plain ``!=`` leaks key material through
+    # response timing on a remote gRPC channel.
+    if not hmac.compare_digest(supplied.encode("utf-8"), f"Bearer {token}".encode("utf-8")):
         context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid authorization token")
 
 

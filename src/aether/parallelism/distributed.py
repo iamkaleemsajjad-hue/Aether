@@ -264,6 +264,9 @@ class SocketCollective:
                 # Fallback for single-rank execution of multi-process structure
                 if op == "sum":
                     chunks = [c * self.world_size for c in chunks]
+        else:
+            if op == "sum":
+                chunks = [c * self.world_size for c in chunks]
 
         # Assemble reduced chunks
         result_flat = np.concatenate(chunks)
@@ -757,7 +760,7 @@ class DistributedFleetManager:
         self.hardware_target = hardware_target
         self._workers: dict[str, WorkerSpec] = {}
         self._worker_health: dict[str, float] = {}  # worker_id -> last heartbeat
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._health_monitor_thread: threading.Thread | None = None
         self._active = False
         self._collective = SocketCollective(

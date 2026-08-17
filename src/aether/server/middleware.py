@@ -82,7 +82,18 @@ class MetricsMiddleware:
 
 
 class CORSMiddleware(BaseHTTPMiddleware):
-    """Configurable CORS middleware."""
+    """Configurable CORS middleware.
+
+    Security rules (matching the CORS specification's credential model):
+
+    - With a wildcard (``*``) origin policy the ``Origin`` is echoed back but
+      ``Access-Control-Allow-Credentials`` is never sent — browsers reject
+      credentialed wildcard responses, and reflecting an arbitrary origin
+      while allowing credentials would let any site make authenticated
+      cross-origin requests.
+    - With an explicit origin allow-list, only listed origins are echoed and
+      credentials are permitted.
+    """
 
     def __init__(
         self,
@@ -101,14 +112,17 @@ class CORSMiddleware(BaseHTTPMiddleware):
             response = Response(status_code=204)
         else:
             response = await call_next(request)
-        origin = request.headers.get("Origin", "*")
-        if "*" in self.allow_origins or origin in self.allow_origins:
+        origin = request.headers.get("Origin", "")
+        wildcard = "*" in self.allow_origins
+        allow_credentials = not wildcard and bool(self.allow_origins)
+        if wildcard:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        elif origin and origin in self.allow_origins:
             response.headers["Access-Control-Allow-Origin"] = origin
-        else:
-            response.headers["Access-Control-Allow-Origin"] = self.allow_origins[0] if self.allow_origins else "*"
+            if allow_credentials:
+                response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Methods"] = ",".join(self.allow_methods)
         response.headers["Access-Control-Allow-Headers"] = ",".join(self.allow_headers)
-        response.headers["Access-Control-Allow-Credentials"] = "true"
         return response
 
 
@@ -117,17 +131,24 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     If no API keys are configured, all requests pass through. When keys are set,
     requests must provide a valid key via the ``Authorization: Bearer <key>``
-    header.
+    header.  Key comparison uses ``hmac.compare_digest`` so an attacker cannot
+    recover a key byte-by-byte through response timing.
     """
 
     def __init__(self, app: ASGIApp, api_keys: list[str] | None = None) -> None:
         super().__init__(app)
-        self._api_keys = frozenset(api_keys) if api_keys else frozenset()
+        self._api_keys = tuple(api_keys) if api_keys else ()
 
     async def dispatch(self, request: Request, call_next: Callable[[Request], Any]) -> Response:
         if self._api_keys:
+            import hmac
+
             auth = request.headers.get("Authorization", "")
-            if not auth.startswith("Bearer ") or auth[7:] not in self._api_keys:
+            supplied = auth[7:] if auth.startswith("Bearer ") else ""
+            valid = any(
+                hmac.compare_digest(supplied, expected) for expected in self._api_keys
+            )
+            if not valid:
                 return Response(
                     status_code=401,
                     content='{"error":"Unauthorized","message":"Invalid or missing API key"}',

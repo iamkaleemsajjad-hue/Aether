@@ -260,6 +260,7 @@ def test_e2e_compile_quantize_save_load_infer() -> None:
     from aether.compiler.stage1_ingestion.ingestion import IngestionPipeline
     from aether.compiler.weight_quantizer import quantize_graph_weights
     from aether.core.aeg_format import AEGPackage
+    from aether.core.aeg_ir import AEGIRModule
     from aether.core.graph import AEGGraph
     from aether.core.types import ModelArchitecture
     from aether.runtime.aeg_loader import load_engine_from_package
@@ -315,6 +316,7 @@ def test_e2e_compile_quantize_save_load_infer() -> None:
         pkg_path = Path(tmp) / "ci_test.aeg"
         pkg = AEGPackage.create(pkg_path, model_id="ci_test", aether_version="0")
         pkg.manifest.architecture = arch  # type: ignore[union-attr]
+        pkg.ir = AEGIRModule.from_graph(graph)
         quantize_graph_weights(graph, pkg, default_precision="Q4_K_M", block_size=32)
         pkg.save()
 
