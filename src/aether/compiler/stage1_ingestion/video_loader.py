@@ -526,6 +526,7 @@ class _FallbackGraph:
         self.arch = arch
         self._nodes: dict[str, Any] = {}
         self._metadata: dict[str, Any] = {}
+        self.edges: list[tuple[str, str]] = []
 
     @property
     def nodes(self) -> dict[str, Any]:
@@ -535,7 +536,7 @@ class _FallbackGraph:
         self._nodes[getattr(node, "id", str(len(self._nodes)))] = node
 
     def add_edge(self, src: str, dst: str) -> None:
-        pass  # Fallback has no edge tracking
+        self.edges.append((src, dst))
 
     def set_metadata(self, key: str, value: Any) -> None:
         self._metadata[key] = value

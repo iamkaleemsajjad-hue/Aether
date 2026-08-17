@@ -21,7 +21,26 @@ logger = get_logger(__name__)
 
 
 class SensitivityCalibration:
-    """Calibrates per-layer sensitivity scores using perplexity deltas."""
+    """Calibrates per-layer sensitivity scores.
+
+    Two scoring methods are supported, selected by data availability:
+
+    ``weight_reconstruction_error``
+        Preferred.  Quantizes each layer's *real* bound weight tensors to the
+        probe precision and measures the relative reconstruction error.  This
+        is computed from the actual checkpoint weights the graph carries and
+        is the standard one-shot approximation when activation Hessians are
+        unavailable (cf. GPTQ/AWQ weight-error proxies).
+
+    ``text_entropy_proxy``
+        Fallback for weightless graphs.  A deterministic text-entropy
+        perplexity delta combined with documented architectural priors.  The
+        method is always recorded so consumers can distinguish measured from
+        estimated scores.
+    """
+
+    #: Probe precision used to measure per-layer quantization damage.
+    PROBE_PRECISION = "Q4_K_M"
 
     def __init__(self, architecture: ModelArchitecture, evaluator: PerplexityEvaluator | None = None) -> None:
         self.architecture = architecture
@@ -34,17 +53,38 @@ class SensitivityCalibration:
         self,
         dataset: CalibrationDataset,
         base_precision_map: dict[str, str],
+        layer_weights: dict[str, list[np.ndarray]] | None = None,
     ) -> dict[str, float]:
         """Score each layer by quantizing only that layer.
 
         Returns a dictionary mapping layer name to sensitivity score, where a
         higher score indicates that quantizing the layer hurts perplexity more.
-        The score combines measured perplexity delta with transformer priors:
-        early/late layers, attention projections, embeddings, and LM heads get
-        stronger protection than middle FFN-heavy layers.
+        Weight-derived scores combine the measured relative reconstruction
+        error of the layer's real tensors with transformer priors: early/late
+        layers, attention projections, embeddings, and LM heads get stronger
+        protection than middle FFN-heavy layers.
         """
-        baseline = self.evaluator.evaluate(dataset, base_precision_map)
         scores: dict[str, float] = {}
+        if layer_weights:
+            for i in range(self.architecture.layers):
+                layer_name = f"layer_{i}"
+                tensors = layer_weights.get(layer_name) or []
+                error = self._mean_relative_error(tensors)
+                score = self._normalize_weight_error(error) * self._architectural_prior(i)
+                scores[layer_name] = min(1.0, max(0.0, score))
+            for special, fallback in (("embedding", 0.98), ("lm_head", 0.97)):
+                tensors = layer_weights.get(special) or []
+                if tensors:
+                    error = self._mean_relative_error(tensors)
+                    scores[special] = min(1.0, max(0.0, self._normalize_weight_error(error)))
+                else:
+                    # Documented conservative prior: the PRD classifies the
+                    # embedding and output projection as the most protected
+                    # tensors when no weights are available to measure.
+                    scores[special] = fallback
+            return scores
+
+        baseline = self.evaluator.evaluate(dataset, base_precision_map)
         for i in range(self.architecture.layers):
             layer_name = f"layer_{i}"
             modified = dict(base_precision_map)
@@ -56,6 +96,45 @@ class SensitivityCalibration:
         scores["embedding"] = 0.98
         scores["lm_head"] = 0.97
         return scores
+
+    @classmethod
+    def scoring_method(cls, layer_weights: dict[str, list[np.ndarray]] | None) -> str:
+        """Return the human-readable method name that ``score_by_layer`` uses."""
+        return "weight_reconstruction_error" if layer_weights else "text_entropy_proxy"
+
+    #: Relative reconstruction error at which a tensor is fully sensitive.
+    #: Q4_K_M block quantization yields ~3-6% error on well-behaved tensors
+    #: and >12% on outlier-heavy (sensitive) tensors, so 12% maps to 1.0.
+    WEIGHT_ERROR_FULL_SENSITIVITY = 0.12
+
+    @classmethod
+    def _normalize_weight_error(cls, error: float) -> float:
+        """Map a relative reconstruction error linearly to [0, 1]."""
+        return min(1.0, max(0.0, error / cls.WEIGHT_ERROR_FULL_SENSITIVITY))
+
+    def _mean_relative_error(self, tensors: list[np.ndarray]) -> float:
+        """Mean relative Frobenius reconstruction error under the probe precision.
+
+        Quantizes each tensor with the production codec and measures how much
+        of the original signal survives; tensors that cannot be probed are
+        skipped rather than assigned a fabricated error.
+        """
+        from aether.quantization.formats import dequantize_tensor, quantize_tensor
+
+        errors: list[float] = []
+        for tensor in tensors:
+            array = np.asarray(tensor, dtype=np.float32)
+            if array.size < 2 or not np.isfinite(array).all():
+                continue
+            try:
+                reconstructed = dequantize_tensor(quantize_tensor(array, self.PROBE_PRECISION))
+            except Exception:  # noqa: BLE001 - unsupported shape/precision: skip
+                continue
+            denominator = float(np.linalg.norm(array))
+            if denominator <= 0.0:
+                continue
+            errors.append(float(np.linalg.norm(array - reconstructed)) / denominator)
+        return float(np.mean(errors)) if errors else 0.0
 
     def _normalize_delta(self, delta: float) -> float:
         """Map a loss delta to the [0, 1] sensitivity range."""

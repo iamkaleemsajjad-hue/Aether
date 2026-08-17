@@ -314,11 +314,20 @@ def estimate_compile_time_s(
 def recommend_backend(target_id: str) -> str | None:
     """Recommend the best backend for a target.
 
+    Returns the first available backend from the target's candidate list.
+    For CPU targets, always returns ``"aether_cpu"`` as the final fallback
+    because the native Aether CPU engine requires no external packages.
+
+    Never returns ``"pytorch"`` unless torch is explicitly installed AND the
+    target is a CUDA/GPU target that would require it. CPU targets use the
+    native engine, not PyTorch.
+
     Args:
         target_id: Hardware target identifier.
 
     Returns:
-        Backend name or None if the target is invalid.
+        Backend name or ``None`` if the target is invalid or no backend is
+        available (callers should emit a warning in that case).
     """
     try:
         target = HardwareTarget.from_string(target_id)
@@ -328,29 +337,33 @@ def recommend_backend(target_id: str) -> str | None:
     # Check availability (optional imports)
     for backend in candidates:
         try:
+            if backend == "aether_cpu":
+                # Always available — no external dependency required.
+                return backend
             if backend == "pytorch":
-                import torch  # noqa: F401
+                # PyTorch is OPTIONAL. Only recommend it when installed.
+                import torch  # noqa: F401,PLC0415
                 return backend
             if backend == "vllm":
-                import vllm  # noqa: F401
+                import vllm  # noqa: F401,PLC0415
                 return backend
             if backend == "llama.cpp":
-                import llama_cpp  # noqa: F401
+                import llama_cpp  # noqa: F401,PLC0415
                 return backend
             if backend == "mlx":
-                import mlx.core  # noqa: F401
+                import mlx.core  # noqa: F401,PLC0415
                 return backend
             if backend == "onnxruntime":
-                import onnxruntime  # noqa: F401
+                import onnxruntime  # noqa: F401,PLC0415
                 return backend
             if backend == "tensorrt-llm":
-                import tensorrt_llm  # noqa: F401
+                import tensorrt_llm  # noqa: F401,PLC0415
                 return backend
         except ImportError:
             continue
-    # Fallback to PyTorch if available
-    try:
-        import torch  # noqa: F401
-        return "pytorch"
-    except ImportError:
-        return None
+    # For any CPU-class target, the native Aether engine is always available.
+    if target_id.startswith("cpu_") or target_id == "cpu":
+        return "aether_cpu"
+    # For GPU targets, no backend is available on this machine — return None
+    # so callers can emit an explicit warning rather than silently falling back.
+    return None

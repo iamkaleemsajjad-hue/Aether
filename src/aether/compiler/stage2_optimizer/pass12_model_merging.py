@@ -278,10 +278,18 @@ def _load_source_weights(source_path: str, base_graph: Any) -> dict[str, list[fl
         except Exception as exc:  # noqa: BLE001
             logger.debug("safetensors load failed: %s", exc)
 
-    # Try PyTorch.
+    # Try PyTorch.  ``weights_only=True`` is mandatory: merging inputs are
+    # model files, and an untrusted checkpoint must never execute arbitrary
+    # pickled code inside the compiler process.
     try:
         import torch  # type: ignore[import]
-        sd = torch.load(str(p), map_location="cpu")
+        try:
+            sd = torch.load(str(p), map_location="cpu", weights_only=True)
+        except TypeError:  # pragma: no cover - torch < 1.13 without the flag
+            raise ValueError(
+                "task-vector merging requires torch.load(weights_only=True) "
+                "support; upgrade PyTorch or provide safetensors inputs"
+            )
         if isinstance(sd, dict):
             return {k: v.float().reshape(-1).tolist() for k, v in sd.items() if hasattr(v, "float")}
     except ImportError:

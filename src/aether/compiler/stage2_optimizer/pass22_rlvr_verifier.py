@@ -411,8 +411,14 @@ class GRPOTrainer:
                 f.write(full_test)
                 tmp_path = f.name
 
+            # ``sys.executable`` (never a bare "python" from PATH, which an
+            # attacker-controlled PATH could swap for an arbitrary binary).
+            # The subprocess runs generated code by PRD design (deterministic
+            # code verifier, PRD v5.0 §34.3); deployers must run GRPO
+            # training in an isolated environment.
+            import sys
             result = subprocess.run(
-                ["python", tmp_path],
+                [sys.executable, tmp_path],
                 capture_output=True, text=True, timeout=10.0,
             )
 

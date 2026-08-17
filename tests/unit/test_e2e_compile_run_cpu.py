@@ -196,6 +196,11 @@ def _compile_and_save(tmp_path: Path) -> tuple[AEGPackage, ModelWeights]:
     output = tmp_path / "test_model.aeg"
     package = AEGPackage.create(output, model_id="test_model", aether_version="0.1.0")
     package.manifest.architecture = arch  # type: ignore[union-attr]
+    # A runnable artifact must carry its graph IR — save() now fails closed on
+    # packages with weights but no computed graph hash.
+    from aether.core.aeg_ir import AEGIRModule
+
+    package.ir = AEGIRModule.from_graph(graph)
 
     stats = quantize_graph_weights(
         graph=graph,
@@ -364,6 +369,9 @@ class TestWeightPersistence:
         pkg_path = tmp_path / "m.aeg"
         package = AEGPackage.create(pkg_path, model_id="m", aether_version="0")
         package.manifest.architecture = arch  # type: ignore[union-attr]
+        from aether.core.aeg_ir import AEGIRModule
+
+        package.ir = AEGIRModule.from_graph(graph)
         GraphWeightQuantizer(default_precision="Q4_K_M", block_size=BLOCK_SIZE).quantize(
             graph, package
         )

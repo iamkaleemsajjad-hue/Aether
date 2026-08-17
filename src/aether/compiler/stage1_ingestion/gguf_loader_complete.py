@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 
-from aether.core.exceptions import IngestionError
+from aether.core.exceptions import IngestionError, UnsupportedFormatError
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -267,8 +267,11 @@ class GGUFReader:
                 )
 
     def _dequantize_q4_0(self, f, shape: tuple) -> np.ndarray:
-        """Dequantize Q4_0 format (4-bit with delta)."""
-        # Q4_0: 32 values per block, 1 delta (FP16), 16 bytes of 4-bit values
+        """Dequantize Q4_0 format (4-bit with delta), ggml-compatible layout.
+
+        Byte j holds element j (low nibble) and element j+16 (high nibble),
+        per dequantize_row_q4_0 in ggml-quanta.c.
+        """
         block_size = 32
         num_blocks = (np.prod(shape) + block_size - 1) // block_size
 
@@ -277,18 +280,19 @@ class GGUFReader:
             delta = np.frombuffer(f.read(2), dtype=np.float16)[0]
             quants = np.frombuffer(f.read(16), dtype=np.uint8)
 
-            # Unpack 4-bit values
-            values = np.zeros(32, dtype=np.float32)
-            for i in range(16):
-                values[i*2] = (quants[i] & 0x0F) - 8
-                values[i*2 + 1] = ((quants[i] >> 4) & 0x0F) - 8
+            values = np.empty(32, dtype=np.float32)
+            values[0:16] = (quants & 0x0F).astype(np.float32) - 8.0
+            values[16:32] = (quants >> 4).astype(np.float32) - 8.0
 
             result.extend(values * delta)
 
         return np.array(result[:np.prod(shape)], dtype=np.float32).reshape(shape)
 
     def _dequantize_q4_1(self, f, shape: tuple) -> np.ndarray:
-        """Dequantize Q4_1 format (4-bit with delta and min)."""
+        """Dequantize Q4_1 format (4-bit with delta and min), ggml layout.
+
+        Byte j holds element j (low nibble) and element j+16 (high nibble).
+        """
         block_size = 32
         num_blocks = (np.prod(shape) + block_size - 1) // block_size
 
@@ -298,17 +302,20 @@ class GGUFReader:
             min_val = np.frombuffer(f.read(2), dtype=np.float16)[0]
             quants = np.frombuffer(f.read(16), dtype=np.uint8)
 
-            values = np.zeros(32, dtype=np.float32)
-            for i in range(16):
-                values[i*2] = (quants[i] & 0x0F)
-                values[i*2 + 1] = ((quants[i] >> 4) & 0x0F)
+            values = np.empty(32, dtype=np.float32)
+            values[0:16] = (quants & 0x0F).astype(np.float32)
+            values[16:32] = (quants >> 4).astype(np.float32)
 
             result.extend(values * delta + min_val)
 
         return np.array(result[:np.prod(shape)], dtype=np.float32).reshape(shape)
 
     def _dequantize_q5_0(self, f, shape: tuple) -> np.ndarray:
-        """Dequantize Q5_0 format (5-bit with delta)."""
+        """Dequantize Q5_0 format (5-bit with delta), ggml-compatible layout.
+
+        Element j = (qs[j] low nibble | qh bit j << 4) - 16 and
+        element j+16 = (qs[j] high nibble | qh bit (j+16) << 4) - 16.
+        """
         block_size = 32
         num_blocks = (np.prod(shape) + block_size - 1) // block_size
 
@@ -318,19 +325,19 @@ class GGUFReader:
             qh = np.frombuffer(f.read(4), dtype=np.uint32)[0]  # High bits
             quants = np.frombuffer(f.read(16), dtype=np.uint8)
 
-            values = np.zeros(32, dtype=np.float32)
-            for i in range(32):
-                low_bits = (quants[i // 2] >> (4 * (i % 2))) & 0x0F
-                high_bit = (qh >> i) & 1
-                value = (high_bit << 4) | low_bits
-                values[i] = value - 16
+            values = np.empty(32, dtype=np.float32)
+            j = np.arange(16)
+            xh0 = ((qh >> j) & 1) << 4
+            xh1 = ((qh >> (j + 16)) & 1) << 4
+            values[0:16] = ((quants & 0x0F) | xh0).astype(np.float32) - 16.0
+            values[16:32] = ((quants >> 4) | xh1).astype(np.float32) - 16.0
 
             result.extend(values * delta)
 
         return np.array(result[:np.prod(shape)], dtype=np.float32).reshape(shape)
 
     def _dequantize_q5_1(self, f, shape: tuple) -> np.ndarray:
-        """Dequantize Q5_1 format (5-bit with delta and min)."""
+        """Dequantize Q5_1 format (5-bit with delta and min), ggml layout."""
         block_size = 32
         num_blocks = (np.prod(shape) + block_size - 1) // block_size
 
@@ -341,12 +348,12 @@ class GGUFReader:
             qh = np.frombuffer(f.read(4), dtype=np.uint32)[0]
             quants = np.frombuffer(f.read(16), dtype=np.uint8)
 
-            values = np.zeros(32, dtype=np.float32)
-            for i in range(32):
-                low_bits = (quants[i // 2] >> (4 * (i % 2))) & 0x0F
-                high_bit = (qh >> i) & 1
-                value = (high_bit << 4) | low_bits
-                values[i] = value
+            j = np.arange(16)
+            xh0 = ((qh >> j) & 1) << 4
+            xh1 = ((qh >> (j + 16)) & 1) << 4
+            values = np.empty(32, dtype=np.float32)
+            values[0:16] = ((quants & 0x0F) | xh0).astype(np.float32)
+            values[16:32] = ((quants >> 4) | xh1).astype(np.float32)
 
             result.extend(values * delta + min_val)
 
@@ -368,15 +375,34 @@ class GGUFReader:
     def _dequantize_k_quant(self, f, shape: tuple, quant_type: int) -> np.ndarray:
         """Dequantize K-quant formats (Q2_K through Q6_K).
 
-        K-quants use a more sophisticated quantization scheme with
-        multiple scales and mins per block.
+        Delegates to the reference-accurate implementations in
+        :mod:`aether.compiler.stage1_ingestion.gguf_loader`, which are faithful
+        transcriptions of llama.cpp's ggml-quanta.c dequantizers. Never returns
+        placeholder data: an unsupported or malformed K-quant tensor raises
+        ``UnsupportedFormatError`` so compilation fails closed.
         """
-        # For now, return a placeholder - full K-quant dequantization
-        # requires implementing the complex llama.cpp K-quant scheme
-        logger.warning(f"K-quant dequantization not fully implemented for type {quant_type}")
+        from aether.compiler.stage1_ingestion import gguf_loader as _gguf_impl
 
-        # Return zeros as placeholder - in production, implement full K-quant
-        return np.zeros(shape, dtype=np.float32)
+        dequant_fn = _gguf_impl._DEQUANT_FN.get(quant_type)
+        if dequant_fn is None:
+            raise UnsupportedFormatError(
+                f"K-quant dequantization is not implemented for ggml type {quant_type}"
+            )
+        block_elems = _gguf_impl._BLOCK_ELEMS.get(quant_type, 256)
+        block_bytes = _gguf_impl._BLOCK_SIZES.get(quant_type)
+        num_elems = int(np.prod(shape))
+        if block_bytes is None or num_elems % block_elems != 0:
+            raise UnsupportedFormatError(
+                f"Cannot dequantize ggml type {quant_type}: tensor with "
+                f"{num_elems} elements does not divide into {block_elems}-element blocks"
+            )
+        raw = f.read(block_bytes * (num_elems // block_elems))
+        if len(raw) < block_bytes * (num_elems // block_elems):
+            raise IngestionError(
+                f"Truncated K-quant tensor: expected "
+                f"{block_bytes * (num_elems // block_elems)} bytes, got {len(raw)}"
+            )
+        return dequant_fn(raw, num_elems).reshape(shape)
 
     def get_architecture_info(self) -> dict[str, Any]:
         """Extract architecture information from metadata."""

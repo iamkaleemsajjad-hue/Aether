@@ -52,8 +52,19 @@ def package_is_runnable(package: Any) -> bool:
     """Return True when a package carries enough weights to execute.
 
     Cheap to call: it reads the weight index but never the tensor payloads.
+    Fails closed on artifacts that were never properly finalized: a pending
+    graph hash, a placeholder architecture, or a missing per-layer tensor
+    set can never be runnable.
     """
     try:
+        manifest = getattr(package, "manifest", None)
+        if manifest is not None:
+            if getattr(manifest, "graph_hash", "") == "sha256:pending":
+                return False
+            architecture = getattr(manifest, "architecture", None)
+            layers = int(getattr(architecture, "layers", 0) or 0) if architecture else 0
+            if layers <= 0:
+                return False
         if not package.has_weights:
             return False
         store = package.weight_store()
@@ -115,9 +126,47 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
     embedding = _require(tensors, (None, "embedding"), "token embedding")
     hidden_size = int(embedding.shape[1])
 
+    # Hard architecture invariants: the rebuilt engine must describe exactly
+    # the model the manifest declares. A mismatch means the artifact is not
+    # the compiled source model and must never reach execution.
+    manifest_hidden = int(architecture.get("hidden_size", 0) or 0)
+    if manifest_hidden > 0 and manifest_hidden != hidden_size:
+        raise AEGLoadError(
+            f"Hidden size invariant violated: manifest declares {manifest_hidden} "
+            f"but the embedding tensor has hidden dimension {hidden_size}"
+        )
+    manifest_vocab = int(architecture.get("vocab_size", 0) or 0)
+    if manifest_vocab > 0 and manifest_vocab != int(embedding.shape[0]):
+        raise AEGLoadError(
+            f"Vocabulary invariant violated: manifest declares vocab_size="
+            f"{manifest_vocab} but the embedding tensor has {int(embedding.shape[0])} rows"
+        )
+    for name, tensor in ((k, v) for k, v in tensors.items() if k[0] is not None):
+        if tensor.ndim == 2 and name[1] in ("q_proj", "k_proj", "v_proj", "o_proj") and tensor.shape[1] != hidden_size:
+            raise AEGLoadError(
+                f"Layer {name[0]} {name[1]} input feature dimension {tensor.shape[1]} "
+                f"does not match hidden size {hidden_size}"
+            )
+
     layers: list[LayerWeights] = []
     for index in range(num_layers):
         layers.append(_build_layer(tensors, index, hidden_size, num_heads, num_kv_heads))
+    if len(layers) != num_layers:  # defensive: loop above always satisfies this
+        raise AEGLoadError(
+            f"Layer count invariant violated: built {len(layers)} layers, "
+            f"manifest declares {num_layers}"
+        )
+    # The weight store must describe exactly the manifest's layer count: a
+    # blob containing layer tensors beyond num_layers-1 means the manifest
+    # understates the model (the silent 4-layer -> 1-layer failure mode).
+    max_stored_layer = max(
+        (key[0] for key in tensors if key[0] is not None and key[0] >= 0), default=-1
+    )
+    if max_stored_layer != num_layers - 1:
+        raise AEGLoadError(
+            f"Layer count invariant violated: manifest declares {num_layers} layers "
+            f"but the weight store contains tensors for layers 0..{max_stored_layer}"
+        )
 
     # Models with tied embeddings ship no separate lm_head; reuse the embedding.
     lm_head = tensors.get((None, "lm_head"))

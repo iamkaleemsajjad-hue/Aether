@@ -215,156 +215,222 @@ def _dequant_q8_0(raw: bytes, num_elems: int) -> np.ndarray:
 
 
 def _dequant_q4_0(raw: bytes, num_elems: int) -> np.ndarray:
-    """Q4_0: blocks of 32 nibbles + f16 scale. Values are unsigned [0,15] shifted by -8."""
+    """Q4_0 — faithful transcription of ``dequantize_row_q4_0`` (ggml-quanta.c).
+
+    Block layout (18 bytes, 32 elements): d (f16) then 16 quant bytes where
+    byte j holds element j in its low nibble and element j+16 in its high
+    nibble. Values are (nibble - 8) * d.
+    """
     n_blocks = num_elems // 32
     result = np.empty(num_elems, dtype=np.float32)
     for i in range(n_blocks):
         base = i * 18
         scale = np.frombuffer(raw[base:base+2], dtype=np.float16)[0].astype(np.float32)
         packed = np.frombuffer(raw[base+2:base+18], dtype=np.uint8)
-        lo = (packed & 0x0F).astype(np.int8) - 8
-        hi = ((packed >> 4) & 0x0F).astype(np.int8) - 8
         block = np.empty(32, dtype=np.float32)
-        block[0::2] = lo.astype(np.float32)
-        block[1::2] = hi.astype(np.float32)
-        result[i*32:(i+1)*32] = block * float(scale)
+        block[0:16] = (packed & 0x0F).astype(np.float32)
+        block[16:32] = (packed >> 4).astype(np.float32)
+        result[i*32:(i+1)*32] = (block - 8.0) * float(scale)
     return result
+
+
+def _get_scale_min_k4(j: int, scales: np.ndarray) -> tuple[int, int]:
+    """Unpack the 6-bit scale/min pair ``j`` from a 12-byte K-quant scale field.
+
+    Faithful transcription of ``get_scale_min_k4`` from ggml-quanta.c:
+    sub-block pairs 0-3 use the low 6 bits of bytes j and j+4; pairs 4-7 use
+    the high nibbles of bytes j+4 combined with the top 2 bits of bytes j-4
+    and j.
+    """
+    if j < 4:
+        d = int(scales[j]) & 63
+        m = int(scales[j + 4]) & 63
+    else:
+        d = (int(scales[j + 4]) & 0xF) | ((int(scales[j - 4]) >> 6) << 4)
+        m = (int(scales[j + 4]) >> 4) | ((int(scales[j]) >> 6) << 4)
+    return d, m
+
+
+def _require_multiple(num_elems: int, block: int, name: str) -> None:
+    """Fail closed when the tensor size does not divide into whole blocks."""
+    if num_elems % block != 0:
+        raise UnsupportedFormatError(
+            f"{name} dequantization requires num_elems divisible by {block}, got {num_elems}"
+        )
 
 
 def _dequant_q4_k(raw: bytes, num_elems: int) -> np.ndarray:
     """
-    Q4_K (super-block of 256 elements, 8 sub-blocks of 32).
-    Layout per 144-byte block:
-      [0:2]   d     f16  overall scale
-      [2:4]   dmin  f16  overall minimum
-      [4:16]  scales  12 bytes (6-bit packed for 8 sub-blocks × scale/min)
-      [16:144] qs   128 bytes  32 nibbles × 4 = 128 nibbles = 256 elements
+    Q4_K — faithful transcription of ``dequantize_row_q4_K`` (ggml-quanta.c).
+
+    Block layout (144 bytes, 256 elements):
+      [0:2]     d     f16  super-block scale
+      [2:4]     dmin  f16  super-block min scale
+      [4:16]    scales 12 bytes  8 × (6-bit scale + 6-bit min), get_scale_min_k4 packed
+      [16:144]  qs   128 bytes  4-bit quants (low nibbles of bytes j..j+31 form
+                sub-block 2g, high nibbles form sub-block 2g+1)
     """
+    _require_multiple(num_elems, 256, "Q4_K")
     n_blocks = num_elems // 256
+    raw_arr = np.frombuffer(raw, dtype=np.uint8, count=144 * n_blocks)
     result = np.empty(num_elems, dtype=np.float32)
     for i in range(n_blocks):
         b = i * 144
-        d    = np.frombuffer(raw[b:b+2],   dtype=np.float16)[0].astype(np.float32)
-        dmin = np.frombuffer(raw[b+2:b+4], dtype=np.float16)[0].astype(np.float32)
-        sc_raw = np.frombuffer(raw[b+4:b+16], dtype=np.uint8)  # 12 bytes → 8 pairs of 6-bit
-        # Decode 6-bit scales and mins from 12 bytes
-        scales_6 = np.zeros(8, dtype=np.uint8)
-        mins_6   = np.zeros(8, dtype=np.uint8)
-        for k in range(8):
-            byte_idx = (k * 12) // 8
-            bit_off  = (k * 12) % 8
-            if bit_off <= 2:
-                scales_6[k] = (sc_raw[byte_idx] >> bit_off) & 0x3F
-                min_bit = bit_off + 6
-                if min_bit < 8:
-                    mins_6[k] = (sc_raw[byte_idx] >> min_bit) & 0x3F
-                else:
-                    mins_6[k] = ((sc_raw[byte_idx] >> min_bit) | (sc_raw[byte_idx+1] << (8-min_bit))) & 0x3F
-            else:
-                scales_6[k] = ((sc_raw[byte_idx] >> bit_off) | (sc_raw[byte_idx+1] << (8-bit_off))) & 0x3F
-                min_bit = bit_off + 6
-                mins_6[k] = ((sc_raw[byte_idx] >> min_bit) | (sc_raw[byte_idx+1] << (8-min_bit))) & 0x3F if byte_idx+1 < 12 else 0
-
-        qs = np.frombuffer(raw[b+16:b+144], dtype=np.uint8)  # 128 bytes = 256 nibbles
-        lo = (qs & 0x0F).astype(np.float32)
-        hi = ((qs >> 4) & 0x0F).astype(np.float32)
-        block_elems = np.empty(256, dtype=np.float32)
-        block_elems[0::2] = lo
-        block_elems[1::2] = hi
-        for k in range(8):
-            sl = k * 32
-            s = float(scales_6[k]) * float(d)
-            m = float(mins_6[k]) * float(dmin)
-            block_elems[sl:sl+32] = block_elems[sl:sl+32] * s - m
-        result[i*256:(i+1)*256] = block_elems
+        d = float(np.frombuffer(raw[b:b + 2], dtype=np.float16)[0])
+        dmin = float(np.frombuffer(raw[b + 2:b + 4], dtype=np.float16)[0])
+        scales = raw_arr[b + 4:b + 16]
+        qs = raw_arr[b + 16:b + 144]
+        base = i * 256
+        is_ = 0
+        qpos = 0
+        for g in range(4):  # four 64-element groups per super-block
+            sc, m = _get_scale_min_k4(is_, scales)
+            d1, m1 = d * sc, dmin * m
+            sc, m = _get_scale_min_k4(is_ + 1, scales)
+            d2, m2 = d * sc, dmin * m
+            chunk = qs[qpos:qpos + 32].astype(np.float32)
+            result[base + g * 64:base + g * 64 + 32] = d1 * (chunk % 16.0) - m1
+            result[base + g * 64 + 32:base + g * 64 + 64] = d2 * (chunk // 16.0) - m2
+            qpos += 32
+            is_ += 2
     return result
 
 
 def _dequant_q6_k(raw: bytes, num_elems: int) -> np.ndarray:
     """
-    Q6_K: 256-element super-block, 210 bytes.
-    Layout: 128 bytes ql (4-bit lo), 64 bytes qh (2-bit hi), 16 bytes scales (int8), 2 bytes d (f16).
+    Q6_K — faithful transcription of ``dequantize_row_q6_K`` (ggml-quanta.c).
+
+    Block layout (210 bytes, 256 elements):
+      [0:128]   ql  uint8[128]  low 4 bits
+      [128:192] qh  uint8[64]   high 2 bits (4 values per byte)
+      [192:208] sc  int8[16]    per-16-element sub-block scales
+      [208:210] d   f16         super-block scale
     """
+    _require_multiple(num_elems, 256, "Q6_K")
     n_blocks = num_elems // 256
+    raw_arr = np.frombuffer(raw, dtype=np.uint8, count=210 * n_blocks)
     result = np.empty(num_elems, dtype=np.float32)
     for i in range(n_blocks):
         b = i * 210
-        ql = np.frombuffer(raw[b:b+128],   dtype=np.uint8)   # low 4 bits
-        qh = np.frombuffer(raw[b+128:b+192], dtype=np.uint8)  # high 2 bits
-        sc = np.frombuffer(raw[b+192:b+208], dtype=np.int8).astype(np.float32)
-        d  = np.frombuffer(raw[b+208:b+210], dtype=np.float16)[0].astype(np.float32)
-        # Reconstruct 6-bit values
-        q = np.empty(256, dtype=np.float32)
-        for j in range(128):
-            lo4 = int(ql[j])
-            hi2_byte = qh[j // 4]
-            shift = (j % 4) * 2
-            hi2 = (hi2_byte >> shift) & 0x03
-            val = ((lo4 & 0x0F) | (hi2 << 4)) - 32  # signed 6-bit
-            q[j] = float(val)
-        for j in range(128, 256):
-            idx = j - 128
-            lo4 = int(ql[idx])
-            hi2_byte = qh[idx // 4 + 32]
-            shift = (idx % 4) * 2
-            hi2 = (hi2_byte >> shift) & 0x03
-            val = (((lo4 >> 4) & 0x0F) | (hi2 << 4)) - 32
-            q[j] = float(val)
-        for k in range(16):
-            sl = k * 16
-            result[i*256 + sl:i*256 + sl + 16] = q[sl:sl+16] * float(d) * float(sc[k])
+        ql = raw_arr[b:b + 128]
+        qh = raw_arr[b + 128:b + 192]
+        sc = np.frombuffer(raw[b + 192:b + 208], dtype=np.int8).astype(np.float32)
+        d = float(np.frombuffer(raw[b + 208:b + 210], dtype=np.float16)[0])
+        base = i * 256
+        for h in range(2):  # two 128-element halves
+            qloff, qhoff, scoff = h * 64, h * 32, h * 8
+            hbase = base + 128 * h
+            l = np.arange(32)
+            is_ = l // 16
+            q1 = ((ql[qloff + l] & 0x0F) | ((qh[qhoff + l] & 0x03) << 4)).astype(np.int32) - 32
+            q2 = ((ql[qloff + l + 32] & 0x0F) | (((qh[qhoff + l] >> 2) & 0x03) << 4)).astype(np.int32) - 32
+            q3 = ((ql[qloff + l] >> 4) | (((qh[qhoff + l] >> 4) & 0x03) << 4)).astype(np.int32) - 32
+            q4 = ((ql[qloff + l + 32] >> 4) | (((qh[qhoff + l] >> 6) & 0x03) << 4)).astype(np.int32) - 32
+            result[hbase + l] = d * sc[scoff + is_ + 0] * q1
+            result[hbase + l + 32] = d * sc[scoff + is_ + 2] * q2
+            result[hbase + l + 64] = d * sc[scoff + is_ + 4] * q3
+            result[hbase + l + 96] = d * sc[scoff + is_ + 6] * q4
     return result
 
 
 def _dequant_q2_k(raw: bytes, num_elems: int) -> np.ndarray:
-    """Q2_K: 256-element super-block, 84 bytes."""
+    """
+    Q2_K — faithful transcription of ``dequantize_row_q2_K`` (ggml-quanta.c).
+
+    Block layout (84 bytes, 256 elements):
+      [0:16]   scales uint8[16]  4-bit scale (low nibble) + 4-bit min (high nibble)
+                                    per 16-element sub-block
+      [16:80]  qs     uint8[64]   2-bit quants, 4 values per byte
+      [80:82]  d      f16         super-block scale
+      [82:84]  dmin   f16         super-block min scale
+    """
+    _require_multiple(num_elems, 256, "Q2_K")
     n_blocks = num_elems // 256
+    raw_arr = np.frombuffer(raw, dtype=np.uint8, count=84 * n_blocks)
     result = np.empty(num_elems, dtype=np.float32)
     for i in range(n_blocks):
         b = i * 84
-        scales = np.frombuffer(raw[b:b+16],   dtype=np.uint8)
-        qs     = np.frombuffer(raw[b+16:b+80], dtype=np.uint8)  # 64 bytes = 256 2-bit
-        d      = np.frombuffer(raw[b+80:b+82], dtype=np.float16)[0].astype(np.float32)
-        dmin   = np.frombuffer(raw[b+82:b+84], dtype=np.float16)[0].astype(np.float32)
-        for k in range(16):
-            sl = k * 16
-            sc = float((scales[k] >> 0) & 0x0F) * float(d)
-            mn = float((scales[k] >> 4) & 0x0F) * float(dmin)
-            for j in range(16):
-                byte_idx = (k * 16 + j) // 4
-                shift = ((k * 16 + j) % 4) * 2
-                q2 = (int(qs[byte_idx]) >> shift) & 0x03
-                result[i*256 + sl + j] = float(q2) * sc - mn
+        scales = raw_arr[b:b + 16]
+        qs = raw_arr[b + 16:b + 80]
+        d = float(np.frombuffer(raw[b + 80:b + 82], dtype=np.float16)[0])
+        dmin = float(np.frombuffer(raw[b + 82:b + 84], dtype=np.float16)[0])
+        base = i * 256
+        is_ = 0
+        qpos = 0
+        for h in range(2):  # two 128-element halves
+            shift = 0
+            hbase = base + 128 * h
+            for j in range(4):  # four sub-block pairs per half
+                sc = int(scales[is_]); is_ += 1
+                dl, ml = d * (sc & 0x0F), dmin * (sc >> 4)
+                result[hbase + j * 32:hbase + j * 32 + 16] = (
+                    dl * ((qs[qpos:qpos + 16] >> shift) & 0x03) - ml
+                )
+                sc = int(scales[is_]); is_ += 1
+                dl, ml = d * (sc & 0x0F), dmin * (sc >> 4)
+                result[hbase + j * 32 + 16:hbase + j * 32 + 32] = (
+                    dl * ((qs[qpos + 16:qpos + 32] >> shift) & 0x03) - ml
+                )
+                shift += 2
+            qpos += 32
     return result
 
 
 def _dequant_q3_k(raw: bytes, num_elems: int) -> np.ndarray:
-    """Q3_K: 256-element super-block, 110 bytes."""
+    """
+    Q3_K — faithful transcription of ``dequantize_row_q3_K`` (ggml-quanta.c).
+
+    Block layout (110 bytes, 256 elements), field order per block_q3_K:
+      [0:32]    hmask   uint8[32]  high bits (bit j of byte l selects sub-block j)
+      [32:96]   qs      uint8[64]  low 2 bits, 4 values per byte
+      [96:108]  scales  uint8[12]  16 × 6-bit scales, de-interleaved via aux
+      [108:110] d       f16        super-block scale
+    """
+    _require_multiple(num_elems, 256, "Q3_K")
     n_blocks = num_elems // 256
+    kmask1 = np.uint32(0x03030303)
+    kmask2 = np.uint32(0x0F0F0F0F)
+    raw_arr = np.frombuffer(raw, dtype=np.uint8, count=110 * n_blocks)
     result = np.empty(num_elems, dtype=np.float32)
     for i in range(n_blocks):
         b = i * 110
-        ql  = np.frombuffer(raw[b:b+32],   dtype=np.uint8)   # low 2 bits → 128 elements
-        qh  = np.frombuffer(raw[b+32:b+64], dtype=np.uint8)   # high bit
-        sc  = np.frombuffer(raw[b+64:b+76], dtype=np.uint8)   # 12 bytes packed 6-bit scales
-        d   = np.frombuffer(raw[b+76:b+78], dtype=np.float16)[0].astype(np.float32)
-        # decode scales (6-bit packed in 12 bytes for 16 sub-blocks of 16)
-        scales_f = np.zeros(16, dtype=np.float32)
-        for k in range(16):
-            byte_pos = (k * 6) // 8
-            bit_pos  = (k * 6) % 8
-            raw_sc = ((int(sc[byte_pos]) >> bit_pos) | (int(sc[byte_pos+1]) << (8-bit_pos)) if byte_pos+1 < 12 else int(sc[byte_pos]) >> bit_pos) & 0x3F
-            scales_f[k] = (float(raw_sc) - 32.0) * float(d)
-        for j in range(256):
-            ql_byte = j // 4
-            ql_shift = (j % 4) * 2
-            qh_byte = j // 8
-            qh_shift = j % 8
-            lo2 = (int(ql[ql_byte]) >> ql_shift) & 0x03
-            hi1 = (int(qh[qh_byte]) >> qh_shift) & 0x01
-            q3 = float((lo2 | (hi1 << 2)) - 4)
-            sub_block = j // 16
-            result[i*256 + j] = q3 * scales_f[sub_block]
+        hm = raw_arr[b:b + 32]
+        q = raw_arr[b + 32:b + 96]
+        d_all = float(np.frombuffer(raw[b + 108:b + 110], dtype=np.float16)[0])
+
+        # De-interleave the 6-bit scales exactly as the reference does: the
+        # 12 bytes are read as three little-endian uint32s and shuffled.
+        aux = np.frombuffer(raw[b + 96:b + 108], dtype=np.uint32).astype(np.uint32).copy()
+        aux = np.concatenate([aux, np.zeros(1, dtype=np.uint32)])
+        tmp = aux[2].copy()
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4)
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4)
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4)
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4)
+        scales = aux.view(np.int8).astype(np.float32)  # 16 signed scales
+
+        base = i * 256
+        is_ = 0
+        qpos = 0
+        m = 1
+        for h in range(2):  # two 128-element halves
+            shift = 0
+            hbase = base + 128 * h
+            for j in range(4):
+                dl1 = d_all * (scales[is_] - 32.0); is_ += 1
+                qchunk = q[qpos:qpos + 32].astype(np.int32)
+                # hmask is indexed l and l+16 over the SAME 32 bytes for every
+                # half; only the m bit advances to select the sub-block bit.
+                mask_lo = (hm[:16] & m) != 0
+                mask_hi = (hm[16:32] & m) != 0
+                vals_lo = ((qchunk[:16] >> shift) & 3) - np.where(mask_lo, 0, 4)
+                dl2 = d_all * (scales[is_] - 32.0); is_ += 1
+                vals_hi = ((qchunk[16:32] >> shift) & 3) - np.where(mask_hi, 0, 4)
+                result[hbase + j * 32:hbase + j * 32 + 16] = dl1 * vals_lo
+                result[hbase + j * 32 + 16:hbase + j * 32 + 32] = dl2 * vals_hi
+                shift += 2
+                m <<= 1
+            qpos += 32
     return result
 
 
@@ -380,6 +446,58 @@ _DEQUANT_FN: dict[int, Any] = {
     _GGML_TYPE_Q2_K: _dequant_q2_k,
     _GGML_TYPE_Q3_K: _dequant_q3_k,
 }
+
+
+def _dequant_q5_k(raw: bytes, num_elems: int) -> np.ndarray:
+    """Q5_K — faithful transcription of ``dequantize_row_q5_K`` (ggml-quanta.c).
+
+    Block layout (176 bytes, 256 elements):
+      [0:2]     d       f16  super-block scale
+      [2:4]     dmin    f16  super-block min scale
+      [4:16]    scales  12 bytes  8 × (6-bit scale + 6-bit min), get_scale_min_k4 packed
+      [16:48]    qh      32 bytes  high bits (u1=1, u2=2 masks shift by ×4 per group)
+      [48:176]   qs      128 bytes 4-bit quants (lo nibbles of bytes j..j+31 form
+                  sub-block 2g, high nibbles form sub-block 2g+1)
+
+    value = d * scale[sub] * (nibble + (qh_bit ? 16 : 0)) - dmin * min[sub]
+    """
+    _require_multiple(num_elems, 256, "Q5_K")
+    n_blocks = num_elems // 256
+    raw_arr = np.frombuffer(raw, dtype=np.uint8, count=176 * n_blocks)
+    result = np.empty(num_elems, dtype=np.float32)
+    for i in range(n_blocks):
+        b = i * 176
+        d = float(np.frombuffer(raw[b:b + 2], dtype=np.float16)[0])
+        dmin = float(np.frombuffer(raw[b + 2:b + 4], dtype=np.float16)[0])
+        scales = raw_arr[b + 4:b + 16]
+        qh = raw_arr[b + 16:b + 48]
+        qs = raw_arr[b + 48:b + 176]
+        base = i * 256
+        is_ = 0
+        qpos = 0
+        u1, u2 = 1, 2
+        for g in range(4):  # four 64-element groups per super-block
+            sc, m = _get_scale_min_k4(is_, scales)
+            d1, m1 = d * sc, dmin * m
+            sc, m = _get_scale_min_k4(is_ + 1, scales)
+            d2, m2 = d * sc, dmin * m
+            chunk = qs[qpos:qpos + 32].astype(np.float32)
+            # qh covers the same 32 bytes for every group; the u1/u2 masks
+            # walk through its bits instead of advancing the pointer.
+            hi1 = np.where((qh[:32] & u1) != 0, 16.0, 0.0)
+            hi2 = np.where((qh[:32] & u2) != 0, 16.0, 0.0)
+            result[base + g * 64:base + g * 64 + 32] = d1 * (chunk % 16.0 + hi1) - m1
+            result[base + g * 64 + 32:base + g * 64 + 64] = d2 * (chunk // 16.0 + hi2) - m2
+            qpos += 32
+            is_ += 2
+            u1 <<= 2
+            u2 <<= 2
+    return result
+
+
+# Update dequant dispatch table with Q5_K
+_DEQUANT_FN[_GGML_TYPE_Q5_K] = _dequant_q5_k
+
 
 _GGML_TYPE_NAMES: dict[int, str] = {
     0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1",

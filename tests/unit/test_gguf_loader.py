@@ -190,10 +190,13 @@ class TestDequantQ4_0:
         packed = np.full(16, 0xF0, dtype=np.uint8)
         raw = scale.tobytes() + packed.tobytes()
         result = _dequant_q4_0(raw, 32)
-        # Even indices: low nibble 0 → -8
-        # Odd indices: high nibble 15 → 7
+        # ggml layout: byte j holds element j (low nibble) and element j+16
+        # (high nibble) — the first 16 elements read low nibbles, the next
+        # 16 read high nibbles (verified against gguf.quants reference).
         assert result[0] == pytest.approx(-8.0, abs=1e-3)
-        assert result[1] == pytest.approx(7.0, abs=1e-3)
+        assert result[15] == pytest.approx(-8.0, abs=1e-3)
+        assert result[16] == pytest.approx(7.0, abs=1e-3)
+        assert result[31] == pytest.approx(7.0, abs=1e-3)
 
 
 class TestDequantQ4K:
