@@ -203,6 +203,11 @@ class GraphWeightQuantizer:
                     stats.record(precision, up_qt)
 
         package.weights = quantized
+        if (package.ir is None or getattr(package.manifest, "graph_hash", "") == "sha256:pending") and graph is not None:
+            try:
+                package.set_graph(graph)
+            except Exception as exc:
+                logger.debug(f"Could not auto-bind graph to package: {exc}")
         logger.info(
             "GraphWeightQuantizer: %d tensors quantized, %d bytes",
             stats.tensors_written,

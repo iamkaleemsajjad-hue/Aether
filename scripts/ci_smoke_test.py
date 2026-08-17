@@ -397,7 +397,7 @@ def main() -> int:
     parser.add_argument("--junit", metavar="FILE", help="Write JUnit XML to FILE")
     args = parser.parse_args()
 
-    print(f"{BOLD}Aether Runtime — CI Smoke Test{RESET}")
+    print(f"{BOLD}Aether Runtime -- CI Smoke Test{RESET}")
     print(f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\n")
 
     suite = TestSuite()
@@ -417,7 +417,7 @@ def main() -> int:
         print()
         for r in suite.results:
             if not r.passed:
-                print(f"  {RED}✗ {r.name}{RESET}")
+                print(f"  {RED}[X] {r.name}{RESET}")
                 for line in r.error.splitlines()[:5]:
                     print(f"      {DIM}{line}{RESET}")
 
