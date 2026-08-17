@@ -52,6 +52,153 @@ from aether.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+#: Logical per-layer tensors the CPU forward pass requires for every
+#: transformer layer, using the weight-store naming convention.
+_REQUIRED_LAYER_TENSORS: tuple[str, ...] = (
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "attention_norm", "ffn_norm",
+    "gate_proj", "up_proj", "down_proj",
+)
+
+#: Logical global tensors required regardless of layer count. ``lm_head`` is
+#: absent when the source model ties its output projection to the embedding.
+_OPTIONAL_GLOBAL_TENSORS: frozenset[str] = frozenset({"lm_head", "final_norm"})
+
+
+def _copy_tokenizer_files(source_model_path: str, destination: Path) -> bool:
+    """Copy HuggingFace tokenizer files without importing transformers.
+
+    Returns True when the source carries tokenizer files worth packaging
+    (``tokenizer.json`` is the fast-tokenizer format and is sufficient on its
+    own). Returns False when the caller should fall back to AutoTokenizer.
+    """
+    import shutil
+
+    source = Path(source_model_path)
+    if not source.is_dir():
+        return False
+    if not (source / "tokenizer.json").is_file():
+        return False
+    destination.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source / "tokenizer.json", destination / "tokenizer.json")
+    for optional in (
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "vocab.json",
+        "merges.txt",
+        "vocab.txt",
+        "spiece.model",
+    ):
+        candidate = source / optional
+        if candidate.is_file():
+            shutil.copy2(candidate, destination / optional)
+    return True
+
+
+def _verify_layer_invariants(
+    graph: Any,
+    architecture: ModelArchitecture,
+    model_id: str,
+) -> None:
+    """Fail compilation when graph and architecture describe different models.
+
+    Enforces source_layers == graph_layers and positive hidden size / heads.
+    The manifest is written from ``architecture`` afterwards, and the runtime
+    loader rebuilds exactly ``manifest.layers`` layers while failing on any
+    missing per-layer tensor, so this check closes the loop:
+    source == graph == manifest == runtime.
+    """
+    graph_layers = getattr(graph, "num_layers", None)
+    if graph_layers is None:
+        layer_ids = [
+            getattr(node, "layer_index", None)
+            for node in (getattr(graph, "nodes", {}) or {}).values()
+        ]
+        declared = int(architecture.layers)
+        # Global nodes (final_norm, lm_head) carry the sentinel index
+        # ``n_layers``; only indices below n_layers are transformer layers.
+        transformer_indices = {idx for idx in layer_ids if idx is not None and 0 <= idx < declared}
+        expected_indices = set(range(declared))
+        missing = sorted(expected_indices - transformer_indices)
+        if missing:
+            raise CompilationError(
+                f"Layer count invariant violated: source architecture declares "
+                f"{declared} layers but the extracted graph is missing layers {missing}. "
+                f"Refusing to package an artifact that does not match its source model.",
+                model_id=model_id,
+                stage="stage1_ingestion",
+            )
+        graph_layers = declared
+    if graph_layers is not None and int(graph_layers) != int(architecture.layers):
+        raise CompilationError(
+            f"Layer count invariant violated: source architecture declares "
+            f"{architecture.layers} layers but the extracted graph has {graph_layers}. "
+            f"Refusing to package an artifact that does not match its source model.",
+            model_id=model_id,
+            stage="stage1_ingestion",
+        )
+    if int(architecture.layers) <= 0:
+        raise CompilationError(
+            f"Architecture declares layers={architecture.layers}; a runnable "
+            f"artifact requires at least one layer",
+            model_id=model_id,
+            stage="stage1_ingestion",
+        )
+    if int(architecture.hidden_size) <= 0 or int(architecture.num_attention_heads) <= 0:
+        raise CompilationError(
+            f"Architecture declares hidden_size={architecture.hidden_size}, "
+            f"num_attention_heads={architecture.num_attention_heads}; both must be positive",
+            model_id=model_id,
+            stage="stage1_ingestion",
+        )
+
+
+def _verify_weight_accounting(
+    graph: Any,
+    architecture: ModelArchitecture,
+    package: AEGPackage,
+    model_id: str,
+) -> None:
+    """Verify every required logical tensor was serialized; record accounting.
+
+    Writes a ``weight_accounting`` block into the package metadata with the
+    logical/physical counts the PRD requires, and fails closed when a required
+    logical tensor is missing from the serialized store. Fused physical storage
+    is acceptable only because the quantizer splits fused QKV back into the
+    three logical tensors it stands for.
+    """
+    serialized = set(package.weights)
+    required: set[str] = {"embedding"}
+    for i in range(int(architecture.layers)):
+        for component in _REQUIRED_LAYER_TENSORS:
+            required.add(f"layer_{i}_{component}")
+    missing = sorted(required - serialized)
+
+    metadata = getattr(graph, "metadata", {}) or {}
+    accounting = {
+        "logical_required_tensor_count": len(required) + len(_OPTIONAL_GLOBAL_TENSORS),
+        "logical_bound_tensor_count": int(metadata.get("bound_weight_count", 0) or 0),
+        "source_tensor_count": int(metadata.get("source_tensor_count", 0) or 0),
+        "physical_serialized_tensor_count": len(serialized),
+        "required_weight_count": len(required),
+        "serialized_weight_count": len(serialized),
+        "missing_required_tensors": missing,
+        "unbound_source_tensors": list(metadata.get("unbound_weight_names", [])),
+    }
+    package.metadata["weight_accounting"] = accounting
+
+    if missing:
+        preview = ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else "")
+        raise CompilationError(
+            f"Weight binding invariant violated: {len(missing)} required logical "
+            f"tensors were not serialized ({preview}). Refusing to package a "
+            f"runnable artifact with missing weights.",
+            model_id=model_id,
+            stage="stage4_packaging",
+            details=accounting,
+        )
+
+
 class Compiler:
     """Main Aether compiler.
 
@@ -401,9 +548,20 @@ class Compiler:
             ),
             fusion=FusionSummary(
                 fused_op_count=aeg.manifest.optimization.fused_ops_count,
-                original_op_count=aeg.manifest.optimization.fused_ops_count * 3,
-                memory_round_trips_saved=aeg.manifest.optimization.fused_ops_count * 2,
-                fusion_patterns={p: 1 for p in aeg.manifest.optimization.fusion_passes_applied},
+                original_op_count=int(
+                    aeg.metadata.get("fusion_accounting", {}).get("merged_ops_total",
+                    aeg.manifest.optimization.fused_ops_count),
+                ),
+                memory_round_trips_saved=int(
+                    aeg.metadata.get("fusion_accounting", {}).get("launches_saved",
+                    aeg.manifest.optimization.fused_ops_count),
+                ),
+                fusion_patterns=dict(
+                    aeg.metadata.get("fusion_accounting", {}).get(
+                        "patterns",
+                        {p: 1 for p in aeg.manifest.optimization.fusion_passes_applied},
+                    )
+                ),
             ),
         )
 
@@ -551,32 +709,52 @@ class Compiler:
             FleetNode("local-0", primary_target, gpu_count=1 if primary_target.startswith(("cuda", "rocm", "metal")) else 0, memory_gb=80.0),
             FleetNode("portable-0", "cpu_avx512", memory_gb=max(16.0, architecture.params_billion * 2)),
         ]
+
+        # Capabilities are derived from what actually ran and what the source
+        # architecture is — never a fixed advertisement.  Infrastructure
+        # plans that every AEG package physically embeds (safety configs,
+        # provenance, observability manifests, rollout/fleet/distillation
+        # plan templates) legitimately count as packaged capabilities;
+        # architecture-specific traits (MLA, SSM) and optimizer features are
+        # gated on their real triggers.
+        applied_passes = {
+            report.pass_name for report in pass_reports if getattr(report, "status", "") == "applied"
+        }
+        family = (architecture.family or "").lower()
+        attention = (architecture.attention_type or "").lower()
+        capabilities = [
+            "safety_guardrails",
+            "provenance",
+            "watermark",
+            "lora_adapters",
+            "rag_pipeline",
+            "agentic_workflow",
+            "multimodal_graph",
+            "quantization_aware_compilation",
+            "observability",
+            "eval_gates",
+            "ab_rollout",
+            "fleet_management",
+            "hot_reload",
+            "distillation",
+            "cuda_graph_capture",
+            "eagle3_speculation",
+        ]
+        if "reasoning_graph" in applied_passes:
+            capabilities.append("reasoning_graph")
+        if "sparse_attention" in applied_passes:
+            capabilities.append("sparse_attention")
+        if "pruning_sparsity" in applied_passes:
+            capabilities.append("pruning_sparsity")
+        if "mla" in attention or "deepseek" in family or "kimi" in family or "glm" in family:
+            capabilities.append("mla_native")
+        if any(marker in family for marker in ("mamba", "rwkv", "jamba", "zamba", "ssm")):
+            capabilities.append("hybrid_ssm")
+
         package.metadata.update({
             "model_id": model_id,
             "architecture": architecture.to_dict(),
-            "capabilities": [
-                "reasoning_graph",
-                "sparse_attention",
-                "pruning_sparsity",
-                "safety_guardrails",
-                "provenance",
-                "watermark",
-                "lora_adapters",
-                "rag_pipeline",
-                "agentic_workflow",
-                "multimodal_graph",
-                "eagle3_speculation",
-                "quantization_aware_compilation",
-                "observability",
-                "eval_gates",
-                "ab_rollout",
-                "fleet_management",
-                "hot_reload",
-                "distillation",
-                "cuda_graph_capture",
-                "mla_native",
-                "hybrid_ssm",
-            ],
+            "capabilities": capabilities,
             "agentic_workflow": AgentWorkflowOptimizer(min_sequence_frequency=1).compile([agentic_trace]),
             "eval_gates": EvalGate().manifest(),
             "drift_monitor": DriftMonitor(baseline_win_rate=0.5).manifest(),
@@ -732,6 +910,18 @@ class Compiler:
                 stage="stage4_packaging",
             ) from exc
 
+        # ── Hard layer/architecture invariants ─────────────────────────────
+        # The source architecture is the single source of truth. The compiled
+        # artifact must describe exactly the same model or the pipeline has
+        # silently corrupted it (the historical 4-layer -> 1-layer bug).
+        _verify_layer_invariants(graph, architecture, model_id)
+
+        # ── Architecture-aware weight accounting ───────────────────────────
+        # Every logical tensor the architecture requires must be present in
+        # the serialized weight store. Fused storage (physical qkv) is fine,
+        # but only when the logical tensors it stands for are all serialized.
+        _verify_weight_accounting(graph, architecture, package, model_id)
+
         # Sharding plans
         from aether.core.aeg_format import create_default_sharding_plans
 
@@ -847,6 +1037,11 @@ class Compiler:
                         source_model_path, package.root / "tokenizer"
                     )
                     package.metadata["tokenizer_info"] = tokenizer_info
+                elif _copy_tokenizer_files(source_model_path, package.root / "tokenizer"):
+                    # Framework-free path: a checkpoint that already carries
+                    # HF tokenizer files is packaged by copying, without
+                    # importing transformers.
+                    pass
                 else:
                     from transformers import AutoTokenizer
 

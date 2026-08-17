@@ -131,7 +131,7 @@ class HardwareProfile:
         """
         if target_id not in SUPPORTED_TARGET_IDS:
             return None
-        backends = BACKEND_BY_TARGET.get(target_id, ["pytorch"])
+        backends = BACKEND_BY_TARGET.get(target_id, ["aether_cpu"])
         profile_data = _TARGET_PROFILES.get(target_id)
         if profile_data is None:
             name = target_id.replace("_", " ").title()
@@ -187,7 +187,9 @@ class HardwareProfile:
                 return profile
         except ImportError:
             pass
-        # CPU fallback
+        # CPU fallback.  The backend contract (``plan.recommend_backend``)
+        # requires CPU targets to execute on the native Aether CPU engine —
+        # never the development-only pytorch backend.
         import os
         return HardwareProfile(
             target_id="cpu_avx512",
@@ -198,7 +200,7 @@ class HardwareProfile:
             tensor_core_flops=0.0,
             supports_fp8=False,
             supports_bf16=False,
-            recommended_backend="pytorch",
+            recommended_backend="aether_cpu",
         )
 
     def to_dict(self) -> dict[str, Any]:

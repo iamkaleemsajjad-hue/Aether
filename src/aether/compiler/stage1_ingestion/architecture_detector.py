@@ -16,6 +16,9 @@ from typing import Any
 from aether.core.constants import ARCHITECTURE_BY_MODEL_PREFIX, SUPPORTED_ARCHITECTURES
 from aether.core.exceptions import ArchitectureDetectionError
 from aether.core.types import ModelArchitecture
+from aether.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 ARCHITECTURE_PATTERNS = {
     "llama_family": {"attn": "GQA", "ffn": "SwiGLU", "norm": "RMSNorm"},
@@ -112,8 +115,13 @@ class ArchitectureDetector:
             config = self._load_config_json(model)
             if config:
                 return self._from_config(config)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - fall through to name matching
+            logger.warning(
+                "config.json detection failed for %s (%s); falling back to "
+                "family name matching",
+                model,
+                exc,
+            )
 
         # 3. Try model name prefix matching
         family = self._match_family(model)

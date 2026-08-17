@@ -499,6 +499,25 @@ class AEGPackage:
             graph_hash = compute_file_hash(self.root / "graph" / AEG_GRAPH_FILENAME)
             self.manifest.graph_hash = graph_hash
             (self.root / "graph" / "graph.sha256").write_text(graph_hash + "\n", encoding="utf-8")
+        # A runnable artifact (weights attached) must never be finalized with a
+        # pending graph hash or the placeholder architecture — that is how the
+        # 4-layer -> 1-layer bug shipped. Graph-only planning packages are
+        # permitted but are rejected by the runtime loader.
+        if self.weights:
+            if self.ir is None or self.manifest.graph_hash == "sha256:pending":
+                msg = (
+                    "Refusing to save a runnable AEG without a computed graph hash "
+                    "(graph_hash would remain 'sha256:pending')"
+                )
+                raise AEGFormatError(msg)
+            arch = self.manifest.architecture
+            if arch.family == "unknown" or arch.layers <= 0:
+                msg = (
+                    "Refusing to save a runnable AEG with a placeholder architecture "
+                    f"(family={arch.family!r}, layers={arch.layers}); set the real "
+                    f"source architecture before saving"
+                )
+                raise AEGFormatError(msg)
         # Write metadata
         (self.root / "graph" / "metadata.json").write_text(json.dumps(self.metadata, indent=2), encoding="utf-8")
         # Write precision map

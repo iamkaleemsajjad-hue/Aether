@@ -42,7 +42,12 @@ classifiers = [
 ]
 
 dependencies = [
-    # Core data and numerical stack
+    # ── aether-core: framework-free dependencies ONLY ─────────────────────────
+    # torch / transformers / tokenizers / sentencepiece are OPTIONAL extras
+    # ([pytorch], [transformers-frontend]); the core runtime, AEG-IR, AEG
+    # loader, CPUExecutionEngine, hardware detection, compiler planning, all
+    # 22 optimizer passes, .aeg execution, and the CLI run without them.
+    # See docs/PYTORCH_INDEPENDENCE.md for the verified proof matrix.
     "numpy>=1.24.0",
     "safetensors>=0.4.0",
     "huggingface-hub>=0.27.0",
@@ -53,25 +58,6 @@ dependencies = [
     "toml>=0.10.2",
     "packaging>=24.0",
     "typing-extensions>=4.9.0",
-
-    # Model loading and tracing
-    "torch>=2.5.0",
-    "transformers>=4.48.0",
-    "tokenizers>=0.19.0",
-    "sentencepiece>=0.2.0",
-    "protobuf>=5.28.3",
-    "grpcio>=1.66.0",
-
-    # Optional but commonly used formats
-    "gguf>=0.1.0",
-    "onnx>=1.16.0",
-
-    # Server and API
-    "fastapi>=0.115.6",
-    "uvicorn[standard]>=0.30.0",
-    "starlette>=0.41.3",
-    "prometheus-client>=0.20.0",
-    "python-multipart>=0.0.20",
 
     # Telemetry and utilities
     "structlog>=24.1.0",
@@ -87,7 +73,46 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Backends (install only what your hardware needs)
+# ── PyTorch frontend + optional backend ───────────────────────────────────────
+# Needed to ingest .pt / .pth / TorchScript models, for PyTorch-based inference,
+# and for the optional reference validator.
+# Install: pip install "aether-runtime[pytorch]"
+pytorch = [
+    "torch>=2.5.0",
+]
+
+# ── Transformers / HuggingFace ecosystem ──────────────────────────────────────
+# Needed for AutoTokenizer, AutoConfig, HuggingFace model ingestion.
+# Install: pip install "aether-runtime[transformers-frontend]"
+transformers-frontend = [
+    "torch>=2.5.0",
+    "transformers>=4.48.0",
+    "tokenizers>=0.19.0",
+    "sentencepiece>=0.2.0",
+]
+
+# ── Model format extras ───────────────────────────────────────────────────────
+# Needed to load GGUF and ONNX model files.
+# Install: pip install "aether-runtime[formats]"
+formats = [
+    "gguf>=0.1.0",
+    "onnx>=1.16.0",
+    "protobuf>=5.28.3",
+]
+
+# ── REST server + OpenAI-compatible API ───────────────────────────────────────
+# Install: pip install "aether-runtime[server]"
+server = [
+    "fastapi>=0.115.6",
+    "uvicorn[standard]>=0.30.0",
+    "starlette>=0.41.3",
+    "prometheus-client>=0.20.0",
+    "python-multipart>=0.0.20",
+    "grpcio>=1.66.0",
+    "protobuf>=5.28.3",
+]
+
+# ── External inference backends (install only what your hardware needs) ────────
 vllm = [
     "vllm>=0.5.0",
 ]
@@ -108,7 +133,7 @@ triton = [
     "triton>=2.3.0; sys_platform == 'linux'",
 ]
 
-# Development tools
+# ── Development tools ─────────────────────────────────────────────────────────
 lint = [
     "ruff>=0.5.0",
     "mypy>=1.10.0",
@@ -141,23 +166,29 @@ benchmark = [
     "scipy>=1.13.0",
 ]
 
-# Distributed execution extras
+# ── Distributed execution extras ──────────────────────────────────────────────
 distributed = [
     "grpcio>=1.66.0",
     "protobuf>=5.28.3",
 ]
 
-# Safety / compliance extras (uses stdlib only — no extra packages required)
+# ── Safety / compliance extras (uses stdlib only — no extra packages required) ─
 safety = []
 
-# Evaluation extras
+# ── Evaluation extras ─────────────────────────────────────────────────────────
 eval = [
     "datasets>=2.19.0",
 ]
 
-# Convenience group that installs everything testable on CPU
+# ── CPU-only dev (no torch required) ──────────────────────────────────────────
+# Proves framework independence. Aether core + native CPU engine only.
 dev = [
-    "aether-runtime[lint,test,docs,benchmark,distributed,eval]",
+    "aether-runtime[lint,test,docs,benchmark,distributed,eval,formats,server]",
+]
+
+# ── Full install including PyTorch frontend ────────────────────────────────────
+full = [
+    "aether-runtime[dev,pytorch,transformers-frontend,formats]",
 ]
 
 [project.urls]

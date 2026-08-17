@@ -86,161 +86,298 @@ def detect_cpu() -> HardwareCapabilities:
 
 
 def detect_cuda_devices() -> list[HardwareCapabilities]:
-    """Detect all NVIDIA CUDA devices on this host.
+    """Detect all NVIDIA CUDA devices on this host via pynvml (no torch required).
 
     Returns one HardwareCapabilities per physical GPU device. If CUDA is
     unavailable, returns a single unavailable capability object.
     """
+    # ── Primary: pynvml (installed as transitive dep via nvidia-ml-py) ────────
     try:
-        import torch
-        if not torch.cuda.is_available():
+        import pynvml  # noqa: PLC0415
+        pynvml.nvmlInit()
+        device_count = pynvml.nvmlDeviceGetCount()
+        if device_count == 0:
+            pynvml.nvmlShutdown()
             return [HardwareCapabilities.unavailable(
                 vendor="NVIDIA",
                 device="unknown",
                 architecture="unknown",
                 target_id="cuda",
-                reason="CUDA runtime is not available on this host "
-                       "(no NVIDIA GPU or driver not installed)",
+                reason="CUDA runtime is not available on this host (no NVIDIA GPU or driver not installed)",
                 implemented=True,
             )]
-
         devices: list[HardwareCapabilities] = []
-        for i in range(torch.cuda.device_count()):
-            props = torch.cuda.get_device_properties(i)
-            cc = f"{props.major}.{props.minor}"
-            sm = f"sm{props.major}{props.minor}"
-            target_id = _cuda_target_id(props.major, props.minor)
+        try:
+            driver_ver = pynvml.nvmlSystemGetDriverVersion()
+            if isinstance(driver_ver, bytes):
+                driver_ver = driver_ver.decode()
+        except Exception:  # noqa: BLE001
+            driver_ver = "unknown"
+        for i in range(device_count):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            try:
+                name = pynvml.nvmlDeviceGetName(handle)
+                if isinstance(name, bytes):
+                    name = name.decode()
+            except Exception:  # noqa: BLE001
+                name = f"NVIDIA GPU {i}"
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            try:
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                total_mem = mem_info.total
+            except Exception:  # noqa: BLE001
+                total_mem = 0
+            cc = f"{major}.{minor}"
+            sm = f"sm{major}{minor}"
+            target_id = _cuda_target_id(major, minor)
             devices.append(HardwareCapabilities(
                 vendor="NVIDIA",
-                device=props.name,
+                device=name,
                 architecture=sm,
                 target_id=target_id,
-                driver_version=_cuda_driver_version(),
-                runtime_version=torch.version.cuda or "unknown",
-                memory_bytes=props.total_memory,
+                driver_version=driver_ver,
+                runtime_version="nvml",
+                memory_bytes=total_mem,
                 supports_fp32=True,
                 supports_fp16=True,
-                supports_bf16=props.major >= 8,
-                supports_fp8=props.major >= 9,
-                supports_fp4=(props.major >= 10),
+                supports_bf16=major >= 8,
+                supports_fp8=major >= 9,
+                supports_fp4=(major >= 10),
                 supports_int8=True,
                 supports_int4=True,
                 supports_cuda_graph=True,
-                supports_tee=False,  # Would require NVIDIA CC attestation
-                supports_nvlink=_has_nvlink(i),
-                supports_peer_access=props.multi_processor_count > 0,
-                warp_or_wavefront_size=32,
-                implemented=True,
-                available=True,
-                compile_tested=False,   # No CUDA compilation tested yet
-                execution_tested=False, # No GPU inference yet
-                production_validated=False,
-                extra={
-                    "device_index": i,
-                    "compute_capability": cc,
-                    "multi_processor_count": props.multi_processor_count,
-                    "max_threads_per_block": props.max_threads_per_block,
-                },
-            ))
-        return devices
-
-    except ImportError:
-        return [HardwareCapabilities.unavailable(
-            vendor="NVIDIA",
-            device="unknown",
-            architecture="unknown",
-            target_id="cuda",
-            reason="PyTorch not installed",
-            implemented=True,
-        )]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("CUDA detection failed: %s", exc)
-        return [HardwareCapabilities.unavailable(
-            vendor="NVIDIA",
-            device="unknown",
-            architecture="unknown",
-            target_id="cuda",
-            reason=f"CUDA detection error: {exc}",
-            implemented=True,
-        )]
-
-
-def detect_rocm_devices() -> list[HardwareCapabilities]:
-    """Detect AMD ROCm/HIP devices on this host."""
-    try:
-        import torch
-        # ROCm appears as CUDA in PyTorch on some builds
-        if hasattr(torch, "hip") and torch.hip.is_available():
-            return _detect_rocm_via_hip(torch)
-        if torch.cuda.is_available():
-            # Check if any GPU is AMD
-            amd_devices = []
-            for i in range(torch.cuda.device_count()):
-                name = torch.cuda.get_device_name(i)
-                if any(kw in name for kw in ("AMD", "Radeon", "Instinct")):
-                    amd_devices.append(_rocm_cap_from_torch(i, name, torch))
-            if amd_devices:
-                return amd_devices
-        return [HardwareCapabilities.unavailable(
-            vendor="AMD",
-            device="unknown",
-            architecture="unknown",
-            target_id="rocm",
-            reason="ROCm runtime not available on this host",
-            implemented=True,
-        )]
-    except Exception as exc:  # noqa: BLE001
-        return [HardwareCapabilities.unavailable(
-            vendor="AMD",
-            device="unknown",
-            architecture="unknown",
-            target_id="rocm",
-            reason=f"ROCm detection error: {exc}",
-            implemented=True,
-        )]
-
-
-def detect_metal() -> HardwareCapabilities:
-    """Detect Apple Metal / MPS availability."""
-    try:
-        import torch
-        if torch.backends.mps.is_available():
-            # Get memory info if possible
-            mem = 0
-            try:
-                mem = torch.mps.driver_allocated_memory() + \
-                      getattr(torch.mps, "recommended_max_memory", lambda: 0)()
-            except Exception:  # noqa: BLE001
-                pass
-            device_name = platform.machine()
-            return HardwareCapabilities(
-                vendor="Apple",
-                device=device_name,
-                architecture="apple_silicon",
-                target_id="metal_m1",
-                driver_version="Metal " + platform.mac_ver()[0],
-                runtime_version=str(torch.__version__),
-                memory_bytes=mem or _host_memory_bytes(),  # unified memory
-                supports_fp32=True,
-                supports_fp16=True,
-                supports_bf16=True,
-                supports_int8=True,
-                supports_unified_memory=True,
+                supports_tee=False,
+                supports_nvlink=_has_nvlink_nvml(handle),
+                supports_peer_access=True,
                 warp_or_wavefront_size=32,
                 implemented=True,
                 available=True,
                 compile_tested=False,
                 execution_tested=False,
                 production_validated=False,
-            )
-    except (ImportError, AttributeError):
+                extra={"device_index": i, "compute_capability": cc},
+            ))
+        pynvml.nvmlShutdown()
+        return devices
+    except Exception as exc:  # noqa: BLE001  — pynvml not installed or no NVIDIA GPU
+        logger.debug("pynvml CUDA detection failed: %s", exc)
+
+    # ── Fallback: CUDA Driver API via ctypes ──────────────────────────────────
+    import ctypes, sys  # noqa: E401,PLC0415
+    try:
+        _lib = ctypes.CDLL("nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1")
+        if _lib.cuInit(0) == 0:  # CUDA_SUCCESS
+            count = ctypes.c_int(0)
+            _lib.cuDeviceGetCount(ctypes.byref(count))
+            if count.value > 0:
+                major = ctypes.c_int(0)
+                minor = ctypes.c_int(0)
+                _lib.cuDeviceGetAttribute(ctypes.byref(major), 75, 0)
+                _lib.cuDeviceGetAttribute(ctypes.byref(minor), 76, 0)
+                target_id = _cuda_target_id(major.value, minor.value)
+                return [HardwareCapabilities(
+                    vendor="NVIDIA",
+                    device=f"NVIDIA GPU (via cuDriver, {count.value} device(s))",
+                    architecture=f"sm{major.value}{minor.value}",
+                    target_id=target_id,
+                    driver_version="unknown (ctypes)",
+                    runtime_version="cuda_driver",
+                    memory_bytes=0,
+                    supports_fp32=True,
+                    supports_fp16=True,
+                    supports_bf16=major.value >= 8,
+                    supports_fp8=major.value >= 9,
+                    supports_fp4=(major.value >= 10),
+                    supports_int8=True,
+                    supports_int4=True,
+                    supports_cuda_graph=True,
+                    warp_or_wavefront_size=32,
+                    implemented=True,
+                    available=True,
+                    compile_tested=False,
+                    execution_tested=False,
+                    production_validated=False,
+                    extra={"device_count": count.value, "detection_method": "ctypes_cuda_driver"},
+                )]
+    except Exception:  # noqa: BLE001
         pass
+
+    return [HardwareCapabilities.unavailable(
+        vendor="NVIDIA",
+        device="unknown",
+        architecture="unknown",
+        target_id="cuda",
+        reason="No NVIDIA GPU detected (pynvml and CUDA Driver API both failed)",
+        implemented=True,
+    )]
+
+
+def detect_rocm_devices() -> list[HardwareCapabilities]:
+    """Detect AMD ROCm/HIP devices on this host (no torch required).
+
+    Uses: amdsmi Python binding, rocm-smi subprocess, or /dev/kfd presence.
+    """
+    import sys  # noqa: PLC0415
+
+    # ── 1. amdsmi Python binding (ROCm 5.6+) ─────────────────────────────────
+    try:
+        import amdsmi  # type: ignore[import]  # noqa: PLC0415
+        amdsmi.amdsmi_init()
+        processors = amdsmi.amdsmi_get_processor_handles()
+        if processors:
+            devices: list[HardwareCapabilities] = []
+            for proc in processors:
+                try:
+                    name = amdsmi.amdsmi_get_gpu_board_info(proc).get("product_name", "AMD GPU")
+                    mem_bytes = amdsmi.amdsmi_get_gpu_memory_total(proc, amdsmi.AmdSmiMemoryType.VRAM)
+                except Exception:  # noqa: BLE001
+                    name, mem_bytes = "AMD GPU", 0
+                devices.append(HardwareCapabilities(
+                    vendor="AMD",
+                    device=name,
+                    architecture="gfx_unknown",
+                    target_id="rocm",
+                    runtime_version="amdsmi",
+                    memory_bytes=mem_bytes,
+                    supports_fp32=True,
+                    supports_fp16=True,
+                    supports_bf16=True,
+                    supports_int8=True,
+                    warp_or_wavefront_size=64,
+                    implemented=True,
+                    available=True,
+                    compile_tested=False,
+                    execution_tested=False,
+                    production_validated=False,
+                ))
+            amdsmi.amdsmi_shut_down()
+            return devices
+        amdsmi.amdsmi_shut_down()
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ── 2. rocm-smi subprocess ────────────────────────────────────────────────
+    if sys.platform in ("linux", "darwin"):
+        try:
+            import subprocess, json  # noqa: E401,PLC0415
+            result = subprocess.run(
+                ["rocm-smi", "--showproductname", "--json"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                devices = []
+                for _key, info in data.items():
+                    if isinstance(info, dict):
+                        devices.append(HardwareCapabilities(
+                            vendor="AMD",
+                            device=info.get("Card Series", "AMD GPU"),
+                            architecture=info.get("GFX Version", "gfx_unknown"),
+                            target_id="rocm",
+                            runtime_version="rocm-smi",
+                            implemented=True,
+                            available=True,
+                            compile_tested=False,
+                            execution_tested=False,
+                            production_validated=False,
+                        ))
+                if devices:
+                    return devices
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── 3. /dev/kfd presence on Linux ────────────────────────────────────────
+    if sys.platform == "linux":
+        try:
+            import pathlib  # noqa: PLC0415
+            if pathlib.Path("/dev/kfd").exists():
+                return [HardwareCapabilities(
+                    vendor="AMD",
+                    device="AMD GPU (/dev/kfd present)",
+                    architecture="gfx_unknown",
+                    target_id="rocm",
+                    runtime_version="kfd",
+                    implemented=True,
+                    available=True,
+                    compile_tested=False,
+                    execution_tested=False,
+                    production_validated=False,
+                )]
+        except Exception:  # noqa: BLE001
+            pass
+
+    return [HardwareCapabilities.unavailable(
+        vendor="AMD",
+        device="unknown",
+        architecture="unknown",
+        target_id="rocm",
+        reason="ROCm runtime not available on this host (amdsmi, rocm-smi, and /dev/kfd all failed)",
+        implemented=True,
+    )]
+
+
+def detect_metal() -> HardwareCapabilities:
+    """Detect Apple Metal availability (no torch required).
+
+    Uses: platform.mac_ver() + system_profiler on macOS. Returns unavailable
+    immediately on non-macOS platforms.
+    """
+    import sys  # noqa: PLC0415
+    if sys.platform != "darwin":
+        return HardwareCapabilities.unavailable(
+            vendor="Apple",
+            device="Apple Silicon",
+            architecture="apple_silicon",
+            target_id="metal",
+            reason="Metal requires macOS; current platform is not macOS",
+            implemented=True,
+        )
+    # ── Check via system_profiler ──────────────────────────────────────────────
+    try:
+        import subprocess  # noqa: PLC0415
+        result = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType"],
+            capture_output=True, text=True, timeout=5,
+        )
+        has_metal = "Metal" in result.stdout or "Apple" in result.stdout
+    except Exception:  # noqa: BLE001
+        has_metal = False  # Cannot confirm, but we are on macOS
+    # ── Check via MLX as secondary indicator ──────────────────────────────────
+    if not has_metal:
+        try:
+            import mlx.core  # noqa: F401,PLC0415
+            has_metal = True
+        except ImportError:
+            pass
+    if has_metal:
+        mac_ver = platform.mac_ver()[0]
+        machine = platform.machine()
+        return HardwareCapabilities(
+            vendor="Apple",
+            device=f"Apple {machine}",
+            architecture="apple_silicon",
+            target_id="metal_m3",
+            driver_version=f"Metal (macOS {mac_ver})",
+            runtime_version="platform",
+            memory_bytes=_host_memory_bytes(),  # unified memory
+            supports_fp32=True,
+            supports_fp16=True,
+            supports_bf16=True,
+            supports_int8=True,
+            supports_unified_memory=True,
+            warp_or_wavefront_size=32,
+            implemented=True,
+            available=True,
+            compile_tested=False,
+            execution_tested=False,
+            production_validated=False,
+        )
     return HardwareCapabilities.unavailable(
         vendor="Apple",
         device="Apple Silicon",
         architecture="apple_silicon",
         target_id="metal",
-        reason="Metal/MPS runtime not available (requires macOS with Apple Silicon)",
+        reason="Metal/MPS not detected on this macOS system (system_profiler and MLX both failed)",
         implemented=True,
     )
 
@@ -283,18 +420,19 @@ def get_memory_info(device_type: str = "cpu", device_index: int = 0) -> MemoryIn
         MemoryInfo with real measurements where available.
     """
     if device_type == "cuda":
+        # Use pynvml (no torch required)
         try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.synchronize(device_index)
-                free, total = torch.cuda.mem_get_info(device_index)
-                used = total - free
-                return MemoryInfo(
-                    total_bytes=total,
-                    free_bytes=free,
-                    used_bytes=used,
-                    device_type="cuda",
-                )
+            import pynvml  # noqa: PLC0415
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            pynvml.nvmlShutdown()
+            return MemoryInfo(
+                total_bytes=mem_info.total,
+                free_bytes=mem_info.free,
+                used_bytes=mem_info.used,
+                device_type="cuda",
+            )
         except Exception:  # noqa: BLE001
             pass
 
@@ -504,20 +642,37 @@ def _cuda_target_id(major: int, minor: int) -> str:
 
 
 def _cuda_driver_version() -> str:
+    """Return CUDA driver version string via pynvml (no torch required)."""
     try:
-        import torch
-        ver = torch.version.cuda
-        return f"CUDA {ver}" if ver else "unknown"
+        import pynvml  # noqa: PLC0415
+        pynvml.nvmlInit()
+        ver = pynvml.nvmlSystemGetDriverVersion()
+        pynvml.nvmlShutdown()
+        if isinstance(ver, bytes):
+            ver = ver.decode()
+        return f"driver/{ver}"
     except Exception:  # noqa: BLE001
         return "unknown"
 
 
 def _has_nvlink(device_index: int) -> bool:
+    """Check NVLink availability by device index via pynvml."""
     try:
         import pynvml  # type: ignore[import]
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
-        # NVLink is link-count > 0
+        result = _has_nvlink_nvml(handle)
+        pynvml.nvmlShutdown()
+        return result
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _has_nvlink_nvml(handle: Any) -> bool:
+    """Check NVLink availability given an already-opened pynvml device handle."""
+    try:
+        import pynvml  # type: ignore[import]  # noqa: PLC0415
         for link in range(6):
             try:
                 state = pynvml.nvmlDeviceGetNvLinkState(handle, link)

@@ -247,7 +247,15 @@ def _load_adapter(adapter_path: str) -> dict[str, Any]:
     if bin_path and bin_path.exists():
         try:
             import torch  # type: ignore[import]
-            sd = torch.load(str(bin_path), map_location="cpu")
+            # ``weights_only=True`` is mandatory: adapter files are untrusted
+            # model artifacts and must not execute pickled code.
+            try:
+                sd = torch.load(str(bin_path), map_location="cpu", weights_only=True)
+            except TypeError:  # pragma: no cover - torch < 1.13 without the flag
+                raise ValueError(
+                    "adapter loading requires torch.load(weights_only=True) "
+                    "support; upgrade PyTorch or use safetensors adapters"
+                )
             for name, tensor in sd.items():
                 flat = tensor.float().reshape(-1).tolist()
                 if "lora_A" in name:

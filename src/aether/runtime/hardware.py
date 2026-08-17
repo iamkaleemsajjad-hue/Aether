@@ -96,14 +96,21 @@ class HardwareDetector:
 
         if self.target.value.startswith("cuda"):
             try:
-                import torch
-                if torch.cuda.is_available():
-                    gpu_count = torch.cuda.device_count()
-                    gpu_name = torch.cuda.get_device_name(0)
-                    gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                    compute_capability = f"{torch.cuda.get_device_capability(0)}"
-                    driver_version = torch.version.cuda
-            except ImportError:
+                import pynvml  # noqa: PLC0415
+                pynvml.nvmlInit()
+                gpu_count = pynvml.nvmlDeviceGetCount()
+                if gpu_count > 0:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    name = pynvml.nvmlDeviceGetName(handle)
+                    gpu_name = name.decode() if isinstance(name, bytes) else name
+                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    gpu_memory_gb = mem_info.total / (1024 ** 3)
+                    major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+                    compute_capability = f"({major}, {minor})"
+                    drv = pynvml.nvmlSystemGetDriverVersion()
+                    driver_version = drv.decode() if isinstance(drv, bytes) else drv
+                pynvml.nvmlShutdown()
+            except Exception:  # noqa: BLE001 — no NVIDIA GPU or pynvml not installed
                 pass
         elif self.target.value.startswith("metal"):
             try:

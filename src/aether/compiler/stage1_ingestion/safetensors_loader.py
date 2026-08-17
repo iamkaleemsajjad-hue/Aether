@@ -87,14 +87,36 @@ class SafeTensorsLoader:
         raise IngestionError(msg)
 
     def load(self) -> dict[str, Any]:
-        """Load all tensors and metadata from discovered SafeTensors files."""
+        """Load all tensors and metadata from discovered SafeTensors files.
+
+        Torch-free by default: the numpy framework covers every dtype the
+        CPU pipeline consumes. Shards numpy cannot represent (e.g. BF16) are
+        retried through the optional PyTorch frontend; without torch such a
+        checkpoint fails with an explicit error instead of silently importing
+        the framework.
+        """
         tensors: dict[str, Any] = {}
         metadata: dict[str, Any] = {}
-        for st_file in self.discover_files():
-            with safe_open(st_file, framework="pt", device="cpu") as f:
-                metadata.update(f.metadata() or {})
-                for key in f.keys():
-                    tensors[key] = f.get_tensor(key)
+        try:
+            for st_file in self.discover_files():
+                with safe_open(st_file, framework="numpy", device="cpu") as f:
+                    metadata.update(f.metadata() or {})
+                    for key in f.keys():
+                        tensors[key] = f.get_tensor(key)
+        except Exception as numpy_exc:  # noqa: BLE001 — retry via torch only when installed
+            try:
+                import torch  # noqa: F401 — optional PyTorch frontend
+            except ImportError:
+                raise IngestionError(
+                    f"SafeTensors file at {self.model_path} contains a dtype numpy "
+                    f"cannot represent (e.g. BF16) and torch is not installed. "
+                    f"Install it with: pip install 'aether-runtime[pytorch]'"
+                ) from numpy_exc
+            for st_file in self.discover_files():
+                with safe_open(st_file, framework="pt", device="cpu") as f:
+                    metadata.update(f.metadata() or {})
+                    for key in f.keys():
+                        tensors[key] = f.get_tensor(key)
         self._tensors = tensors
         self._metadata = metadata
         logger.info("Loaded SafeTensors", path=str(self.model_path), tensors=len(tensors))
@@ -155,15 +177,19 @@ class SafeTensorsLoader:
                     f"Expected {num_layers} layers but found ~{actual_layers} based on tensor count"
                 )
 
-        # Check for NaN or Inf values in a sample of tensors
-        import torch
+        # Check for NaN or Inf values in a sample of tensors (numpy; no torch).
+        import numpy as _np
+
+        def _to_numpy(tensor: Any) -> Any:
+            return tensor if isinstance(tensor, _np.ndarray) else _np.asarray(tensor)
+
         sample_keys = list(loaded_keys)[:10]  # Check first 10 tensors
         for key in sample_keys:
-            tensor = self._tensors[key]
-            if torch.isnan(tensor).any():
+            array = _to_numpy(self._tensors[key]).astype(_np.float32, copy=False)
+            if _np.isnan(array).any():
                 report["errors"].append(f"NaN values detected in {key}")
                 report["valid"] = False
-            if torch.isinf(tensor).any():
+            if _np.isinf(array).any():
                 report["warnings"].append(f"Inf values detected in {key}")
 
         logger.info("Weight validation complete", valid=report["valid"],
@@ -195,7 +221,8 @@ class SafeTensorsLoader:
             Hex string of SHA-256 hash.
         """
         import hashlib
-        import torch
+
+        import numpy as _np
 
         hasher = hashlib.sha256()
 
@@ -206,8 +233,9 @@ class SafeTensorsLoader:
             hasher.update(key.encode('utf-8'))
             hasher.update(str(tensor.shape).encode('utf-8'))
             hasher.update(str(tensor.dtype).encode('utf-8'))
-            # Hash tensor data
-            hasher.update(tensor.cpu().numpy().tobytes())
+            # Hash tensor data (numpy; no torch dependency)
+            array = tensor if isinstance(tensor, _np.ndarray) else _np.asarray(tensor)
+            hasher.update(_np.ascontiguousarray(array).tobytes())
 
         return hasher.hexdigest()
 

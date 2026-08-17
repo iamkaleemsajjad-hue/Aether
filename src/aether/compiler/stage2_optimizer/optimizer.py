@@ -73,6 +73,7 @@ class OperatorFusionPass(BasePass):
                 return graph, report
 
             fused_count = 0
+            merged_ops_total = 0
             patterns: dict[str, int] = {}
             # Track already-fused node IDs to prevent double-fusion.
             already_fused_ids: set[str] = set()
@@ -131,6 +132,7 @@ class OperatorFusionPass(BasePass):
                                     fused_op_type,
                                 )
                                 fused_count += 1
+                                merged_ops_total += len(candidates)
                                 patterns[pattern_key] = patterns.get(pattern_key, 0) + 1
                                 # Mark fused nodes so they aren't reused in subsequent sequences.
                                 already_fused_ids.update(candidate_ids)
@@ -143,6 +145,13 @@ class OperatorFusionPass(BasePass):
                             except Exception as fuse_exc:  # noqa: BLE001
                                 logger.debug("Pass 1: fuse_subgraph failed for %s: %s", fused_name, fuse_exc)
 
+            if hasattr(graph, "set_metadata"):
+                graph.set_metadata("fusion_accounting", {
+                    "fused_groups": fused_count,
+                    "merged_ops_total": merged_ops_total,
+                    "launches_saved": max(0, merged_ops_total - fused_count),
+                    "patterns": dict(patterns),
+                })
             report = PassReport(
                 pass_name=self.name,
                 status="applied",
@@ -150,6 +159,7 @@ class OperatorFusionPass(BasePass):
                 nodes_affected=fused_count * 3,
                 details={
                     "fused_count": fused_count,
+                    "merged_ops_total": merged_ops_total,
                     "fusion_patterns": patterns,
                 },
             )
@@ -186,9 +196,16 @@ class SensitivityAnalysisPass(BasePass):
             base_precision_map["lm_head"] = "BF16"
             dataset = get_dataset(config.calibration_dataset, max_tokens=config.calibration_tokens)
             calibration = SensitivityCalibration(architecture)
-            sensitivity_map = calibration.score_by_layer(dataset, base_precision_map)
+            layer_weights = self._collect_layer_weights(graph, architecture.layers)
+            method = SensitivityCalibration.scoring_method(layer_weights)
+            sensitivity_map = calibration.score_by_layer(
+                dataset, base_precision_map, layer_weights=layer_weights
+            )
             summary = calibration.score_summary(sensitivity_map)
+            summary["method"] = method
             annotated_count = self._annotate_graph(graph, sensitivity_map)
+            if hasattr(graph, "set_metadata"):
+                graph.set_metadata("sensitivity_method", method)
 
             report = PassReport(
                 pass_name=self.name,
@@ -198,13 +215,18 @@ class SensitivityAnalysisPass(BasePass):
                 details={
                     "sensitivity_map": sensitivity_map,
                     "summary": summary,
+                    "method": method,
                     "dataset": dataset.name,
                     "calibration_tokens": dataset.token_count() if hasattr(dataset, "token_count") else 0,
                     "high_sensitivity_layers": sum(1 for v in sensitivity_map.values() if v > 0.7),
                     "low_sensitivity_layers": sum(1 for v in sensitivity_map.values() if v < 0.4),
                 },
             )
-            logger.info(f"Pass 2: Computed sensitivity for {annotated_count} graph nodes")
+            logger.info(
+                "Pass 2: Computed sensitivity for %d graph nodes (method: %s)",
+                annotated_count,
+                method,
+            )
         except Exception as exc:
             report = PassReport(
                 pass_name=self.name,
@@ -214,6 +236,42 @@ class SensitivityAnalysisPass(BasePass):
             )
             logger.error(f"Pass 2 failed: {exc}")
         return graph, report
+
+    @staticmethod
+    def _collect_layer_weights(graph: Any, num_layers: int) -> dict[str, list[Any]]:
+        """Gather real bound weight tensors per layer from the graph.
+
+        Returns ``{layer_i: [ndarray, ...]}`` plus ``embedding``/``lm_head``
+        entries.  Layers with no bound tensors are simply absent, which keeps
+        ``score_by_layer`` on the honest fallback path when the checkpoint
+        carried no weights.
+        """
+        import numpy as np
+
+        layer_weights: dict[str, list[Any]] = {}
+        node_iter = (
+            graph.nodes.values()
+            if hasattr(graph, "nodes")
+            else (graph if hasattr(graph, "__iter__") else [])
+        )
+        for node in node_iter:
+            attributes = getattr(node, "attributes", {}) or {}
+            candidate = attributes.get("weight") if isinstance(attributes, dict) else None
+            if candidate is None:
+                continue
+            try:
+                array = np.asarray(candidate)
+            except (TypeError, ValueError):
+                continue
+            if array.ndim == 0 or array.size == 0:
+                continue
+            node_id = str(getattr(node, "id", ""))
+            layer_index = getattr(node, "layer_index", None)
+            if layer_index is not None and 0 <= int(layer_index) < num_layers:
+                layer_weights.setdefault(f"layer_{int(layer_index)}", []).append(array)
+            elif node_id == "embedding" or node_id == "lm_head":
+                layer_weights.setdefault(node_id, []).append(array)
+        return layer_weights
 
     def _annotate_graph(self, graph: Any, sensitivity_map: dict[str, float]) -> int:
         """Attach sensitivity scores to every graph node with a layer index."""
@@ -411,13 +469,53 @@ class KVCacheStructuringPass(BasePass):
 class MoERoutingPass(BasePass):
     """Pass 5: MoE Expert Routing Optimization.
 
-    For MoE models, this pass profiles expert activations, classifies experts
-    into hot/warm/cold tiers, adds threshold-based routing hints, and emits
-    intra-expert sparsity annotations.
+    For MoE models, this pass classifies experts into hot/warm/cold tiers,
+    adds threshold-based routing hints, and emits intra-expert sparsity
+    annotations.  Tier assignment prefers *measured* per-expert activation
+    frequencies (recorded on the graph by profiling loaders or calibration);
+    without measurements it falls back to the documented Zipf-like empirical
+    prior and labels the router node with the tier basis so downstream
+    consumers can distinguish measured from prior estimates.
     """
 
     name = "moe_routing"
     description = "Optimize MoE expert routing and tiering."
+
+    #: Zipf-like activation prior (Zoph et al. 2022; Fedus et al. 2022):
+    #: ~20% of experts handle ~50% of tokens.  Mirrors
+    #: ``moe_loader._classify_experts`` so both classification sites agree.
+    _PRIOR_HOT_FRACTION = 0.20
+    _PRIOR_WARM_FRACTION = 0.30
+
+    @staticmethod
+    def _collect_activation_frequencies(graph: Any, total_experts: int) -> Any:
+        """Return per-expert activation frequencies when the graph has them.
+
+        Accepts either normalized frequencies (``expert_activation_frequencies``)
+        or raw counts (``expert_activation_counts``); counts are normalized to
+        frequencies here.  Returns ``None`` when no complete, valid profile is
+        attached — never a fabricated distribution.
+        """
+        metadata = getattr(graph, "metadata", {}) or {}
+        for key in ("expert_activation_frequencies", "expert_activation_counts"):
+            raw = metadata.get(key)
+            if raw is None:
+                continue
+            try:
+                import numpy as np
+
+                values = np.asarray(raw, dtype=np.float64).ravel()
+            except (TypeError, ValueError):
+                continue
+            if values.size != total_experts or bool((values < 0).any()):
+                continue
+            if key == "expert_activation_counts":
+                total = float(values.sum())
+                if total <= 0:
+                    continue
+                values = values / total
+            return values
+        return None
 
     def run(self, graph: Any, architecture: Any, config: CompilerConfig) -> tuple[Any, PassReport]:
         start = time.perf_counter()
@@ -425,6 +523,7 @@ class MoERoutingPass(BasePass):
             hot_experts = 0
             warm_experts = 0
             cold_experts = 0
+            tier_basis = "none"
             total_experts = architecture.num_experts if architecture.is_moe else 0
 
             if total_experts > 0 and hasattr(graph, "add_node"):
@@ -432,6 +531,26 @@ class MoERoutingPass(BasePass):
 
                 hot_threshold = config.moe_hot_threshold
                 warm_threshold = config.moe_warm_threshold
+                frequencies = self._collect_activation_frequencies(graph, total_experts)
+                if frequencies is not None:
+                    hot_mask = frequencies > hot_threshold
+                    warm_mask = (frequencies > warm_threshold) & ~hot_mask
+                    hot_experts = int(hot_mask.sum())
+                    warm_experts = int(warm_mask.sum())
+                    cold_experts = total_experts - hot_experts - warm_experts
+                    tier_basis = "measured_activation_frequency"
+                else:
+                    hot_experts = min(
+                        total_experts,
+                        max(1, round(total_experts * self._PRIOR_HOT_FRACTION)),
+                    )
+                    warm_experts = min(
+                        total_experts - hot_experts,
+                        max(1, round(total_experts * self._PRIOR_WARM_FRACTION)),
+                    )
+                    cold_experts = total_experts - hot_experts - warm_experts
+                    tier_basis = "empirical_zipf_prior"
+
                 router_node = AEGGraphNode(
                     id="moe_router",
                     node_type=AEGGraphNodeType.EXPERT_ROUTER,
@@ -443,15 +562,13 @@ class MoERoutingPass(BasePass):
                         "warm_threshold": warm_threshold,
                         "routing_strategy": "threshold",
                         "total_experts": total_experts,
-                        "hot_count": int(total_experts * 0.2),
-                        "warm_count": int(total_experts * 0.5),
-                        "cold_count": total_experts - int(total_experts * 0.7),
+                        "hot_count": hot_experts,
+                        "warm_count": warm_experts,
+                        "cold_count": cold_experts,
+                        "tier_basis": tier_basis,
                     },
                 )
                 graph.add_node(router_node)
-                hot_experts = int(total_experts * 0.2)
-                warm_experts = int(total_experts * 0.5)
-                cold_experts = total_experts - hot_experts - warm_experts
 
             report = PassReport(
                 pass_name=self.name,
@@ -463,12 +580,17 @@ class MoERoutingPass(BasePass):
                     "hot_experts": hot_experts,
                     "warm_experts": warm_experts,
                     "cold_experts": cold_experts,
+                    "tier_basis": tier_basis,
                     "threshold_hot": config.moe_hot_threshold,
                     "threshold_warm": config.moe_warm_threshold,
                 },
             )
             if total_experts > 0:
-                logger.info(f"Pass 5: Classified {total_experts} experts ({hot_experts} hot, {warm_experts} warm, {cold_experts} cold)")
+                logger.info(
+                    f"Pass 5: Classified {total_experts} experts "
+                    f"({hot_experts} hot, {warm_experts} warm, {cold_experts} cold; "
+                    f"basis: {tier_basis})"
+                )
         except Exception as exc:
             report = PassReport(
                 pass_name=self.name,
@@ -597,7 +719,8 @@ class SparseAttentionPass(BasePass):
     def run(self, graph: Any, architecture: Any, config: CompilerConfig) -> tuple[Any, PassReport]:
         start = time.perf_counter()
         try:
-            patterns = self._assign_head_patterns(architecture)
+            calibrated_maps = self._collect_calibration_maps(graph)
+            patterns, pattern_basis = self._assign_head_patterns(architecture, calibrated_maps)
             enabled = architecture.context_length >= config.sparse_attention_context_threshold
             plan = {
                 "version": "sparse_attention/1.0",
@@ -605,8 +728,13 @@ class SparseAttentionPass(BasePass):
                 "activation_context_length": config.sparse_attention_context_threshold,
                 "model_context_length": architecture.context_length,
                 "patterns": patterns,
+                "pattern_basis": pattern_basis,
                 "runtime_fallback": "dense_attention",
-                "research_basis": ["MInference", "MMInference", "Ring Attention"],
+                "research_basis": (
+                    ["MInference", "MMInference", "Ring Attention"]
+                    if pattern_basis == "minference_calibrated"
+                    else ["MInference (pattern taxonomy)", "deterministic rotation assignment"]
+                ),
             }
             if hasattr(graph, "set_metadata"):
                 graph.set_metadata("attention_head_patterns", plan)
@@ -617,7 +745,11 @@ class SparseAttentionPass(BasePass):
                 nodes_affected=len(patterns),
                 details=plan,
             )
-            logger.info(f"Pass 8: Planned {len(patterns)} sparse attention head groups")
+            logger.info(
+                "Pass 8: Planned %d sparse attention head groups (basis: %s)",
+                len(patterns),
+                pattern_basis,
+            )
         except Exception as exc:
             report = PassReport(
                 pass_name=self.name,
@@ -628,16 +760,76 @@ class SparseAttentionPass(BasePass):
             logger.error(f"Pass 8 failed: {exc}")
         return graph, report
 
-    def _assign_head_patterns(self, architecture: Any) -> list[dict[str, Any]]:
-        patterns: list[dict[str, Any]] = []
+    @staticmethod
+    def _collect_calibration_maps(graph: Any) -> dict[int, Any]:
+        """Return per-layer calibration attention maps recorded on the graph.
+
+        Calibration forward passes may attach ``attention_calibration_maps`` as
+        ``{layer_idx: {head_idx: 2-D attention array}}``.  Returns ``{}`` when
+        absent — the pass then falls back to a deterministic, labelled
+        rotation assignment instead of pretending MInference profiling ran.
+        """
+        metadata = getattr(graph, "metadata", {}) or {}
+        raw = metadata.get("attention_calibration_maps")
+        if not isinstance(raw, dict):
+            return {}
+        maps: dict[int, Any] = {}
+        for layer_key, head_map in raw.items():
+            if isinstance(head_map, dict):
+                try:
+                    maps[int(layer_key)] = head_map
+                except (TypeError, ValueError):
+                    continue
+        return maps
+
+    def _assign_head_patterns(
+        self,
+        architecture: Any,
+        calibration_maps: dict[int, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Assign a sparse pattern to every attention head.
+
+        When calibration attention maps are available the real MInference
+        classifier (``AttentionPatternClassifier``) scores each head's map.
+        Without calibration data a deterministic rotation over the MInference
+        pattern taxonomy is used so every pattern class is represented; the
+        returned basis string records which path produced the plan.
+        """
         head_count = max(1, architecture.num_attention_heads)
+        maps = calibration_maps or {}
+        if maps:
+            from aether.compiler.stage2_optimizer.pass8_minference import AttentionPatternClassifier
+
+            classifier = AttentionPatternClassifier()
+            patterns: list[dict[str, Any]] = []
+            for head in range(head_count):
+                head_map = maps.get(0, {}).get(head) or maps.get(head)
+                if head_map is None:
+                    raise ValueError(
+                        "partial attention calibration maps: head "
+                        f"{head} has no map; refusing to mix measured and "
+                        "fabricated patterns"
+                    )
+                classified = classifier.classify_head(
+                    layer_idx=0,
+                    head_idx=head,
+                    num_layers=1,
+                    num_heads=head_count,
+                    attention_map=head_map,
+                )
+                patterns.append({
+                    "head": head,
+                    "pattern": str(classified.pattern_type),
+                    "sink_tokens": classified.num_sink_tokens,
+                    "local_window": classified.local_window_size,
+                    "stride": 128 if classified.pattern_type == "vertical_slash" else 0,
+                })
+            return patterns, "minference_calibrated"
+
+        rotation = ("vertical_slash", "block_sparse", "a_shape")
+        patterns = []
         for head in range(head_count):
-            if head % 3 == 0:
-                pattern = "vertical_slash"
-            elif head % 3 == 1:
-                pattern = "block_sparse"
-            else:
-                pattern = "a_shape"
+            pattern = rotation[head % 3]
             patterns.append({
                 "head": head,
                 "pattern": pattern,
@@ -645,7 +837,7 @@ class SparseAttentionPass(BasePass):
                 "local_window": 4096,
                 "stride": 128 if pattern == "vertical_slash" else 0,
             })
-        return patterns
+        return patterns, "deterministic_rotation_fallback"
 
 
 class PruningSparsityPass(BasePass):
@@ -966,20 +1158,24 @@ class OptimizerPipeline:
             "reasoning_graph": True,
             "sparse_attention": True,
             "pruning_sparsity": True,
-            # PRD v4.0 — on by default unless opt-in required
-            "mtp_head_compilation": True,
+            # PRD v4.0 — opt-in passes; ``_sync_enabled_from_config`` applies
+            # the CompilerConfig flags before every run, and constants.py
+            # keeps every v4/v5 pass disabled by default.  The values here
+            # mirror those defaults so a directly-constructed pipeline (used
+            # by tests) cannot silently run v4/v5 passes unconfigured.
+            "mtp_head_compilation": False,          # opt-in (enable_mtp_head)
             "grammar_constraint_compilation": False,   # opt-in
             "model_merging": False,                    # opt-in
             "ttt_fast_weight_injection": False,        # opt-in
-            "semantic_kv_compression": True,
-            "cross_layer_kv_sharing": True,
+            "semantic_kv_compression": False,       # opt-in (enable_semantic_kv)
+            "cross_layer_kv_sharing": False,        # opt-in (enable_cross_layer_kv)
             "green_energy_compilation": False,         # opt-in
             "tee_kernel_wrapping": False,              # opt-in
             # PRD v5.0
             "mdlm_drafter_compilation": False,         # opt-in
             "sub2bit_quantization": False,             # opt-in
-            "video_token_compression": True,           # auto-skips non-VLM
-            "advanced_peft_compilation": True,
+            "video_token_compression": False,      # opt-in (enable_video_compression)
+            "advanced_peft_compilation": False,    # opt-in (enable_advanced_peft)
             "rlvr_verifier_head_injection": False,     # opt-in
         }
 

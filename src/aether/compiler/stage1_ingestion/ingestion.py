@@ -21,9 +21,13 @@ from aether.utils.logging import get_logger
 logger = get_logger(__name__)
 
 try:
-    import torch  # noqa: F401
-    HAS_TORCH = True
-except ImportError:
+    # Probe torch WITHOUT importing it: importing the full package here would
+    # make every framework-free path (AEG loading, CPU execution) pull torch
+    # into sys.modules. Only the PyTorch loader imports it, lazily.
+    from importlib.util import find_spec as _find_spec
+
+    HAS_TORCH = _find_spec("torch") is not None
+except (ImportError, ValueError):
     HAS_TORCH = False
 
 try:
@@ -55,6 +59,10 @@ class IngestionPipeline:
         # default.  Network materialization belongs to Compiler, which passes
         # its explicit ``skip_download`` policy through this object.
         self.config = config or CompilerConfig(skip_download=True)
+        # Metadata stashed by a specialised loader whose graph could not host
+        # the checkpoint weights.  The generic graph inherits these keys so a
+        # fallback still preserves MLA/MoE/VLM/SSM structure information.
+        self._specialised_fallback_metadata: dict[str, Any] = {}
         logger.info("Ingestion pipeline initialized")
 
     def ingest(self, model: str, architecture: ModelArchitecture) -> AEGGraph:
@@ -100,6 +108,14 @@ class IngestionPipeline:
         ):
             graph.set_metadata("source_model_path", str(local_path.resolve()))
             graph.set_metadata("source_format", format_type)
+        # A specialised loader may have produced structure metadata that the
+        # generic graph cannot recompute (MLA ranks, MoE layout, ...).  Merge
+        # it without clobbering anything the generic path already recorded.
+        if self._specialised_fallback_metadata:
+            for key, value in self._specialised_fallback_metadata.items():
+                if graph.get_metadata(key) is None:
+                    graph.set_metadata(key, value)
+            self._specialised_fallback_metadata = {}
         return graph
 
     def _try_specialised_loader(
@@ -128,16 +144,59 @@ class IngestionPipeline:
         arch_family = (getattr(architecture, "family", "") or "").lower()
         model_type = (config.get("model_type") or arch_family).lower()
 
+        def _qualified(result: dict[str, Any], loader_name: str) -> AEGGraph | None:
+            """Wrap a specialised result and verify it can host the checkpoint.
+
+            Returns the graph when it is runnable, otherwise ``None`` so the
+            generic dispatch path takes over.  Structure metadata from the
+            specialised loader is stashed for the generic graph either way,
+            guaranteeing compile-time invariants (every required tensor bound)
+            never trade away the specialised loader's architectural insight.
+            """
+            candidate = self._wrap_specialised_result(result, architecture)
+            attached = self._attach_checkpoint_weights(candidate, model, format_type)
+            unbound = candidate.get_metadata("unbound_weight_names") or []
+            has_checkpoint = self._local_checkpoint_exists(model)
+            if attached > 0 and not unbound:
+                return candidate
+            if not has_checkpoint:
+                # No weights anywhere: keep the richer specialised graph and
+                # let the packaging invariant fail loudly downstream.
+                return candidate
+            self._specialised_fallback_metadata.update(
+                {
+                    key: value
+                    for key, value in (candidate.metadata or {}).items()
+                    if key not in {
+                        "weights_attached", "weight_tensor_count",
+                        "bound_weight_count", "source_tensor_count",
+                        "unbound_weight_names", "source_model_path", "source_format",
+                        # The generic graph is NOT specialised-loader output;
+                        # claiming so would misreport the ingestion path.
+                        "specialised_loader_arch", "specialised_loader_format",
+                    }
+                }
+            )
+            logger.info(
+                "%s graph cannot host the local checkpoint (%d tensors attached, "
+                "%d unbound); falling back to generic ingestion with %s metadata",
+                loader_name,
+                attached,
+                len(unbound),
+                loader_name,
+            )
+            return None
+
         # --- MLA (DeepSeek V2/V3/R1) ---
         if "deepseek" in model_type or "kv_lora_rank" in config:
             try:
                 from aether.compiler.stage1_ingestion.mla_loader import MLALoader
                 if path.exists():
-                    result = MLALoader(path).load()
-                    graph = self._wrap_specialised_result(result, architecture)
-                    logger.info("Ingested via MLALoader (DeepSeek MLA)")
-                    return graph
-            except Exception as exc:
+                    graph = _qualified(MLALoader(path).load(), "MLALoader")
+                    if graph is not None:
+                        logger.info("Ingested via MLALoader (DeepSeek MLA)")
+                        return graph
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(f"MLALoader failed, falling back: {exc}")
 
         # --- MoE (Mixtral, Qwen MoE, Jamba, DBRX, OLMoE) ---
@@ -146,11 +205,11 @@ class IngestionPipeline:
             try:
                 from aether.compiler.stage1_ingestion.moe_loader import MoELoader
                 if path.exists():
-                    result = MoELoader(path).load()
-                    graph = self._wrap_specialised_result(result, architecture)
-                    logger.info("Ingested via MoELoader")
-                    return graph
-            except Exception as exc:
+                    graph = _qualified(MoELoader(path).load(), "MoELoader")
+                    if graph is not None:
+                        logger.info("Ingested via MoELoader")
+                        return graph
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(f"MoELoader failed, falling back: {exc}")
 
         # --- Video models ---
@@ -160,11 +219,11 @@ class IngestionPipeline:
             try:
                 from aether.compiler.stage1_ingestion.video_loader import VideoModelLoader
                 if path.exists():
-                    result = VideoModelLoader(path).load()
-                    graph = self._wrap_specialised_result(result, architecture)
-                    logger.info("Ingested via VideoModelLoader")
-                    return graph
-            except Exception as exc:
+                    graph = _qualified(VideoModelLoader(path).load(), "VideoModelLoader")
+                    if graph is not None:
+                        logger.info("Ingested via VideoModelLoader")
+                        return graph
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(f"VideoModelLoader failed, falling back: {exc}")
 
         # --- VLM (LLaVA, Qwen-VL, InternVL, PaliGemma, etc.) ---
@@ -174,11 +233,11 @@ class IngestionPipeline:
             try:
                 from aether.compiler.stage1_ingestion.vlm_loader import VLMLoader
                 if path.exists():
-                    result = VLMLoader(path).load()
-                    graph = self._wrap_specialised_result(result, architecture)
-                    logger.info("Ingested via VLMLoader")
-                    return graph
-            except Exception as exc:
+                    graph = _qualified(VLMLoader(path).load(), "VLMLoader")
+                    if graph is not None:
+                        logger.info("Ingested via VLMLoader")
+                        return graph
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(f"VLMLoader failed, falling back: {exc}")
 
         # --- SSM / Mamba / Jamba ---
@@ -187,14 +246,59 @@ class IngestionPipeline:
             try:
                 from aether.compiler.stage1_ingestion.ssm_loader import SSMLoader
                 if path.exists():
-                    result = SSMLoader(path).load()
-                    graph = self._wrap_specialised_result(result, architecture)
-                    logger.info("Ingested via SSMLoader")
-                    return graph
-            except Exception as exc:
+                    graph = _qualified(SSMLoader(path).load(), "SSMLoader")
+                    if graph is not None:
+                        logger.info("Ingested via SSMLoader")
+                        return graph
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(f"SSMLoader failed, falling back: {exc}")
 
         return None  # No specialised loader matched — use generic dispatch
+
+    def _attach_checkpoint_weights(
+        self,
+        graph: "AEGGraph",
+        model: str,
+        format_type: str,
+    ) -> int:
+        """Bind local checkpoint tensors onto a specialised-loader graph.
+
+        Specialised loaders build structure-rich graphs but historically never
+        attached weights, which silently produced un-runnable artifacts.  This
+        reuses the exact per-format attachers the generic dispatch path uses so
+        accounting metadata (``weights_attached``, ``unbound_weight_names``)
+        is populated identically for both paths.
+        """
+        try:
+            if format_type == "safetensors":
+                return self._attach_safetensors_weights(graph, model)
+            if format_type == "gguf":
+                return self._attach_gguf_weights(graph, model)
+            if format_type == "onnx":
+                return self._attach_onnx_weights(graph, model)
+            if format_type == "mlx":
+                return self._attach_mlx_weights(graph, model)
+            if format_type == "pytorch":
+                return self._attach_pytorch_weights(graph, model)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Checkpoint weight attachment failed for %s: %s", model, exc)
+        return 0
+
+    def _local_checkpoint_exists(self, model: str) -> bool:
+        """Return True when a local directory or file carries model weights."""
+        path = Path(model)
+        if not path.exists():
+            return False
+        if path.is_file():
+            return path.suffix.lower() in {
+                ".safetensors", ".gguf", ".ggml", ".onnx", ".mlx", ".pt", ".bin",
+            }
+        weight_patterns = ("*.safetensors", "*.gguf", "*.onnx", "*.pt", "*.bin")
+        return any(
+            entry
+            for pattern in weight_patterns
+            for entry in path.glob(pattern)
+        )
 
     def _wrap_specialised_result(
         self,
@@ -320,20 +424,33 @@ class IngestionPipeline:
 
         Checkpoint layouts vary across model families, so matching is done by
         normalising both sides to a comparable suffix rather than by exact name.
+
+        Records architecture-aware accounting metadata on the graph:
+        ``source_tensor_count`` (logical checkpoint tensors), ``bound_weight_count``
+        (logical tensors consumed by a node, counting every member of a fused
+        group), and ``unbound_weight_names`` (logical tensors with no valid
+        graph mapping). Compilation treats a non-empty unbound list as a defect
+        rather than silently dropping parameters.
         """
         import numpy as np
 
         lookup: dict[tuple[int | None, str | None], list[tuple[str, Any]]] = {}
+        unresolvable: list[str] = []
         for name, tensor in tensors.items():
             key = self._normalise_weight_name(name)
             # A key without a component identifies nothing: several unrelated
             # names reduce to (layer, None), which would match each other.
+            # Such tensors stay visible in the accounting instead of silently
+            # disappearing from both the bound and unbound counts.
             if key[1] is None:
+                unresolvable.append(name)
                 continue
             value = tensor.numpy() if hasattr(tensor, "numpy") else np.asarray(tensor)
             lookup.setdefault(key, []).append((name, value))
 
         attached = 0
+        bound_names: list[str] = []
+        unbound_names: list[str] = []
         for node in graph:
             if not hasattr(node, "add_attribute"):
                 continue
@@ -369,6 +486,9 @@ class IngestionPipeline:
             node.add_attribute("weight", value)
             node.add_attribute("weight_shape", list(value.shape))
             node.add_attribute("weight_source", source_name)
+            # Every candidate consumed by this node counts as a bound logical
+            # tensor, even when several are fused into one physical array.
+            bound_names.extend(name for name, _ in candidates)
             if key[1] == "gate_proj":
                 up_candidates = [
                     item
@@ -386,6 +506,17 @@ class IngestionPipeline:
             if len(candidates) > 1:
                 node.add_attribute("fused_weight_sources", [n for n, _ in candidates])
             attached += 1
+
+        bound_set = set(bound_names)
+        for key_group in lookup.values():
+            for name, _ in key_group:
+                if name not in bound_set:
+                    unbound_names.append(name)
+        graph.set_metadata("source_tensor_count", len(tensors))
+        graph.set_metadata("bound_weight_count", len(bound_set))
+        graph.set_metadata(
+            "unbound_weight_names", sorted(unbound_names + unresolvable)
+        )
         return attached
 
     #: Checkpoint component names mapped to the graph's node-id vocabulary. Node
@@ -403,6 +534,11 @@ class IngestionPipeline:
         "attn_q": "qkv",
         "attn_k": "qkv",
         "attn_v": "qkv",
+        # GPT-2 / DialoGPT layernorm spellings.
+        "ln_1": "rmsnorm",
+        "ln_2": "ffn_norm",
+        "ln_f": "final_norm",
+        "lnf": "final_norm",
         "o_proj": "out_proj",
         "attn_output": "out_proj",
         "embed_tokens": "embedding",
