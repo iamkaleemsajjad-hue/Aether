@@ -61,7 +61,7 @@ class SafeTensorsLoader:
                     shard_files: list[Path] = []
                     for shard_name in shard_names:
                         relative = Path(shard_name)
-                        if relative.is_absolute() or ".." in relative.parts:
+                        if shard_name.startswith(("/", "\\")) or relative.is_absolute() or ".." in relative.parts:
                             raise ValueError(f"unsafe shard path {shard_name!r}")
                         shard = (self.model_path / relative).resolve()
                         if not shard.is_relative_to(root):
@@ -149,33 +149,33 @@ class SafeTensorsLoader:
             report["errors"].append("No tensors loaded")
             return report
 
-        # Load config to validate against expected architecture
+        loaded_keys = set(self._tensors.keys())
+
+        # Load config to validate against expected architecture if available
         config = self.load_config()
         if not config:
             report["warnings"].append("No config.json found - skipping architecture validation")
-            return report
+        else:
+            # Expected tensor patterns for common architectures
+            expected_patterns = self._get_expected_tensor_patterns(config)
 
-        # Expected tensor patterns for common architectures
-        expected_patterns = self._get_expected_tensor_patterns(config)
+            # Check for missing critical tensors
+            for pattern_type, patterns in expected_patterns.items():
+                found = any(any(p in key for p in patterns) for key in loaded_keys)
+                if not found and pattern_type in ["embed", "lm_head"]:
+                    report["errors"].append(f"Missing critical tensors: {pattern_type}")
+                    report["valid"] = False
 
-        # Check for missing critical tensors
-        loaded_keys = set(self._tensors.keys())
-        for pattern_type, patterns in expected_patterns.items():
-            found = any(any(p in key for p in patterns) for key in loaded_keys)
-            if not found and pattern_type in ["embed", "lm_head"]:
-                report["errors"].append(f"Missing critical tensors: {pattern_type}")
-                report["valid"] = False
-
-        # Validate tensor shapes against config
-        num_layers = config.get("num_hidden_layers", config.get("num_layers", 0))
-        if num_layers > 0:
-            layer_count = sum(1 for key in loaded_keys if ".layers." in key or ".h." in key)
-            expected_keys_per_layer = 8  # typical: attn.q,k,v,o + mlp.gate,up,down + norm
-            actual_layers = layer_count // expected_keys_per_layer
-            if actual_layers < num_layers * 0.9:  # Allow 10% tolerance
-                report["warnings"].append(
-                    f"Expected {num_layers} layers but found ~{actual_layers} based on tensor count"
-                )
+            # Validate tensor shapes against config
+            num_layers = config.get("num_hidden_layers", config.get("num_layers", 0))
+            if num_layers > 0:
+                layer_count = sum(1 for key in loaded_keys if ".layers." in key or ".h." in key)
+                expected_keys_per_layer = 8  # typical: attn.q,k,v,o + mlp.gate,up,down + norm
+                actual_layers = layer_count // expected_keys_per_layer
+                if actual_layers < num_layers * 0.9:  # Allow 10% tolerance
+                    report["warnings"].append(
+                        f"Expected {num_layers} layers but found ~{actual_layers} based on tensor count"
+                    )
 
         # Check for NaN or Inf values in a sample of tensors (numpy; no torch).
         import numpy as _np

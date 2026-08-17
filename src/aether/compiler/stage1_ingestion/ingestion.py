@@ -553,6 +553,13 @@ class IngestionPipeline:
         "up_proj": "gate_proj",
         "ffn_up": "gate_proj",
         "ffn_gate": "gate_proj",
+        # BERT / RoBERTa / DeBERTa / ELECTRA spellings:
+        "query": "qkv",
+        "key": "qkv",
+        "value": "qkv",
+        "word_embeddings": "embedding",
+        "position_embeddings": "position_embedding",
+        "token_type_embeddings": "token_type_embedding",
         # Canonical names, as used in graph node ids.
         "qkv": "qkv",
         "out_proj": "out_proj",

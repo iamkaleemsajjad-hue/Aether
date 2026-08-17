@@ -23,14 +23,16 @@ Four verifier types compiled into AEG:
    - Reward = fraction of tests passing.
 
 3. **llm_judge**: Small LM verifier (e.g., Qwen-2.5-1.5B judge).
-   - Call judge model, parse "correct"/"incorrect" output.
+   - Judge model is referenced by ID in the config; no judge weights are
+     bundled into the AEG (the judge runs as a separate service at
+     training time).
 
 4. **human**: Human preference feedback loop.
-   - Placeholder: deferred to training pipeline.
+   - Deferred to the external training pipeline; the pass records the
+     routing schema only.
 
 AEG artifacts:
   - ``.aeg/training/rlvr_config.json``: verifier type, GRPO K, reward schema.
-  - ``.aeg/training/verifier_head.bin``: compiled verifier weights (for LM judge).
   - ``aeg.rlvr_sample(K)``, ``aeg.rlvr_verify(type)``, ``aeg.grpo_update()`` opcodes.
 
 Research basis:

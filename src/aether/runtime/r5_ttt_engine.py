@@ -342,6 +342,32 @@ class TTTFastWeightEngine:
                 return None
             return weights[layer_idx]
 
+    def apply_fast_weights(
+        self,
+        request_id: str,
+        hidden_states: Any,
+        layer_idx: int,
+    ) -> Any:
+        """Apply adapted fast-weight LoRA deltas to hidden_states.
+
+        Computes y = h + (h @ A) @ B
+        """
+        weights = self.get_fast_weights(request_id, layer_idx)
+        if weights is None:
+            return hidden_states
+        import numpy as np
+
+        H = self.hidden_size
+        R = self.rank
+        A = np.asarray(weights["A"], dtype=np.float32).reshape(H, R)
+        B = np.asarray(weights["B"], dtype=np.float32).reshape(R, H)
+
+        is_numpy = isinstance(hidden_states, np.ndarray)
+        h = hidden_states if is_numpy else np.asarray(hidden_states, dtype=np.float32)
+        delta = (h @ A) @ B
+        out = h + delta
+        return out if is_numpy else out.tolist()
+
     def end_request(self, request_id: str) -> None:
         """Release fast weights for a completed request."""
         with self._lock:

@@ -55,6 +55,12 @@ KNOWN_MODEL_SPECS: dict[str, dict[str, Any]] = {
     "mamba-3": {"family": "hybrid_ssm_family", "params_billion": 7.0, "layers": 48, "hidden_size": 4096, "heads": 1, "kv_heads": 1, "context_length": 1048576, "vocab_size": 32000, "intermediate_size": 8192},
     "jamba": {"family": "hybrid_ssm_family", "params_billion": 52.0, "layers": 56, "hidden_size": 4096, "heads": 32, "kv_heads": 8, "context_length": 262144, "vocab_size": 65536, "intermediate_size": 14336, "is_moe": True, "num_experts": 16, "num_activated_experts": 2},
     "rwkv-7": {"family": "hybrid_ssm_family", "params_billion": 7.0, "layers": 32, "hidden_size": 4096, "heads": 1, "kv_heads": 1, "context_length": 1048576, "vocab_size": 65536, "intermediate_size": 8192},
+    "bert-base-uncased": {"family": "bert_family", "params_billion": 0.11, "layers": 12, "hidden_size": 768, "heads": 12, "kv_heads": 12, "context_length": 512, "vocab_size": 30522, "intermediate_size": 3072, "is_moe": False, "is_encoder": True},
+    "bert-large-uncased": {"family": "bert_family", "params_billion": 0.34, "layers": 24, "hidden_size": 1024, "heads": 16, "kv_heads": 16, "context_length": 512, "vocab_size": 30522, "intermediate_size": 4096, "is_moe": False, "is_encoder": True},
+    "roberta-base": {"family": "roberta_family", "params_billion": 0.125, "layers": 12, "hidden_size": 768, "heads": 12, "kv_heads": 12, "context_length": 512, "vocab_size": 50265, "intermediate_size": 3072, "is_moe": False, "is_encoder": True},
+    "roberta-large": {"family": "roberta_family", "params_billion": 0.355, "layers": 24, "hidden_size": 1024, "heads": 16, "kv_heads": 16, "context_length": 512, "vocab_size": 50265, "intermediate_size": 4096, "is_moe": False, "is_encoder": True},
+    "deberta-v3-base": {"family": "deberta_family", "params_billion": 0.184, "layers": 12, "hidden_size": 768, "heads": 12, "kv_heads": 12, "context_length": 512, "vocab_size": 128100, "intermediate_size": 3072, "is_moe": False, "is_encoder": True},
+    "electra-base": {"family": "electra_family", "params_billion": 0.11, "layers": 12, "hidden_size": 768, "heads": 12, "kv_heads": 12, "context_length": 512, "vocab_size": 30522, "intermediate_size": 3072, "is_moe": False, "is_encoder": True},
 }
 
 
@@ -243,6 +249,7 @@ class ArchitectureDetector:
             vocab_size=spec.get("vocab_size", 32000),
             intermediate_size=spec.get("intermediate_size"),
             is_moe=spec.get("is_moe", False),
+            is_encoder=spec.get("is_encoder", False),
             num_experts=spec.get("num_experts", 0),
             num_activated_experts=spec.get("num_activated_experts", 0),
         )
@@ -293,6 +300,7 @@ class ArchitectureDetector:
         num_experts = config.get("num_local_experts", config.get("num_experts", 0))
         num_activated_experts = config.get("num_experts_per_tok", config.get("top_k", 0))
         is_moe = num_experts > 0
+        is_encoder = family in ("bert_family", "roberta_family", "deberta_family", "electra_family", "albert_family")
         mtp_declared = config.get(
             "mtp_heads",
             config.get("num_mtp_heads", config.get("num_nextn_predict_layers", 0)),
@@ -315,13 +323,14 @@ class ArchitectureDetector:
             vocab_size=vocab_size,
             intermediate_size=intermediate_size,
             is_moe=is_moe,
+            is_encoder=is_encoder,
             num_experts=num_experts,
             num_activated_experts=num_activated_experts,
             mtp_heads=mtp_heads,
         )
 
     def _detect_family_from_arch_type(self, arch_type: str) -> str | None:
-        """Map a HuggingFace architecture type to an Aether family."""
+        """Map a HuggingFace architecture type or GGUF type to an Aether family."""
         mapping = {
             "LlamaForCausalLM": "llama_family",
             "Qwen2ForCausalLM": "qwen_family",
@@ -341,9 +350,19 @@ class ArchitectureDetector:
             "MambaForCausalLM": "hybrid_ssm_family",
             "JambaForCausalLM": "hybrid_ssm_family",
             "RwkvForCausalLM": "hybrid_ssm_family",
-            # Some repositories publish only ``model_type`` rather than a
-            # fully-qualified ``architectures`` entry.  These aliases make
-            # local config ingestion independent of a model-name guess.
+            # Encoder architectures:
+            "BertModel": "bert_family",
+            "BertForMaskedLM": "bert_family",
+            "BertForSequenceClassification": "bert_family",
+            "RobertaModel": "roberta_family",
+            "RobertaForMaskedLM": "roberta_family",
+            "RobertaForSequenceClassification": "roberta_family",
+            "DebertaModel": "deberta_family",
+            "DebertaV2Model": "deberta_family",
+            "ElectraModel": "electra_family",
+            "ElectraForMaskedLM": "electra_family",
+            "AlbertModel": "albert_family",
+            # Short / model_type aliases:
             "llama": "llama_family",
             "llama2": "llama_family",
             "llama3": "llama_family",
@@ -363,6 +382,7 @@ class ArchitectureDetector:
             "deepseek_v2": "deepseek_family",
             "deepseek_v3": "deepseek_family",
             "deepseek_vl": "deepseek_family",
+            "phi": "phi_family",
             "phi3": "phi_family",
             "phi4": "phi_family",
             "falcon": "falcon_family",
@@ -373,16 +393,32 @@ class ArchitectureDetector:
             "mamba": "hybrid_ssm_family",
             "jamba": "hybrid_ssm_family",
             "rwkv": "hybrid_ssm_family",
+            "bert": "bert_family",
+            "roberta": "roberta_family",
+            "deberta": "deberta_family",
+            "deberta_v2": "deberta_family",
+            "deberta-v2": "deberta_family",
+            "electra": "electra_family",
+            "albert": "albert_family",
         }
         if arch_type in mapping:
             return mapping[arch_type]
         normalized = arch_type.lower().replace("-", "_").replace(".", "_")
-        return mapping.get(normalized)
+        if normalized in mapping:
+            return mapping[normalized]
+        for key, fam in mapping.items():
+            if key.lower() in arch_type.lower():
+                return fam
+        return None
 
     def _match_family(self, model: str) -> str | None:
         """Match a model name to an architecture family."""
         lower = model.lower().replace("-", "").replace("_", "")
-        for name_part in ["llama", "qwen", "gemma", "deepseek", "mixtral", "mistral", "phi", "falcon", "whisper", "vit", "mamba", "jamba", "bamba", "rwkv"]:
+        for name_part in [
+            "llama", "qwen", "gemma", "deepseek", "mixtral", "mistral",
+            "phi", "falcon", "whisper", "vit", "mamba", "jamba", "bamba", "rwkv",
+            "bert", "roberta", "deberta", "electra", "albert",
+        ]:
             if name_part in lower:
                 return ARCHITECTURE_BY_MODEL_PREFIX.get(name_part, "llama_family")
         return None

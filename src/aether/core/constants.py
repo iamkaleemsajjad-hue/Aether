@@ -208,6 +208,46 @@ SUPPORTED_ARCHITECTURES: dict[str, dict[str, str | bool]] = {
         "stateful": True,
         "is_moe": False,
     },
+    "bert_family": {
+        "attn": "Bidirectional_Self_Attention",
+        "ffn": "GELU",
+        "norm": "LayerNorm",
+        "rope": False,
+        "is_moe": False,
+        "is_encoder": True,
+    },
+    "roberta_family": {
+        "attn": "Bidirectional_Self_Attention",
+        "ffn": "GELU",
+        "norm": "LayerNorm",
+        "rope": False,
+        "is_moe": False,
+        "is_encoder": True,
+    },
+    "deberta_family": {
+        "attn": "Disentangled_Attention",
+        "ffn": "GELU",
+        "norm": "LayerNorm",
+        "rope": False,
+        "is_moe": False,
+        "is_encoder": True,
+    },
+    "electra_family": {
+        "attn": "Bidirectional_Self_Attention",
+        "ffn": "GELU",
+        "norm": "LayerNorm",
+        "rope": False,
+        "is_moe": False,
+        "is_encoder": True,
+    },
+    "albert_family": {
+        "attn": "Bidirectional_Self_Attention",
+        "ffn": "GELU",
+        "norm": "LayerNorm",
+        "rope": False,
+        "is_moe": False,
+        "is_encoder": True,
+    },
 }
 """Architecture detection patterns keyed by family name."""
 
@@ -227,6 +267,11 @@ ARCHITECTURE_BY_MODEL_PREFIX: dict[str, str] = {
     "jamba": "hybrid_ssm_family",
     "bamba": "hybrid_ssm_family",
     "rwkv": "hybrid_ssm_family",
+    "bert": "bert_family",
+    "roberta": "roberta_family",
+    "deberta": "deberta_family",
+    "electra": "electra_family",
+    "albert": "albert_family",
 }
 """Model name prefix to architecture family mapping."""
 

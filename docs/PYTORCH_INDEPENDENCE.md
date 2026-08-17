@@ -16,12 +16,15 @@ Aether Runtime ≥ 1.0 operates as a **genuinely framework-independent** AI comp
 - `import aether` loads only the framework-free core (Runtime, RuntimeConfig, KVCacheManager, HardwareDetector).
 - R-layers are only imported on first attribute access, so any torch dependency in R1 only loads when `PEAGLEEngine` is actually used.
 
-### `src/aether/compiler/graph_tracer.py`
-- `import torch` / `from torch.fx` guarded inside `trace()` method body.
-- `GraphTracer` can be imported and instantiated in framework-free environments.
+### `src/aether/compiler/stage1_ingestion/graph_tracer.py` *(removed)*
+- The dead, torch.fx-placeholder conversion module was deleted; the live
+  PyTorch ingestion path is `pytorch_loader.py`, which guards every torch
+  import inside its load methods and fails closed without the framework.
 
-### `src/aether/compiler/stage2_optimizer/pass02_sensitivity_analysis.py`
-- Bare `import torch` removed. Numpy-based sensitivity heuristics run when torch is absent.
+### `src/aether/compiler/stage2_optimizer/pass02_sensitivity_analysis.py` *(removed)*
+- The unregistered duplicate pass (random-number "sensitivity") was deleted.
+  The live Pass 2 in `optimizer.py` + `calibration/sensitivity.py` is
+  numpy-only and runs with or without torch.
 
 ### `src/aether/core/types.py` — `HardwareTarget.auto()`
 - Replaced `torch.cuda.is_available()` + `torch.cuda.get_device_properties()` with **pynvml** (NVIDIA Management Library).

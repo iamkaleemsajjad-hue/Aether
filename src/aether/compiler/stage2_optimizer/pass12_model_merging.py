@@ -229,6 +229,20 @@ def _extract_weights(graph: Any, role: str = "base") -> dict[str, list[float]]:
         if hasattr(store, "items"):
             for name, tensor in store.items():
                 weights[name] = list(tensor) if hasattr(tensor, "__iter__") else [float(tensor)]
+    elif hasattr(graph, "nodes"):
+        nodes = graph.nodes.values() if hasattr(graph.nodes, "values") else graph.nodes
+        for node in nodes:
+            node_id = str(getattr(node, "id", "weight"))
+            attributes = getattr(node, "attributes", {})
+            if isinstance(attributes, dict):
+                for key in ("weight", "up_weight"):
+                    val = attributes.get(key)
+                    if val is not None:
+                        k = node_id if key == "weight" else f"{node_id}_up"
+                        if hasattr(val, "tolist"):
+                            weights[k] = val.reshape(-1).tolist()
+                        elif isinstance(val, (list, tuple)):
+                            weights[k] = list(val)
     elif isinstance(graph, dict):
         for name, val in graph.items():
             if isinstance(val, (list, tuple)):
@@ -239,9 +253,10 @@ def _extract_weights(graph: Any, role: str = "base") -> dict[str, list[float]]:
 def _load_source_weights(source_path: str, base_graph: Any) -> dict[str, list[float]]:
     """Load weights from a source model path.
 
-    Tries: AEG weight store → safetensors → GGUF → PyTorch state_dict.
+    Tries: AEG weight store → safetensors (numpy/torch) → GGUF → PyTorch state_dict.
     Falls back to empty dict if path does not resolve to any known format.
     """
+    import numpy as np
     from pathlib import Path
     p = Path(source_path)
 
@@ -249,7 +264,7 @@ def _load_source_weights(source_path: str, base_graph: Any) -> dict[str, list[fl
         logger.debug("Source path does not exist: %s", source_path)
         return {}
 
-    # AEG is the native artifact format.  Read and dequantize its persisted
+    # AEG is the native artifact format. Read and dequantize its persisted
     # weight store instead of treating the directory as an opaque success.
     if p.is_dir() and (p / "manifest.json").is_file():
         try:
@@ -266,19 +281,41 @@ def _load_source_weights(source_path: str, base_graph: Any) -> dict[str, list[fl
             logger.debug("AEG source load failed: %s", exc)
             return {}
 
-    # Try safetensors.
+    # Try safetensors with numpy (Torch-independent).
     if p.suffix == ".safetensors" or (p.is_dir() and (p / "model.safetensors").exists()):
+        sf_path = p if p.suffix == ".safetensors" else p / "model.safetensors"
         try:
-            import safetensors.torch as st  # type: ignore[import]
-            sf_path = p if p.suffix == ".safetensors" else p / "model.safetensors"
-            tensors = st.load_file(str(sf_path))
-            return {k: v.float().reshape(-1).tolist() for k, v in tensors.items()}
-        except ImportError:
-            logger.debug("safetensors not installed.")
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("safetensors load failed: %s", exc)
+            from safetensors import safe_open
 
-    # Try PyTorch.  ``weights_only=True`` is mandatory: merging inputs are
+            tensors_dict: dict[str, list[float]] = {}
+            with safe_open(str(sf_path), framework="numpy", device="cpu") as f:
+                for k in f.keys():
+                    tensors_dict[k] = f.get_tensor(k).astype(np.float32).reshape(-1).tolist()
+            return tensors_dict
+        except Exception:
+            try:
+                import safetensors.torch as st  # type: ignore[import]
+
+                tensors = st.load_file(str(sf_path))
+                return {k: v.float().reshape(-1).tolist() for k, v in tensors.items()}
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("safetensors load failed: %s", exc)
+
+    # Try GGUF.
+    if p.suffix.lower() in (".gguf", ".ggml") or (p.is_dir() and list(p.glob("*.gguf"))):
+        gguf_path = p if p.suffix.lower() in (".gguf", ".ggml") else next(p.glob("*.gguf"))
+        try:
+            from aether.compiler.stage1_ingestion.gguf_loader import GGUFReader
+
+            reader = GGUFReader(gguf_path)
+            return {
+                name: reader.dequantize(name).reshape(-1).tolist()
+                for name in reader.tensors
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("GGUF source load failed: %s", exc)
+
+    # Try PyTorch. ``weights_only=True`` is mandatory: merging inputs are
     # model files, and an untrusted checkpoint must never execute arbitrary
     # pickled code inside the compiler process.
     try:
@@ -339,9 +376,39 @@ def _update_graph_weights(graph: Any, merged_weights: dict[str, list[float]]) ->
     if hasattr(graph, "weight_store") and hasattr(graph.weight_store, "update"):
         graph.weight_store.update(merged_weights)
         n_updated = len(merged_weights)
+    elif hasattr(graph, "nodes"):
+        nodes = graph.nodes.values() if hasattr(graph.nodes, "values") else graph.nodes
+        import numpy as np
+
+        for node in nodes:
+            node_id = str(getattr(node, "id", "weight"))
+            attributes = getattr(node, "attributes", {})
+            if isinstance(attributes, dict):
+                if node_id in merged_weights and "weight" in attributes:
+                    orig = attributes["weight"]
+                    arr = np.asarray(merged_weights[node_id], dtype=np.float32)
+                    if hasattr(orig, "shape"):
+                        arr = arr.reshape(orig.shape)
+                    if hasattr(node, "add_attribute"):
+                        node.add_attribute("weight", arr)
+                    else:
+                        attributes["weight"] = arr
+                    n_updated += 1
+                up_key = f"{node_id}_up"
+                if up_key in merged_weights and "up_weight" in attributes:
+                    orig = attributes["up_weight"]
+                    arr = np.asarray(merged_weights[up_key], dtype=np.float32)
+                    if hasattr(orig, "shape"):
+                        arr = arr.reshape(orig.shape)
+                    if hasattr(node, "add_attribute"):
+                        node.add_attribute("up_weight", arr)
+                    else:
+                        attributes["up_weight"] = arr
+                    n_updated += 1
     elif hasattr(graph, "parameters") and callable(graph.parameters):
         try:
             import torch  # type: ignore[import]
+
             for name, param in graph.named_parameters():
                 if name in merged_weights:
                     new_vals = merged_weights[name]
