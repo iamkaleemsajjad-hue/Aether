@@ -29,6 +29,11 @@ _GGML_QUANT_TO_AETHER = {
     GGMLQuantizationType.Q6_K: gl._GGML_TYPE_Q6_K,
     GGMLQuantizationType.Q8_0: gl._GGML_TYPE_Q8_0,
     GGMLQuantizationType.Q4_0: gl._GGML_TYPE_Q4_0,
+    GGMLQuantizationType.Q4_1: gl._GGML_TYPE_Q4_1,
+    GGMLQuantizationType.Q5_0: gl._GGML_TYPE_Q5_0,
+    GGMLQuantizationType.Q5_1: gl._GGML_TYPE_Q5_1,
+    # Q8_K is excluded: the gguf reference package raises NotImplementedError
+    # for it, so it is covered by the hand-computed block test below instead.
 }
 
 _BLOCK_SHAPES = {
@@ -39,7 +44,17 @@ _BLOCK_SHAPES = {
     gl._GGML_TYPE_Q6_K: 210,
     gl._GGML_TYPE_Q8_0: 34,
     gl._GGML_TYPE_Q4_0: 18,
+    gl._GGML_TYPE_Q4_1: 20,
+    gl._GGML_TYPE_Q5_0: 22,
+    gl._GGML_TYPE_Q5_1: 24,
+    gl._GGML_TYPE_Q8_K: 292,
 }
+
+#: Types whose blocks hold 32 elements (K-quants hold 256 per super-block).
+_BLOCK32_TYPES = frozenset({
+    gl._GGML_TYPE_Q8_0, gl._GGML_TYPE_Q4_0,
+    gl._GGML_TYPE_Q4_1, gl._GGML_TYPE_Q5_0, gl._GGML_TYPE_Q5_1,
+})
 
 
 def _reference_dequant(raw: bytes, block_bytes: int, ggml_type: GGMLQuantizationType, n_blocks: int) -> np.ndarray:
@@ -58,7 +73,7 @@ def test_kquant_matches_gguf_reference(ggml_type: GGMLQuantizationType) -> None:
     aether_type = _GGML_QUANT_TO_AETHER[ggml_type]
     block_bytes = _BLOCK_SHAPES[aether_type]
     n_blocks = 4  # exercise multi-block ordering including both 128-elem halves
-    num_elems = n_blocks * 256 if aether_type not in (gl._GGML_TYPE_Q8_0, gl._GGML_TYPE_Q4_0) else n_blocks * 32
+    num_elems = n_blocks * (32 if aether_type in _BLOCK32_TYPES else 256)
     block_bytes = _BLOCK_SHAPES[aether_type]
 
     rng = np.random.default_rng(1234)
@@ -109,21 +124,27 @@ def test_q6_k_known_block() -> None:
 
 
 @pytest.mark.parametrize(
-    "aether_type,block_bytes",
+    "aether_type,block_bytes,elements_per_block",
     [
-        (gl._GGML_TYPE_Q2_K, 84),
-        (gl._GGML_TYPE_Q3_K, 110),
-        (gl._GGML_TYPE_Q4_K, 144),
-        (gl._GGML_TYPE_Q5_K, 176),
-        (gl._GGML_TYPE_Q6_K, 210),
+        (gl._GGML_TYPE_Q2_K, 84, 256),
+        (gl._GGML_TYPE_Q3_K, 110, 256),
+        (gl._GGML_TYPE_Q4_K, 144, 256),
+        (gl._GGML_TYPE_Q5_K, 176, 256),
+        (gl._GGML_TYPE_Q6_K, 210, 256),
+        (gl._GGML_TYPE_Q8_K, 292, 256),
+        (gl._GGML_TYPE_Q4_1, 20, 32),
+        (gl._GGML_TYPE_Q5_0, 22, 32),
+        (gl._GGML_TYPE_Q5_1, 24, 32),
     ],
 )
-def test_kquant_never_returns_all_zeros(aether_type: int, block_bytes: int) -> None:
+def test_kquant_never_returns_all_zeros(
+    aether_type: int, block_bytes: int, elements_per_block: int
+) -> None:
     """Valid random quantized data must never dequantize to all zeros."""
     rng = np.random.default_rng(99)
     raw = rng.integers(0, 256, size=block_bytes * 2, dtype=np.uint8).tobytes()
-    out = gl._DEQUANT_FN[aether_type](raw, 512)
-    assert out.shape == (512,)
+    out = gl._DEQUANT_FN[aether_type](raw, elements_per_block * 2)
+    assert out.shape == (elements_per_block * 2,)
     assert not np.all(out == 0.0), "dequantization produced placeholder zeros"
 
 
@@ -135,6 +156,10 @@ def test_kquant_never_returns_all_zeros(aether_type: int, block_bytes: int) -> N
         (gl._GGML_TYPE_Q4_K, 144),
         (gl._GGML_TYPE_Q5_K, 176),
         (gl._GGML_TYPE_Q6_K, 210),
+        (gl._GGML_TYPE_Q8_K, 292),
+        (gl._GGML_TYPE_Q4_1, 20),
+        (gl._GGML_TYPE_Q5_0, 22),
+        (gl._GGML_TYPE_Q5_1, 24),
     ],
 )
 def test_kquant_rejects_bad_element_count(aether_type: int, block_bytes: int) -> None:
@@ -143,6 +168,68 @@ def test_kquant_rejects_bad_element_count(aether_type: int, block_bytes: int) ->
 
     with pytest.raises(UnsupportedFormatError):
         gl._DEQUANT_FN[aether_type](b"\x00" * block_bytes, 100)
+
+
+def test_q4_1_known_block() -> None:
+    """Hand-computed Q4_1 block: value = d * nibble + m."""
+    d = np.float16(0.5)
+    m = np.float16(1.0)
+    qs = bytearray(16)
+    qs[0] = 0x21  # lo nibble 1 (elem 0), hi nibble 2 (elem 16)
+    block = struct.pack("<e", d) + struct.pack("<e", m) + bytes(qs)
+    assert len(block) == 20
+    out = gl._dequant_q4_1(block, 32)
+    assert out[0] == pytest.approx(0.5 * 1 + 1.0)
+    assert out[16] == pytest.approx(0.5 * 2 + 1.0)
+
+
+def test_q5_0_known_block() -> None:
+    """Hand-computed Q5_0 block: 5-bit code minus 16, scaled by d."""
+    d = np.float16(2.0)
+    qh = struct.pack("<I", 0)  # all high bits clear
+    qs = bytearray(16)
+    qs[0] = 0x30  # lo nibble 0 (elem 0), hi nibble 3 (elem 16)
+    block = struct.pack("<e", d) + qh + bytes(qs)
+    assert len(block) == 22
+    out = gl._dequant_q5_0(block, 32)
+    assert out[0] == pytest.approx(2.0 * (0 - 16.0))
+    assert out[16] == pytest.approx(2.0 * (3 - 16.0))
+    # Setting qh bit 0 adds 16 to element 0's code.
+    block_hi = struct.pack("<e", d) + struct.pack("<I", 1) + bytes(qs)
+    out_hi = gl._dequant_q5_0(block_hi, 32)
+    assert out_hi[0] == pytest.approx(2.0 * ((0 | 16) - 16.0))
+
+
+def test_q5_1_known_block() -> None:
+    """Hand-computed Q5_1 block: value = d * code + m."""
+    d = np.float16(0.25)
+    m = np.float16(0.5)
+    qh = struct.pack("<I", 1 << 16)  # high bit for element 16
+    qs = bytearray(16)
+    qs[0] = 0x10  # lo nibble 0 (elem 0), hi nibble 1 (elem 16)
+    block = struct.pack("<e", d) + struct.pack("<e", m) + qh + bytes(qs)
+    assert len(block) == 24
+    out = gl._dequant_q5_1(block, 32)
+    assert out[0] == pytest.approx(0.25 * 0 + 0.5)
+    # element 16: lo2 = 1, hi2 = (qh >> 16) & 1 = 1 -> code = 1 | 16 = 17
+    assert out[16] == pytest.approx(0.25 * 17 + 0.5)
+
+
+def test_q8_k_known_block() -> None:
+    """Hand-computed Q8_K block: fp32 scale d, int8 quants, trailing bsums.
+
+    Block layout (292 bytes): ``[4-byte fp32 d][256 int8 quants][16 int16
+    bsums]`` per ggml-common.h; bsums are dot-product partial sums and are
+    ignored by dequantization.
+    """
+    d = 0.5
+    qs = np.arange(256).astype(np.int8).tobytes()  # wraps to negatives past 127
+    bsums = bytes(32)
+    block = struct.pack("<f", d) + qs + bsums
+    assert len(block) == 292
+    out = gl._dequant_q8_k(block, 256)
+    expected = np.arange(256).astype(np.int8).astype(np.float32) * 0.5
+    np.testing.assert_allclose(out, expected, rtol=0, atol=0)
 
 
 def test_complete_loader_kquant_delegates_no_zeros() -> None:
