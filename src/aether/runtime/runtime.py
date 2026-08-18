@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Callable, Iterator
 
 from aether.backends.base import Backend, GenerationRequest, GenerationResult
 from aether.backends.registry import BackendRegistry
@@ -1942,6 +1942,10 @@ class Runtime:
         *,
         model: str | None = None,
         verifier_domain: str | None = None,
+        ground_truths: list[str] | None = None,
+        test_suites: list[str] | None = None,
+        model_forward_fn: Callable[..., Any] | None = None,
+        optimizer_step_fn: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
         """Execute one GRPO (Group Relative Policy Optimization) training step.
 
@@ -1980,20 +1984,65 @@ class Runtime:
         if group_size < 2:
             raise ValueError("group_size must be at least 2 for GRPO")
 
-        # Runtime.generate is an inference-only path.  It cannot provide
-        # gradient-carrying logits or an optimizer step, so reporting GRPO
-        # success here would be a false training result.  The standalone
-        # RLVRTrainingHarness accepts explicit model/optimizer callbacks for a
-        # real training integration.
+        if model_forward_fn is None or optimizer_step_fn is None:
+            return {
+                "status": "failed",
+                "error": (
+                    "GRPO training requires explicit model_forward_fn and optimizer_step_fn "
+                    "callbacks backed by a gradient-capable policy; inference-only Runtime "
+                    "refuses to claim a weight update"
+                ),
+                "prompts": len(prompts),
+                "group_size": group_size,
+                "domain": domain,
+            }
+
+        aeg_path = self._resolve_aeg_path(model_id)
+        if aeg_path is None:
+            raise ModelNotFoundError(f"GRPO model AEG not found: {model_id}")
+        rlvr_config = Path(aeg_path) / "training" / "rlvr_config.json"
+        if not rlvr_config.is_file():
+            raise AetherRuntimeError(
+                "GRPO requires an AEG compiled with the RLVR verifier pass; "
+                "training/rlvr_config.json is missing"
+            )
+        from aether.runtime.r12_rlvr_harness import RLVRTrainingHarness
+
+        harness = RLVRTrainingHarness(
+            rlvr_config_path=str(rlvr_config),
+            model_forward_fn=model_forward_fn,
+            optimizer_step_fn=optimizer_step_fn,
+        )
+        harness._K = group_size  # caller-selected group size is validated above
+        results: list[dict[str, Any]] = []
+        for index, prompt in enumerate(prompts):
+            result = harness.train_step(
+                prompt=prompt,
+                ground_truth=(ground_truths[index] if ground_truths and index < len(ground_truths) else None),
+                test_suite=(test_suites[index] if test_suites and index < len(test_suites) else None),
+                max_new_tokens=max_tokens,
+            )
+            results.append(
+                {
+                    "rewards": result.rewards,
+                    "advantages": result.advantages,
+                    "loss": result.loss,
+                    "grad_norm": result.grad_norm,
+                    "pass_at_k": result.pass_at_k,
+                    "elapsed_ms": result.elapsed_ms,
+                }
+            )
         return {
-            "status": "failed",
-            "error": (
-                "GRPO training requires a gradient-capable policy backend and optimizer callback; "
-                "the inference Runtime has neither configured"
-            ),
-            "prompts": len(prompts),
+            "status": "ok",
+            "prompts": len(results),
             "group_size": group_size,
             "domain": domain,
+            "mean_loss": sum(item["loss"] for item in results) / max(1, len(results)),
+            "mean_pass_at_k": sum(item["pass_at_k"] for item in results) / max(1, len(results)),
+            "optimizer_steps": len(results),
+            "training_backend": "caller_supplied_policy_and_optimizer",
+            "steps": results,
+            "harness": harness.summary(),
         }
 
     def generate_video(
@@ -2031,13 +2080,36 @@ class Runtime:
         video = Path(video_path)
         if not video.is_file():
             raise FileNotFoundError(f"video input does not exist: {video_path}")
-        # Pass 20 currently emits compile-time graph opcodes.  It does not
-        # provide a decoder/vision encoder that can turn pixels into model
-        # embeddings at runtime.  Refusing the request is safer than silently
-        # dropping the video and returning a text-only answer.
+        # Dispatch only to a real vision backend.  The CPU AEG engine does not
+        # contain a pixel decoder/vision tower, so it must remain fail-closed;
+        # an installed VLM backend may implement this method and advertise the
+        # capability explicitly.
+        try:
+            backend = self._load_model(model_id)
+        except ModelNotFoundError as exc:
+            raise ModelNotFoundError(
+                f"video generation cannot start because the requested video AEG is unavailable: {exc}",
+                model_id=model_id,
+            ) from exc
+        generator = getattr(backend, "generate_video", None)
+        supports_vision = getattr(backend, "supports", lambda _name: False)("vision")
+        if callable(generator) and supports_vision:
+            result = generator(
+                model_id,
+                str(video),
+                prompt,
+                compression=compression,
+                max_visual_tokens=max_visual_tokens,
+                **kwargs,
+            )
+            if isinstance(result, GenerationResponse):
+                return result
+            raise AetherRuntimeError(
+                f"Vision backend {backend.name!r} returned an unsupported video result type"
+            )
         raise AetherRuntimeError(
-            "video generation requires a runtime VLM/video encoder backend; "
-            "the compiled artifact contains no executable video encoder"
+            f"video generation requires a runtime VLM/video encoder backend; "
+            f"backend {backend.name!r} does not advertise executable vision support"
         )
 
     def semantic_cache_stats(self) -> dict[str, Any]:

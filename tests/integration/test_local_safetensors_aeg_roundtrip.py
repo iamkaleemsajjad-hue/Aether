@@ -1002,3 +1002,47 @@ def test_cross_layer_kv_plan_survives_aeg_reload_and_aliases_cpu_cache(tmp_path:
     assert cache.keys[0] is cache.keys[1]
     assert cache.values[0] is cache.values[1]
     assert cache.positions[0] is cache.positions[1]
+
+
+@pytest.mark.integration
+def test_mdlm_bundle_compiles_into_aeg_and_reloads_r9(tmp_path: Path) -> None:
+    """Pass 18 must persist and execute a real trained-shaped CPU head."""
+    source = tmp_path / "tiny-llama-mdlm"
+    source.mkdir()
+    _write_tiny_llama(source)
+    rng = np.random.default_rng(31)
+    weights = {
+        "token_embedding": rng.normal(size=(32, 4)).astype("float32"),
+        "context_projection": rng.normal(size=(16, 4)).astype("float32"),
+        "output_projection": rng.normal(size=(4, 32)).astype("float32"),
+        "output_bias": np.zeros(32, dtype="float32"),
+        "time_embedding": rng.normal(size=(7, 4)).astype("float32"),
+    }
+    bundle = tmp_path / "mdlm-head.npz"
+    np.savez(bundle, **weights)
+    artifact = tmp_path / "mdlm.aeg"
+    package = Compiler(
+        CompilerConfig(
+            targets=["cpu_avx512"],
+            overwrite=True,
+            calibration_tokens=8,
+            cache_dir=str(tmp_path / "cache"),
+            enable_mdlm_drafter=True,
+            mdlm_drafter_weights_path=str(bundle),
+            mdlm_drafter_steps=6,
+            mdlm_draft_block_size=3,
+        )
+    ).compile(str(source), output_path=artifact)
+    assert package.manifest.format_version == "AEG/3.0"
+    assert "mdlm_drafter_compilation" in package.metadata["optimizer_passes"]
+    package.verify_integrity()
+    assert (artifact / "graph" / "mdlm_draft_head.npz").is_file()
+
+    runtime = Runtime(RuntimeConfig(hf_offline=True, enable_semantic_cache=False))
+    runtime._load_model(str(artifact))  # noqa: SLF001 - verify restart path
+    engine = runtime._diffusion_engine  # noqa: SLF001 - inspect loaded R9 layer
+    assert engine is not None and engine.is_ready()
+    engine.mask_token_id = 99
+    draft = engine.draft(np.ones((2, 16), dtype="float32"), position=0)
+    assert len(draft.tokens) == 3
+    assert all(0 <= token < 32 for token in draft.tokens)

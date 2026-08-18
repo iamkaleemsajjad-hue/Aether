@@ -63,8 +63,13 @@ _STRUCTURAL_OPS = frozenset({
 #: the cases where op_type adds more information than the node id alone.
 _NODE_ID_TO_WEIGHT_KEY: dict[str, str] = {
     "embedding": "embedding",
+    "token_embeddings": "embedding",
+    "position_embeddings": "position_embedding",
+    "token_type_embeddings": "token_type_embedding",
+    "embedding_layernorm": "embedding_norm",
     "lm_head": "lm_head",
     "final_norm": "final_norm",
+    "pooler": "pooler",
 }
 
 #: Regex that parses "layer_{i}_{suffix}" node ids.
@@ -80,6 +85,12 @@ _LAYER_SUFFIX_MAP: dict[str, str] = {
     "ffn": "down_proj",
     # Dense SwiGLU up projection is stored separately by the ingestion pipeline.
     "up_proj": "up_proj",
+    # BERT-style encoder blocks.
+    "attn_output": "o_proj",
+    "attn_layernorm": "attention_norm",
+    "ffn_intermediate": "intermediate_proj",
+    "ffn_output": "output_proj",
+    "output_layernorm": "output_norm",
 }
 
 
@@ -183,6 +194,17 @@ class GraphWeightQuantizer:
                 for name, qt in sub_tensors.items():
                     quantized[name] = qt
                     stats.record(precision, qt)
+                attrs = getattr(node, "attributes", {}) or {}
+                for projection in ("q", "k", "v"):
+                    bias = attrs.get(f"{projection}_bias")
+                    if bias is None:
+                        continue
+                    bias_name = f"layer_{layer_index}_{projection}_proj_bias"
+                    bias_qt = quantize_tensor(
+                        np.asarray(bias, dtype=np.float32), "BF16", self.block_size
+                    )
+                    quantized[bias_name] = bias_qt
+                    stats.record("BF16", bias_qt)
             else:
                 name = self._weight_name(node_id, op_type, layer_index)
                 if name is None:
@@ -191,6 +213,7 @@ class GraphWeightQuantizer:
                 qt = quantize_tensor(weight, precision, self.block_size)
                 quantized[name] = qt
                 stats.record(precision, qt)
+                self._store_biases(node, name, quantized, stats)
                 # The ingestion graph models SwiGLU's gate and up projections
                 # as one logical node, but they are distinct checkpoint tensors.
                 # Persist both real tensors so the CPU engine can reconstruct
@@ -210,6 +233,21 @@ class GraphWeightQuantizer:
         )
         return stats
 
+    def _store_biases(
+        self,
+        node: Any,
+        weight_name: str,
+        quantized: dict[str, QuantizedTensor],
+        stats: QuantizationStats,
+    ) -> None:
+        """Persist parameter biases alongside the real weight tensor."""
+        attrs = getattr(node, "attributes", {}) or {}
+        bias = attrs.get("bias")
+        if bias is not None:
+            qt = quantize_tensor(np.asarray(bias, dtype=np.float32), "BF16", self.block_size)
+            quantized[f"{weight_name}_bias"] = qt
+            stats.record("BF16", qt)
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _extract_weight(self, node: Any) -> np.ndarray | None:
@@ -222,6 +260,23 @@ class GraphWeightQuantizer:
             arr = np.asarray(weight, dtype=np.float32)
             if arr.ndim >= 1 and arr.size > 0:
                 return arr
+
+        # GQA path: ingestion stored Q/K/V separately (shapes differ, can't concat).
+        # Reconstruct a combined array so _split_qkv can split them back out.
+        q_w = attrs.get("q_weight")
+        k_w = attrs.get("k_weight")
+        v_w = attrs.get("v_weight")
+        if q_w is not None and k_w is not None and v_w is not None:
+            q_arr = np.asarray(q_w, dtype=np.float32)
+            k_arr = np.asarray(k_w, dtype=np.float32)
+            v_arr = np.asarray(v_w, dtype=np.float32)
+            if q_arr.size > 0:
+                try:
+                    # If shapes are compatible, concat for downstream _split_qkv.
+                    return np.concatenate([q_arr, k_arr, v_arr], axis=0)
+                except ValueError:
+                    # Shapes truly incompatible: just return Q (splitter handles rest).
+                    return q_arr
 
         # Never manufacture model parameters. A graph without attached
         # checkpoint tensors is useful for planning, but it must not become a
@@ -345,6 +400,24 @@ class GraphWeightQuantizer:
         hd = attrs.get("head_dim", 0)
         prefix = f"layer_{layer_index}" if layer_index is not None else "layer_0"
 
+        # Fast path: GQA pre-split arrays stored directly (from _bind_weights GQA path).
+        # These are already correctly shaped Q/K/V — just quantize separately.
+        q_pre = attrs.get("q_weight")
+        k_pre = attrs.get("k_weight")
+        v_pre = attrs.get("v_weight")
+        if q_pre is not None and k_pre is not None and v_pre is not None:
+            return {
+                f"{prefix}_q_proj": quantize_tensor(
+                    np.asarray(q_pre, dtype=np.float32), precision, self.block_size
+                ),
+                f"{prefix}_k_proj": quantize_tensor(
+                    np.asarray(k_pre, dtype=np.float32), precision, self.block_size
+                ),
+                f"{prefix}_v_proj": quantize_tensor(
+                    np.asarray(v_pre, dtype=np.float32), precision, self.block_size
+                ),
+            }
+
         if n_q > 0 and n_kv > 0 and hd > 0:
             q_rows = n_q * hd
             kv_rows = n_kv * hd
@@ -358,6 +431,19 @@ class GraphWeightQuantizer:
                     f"{prefix}_k_proj": quantize_tensor(k_w, precision, self.block_size),
                     f"{prefix}_v_proj": quantize_tensor(v_w, precision, self.block_size),
                 }
+
+        # Fallback for MHA where we have total_rows but no explicit head metadata:
+        # try equal three-way split.
+        if weight.ndim >= 1 and weight.shape[0] % 3 == 0:
+            third = weight.shape[0] // 3
+            q_w = weight[:third]
+            k_w = weight[third : 2 * third]
+            v_w = weight[2 * third :]
+            return {
+                f"{prefix}_q_proj": quantize_tensor(q_w, precision, self.block_size),
+                f"{prefix}_k_proj": quantize_tensor(k_w, precision, self.block_size),
+                f"{prefix}_v_proj": quantize_tensor(v_w, precision, self.block_size),
+            }
 
         # Fallback: store as one monolithic weight.
         node_id = getattr(node, "id", f"{prefix}_qkv")

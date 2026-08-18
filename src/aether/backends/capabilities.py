@@ -279,19 +279,36 @@ class HardwareCapabilities:
         arch = platform.machine()
         proc = platform.processor() or arch
         cpu_count = os.cpu_count() or 1
-        # Check AVX-512 support on x86 Linux (best-effort)
+        # Detect the actual instruction set on every supported host.  The old
+        # implementation only inspected Linux /proc/cpuinfo, which made
+        # Windows report a generic CPU even when NumPy exposed the real CPU
+        # feature table (and made AVX-512 claims depend on the target string).
         has_avx512 = False
         try:
-            if platform.system() == "Linux":
+            from numpy.core import _multiarray_umath
+
+            features = getattr(_multiarray_umath, "__cpu_features__", {})
+            has_avx512 = any(
+                bool(features.get(name))
+                for name in ("AVX512F", "AVX512BW", "AVX512VL")
+            )
+        except (ImportError, AttributeError):
+            pass
+        if not has_avx512 and platform.system() == "Linux":
+            try:
                 with open("/proc/cpuinfo") as f:
                     has_avx512 = "avx512" in f.read().lower()
-        except OSError:
-            pass
+            except OSError:
+                pass
         return cls(
             vendor="CPU",
             device=proc,
             architecture=arch,
-            target_id="cpu_avx512" if has_avx512 else "cpu",
+            target_id=(
+                "cpu_avx512"
+                if has_avx512
+                else ("cpu_neon" if arch.lower() in {"arm64", "aarch64"} else "cpu_avx2")
+            ),
             driver_version="n/a",
             runtime_version=platform.python_version(),
             memory_bytes=_host_memory_bytes(),

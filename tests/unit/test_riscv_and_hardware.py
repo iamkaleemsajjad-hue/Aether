@@ -630,3 +630,13 @@ class TestOpcodeMappings:
     def test_unknown_op_maps_to_none(self):
         result = RISCVNPUIRBuilder._map_opcode("custom.totally_unknown", {})
         assert result is None
+
+
+def test_unavailable_profile_only_is_not_reported_as_implemented():
+    from aether.backends.hardware_detector import detect_all_capabilities
+
+    reports = detect_all_capabilities()
+    by_target = {item.target_id: item for item in reports}
+    for target in ("qualcomm_qnn", "riscv_sifive_x160", "fpga_xilinx_vu9p"):
+        assert by_target[target].available is False
+        assert by_target[target].implemented is False

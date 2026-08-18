@@ -253,6 +253,45 @@ class IngestionPipeline:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"SSMLoader failed, falling back: {exc}")
 
+        # --- BERT / RoBERTa / DeBERTa / ELECTRA / ALBERT (encoder-only) ---
+        encoder_families = {
+            "bert", "roberta", "deberta", "electra", "albert",
+            "bert_family", "roberta_family", "deberta_family",
+            "electra_family", "albert_family",
+        }
+        is_encoder = (
+            getattr(architecture, "is_encoder", False)
+            or any(ef in model_type for ef in encoder_families)
+            or any(ef in arch_family for ef in encoder_families)
+        )
+        if is_encoder:
+            # Build encoder graph directly without a separate loader module;
+            # BERT-family models are architecturally simple enough that the
+            # structure can be synthesised from architecture metadata alone.
+            try:
+                from aether.core.graph import AEGGraph
+                enc_graph = AEGGraph(
+                    name=f"{arch_family or 'bert'}",
+                    architecture=architecture,
+                )
+                self._build_encoder_graph(enc_graph, architecture)
+                enc_graph.set_metadata("is_encoder", True)
+                enc_graph.set_metadata("encoder_family", arch_family or model_type)
+                # Attach weights from local checkpoint if available
+                if path.exists():
+                    attached = self._attach_checkpoint_weights(enc_graph, model, format_type)
+                    enc_graph.set_metadata("weights_attached", attached > 0)
+                logger.info(
+                    "Ingested encoder model %s (%s family, %d layers, %dD hidden)",
+                    model,
+                    arch_family,
+                    architecture.layers,
+                    architecture.hidden_size,
+                )
+                return enc_graph
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Encoder graph build failed for %s: %s", model, exc)
+
         return None  # No specialised loader matched — use generic dispatch
 
     def _attach_checkpoint_weights(
@@ -466,26 +505,99 @@ class IngestionPipeline:
             # single SwiGLU node keeps the separate up projection as metadata for
             # the weight packer.
             if key[1] == "qkv" and len(candidates) > 1:
+                # A BERT-style checkpoint stores Q/K/V weights and biases
+                # under the same normalized component.  Only matrices may be
+                # fused into QKV; treating one-dimensional biases as matrices
+                # corrupts the projection layout and can silently bind a bias
+                # as a model weight.
+                matrix_candidates = [
+                    item for item in candidates if np.asarray(item[1]).ndim >= 2
+                ]
+                bias_candidates = [
+                    item for item in candidates
+                    if np.asarray(item[1]).ndim == 1 and "bias" in item[0].lower()
+                ]
+                candidates_for_projection = matrix_candidates or candidates
+
                 def projection_order(item: tuple[str, Any]) -> int:
                     name = item[0].lower()
                     return (
                         0
-                        if "q_proj" in name or "attn_q" in name
+                        if "q_proj" in name or "attn_q" in name or name.endswith("_q")
                         else 1
-                        if "k_proj" in name or "attn_k" in name
+                        if "k_proj" in name or "attn_k" in name or name.endswith("_k")
                         else 2
                     )
 
-                ordered = sorted(candidates, key=projection_order)
+                ordered = sorted(candidates_for_projection, key=projection_order)
                 source_name = "+".join(name for name, _ in ordered)
                 import numpy as np
 
-                value = np.concatenate([np.asarray(array) for _, array in ordered], axis=0)
+                arrays = [np.asarray(arr) for _, arr in ordered]
+                # GQA models (Llama-3, Qwen2, Mistral) have Q with more heads
+                # than K/V, so shapes differ on axis=0 and concatenation fails.
+                # In that case, store each projection separately so the weight
+                # packer can handle them individually.
+                try:
+                    # Only fuse when all shapes match on axis=0 (full MHA).
+                    if len({a.shape[0] for a in arrays}) == 1:
+                        value = np.concatenate(arrays, axis=0)
+                    else:
+                        # GQA: store Q, K, V arrays as separate attributes.
+                        q_arr = next((a for (n, _), a in zip(ordered, arrays) if "q" in n.lower().split(".")[-1].split("_")), arrays[0])
+                        k_arr = next((a for (n, _), a in zip(ordered, arrays) if "k" in n.lower().split(".")[-1].split("_")), arrays[1] if len(arrays) > 1 else arrays[0])
+                        v_arr = next((a for (n, _), a in zip(ordered, arrays) if "v" in n.lower().split(".")[-1].split("_")), arrays[2] if len(arrays) > 2 else arrays[-1])
+                        node.add_attribute("q_weight", q_arr)
+                        node.add_attribute("k_weight", k_arr)
+                        node.add_attribute("v_weight", v_arr)
+                        node.add_attribute("weight_source", source_name)
+                        node.add_attribute("fused_weight_sources", [n for n, _ in ordered])
+                        node.add_attribute("is_gqa", True)
+                        bound_names.extend(name for name, _ in candidates)
+                        self._attach_projection_biases(node, bias_candidates)
+                        attached += 1
+                        continue  # Skip the generic node.add_attribute("weight", ...) below
+                except (ValueError, Exception) as qkv_exc:
+                    # Last resort: store first available array and log the issue.
+                    logger.debug(
+                        "QKV fusion failed for node %s (%s); storing Q projection only: %s",
+                        getattr(node, "id", "?"),
+                        source_name,
+                        qkv_exc,
+                    )
+                    value = arrays[0]
+
             else:
-                source_name, value = candidates[0]
+                # Prefer the matrix/scale tensor over a same-key bias.  A
+                # normalized key is intentionally shared by a parameter and
+                # its bias, so selecting candidates[0] is not deterministic
+                # across checkpoint writers.
+                value_candidates = [
+                    item for item in candidates
+                    if np.asarray(item[1]).ndim >= 2
+                ] or sorted(
+                    candidates,
+                    key=lambda item: (
+                        0 if item[0].lower().endswith(".weight") else 1,
+                        item[0],
+                    ),
+                )
+                source_name, value = value_candidates[0]
             node.add_attribute("weight", value)
             node.add_attribute("weight_shape", list(value.shape))
             node.add_attribute("weight_source", source_name)
+            bias_candidates = [
+                item for item in candidates
+                if np.asarray(item[1]).ndim == 1 and "bias" in item[0].lower()
+            ]
+            if key[1] == "qkv":
+                # Full-MHA fusion reaches this common path; GQA reaches the
+                # early branch above.  Both forms must retain all three real
+                # bias vectors rather than selecting the first one.
+                self._attach_projection_biases(node, bias_candidates)
+            elif bias_candidates:
+                node.add_attribute("bias", bias_candidates[0][1])
+                node.add_attribute("bias_source", bias_candidates[0][0])
             # Every candidate consumed by this node counts as a bound logical
             # tensor, even when several are fused into one physical array.
             bound_names.extend(name for name, _ in candidates)
@@ -518,6 +630,24 @@ class IngestionPipeline:
             "unbound_weight_names", sorted(unbound_names + unresolvable)
         )
         return attached
+
+    @staticmethod
+    def _attach_projection_biases(node: Any, candidates: list[tuple[str, Any]]) -> None:
+        """Attach Q/K/V bias vectors to a fused projection node.
+
+        Biases are kept separate from the fused matrices because grouped-query
+        attention may have different K/V row counts.  The quantizer can then
+        persist them under their canonical per-projection names.
+        """
+        for name, value in candidates:
+            lowered = name.lower()
+            projection = "q" if ".query." in lowered or "q_proj" in lowered else (
+                "k" if ".key." in lowered or "k_proj" in lowered else (
+                    "v" if ".value." in lowered or "v_proj" in lowered else None
+                )
+            )
+            if projection is not None:
+                node.add_attribute(f"{projection}_bias", value)
 
     #: Checkpoint component names mapped to the graph's node-id vocabulary. Node
     #: ids are coarser than checkpoint names (one ``qkv`` node stands in for
@@ -560,6 +690,69 @@ class IngestionPipeline:
         "word_embeddings": "embedding",
         "position_embeddings": "position_embedding",
         "token_type_embeddings": "token_type_embedding",
+        "token_embeddings": "embedding",
+        # BERT intermediate (FFN first layer) and output (FFN second layer):
+        "intermediate_dense": "gate_proj",
+        "intermediate": "gate_proj",
+        "output_dense": "ffn",
+        # BERT layernorm spellings:
+        "layernorm": "rmsnorm",
+        "layer_norm": "rmsnorm",
+        "attention_output_layernorm": "rmsnorm",
+        "output_layernorm": "ffn_norm",
+        "embedding_layernorm": "rmsnorm",
+        # BERT attention output projection:
+        "attention_output_dense": "out_proj",
+        "ffn_intermediate": "gate_proj",
+        "ffn_output": "ffn",
+        # Pooler (sentence-transformers / BERT CLS):
+        "pooler_dense": "pooler",
+        "pooler": "pooler",
+        # T5 / Flan-T5 spellings:
+        "densereluredense_wi": "gate_proj",
+        "densereluredense_wo": "ffn",
+        "denseactdense_wi_0": "gate_proj",
+        "denseactdense_wi_1": "gate_proj",
+        "denseactdense_wo": "ffn",
+        "selfattention_q": "qkv",
+        "selfattention_k": "qkv",
+        "selfattention_v": "qkv",
+        "selfattention_o": "out_proj",
+        "encderattenion_q": "qkv",
+        "encderattenion_k": "qkv",
+        "encderattenion_v": "qkv",
+        "encderattenion_o": "out_proj",
+        "layer_0": "rmsnorm",
+        # OPT spellings:
+        "q_proj_weight": "qkv",
+        "k_proj_weight": "qkv",
+        "v_proj_weight": "qkv",
+        "fc1": "gate_proj",
+        "fc2": "ffn",
+        "self_attn_layer_norm": "rmsnorm",
+        "final_layer_norm": "final_norm",
+        # Falcon / RWKV spellings:
+        "query_key_value": "qkv",
+        "dense": "out_proj",
+        "dense_h_to_4h": "gate_proj",
+        "dense_4h_to_h": "ffn",
+        "ln_attn": "rmsnorm",
+        "ln_mlp": "ffn_norm",
+        # GPT-Neo / GPT-J:
+        "q_proj": "qkv",
+        "k_proj": "qkv",
+        "v_proj": "qkv",
+        "out_proj": "out_proj",
+        "c_attn": "qkv",
+        "c_proj": "out_proj",
+        "c_fc": "gate_proj",
+        "mlp_c_proj": "ffn",
+        # Phi-2 / Phi-3:
+        "Wqkv": "qkv",
+        "wqkv": "qkv",
+        "out_proj": "out_proj",
+        "fc1": "gate_proj",
+        "fc2": "ffn",
         # Canonical names, as used in graph node ids.
         "qkv": "qkv",
         "out_proj": "out_proj",
@@ -572,6 +765,7 @@ class IngestionPipeline:
         "output_norm": "final_norm",
         "final_norm": "final_norm",
     }
+
 
     #: Structural path segments that carry no identifying information.
     _IGNORED_SEGMENTS = frozenset({"model", "transformer", "module", "self_attn", "mlp", "blk", "weight"})
@@ -848,9 +1042,278 @@ class IngestionPipeline:
     def _build_architecture_graph(self, graph: AEGGraph, architecture: ModelArchitecture) -> AEGGraph:
         """Build a detailed AEG graph from architecture metadata.
 
-        This creates the full computation graph structure: embedding layer,
-        N transformer layers (attention + FFN), and LM head.
+        Dispatches to the encoder-specific builder for BERT-family models
+        (is_encoder=True) and uses the decoder-only builder for causal LMs.
         """
+        if getattr(architecture, "is_encoder", False):
+            return self._build_encoder_graph(graph, architecture)
+        return self._build_decoder_graph(graph, architecture)
+
+    def _build_encoder_graph(self, graph: AEGGraph, architecture: ModelArchitecture) -> AEGGraph:
+        """Build an encoder-only (BERT-style) AEG graph.
+
+        Encoder graphs differ from decoder graphs in several key ways:
+        - Bidirectional attention (no causal mask, no RoPE by default)
+        - LayerNorm instead of RMSNorm
+        - GELU activation in FFN (not SwiGLU)
+        - Positional embeddings + token-type embeddings
+        - Pooler (CLS-token extraction) instead of LM head
+        - No KV cache
+        """
+        from aether.core.graph import AEGGraphEdge, AEGGraphNode, AEGGraphNodeType
+        from aether.core.types import DType, TensorLayout, TensorShape
+
+        h = architecture.hidden_size
+        i = architecture.intermediate_size or (h * 4)
+        v = architecture.vocab_size
+        n_layers = architecture.layers
+        n_heads = architecture.num_attention_heads
+        head_dim = architecture.head_dim or (h // n_heads)
+        max_pos = architecture.context_length or 512
+        batch_dim = None  # dynamic
+
+        # ── Inputs ──
+        token_ids_node = AEGGraphNode(
+            id="input_ids",
+            node_type=AEGGraphNodeType.INPUT,
+            name="input_ids",
+            op_type="input",
+            layout=TensorLayout(
+                shape=TensorShape.from_list([batch_dim]),
+                dtype=DType.INT64,
+            ),
+        )
+        graph.add_node(token_ids_node)
+
+        # ── Token embeddings ──
+        tok_emb_node = AEGGraphNode(
+            id="token_embeddings",
+            node_type=AEGGraphNodeType.OPERATION,
+            name="token_embeddings",
+            op_type="embedding",
+            inputs=[token_ids_node.id],
+            attributes={"vocab_size": v, "hidden_size": h},
+            layer_index=0,
+        )
+        graph.add_node(tok_emb_node)
+        graph.add_edge(AEGGraphEdge(source=token_ids_node.id, target=tok_emb_node.id))
+
+        # ── Positional embeddings ──
+        pos_emb_node = AEGGraphNode(
+            id="position_embeddings",
+            node_type=AEGGraphNodeType.OPERATION,
+            name="position_embeddings",
+            op_type="embedding",
+            inputs=[token_ids_node.id],
+            attributes={"vocab_size": max_pos, "hidden_size": h, "embedding_type": "position"},
+            layer_index=0,
+        )
+        graph.add_node(pos_emb_node)
+        graph.add_edge(AEGGraphEdge(source=token_ids_node.id, target=pos_emb_node.id))
+
+        # ── Token-type embeddings ──
+        seg_emb_node = AEGGraphNode(
+            id="token_type_embeddings",
+            node_type=AEGGraphNodeType.OPERATION,
+            name="token_type_embeddings",
+            op_type="embedding",
+            inputs=[token_ids_node.id],
+            attributes={"vocab_size": 2, "hidden_size": h, "embedding_type": "token_type"},
+            layer_index=0,
+        )
+        graph.add_node(seg_emb_node)
+        graph.add_edge(AEGGraphEdge(source=token_ids_node.id, target=seg_emb_node.id))
+
+        # ── Embedding sum + LayerNorm ──
+        emb_sum_node = AEGGraphNode(
+            id="embedding_sum",
+            node_type=AEGGraphNodeType.OPERATION,
+            name="embedding_sum",
+            op_type="add",
+            inputs=[tok_emb_node.id, pos_emb_node.id, seg_emb_node.id],
+            attributes={},
+            layer_index=0,
+        )
+        graph.add_node(emb_sum_node)
+        graph.add_edge(AEGGraphEdge(source=tok_emb_node.id, target=emb_sum_node.id))
+        graph.add_edge(AEGGraphEdge(source=pos_emb_node.id, target=emb_sum_node.id))
+        graph.add_edge(AEGGraphEdge(source=seg_emb_node.id, target=emb_sum_node.id))
+
+        emb_ln_node = AEGGraphNode(
+            id="embedding_layernorm",
+            node_type=AEGGraphNodeType.OPERATION,
+            name="embedding_layernorm",
+            op_type="layernorm",
+            inputs=[emb_sum_node.id],
+            attributes={"eps": architecture.norm_eps or 1e-12, "hidden_size": h},
+            layer_index=0,
+        )
+        graph.add_node(emb_ln_node)
+        graph.add_edge(AEGGraphEdge(source=emb_sum_node.id, target=emb_ln_node.id))
+
+        prev_node = emb_ln_node
+
+        # ── Encoder layers ──
+        for layer in range(n_layers):
+            lp = f"layer_{layer}"
+
+            # Self-attention: QKV projection
+            qkv_node = AEGGraphNode(
+                id=f"{lp}_qkv",
+                node_type=AEGGraphNodeType.OPERATION,
+                name=f"Layer {layer} QKV Projection",
+                op_type="qkv_proj",
+                inputs=[prev_node.id],
+                attributes={"num_heads": n_heads, "num_kv_heads": n_heads, "head_dim": head_dim,
+                            "bidirectional": True},
+                layer_index=layer,
+            )
+            graph.add_node(qkv_node)
+            graph.add_edge(AEGGraphEdge(source=prev_node.id, target=qkv_node.id))
+
+            # Bidirectional full attention (no causal mask)
+            attn_node = AEGGraphNode(
+                id=f"{lp}_attention",
+                node_type=AEGGraphNodeType.OPERATION,
+                name=f"Layer {layer} Bidirectional Attention",
+                op_type="mha",
+                inputs=[qkv_node.id],
+                attributes={"num_heads": n_heads, "head_dim": head_dim,
+                            "causal": False, "bidirectional": True},
+                layer_index=layer,
+            )
+            graph.add_node(attn_node)
+            graph.add_edge(AEGGraphEdge(source=qkv_node.id, target=attn_node.id))
+
+            # Attention output projection
+            attn_out_node = AEGGraphNode(
+                id=f"{lp}_attn_output",
+                node_type=AEGGraphNodeType.OPERATION,
+                name=f"Layer {layer} Attention Output",
+                op_type="linear",
+                inputs=[attn_node.id],
+                attributes={"in_features": h, "out_features": h},
+                layer_index=layer,
+            )
+            graph.add_node(attn_out_node)
+            graph.add_edge(AEGGraphEdge(source=attn_node.id, target=attn_out_node.id))
+
+            # Residual + LayerNorm (post-attention)
+            attn_res_node = AEGGraphNode(
+                id=f"{lp}_attn_residual",
+                node_type=AEGGraphNodeType.OPERATION,
+                name=f"Layer {layer} Attention Residual",
+                op_type="add",
+                inputs=[prev_node.id, attn_out_node.id],
+                attributes={},
+                layer_index=layer,
+            )
+            graph.add_node(attn_res_node)
+            graph.add_edge(AEGGraphEdge(source=prev_node.id, target=attn_res_node.id))
+            graph.add_edge(AEGGraphEdge(source=attn_out_node.id, target=attn_res_node.id))
+
+            attn_ln_node = AEGGraphNode(
+                id=f"{lp}_attn_layernorm",
+                node_type=AEGGraphNodeType.OPERATION,
+                name=f"Layer {layer} Attention LayerNorm",
+                op_type="layernorm",
+                inputs=[attn_res_node.id],
+                attributes={"eps": architecture.norm_eps or 1e-12, "hidden_size": h},
+                layer_index=layer,
+            )
+            graph.add_node(attn_ln_node)
+            graph.add_edge(AEGGraphEdge(source=attn_res_node.id, target=attn_ln_node.id))
+
+            # FFN: intermediate (GELU) + output
+            ffn_int_node = AEGGraphNode(
+                id=f"{lp}_ffn_intermediate",
+                node_type=AEGGraphNodeType.OPERATION,
+                name=f"Layer {layer} FFN Intermediate",
+                op_type="linear",
+                inputs=[attn_ln_node.id],
+                attributes={"in_features": h, "out_features": i, "activation": "gelu"},
+                layer_index=layer,
+            )
+            graph.add_node(ffn_int_node)
+            graph.add_edge(AEGGraphEdge(source=attn_ln_node.id, target=ffn_int_node.id))
+
+            ffn_out_node = AEGGraphNode(
+                id=f"{lp}_ffn_output",
+                node_type=AEGGraphNodeType.OPERATION,
+                name=f"Layer {layer} FFN Output",
+                op_type="linear",
+                inputs=[ffn_int_node.id],
+                attributes={"in_features": i, "out_features": h},
+                layer_index=layer,
+            )
+            graph.add_node(ffn_out_node)
+            graph.add_edge(AEGGraphEdge(source=ffn_int_node.id, target=ffn_out_node.id))
+
+            # Residual + LayerNorm (post-FFN)
+            ffn_res_node = AEGGraphNode(
+                id=f"{lp}_ffn_residual",
+                node_type=AEGGraphNodeType.OPERATION,
+                name=f"Layer {layer} FFN Residual",
+                op_type="add",
+                inputs=[attn_ln_node.id, ffn_out_node.id],
+                attributes={},
+                layer_index=layer,
+            )
+            graph.add_node(ffn_res_node)
+            graph.add_edge(AEGGraphEdge(source=attn_ln_node.id, target=ffn_res_node.id))
+            graph.add_edge(AEGGraphEdge(source=ffn_out_node.id, target=ffn_res_node.id))
+
+            ffn_ln_node = AEGGraphNode(
+                id=f"{lp}_output_layernorm",
+                node_type=AEGGraphNodeType.OPERATION,
+                name=f"Layer {layer} Output LayerNorm",
+                op_type="layernorm",
+                inputs=[ffn_res_node.id],
+                attributes={"eps": architecture.norm_eps or 1e-12, "hidden_size": h},
+                layer_index=layer,
+            )
+            graph.add_node(ffn_ln_node)
+            graph.add_edge(AEGGraphEdge(source=ffn_res_node.id, target=ffn_ln_node.id))
+
+            prev_node = ffn_ln_node
+
+        # ── Pooler (CLS token extraction for sentence-level tasks / SBERT) ──
+        pooler_node = AEGGraphNode(
+            id="pooler",
+            node_type=AEGGraphNodeType.OPERATION,
+            name="pooler",
+            op_type="pooler",
+            inputs=[prev_node.id],
+            attributes={"hidden_size": h, "pool_type": "cls", "activation": "tanh"},
+        )
+        graph.add_node(pooler_node)
+        graph.add_edge(AEGGraphEdge(source=prev_node.id, target=pooler_node.id))
+
+        # ── Output (sentence embedding or logits depending on task head) ──
+        output_node = AEGGraphNode(
+            id="output",
+            node_type=AEGGraphNodeType.OUTPUT,
+            name="sentence_embedding",
+            op_type="output",
+            inputs=[pooler_node.id],
+        )
+        graph.add_node(output_node)
+        graph.add_edge(AEGGraphEdge(source=pooler_node.id, target=output_node.id))
+
+        # Mark as encoder
+        graph.set_metadata("is_encoder", True)
+        graph.set_metadata("encoder_arch", "bert_style")
+        graph.set_metadata("encoder_layers", n_layers)
+        graph.set_metadata("encoder_heads", n_heads)
+        graph.set_metadata("encoder_hidden_size", h)
+
+        logger.info(
+            "Built BERT/encoder graph: %d nodes, %d edges, %d layers, %dD hidden",
+            graph.node_count, graph.edge_count, n_layers, h,
+        )
+        return graph
+
+    def _build_decoder_graph(self, graph: AEGGraph, architecture: ModelArchitecture) -> AEGGraph:
         from aether.core.graph import AEGGraphEdge, AEGGraphEdgeType, AEGGraphNode, AEGGraphNodeType
         from aether.core.types import DType, TensorLayout, TensorShape
 

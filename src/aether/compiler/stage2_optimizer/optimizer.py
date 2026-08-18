@@ -1,8 +1,9 @@
 """
 OptimizerPipeline — pass manager for Stage 2 optimizer passes.
 
-The OptimizerPipeline orchestrates the six compiler passes in the correct order.
-It also handles pass registration, dependency checking, and report generation.
+The OptimizerPipeline orchestrates all 22 compiler passes in the PRD-defined
+order.  It also handles pass registration, dependency checking, and report
+generation.
 """
 
 from __future__ import annotations

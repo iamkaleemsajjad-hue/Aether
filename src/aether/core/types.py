@@ -388,6 +388,7 @@ class HardwareTarget(enum.Enum):
     OPENVINO_NPU = "openvino_npu"
     QUALCOMM_QNN = "qualcomm_qnn"
     CPU_AVX512 = "cpu_avx512"
+    CPU_AVX2 = "cpu_avx2"
     CPU_NEON = "cpu_neon"
 
     # ── v4.0 new hardware targets ──────────────────────────────────────────────
@@ -445,6 +446,7 @@ class HardwareTarget(enum.Enum):
             HardwareTarget.QUALCOMM_QNN: "Qualcomm",
             HardwareTarget.QUALCOMM_CLOUD_AI100: "Qualcomm",
             HardwareTarget.CPU_AVX512: "CPU",
+            HardwareTarget.CPU_AVX2: "CPU",
             HardwareTarget.CPU_NEON: "CPU",
             HardwareTarget.CPU_AVX512_TERNARY: "CPU",
             HardwareTarget.CPU_NEON_TERNARY: "CPU",
@@ -480,6 +482,7 @@ class HardwareTarget(enum.Enum):
             HardwareTarget.QUALCOMM_QNN: "Qualcomm Snapdragon NPU (QNN)",
             HardwareTarget.QUALCOMM_CLOUD_AI100: "Qualcomm Cloud AI 100 Ultra",
             HardwareTarget.CPU_AVX512: "x86_64 (AVX-512)",
+            HardwareTarget.CPU_AVX2: "x86_64 (AVX2)",
             HardwareTarget.CPU_NEON: "ARM (NEON SIMD)",
             HardwareTarget.CPU_AVX512_TERNARY: "x86_64 AVX2 Ternary (BitNet b1.58)",
             HardwareTarget.CPU_NEON_TERNARY: "ARM NEON Ternary (BitNet b1.58)",
@@ -515,6 +518,7 @@ class HardwareTarget(enum.Enum):
             HardwareTarget.QUALCOMM_QNN: ["onnxruntime", "pytorch"],
             HardwareTarget.QUALCOMM_CLOUD_AI100: ["onnxruntime", "pytorch"],
             HardwareTarget.CPU_AVX512: ["llama.cpp", "onnxruntime", "aether_cpu"],
+            HardwareTarget.CPU_AVX2: ["llama.cpp", "onnxruntime", "aether_cpu"],
             HardwareTarget.CPU_NEON: ["llama.cpp", "onnxruntime", "aether_cpu"],
             HardwareTarget.CPU_AVX512_TERNARY: ["bitnet.cpp", "llama.cpp", "aether_cpu"],
             HardwareTarget.CPU_NEON_TERNARY: ["bitnet.cpp", "llama.cpp", "aether_cpu"],
@@ -674,7 +678,22 @@ class HardwareTarget(enum.Enum):
                 pass
 
         # ── 5. CPU fallback — always available ────────────────────────────────
-        return HardwareTarget.CPU_AVX512
+        # CPU fallback: report the actual instruction-set floor rather than
+        # labeling every x86 host as AVX-512.
+        import platform
+
+        machine = platform.machine().lower()
+        if machine in {"arm64", "aarch64"}:
+            return HardwareTarget.CPU_NEON
+        try:
+            from numpy.core import _multiarray_umath
+
+            features = getattr(_multiarray_umath, "__cpu_features__", {})
+            if bool(features.get("AVX512F")):
+                return HardwareTarget.CPU_AVX512
+        except (ImportError, AttributeError):
+            pass
+        return HardwareTarget.CPU_AVX2
 
 
 @dataclass(frozen=True)

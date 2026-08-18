@@ -288,13 +288,35 @@ class ArchitectureDetector:
                 f"Unsupported Hugging Face architecture {arch_type!r}; refusing to assume Llama"
             )
 
-        num_hidden_layers = config.get("num_hidden_layers", config.get("num_layers", 32))
-        hidden_size = config.get("hidden_size", config.get("d_model", 4096))
-        num_attention_heads = config.get("num_attention_heads", config.get("num_heads", 32))
-        num_kv_heads = config.get("num_key_value_heads", config.get("num_kv_heads"))
+        # GPT-2/GPT-Neo checkpoints use the historical ``n_*`` names while
+        # modern Transformers configs use ``num_*``/``hidden_*``.  Normalize
+        # both forms here so detection produces executable dimensions rather
+        # than a generic 32-layer fallback.
+        num_hidden_layers = config.get(
+            "num_hidden_layers",
+            config.get("num_layers", config.get("n_layer", 32)),
+        )
+        hidden_size = config.get(
+            "hidden_size",
+            config.get("d_model", config.get("n_embd", 4096)),
+        )
+        num_attention_heads = config.get(
+            "num_attention_heads",
+            config.get("num_heads", config.get("n_head", 32)),
+        )
+        num_kv_heads = config.get(
+            "num_key_value_heads",
+            config.get("num_kv_heads", config.get("n_head")),
+        )
         vocab_size = config.get("vocab_size", 32000)
-        context_length = config.get("max_position_embeddings", config.get("seq_length", 4096))
-        intermediate_size = config.get("intermediate_size", 11008)
+        context_length = config.get(
+            "max_position_embeddings",
+            config.get("seq_length", config.get("n_positions", 4096)),
+        )
+        intermediate_size = config.get(
+            "intermediate_size",
+            config.get("n_inner", int(hidden_size) * 4),
+        )
 
         # Detect MoE
         num_experts = config.get("num_local_experts", config.get("num_experts", 0))
@@ -350,6 +372,12 @@ class ArchitectureDetector:
             "MambaForCausalLM": "hybrid_ssm_family",
             "JambaForCausalLM": "hybrid_ssm_family",
             "RwkvForCausalLM": "hybrid_ssm_family",
+            "GPT2Model": "gpt_family",
+            "GPT2LMHeadModel": "gpt_family",
+            "GPTNeoModel": "gpt_family",
+            "GPTNeoForCausalLM": "gpt_family",
+            "GPTNeoXModel": "gpt_family",
+            "GPTNeoXForCausalLM": "gpt_family",
             # Encoder architectures:
             "BertModel": "bert_family",
             "BertForMaskedLM": "bert_family",
@@ -362,6 +390,9 @@ class ArchitectureDetector:
             "ElectraModel": "electra_family",
             "ElectraForMaskedLM": "electra_family",
             "AlbertModel": "albert_family",
+            "MPNetModel": "bert_family",
+            "MPNetForMaskedLM": "bert_family",
+            "MPNetForSequenceClassification": "bert_family",
             # Short / model_type aliases:
             "llama": "llama_family",
             "llama2": "llama_family",
@@ -400,6 +431,11 @@ class ArchitectureDetector:
             "deberta-v2": "deberta_family",
             "electra": "electra_family",
             "albert": "albert_family",
+            "mpnet": "bert_family",
+            "distilbert": "bert_family",
+            "gpt2": "gpt_family",
+            "gpt_neo": "gpt_family",
+            "gpt-neox": "gpt_family",
         }
         if arch_type in mapping:
             return mapping[arch_type]
@@ -417,7 +453,8 @@ class ArchitectureDetector:
         for name_part in [
             "llama", "qwen", "gemma", "deepseek", "mixtral", "mistral",
             "phi", "falcon", "whisper", "vit", "mamba", "jamba", "bamba", "rwkv",
-            "bert", "roberta", "deberta", "electra", "albert",
+            "bert", "roberta", "deberta", "electra", "albert", "mpnet", "distilbert",
+            "gpt2", "gpt_neo", "gpt-neox",
         ]:
             if name_part in lower:
                 return ARCHITECTURE_BY_MODEL_PREFIX.get(name_part, "llama_family")

@@ -25,6 +25,7 @@ import numpy as np
 from aether.core.exceptions import AEGFormatError
 from aether.kernels.native_cpu import get_native_kernels
 from aether.runtime.cpu_engine import CPUExecutionEngine, LayerWeights, ModelWeights
+from aether.runtime.encoder_engine import EncoderExecutionEngine, EncoderLayerWeights, EncoderModelWeights
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -112,6 +113,8 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
         raise AEGLoadError(msg)
 
     architecture = _architecture_dict(package)
+    if bool(architecture.get("is_encoder", False)):
+        return _load_encoder_engine_from_package(package, architecture)
     num_layers = int(architecture.get("layers", 0) or 0)
     num_heads = int(architecture.get("num_attention_heads", 0) or 0)
     if num_layers <= 0 or num_heads <= 0:
@@ -206,6 +209,76 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
         num_kv_heads,
     )
     return engine
+
+
+def _load_encoder_engine_from_package(
+    package: Any, architecture: dict[str, Any]
+) -> EncoderExecutionEngine:
+    """Build the bidirectional CPU encoder from named AEG tensors."""
+    from aether.quantization.formats import dequantize_tensor
+
+    store = package.weight_store()
+
+    def required(name: str) -> np.ndarray:
+        if name not in store.entries:
+            raise AEGLoadError(f"encoder AEG is missing required tensor {name!r}")
+        return np.asarray(dequantize_tensor(store.load_tensor(name)), dtype=np.float32)
+
+    def optional(name: str) -> np.ndarray | None:
+        return required(name) if name in store.entries else None
+
+    embedding = required("embedding")
+    hidden_size = int(embedding.shape[1])
+    declared_hidden = int(architecture.get("hidden_size", 0) or 0)
+    if declared_hidden and declared_hidden != hidden_size:
+        raise AEGLoadError(
+            f"encoder hidden size invariant violated: manifest={declared_hidden}, tensor={hidden_size}"
+        )
+    declared_vocab = int(architecture.get("vocab_size", 0) or 0)
+    if declared_vocab and declared_vocab != int(embedding.shape[0]):
+        raise AEGLoadError(
+            f"encoder vocabulary invariant violated: manifest={declared_vocab}, tensor={embedding.shape[0]}"
+        )
+
+    layers: list[EncoderLayerWeights] = []
+    layer_count = int(architecture.get("layers", 0) or 0)
+    for index in range(layer_count):
+        prefix = f"layer_{index}_"
+        layers.append(
+            EncoderLayerWeights(
+                q_proj=required(prefix + "q_proj"),
+                k_proj=required(prefix + "k_proj"),
+                v_proj=required(prefix + "v_proj"),
+                o_proj=required(prefix + "o_proj"),
+                attention_norm=required(prefix + "attention_norm"),
+                intermediate_proj=required(prefix + "intermediate_proj"),
+                output_proj=required(prefix + "output_proj"),
+                output_norm=required(prefix + "output_norm"),
+                q_bias=optional(prefix + "q_proj_bias"),
+                k_bias=optional(prefix + "k_proj_bias"),
+                v_bias=optional(prefix + "v_proj_bias"),
+                o_bias=optional(prefix + "o_proj_bias"),
+                intermediate_bias=optional(prefix + "intermediate_proj_bias"),
+                output_bias=optional(prefix + "output_proj_bias"),
+                attention_norm_bias=optional(prefix + "attention_norm_bias"),
+                output_norm_bias=optional(prefix + "output_norm_bias"),
+            )
+        )
+    if len(layers) != layer_count or layer_count <= 0:
+        raise AEGLoadError("encoder manifest must declare at least one layer")
+    num_heads = int(architecture.get("num_attention_heads", 0) or 0)
+    weights = EncoderModelWeights(
+        embedding=embedding,
+        position_embedding=required("position_embedding"),
+        token_type_embedding=required("token_type_embedding"),
+        embedding_norm=required("embedding_norm"),
+        pooler=required("pooler"),
+        layers=layers,
+        embedding_norm_bias=optional("embedding_norm_bias"),
+        pooler_bias=optional("pooler_bias"),
+        norm_eps=float(architecture.get("norm_eps", 1e-12) or 1e-12),
+    )
+    return EncoderExecutionEngine(weights, num_heads=num_heads)
 
 
 def _runtime_sparse_attention_plan(

@@ -660,6 +660,23 @@ _TARGET_PROFILES: dict[str, dict[str, Any]] = {
         "sm_count": 0,             # CPU has no SM concept
         "tdp_watts": 280.0,        # Typical server CPU TDP
     },
+    "cpu_avx2": {
+        "name": "x86_64 (AVX2)",
+        "compute_capability": "cpu_avx2",
+        "memory_gb": 128.0,
+        "memory_bandwidth_gb_s": 120.0,
+        "tensor_core_flops": 6.0,
+        "flops_fp4": 0.0,
+        "supports_fp8": False,
+        "supports_fp4": False,
+        "supports_bf16": False,
+        "supports_flash_attention": False,
+        "recommended_flash_attention": "paged_attention",
+        "max_shm_size_bytes": 32768,
+        "warp_size": 1,
+        "sm_count": 0,
+        "tdp_watts": 180.0,
+    },
     "cpu_neon": {
         "name": "ARM (NEON SIMD)",
         "compute_capability": "cpu_arm",

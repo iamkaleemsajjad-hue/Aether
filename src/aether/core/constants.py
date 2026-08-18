@@ -80,6 +80,7 @@ SUPPORTED_TARGETS: dict[str, str] = {
     "openvino_npu": "Intel Arc NPU (OpenVINO)",
     "qualcomm_qnn": "Qualcomm Snapdragon NPU (QNN)",
     "cpu_avx512": "x86_64 (AVX-512)",
+    "cpu_avx2": "x86_64 (AVX2)",
     "cpu_neon": "ARM (NEON SIMD)",
     # ── v4.0 new targets ──────────────────────────────────────────────────────
     "cuda_sm130": "NVIDIA Rubin Ultra (sm_130, dual-core ~100 PFLOPS FP4)",
@@ -118,6 +119,7 @@ BACKEND_BY_TARGET: dict[str, list[str]] = {
     "openvino_npu": ["onnxruntime", "pytorch"],
     "qualcomm_qnn": ["onnxruntime", "pytorch"],
     "cpu_avx512": ["llama.cpp", "onnxruntime", "pytorch"],
+    "cpu_avx2": ["llama.cpp", "onnxruntime", "aether_cpu"],
     "cpu_neon": ["llama.cpp", "onnxruntime", "pytorch"],
     # v4.0
     "cuda_sm130": ["vllm", "pytorch", "tensorrt-llm"],
@@ -191,6 +193,13 @@ SUPPORTED_ARCHITECTURES: dict[str, dict[str, str | bool]] = {
         "attn": "MQA",
         "ffn": "GELU",
         "norm": "LayerNorm",
+        "is_moe": False,
+    },
+    "gpt_family": {
+        "attn": "Causal_Self_Attention",
+        "ffn": "GELU",
+        "norm": "LayerNorm",
+        "rope": False,
         "is_moe": False,
     },
     "vision_family": {
@@ -272,6 +281,10 @@ ARCHITECTURE_BY_MODEL_PREFIX: dict[str, str] = {
     "deberta": "deberta_family",
     "electra": "electra_family",
     "albert": "albert_family",
+    "gpt2": "gpt_family",
+    "gpt_neo": "gpt_family",
+    "gpt_neox": "gpt_family",
+    "gpt": "gpt_family",
 }
 """Model name prefix to architecture family mapping."""
 

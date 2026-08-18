@@ -700,6 +700,134 @@ class AetherClient:
             "active_sessions": len(self._sessions),
         }
 
+    def generate_with_tools(
+        self,
+        prompt: str,
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        max_rounds: int = 4,
+    ) -> GenerationResponse:
+        """Generate text while dispatching explicitly requested MCP tools."""
+        self._ensure_loaded()
+        if self._runtime is None or not hasattr(self._runtime, "generate_with_tools"):
+            raise RuntimeError(f"MCP-aware generation is unavailable for {self.model_path}")
+        return self._runtime.generate_with_tools(
+            str(self.model_path),
+            prompt,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            max_tool_rounds=max_rounds,
+        )
+
+    def generate_video(
+        self,
+        video_path: str | Path,
+        prompt: str,
+        *,
+        compression: str = "stc",
+        max_visual_tokens: int = 4096,
+        **kwargs: Any,
+    ) -> GenerationResponse:
+        """Run the compiled video/VLM path or raise its explicit capability error."""
+        self._ensure_loaded()
+        if self._runtime is None or not hasattr(self._runtime, "generate_video"):
+            raise RuntimeError(f"video generation is unavailable for {self.model_path}")
+        return self._runtime.generate_video(
+            str(self.model_path),
+            str(video_path),
+            prompt,
+            compression,
+            max_visual_tokens,
+            **kwargs,
+        )
+
+    def grpo_train_step(
+        self,
+        prompts: list[str],
+        *,
+        group_size: int = 8,
+        domain: str = "math",
+        learning_rate: float = 1e-5,
+        max_tokens: int = 256,
+        ground_truths: list[str] | None = None,
+        test_suites: list[str] | None = None,
+        model_forward_fn: Any | None = None,
+        optimizer_step_fn: Any | None = None,
+    ) -> dict[str, Any]:
+        """Run one RLVR/GRPO step, returning a structured capability result."""
+        self._ensure_loaded()
+        if self._runtime is None or not hasattr(self._runtime, "grpo_train_step"):
+            raise RuntimeError(f"GRPO is unavailable for {self.model_path}")
+        return self._runtime.grpo_train_step(
+            str(self.model_path),
+            prompts,
+            group_size=group_size,
+            domain=domain,
+            learning_rate=learning_rate,
+            max_tokens=max_tokens,
+            ground_truths=ground_truths,
+            test_suites=test_suites,
+            model_forward_fn=model_forward_fn,
+            optimizer_step_fn=optimizer_step_fn,
+        )
+
+    def get_attestation_report(self) -> dict[str, Any]:
+        """Return hardware-backed or clearly labelled software TEE attestation."""
+        self._ensure_loaded()
+        if self._runtime is None or not hasattr(self._runtime, "get_attestation_report"):
+            raise RuntimeError(f"attestation is unavailable for {self.model_path}")
+        report = self._runtime.get_attestation_report(str(self.model_path))
+        return report.to_dict() if hasattr(report, "to_dict") else dict(report)
+
+    def quantization_report(self) -> dict[str, Any]:
+        """Return the measured quantization metadata persisted in this AEG."""
+        self._ensure_loaded()
+        if self._runtime is None or not hasattr(self._runtime, "quantization_report"):
+            raise RuntimeError(f"quantization reporting is unavailable for {self.model_path}")
+        return self._runtime.quantization_report(str(self.model_path))
+
+    def semantic_cache_stats(self) -> dict[str, Any]:
+        """Return semantic request-cache statistics for the local runtime."""
+        self._ensure_loaded()
+        if self._runtime is None or not hasattr(self._runtime, "semantic_cache_stats"):
+            raise RuntimeError("semantic cache statistics are unavailable")
+        return self._runtime.semantic_cache_stats()
+
+    def kv_transfer_stats(self) -> dict[str, Any]:
+        """Return KV transfer statistics and explicit local fallback state."""
+        self._ensure_loaded()
+        if self._runtime is None or not hasattr(self._runtime, "kv_transfer_stats"):
+            raise RuntimeError("KV transfer statistics are unavailable")
+        return self._runtime.kv_transfer_stats()
+
+    def set_task_weights(self, **weights: float) -> dict[str, float]:
+        """Update task-routing weights through the loaded runtime."""
+        self._ensure_loaded()
+        if self._runtime is None or not hasattr(self._runtime, "set_task_weights"):
+            raise RuntimeError("task-weight routing is unavailable")
+        return self._runtime.set_task_weights(str(self.model_path), **weights)
+
+    def multi_agent_session(
+        self,
+        *,
+        agent_count: int = 4,
+        shared_prefix: str = "",
+        coordination: str = "relay",
+    ) -> dict[str, Any]:
+        """Create a multi-agent KV-coordination session for this model."""
+        self._ensure_loaded()
+        if self._runtime is None or not hasattr(self._runtime, "multi_agent_session"):
+            raise RuntimeError("multi-agent coordination is unavailable")
+        return self._runtime.multi_agent_session(
+            models=[str(self.model_path)],
+            coordination=coordination,
+            agent_count=agent_count,
+            shared_prefix=shared_prefix,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Remote HTTP client

@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from aether.core.constants import AETHER_VERSION
+
 
 # ---------------------------------------------------------------------------
 # Span model
@@ -166,7 +168,7 @@ class AetherTracer:
                     "resource": {
                         "attributes": [
                             {"key": "service.name", "value": {"stringValue": self.service_name}},
-                            {"key": "service.version", "value": {"stringValue": "3.1.0"}},
+                            {"key": "service.version", "value": {"stringValue": AETHER_VERSION}},
                         ]
                     },
                     "scopeSpans": [

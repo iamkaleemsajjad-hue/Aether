@@ -101,9 +101,19 @@ class MDLMDrafterCompilationPass(BasePass):
             K = config.mdlm_draft_block_size    # tokens per diffusion block
 
             vocab_size = _infer_vocab_size(architecture)
-            hidden_size = min(_infer_hidden_size(architecture), 2048)  # drafter is smaller
-            n_drafter_layers = 3  # lightweight drafter (3L per DiffuSpec paper)
-            n_heads = 16
+            hidden_size = _infer_hidden_size(architecture)
+            validated = _validate_mdlm_weights(
+                drafter_weights,
+                vocab_size=vocab_size,
+                hidden_size=hidden_size,
+                steps=T,
+            )
+            draft_hidden = int(validated["token_embedding"].shape[1])
+            # The portable reference head is a single masked-denoising block;
+            # its trained tensors, rather than a decorative layer count, are
+            # what define the executable computation.
+            n_drafter_layers = 1
+            n_heads = 1
 
             logger.info(
                 "Pass 18: Compiling MDLM drafter (T=%d, K=%d, hidden=%d, layers=%d).",
@@ -118,7 +128,9 @@ class MDLMDrafterCompilationPass(BasePass):
                 "type": "mdlm_drafter",
                 "n_layers": n_drafter_layers,
                 "hidden_size": hidden_size,
-                "n_heads": n_heads,
+                "draft_hidden": draft_hidden,
+                "head_type": "aether_numpy_mdlm_head_v1",
+                "backend": "numpy_cpu",
                 "vocab_size": vocab_size,
                 "T_steps": T,
                 "K_block": K,
@@ -141,6 +153,7 @@ class MDLMDrafterCompilationPass(BasePass):
                     schedule=schedule,
                     T=T,
                     K=K,
+                    weights=validated,
                 )
 
             elapsed = time.perf_counter() - start
@@ -222,6 +235,7 @@ def _write_drafter_artifacts(
     schedule: list[float],
     T: int,
     K: int,
+    weights: dict[str, Any],
 ) -> None:
     """Write drafter config and schedule to .aeg/diffusion/."""
     diff_dir = output_dir / "diffusion"
@@ -239,7 +253,95 @@ def _write_drafter_artifacts(
     (diff_dir / "schedule.json").write_text(
         json.dumps(schedule_data, indent=2), encoding="utf-8"
     )
+    graph_dir = output_dir / "graph"
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    head_config = dict(drafter_arch)
+    head_config.update(
+        {
+            "format": "aether_mdlm_head_v1",
+            "weight_file": "mdlm_draft_head.npz",
+            "weight_keys": sorted(weights),
+        }
+    )
+    (graph_dir / "mdlm_draft_head_config.json").write_text(
+        json.dumps(head_config, indent=2), encoding="utf-8"
+    )
+    import numpy as np
+
+    np.savez(graph_dir / "mdlm_draft_head.npz", **weights)
     logger.debug("Wrote MDLM drafter artifacts to %s", diff_dir)
+
+
+def load_mdlm_weight_bundle(path: str | Path) -> dict[str, Any]:
+    """Load a trained MDLM head bundle without silently fabricating weights.
+
+    The portable bundle contains ``token_embedding``, ``context_projection``
+    and ``output_projection``.  ``output_bias`` and ``time_embedding`` are
+    optional and default to mathematically neutral values in the validated
+    runtime head.  Both NumPy ``.npz`` and SafeTensors are accepted.
+    """
+    import numpy as np
+
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"MDLM weight bundle does not exist: {source}")
+    if source.suffix.lower() == ".npz":
+        with np.load(source, allow_pickle=False) as data:
+            return {key: np.asarray(data[key], dtype=np.float32) for key in data.files}
+    if source.suffix.lower() in {".safetensors", ".safe"}:
+        try:
+            from safetensors.numpy import load_file
+        except ImportError as exc:
+            raise RuntimeError("SafeTensors MDLM bundles require safetensors") from exc
+        return {key: np.asarray(value, dtype=np.float32) for key, value in load_file(str(source)).items()}
+    raise ValueError("MDLM weights must be a .npz or .safetensors file")
+
+
+def _validate_mdlm_weights(
+    weights: dict[str, Any],
+    *,
+    vocab_size: int,
+    hidden_size: int,
+    steps: int,
+) -> dict[str, Any]:
+    """Validate the exact tensors consumed by the portable CPU MDLM head."""
+    import numpy as np
+
+    required = {"token_embedding", "context_projection", "output_projection"}
+    missing = sorted(required - set(weights))
+    if missing:
+        raise ValueError(f"MDLM bundle missing required tensors: {', '.join(missing)}")
+    out: dict[str, Any] = {}
+    for name in required | {"output_bias", "time_embedding"}:
+        if name not in weights:
+            continue
+        value = np.asarray(weights[name], dtype=np.float32)
+        if not np.isfinite(value).all():
+            raise ValueError(f"MDLM tensor {name!r} contains non-finite values")
+        out[name] = np.ascontiguousarray(value)
+    token = out["token_embedding"]
+    context = out["context_projection"]
+    output = out["output_projection"]
+    if token.ndim != 2 or token.shape[0] != vocab_size:
+        raise ValueError(f"token_embedding must have shape [{vocab_size}, draft_hidden]")
+    draft_hidden = token.shape[1]
+    if context.shape != (hidden_size, draft_hidden):
+        raise ValueError(
+            f"context_projection must have shape [{hidden_size}, {draft_hidden}], got {context.shape}"
+        )
+    if output.shape != (draft_hidden, vocab_size):
+        raise ValueError(
+            f"output_projection must have shape [{draft_hidden}, {vocab_size}], got {output.shape}"
+        )
+    if "output_bias" in out and out["output_bias"].shape != (vocab_size,):
+        raise ValueError(f"output_bias must have shape [{vocab_size}]")
+    if "time_embedding" in out and out["time_embedding"].shape not in {
+        (steps + 1, draft_hidden), (draft_hidden,),
+    }:
+        raise ValueError(
+            f"time_embedding must have shape [{steps + 1}, {draft_hidden}] or [{draft_hidden}]"
+        )
+    return out
 
 
 def _infer_vocab_size(arch: Any) -> int:

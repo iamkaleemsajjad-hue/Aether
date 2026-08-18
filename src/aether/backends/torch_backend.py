@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
 from aether.core.exceptions import BackendError
 from aether.core.hash_utils import compute_file_hash
@@ -923,6 +925,32 @@ class TorchBackend(Backend):
 
     def embed(self, model_id: str, inputs: list[str]) -> list[list[float]]:
         """Generate embeddings using a sentence-transformers style model."""
+        compiled = self._models.get(model_id)
+        if isinstance(compiled, CompiledAEGHandle) and hasattr(compiled.engine, "pooled"):
+            if compiled.tokenizer is None:
+                raise BackendError("encoder AEG has no packaged tokenizer", backend_name=self.name)
+            if compiled.tokenizer.pad_token_id is None:
+                # A packaged tokenizer is allowed to omit padding (common for
+                # minimal WordLevel fixtures and decoder-derived tokenizers).
+                # Encode each request independently rather than inventing a
+                # pad token that could be a real model input.
+                results: list[list[float]] = []
+                for text in inputs:
+                    encoded = compiled.tokenizer(text, return_tensors="np", truncation=True)
+                    results.extend(
+                        compiled.engine.embed(
+                            encoded["input_ids"],
+                            encoded.get("attention_mask"),
+                            encoded.get("token_type_ids"),
+                        )
+                    )
+                return results
+            encoded = compiled.tokenizer(
+                inputs, return_tensors="np", padding=True, truncation=True
+            )
+            return compiled.engine.embed(
+                encoded["input_ids"], encoded.get("attention_mask"), encoded.get("token_type_ids")
+            )
         try:
             from transformers import AutoModel, AutoTokenizer
         except ImportError:
@@ -940,6 +968,32 @@ class TorchBackend(Backend):
 
     def rerank(self, model_id: str, query: str, documents: list[str]) -> list[dict[str, Any]]:
         """Rerank documents using a cross-encoder style model."""
+        compiled = self._models.get(model_id)
+        if isinstance(compiled, CompiledAEGHandle) and hasattr(compiled.engine, "pooled"):
+            if compiled.tokenizer is None:
+                raise BackendError("encoder AEG has no packaged tokenizer", backend_name=self.name)
+            query_ids = compiled.tokenizer(query, return_tensors="np", truncation=True)
+            query_vector = np.asarray(
+                compiled.engine.embed(
+                    query_ids["input_ids"], query_ids.get("attention_mask"), query_ids.get("token_type_ids")
+                )[0], dtype=np.float32
+            )
+            scored: list[tuple[int, float]] = []
+            for index, document in enumerate(documents):
+                encoded = compiled.tokenizer(document, return_tensors="np", truncation=True)
+                vector = np.asarray(
+                    compiled.engine.embed(
+                        encoded["input_ids"], encoded.get("attention_mask"), encoded.get("token_type_ids")
+                    )[0], dtype=np.float32
+                )
+                denominator = float(np.linalg.norm(query_vector) * np.linalg.norm(vector))
+                score = float(np.dot(query_vector, vector) / denominator) if denominator else 0.0
+                scored.append((index, score))
+            scored.sort(key=lambda item: item[1], reverse=True)
+            return [
+                {"index": index, "document": documents[index], "score": score}
+                for index, score in scored
+            ]
         try:
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
         except ImportError:

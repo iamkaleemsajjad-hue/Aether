@@ -31,7 +31,11 @@ def create_app(config: RuntimeConfig | None = None) -> Any:
     try:
         from fastapi import FastAPI
         from fastapi.middleware.cors import CORSMiddleware
-        from aether.server.middleware import AuthMiddleware
+        from aether.server.middleware import (
+            AuthMiddleware,
+            RequestIDMiddleware,
+            TimingMiddleware,
+        )
     except ImportError:
         msg = "fastapi is required for the server. Install with: pip install aether-runtime"
         raise ImportError(msg)
@@ -59,6 +63,12 @@ def create_app(config: RuntimeConfig | None = None) -> Any:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # Install correlation/timing middleware on the real application.  These
+    # classes previously existed but were not attached, which made production
+    # tracing unable to correlate requests and hid request duration from API
+    # clients.
+    app.add_middleware(RequestIDMiddleware)
+    app.add_middleware(TimingMiddleware)
     api_keys = [key.strip() for key in os.environ.get("AETHER_API_KEYS", "").split(",") if key.strip()]
     app.add_middleware(AuthMiddleware, api_keys=api_keys)
 

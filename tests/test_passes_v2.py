@@ -571,6 +571,13 @@ class TestPass22RLVR:
         _, report = p.run(_make_graph(), _make_arch(), _make_config(enable_rlvr_verifier=False))
         assert report.status == "skipped"
 
+    def test_human_verifier_fails_closed_without_feedback_backend(self):
+        p = self._import()
+        cfg = _make_config(enable_rlvr_verifier=True, rlvr_verifier_type="human")
+        _, report = p.run(_make_graph(), _make_arch(), cfg)
+        assert report.status == "skipped"
+        assert report.details["reason"] == "human_feedback_backend_unconfigured"
+
     def test_k_bounds_enforced(self):
         p = self._import()
         cfg = _make_config(enable_rlvr_verifier=True, rlvr_verifier_type="sympy", rlvr_group_size=100)
