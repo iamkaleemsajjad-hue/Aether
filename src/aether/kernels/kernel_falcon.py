@@ -252,6 +252,7 @@ void aether_falcon_softmax_c(const float* x, float* out, int rows, int cols) {
 
 def _c_sgemm_source(unroll: int) -> str:
     return f"""
+#include <stddef.h>
 void aether_falcon_sgemm_u{unroll}(const float* A, const float* B, float* C, int M, int N, int K) {{
     for (int m = 0; m < M; ++m) {{
         for (int n = 0; n < N; ++n) {{
