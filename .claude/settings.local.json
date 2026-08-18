@@ -97,7 +97,12 @@
       "Bash(python -m pytest tests/unit/test_safetensors_loader_complete.py -v --tb=short)",
       "Bash(python -m pytest tests/unit/test_safetensors_loader_complete.py::TestSafeTensorsLoaderBasic::test_single_file_loading -xvs)",
       "Bash(python -m pytest tests/ -v --tb=short)",
-      "Bash(python -m pytest tests/unit/ -v --tb=short)"
+      "Bash(python -m pytest tests/unit/ -v --tb=short)",
+      "Bash(python -m pytest tests/ -v --tb=short -k \"pass\")",
+      "Bash(python -m pytest tests/ -v --co -q)",
+      "Bash(python -m pytest tests/ --tb=no -q)",
+      "Bash(python -m pytest tests/unit/test_gguf_kquant.py -v --tb=short)",
+      "Bash(awk '{print $9, \"\\(\" $5 \"\\)\"}')"
     ]
   }
 }
