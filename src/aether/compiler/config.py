@@ -224,6 +224,15 @@ class CompilerConfig:
     mdlm_draft_block_size: int = 8
     """Number of draft tokens proposed per diffusion forward pass (K parameter)."""
 
+    mdlm_drafter_weights_path: str | None = None
+    """Path to a trained MDLM head bundle (``.npz`` or SafeTensors).
+
+    The compiler never invents drafter weights.  When Pass 18 is enabled this
+    path must contain the validated tensors required by Aether's portable CPU
+    MDLM head format; otherwise the pass is skipped and the requested feature
+    is rejected by the public compile command.
+    """
+
     enable_sub2bit: bool = DEFAULT_SUB2BIT_PASS
     """Pass 19: Quantize model weights to sub-2-bit ternary or binary format.
 

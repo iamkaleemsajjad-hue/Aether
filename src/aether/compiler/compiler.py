@@ -168,10 +168,30 @@ def _verify_weight_accounting(
     three logical tensors it stands for.
     """
     serialized = set(package.weights)
-    required: set[str] = {"embedding"}
-    for i in range(int(architecture.layers)):
-        for component in _REQUIRED_LAYER_TENSORS:
-            required.add(f"layer_{i}_{component}")
+    if bool(getattr(architecture, "is_encoder", False)):
+        # Encoder artifacts use the BERT/RoBERTa execution vocabulary.  They
+        # do not have decoder-only RMSNorm/SwiGLU/lm_head tensors, so applying
+        # the causal-LM invariant here would reject valid checkpoints after
+        # ingestion had already extracted their real parameters.
+        required = {
+            "embedding",
+            "position_embedding",
+            "token_type_embedding",
+            "embedding_norm",
+            "pooler",
+        }
+        encoder_layer_tensors = (
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "attention_norm", "intermediate_proj", "output_proj", "output_norm",
+        )
+        for i in range(int(architecture.layers)):
+            for component in encoder_layer_tensors:
+                required.add(f"layer_{i}_{component}")
+    else:
+        required = {"embedding"}
+        for i in range(int(architecture.layers)):
+            for component in _REQUIRED_LAYER_TENSORS:
+                required.add(f"layer_{i}_{component}")
     missing = sorted(required - serialized)
 
     metadata = getattr(graph, "metadata", {}) or {}
@@ -431,6 +451,25 @@ class Compiler:
         except Exception as exc:
             msg = f"Model ingestion failed for {model}: {exc}"
             raise CompilationError(msg, model_id=model_id, stage="stage1_ingestion") from exc
+
+        # Pass 18 consumes an explicit trained drafter bundle.  Load it into
+        # the in-memory graph before optimization; the pass validates and
+        # persists it into the AEG package.  No random/default weights are
+        # ever synthesized for a requested diffusion feature.
+        if config.enable_mdlm_drafter and config.mdlm_drafter_weights_path:
+            try:
+                from aether.compiler.stage2_optimizer.pass18_mdlm_drafter import (
+                    load_mdlm_weight_bundle,
+                )
+
+                setattr(
+                    graph,
+                    "mdlm_drafter_weights",
+                    load_mdlm_weight_bundle(config.mdlm_drafter_weights_path),
+                )
+            except Exception as exc:
+                msg = f"MDLM drafter weights could not be loaded: {exc}"
+                raise CompilationError(msg, model_id=model_id, stage="stage1_ingestion") from exc
 
         # Optional optimizer passes emit binary/config artifacts while they
         # transform the in-memory graph.  Give those passes a real staging

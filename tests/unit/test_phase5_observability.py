@@ -92,6 +92,11 @@ class TestAetherTracer:
         assert len(spans) == 1
         assert spans[0]["name"] == "aether.inference"
 
+        from aether import AETHER_VERSION
+        attrs = {a["key"]: a["value"]["stringValue"]
+                 for a in resource_spans[0]["resource"]["attributes"]}
+        assert attrs["service.version"] == AETHER_VERSION
+
     def test_clear(self):
         from aether.observability.otel import AetherTracer
         tracer = AetherTracer()

@@ -669,6 +669,13 @@ class AEGIRModule:
             "rmsnorm": AEGOpCode.RMS_NORM,
             "layernorm": AEGOpCode.LAYER_NORM,
             "linear": AEGOpCode.LINEAR,
+            # Encoder-only and generic attention graph nodes.  These entries
+            # are deliberately explicit: falling through to the raw graph
+            # op_type would create an invalid AEG-IR opcode without the
+            # required ``aeg.`` namespace prefix.
+            "mha": AEGOpCode.MHA,
+            "pooler": AEGOpCode.LINEAR,
+            "gelu": AEGOpCode.GELU,
             "qkv_proj": AEGOpCode.QKV_PROJ,
             "gate_proj": AEGOpCode.GATE_PROJ,
             "up_proj": AEGOpCode.UP_PROJ,

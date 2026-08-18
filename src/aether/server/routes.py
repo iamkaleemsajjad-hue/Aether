@@ -62,6 +62,7 @@ def create_router(runtime: Runtime) -> Any:
     video_jobs: dict[str, dict[str, Any]] = {}
     ab_experiments: dict[str, dict[str, Any]] = {}
     multi_agent_sessions: dict[str, Any] = {}
+    kernel_artifacts: dict[str, dict[str, Any]] = {}
 
     # ── Request / Response models ─────────────────────────────────────────────
 
@@ -192,6 +193,12 @@ def create_router(runtime: Runtime) -> Any:
         shared_prefix: str = ""
         model: str = ""
 
+    class MultiAgentSpawnRequest(BaseModel):
+        session_id: str
+        model: str
+        context: str = ""
+        inherit_agent_id: str | None = None
+
     class TTTAdaptRequest(BaseModel):
         model: str
         session_id: str
@@ -222,6 +229,10 @@ def create_router(runtime: Runtime) -> Any:
         domain: str = "math"
         learning_rate: float = 1e-6
         max_tokens: int = 2048
+
+    class KernelGenerateRequest(BaseModel):
+        target: str
+        op_name: str
 
     # ── v4.0 NEW request models ───────────────────────────────────────────────
 
@@ -283,6 +294,16 @@ def create_router(runtime: Runtime) -> Any:
         )
 
     # ── v3.1 Routes (preserved) ────────────────────────────────────────────────
+
+    @router.get("/health", tags=["System"])
+    async def api_health():
+        """Return the PRD-defined versioned health endpoint."""
+        return {
+            "status": "healthy",
+            "version": AETHER_VERSION,
+            "target": runtime.fingerprint.target_id,
+            "loaded_models": len(runtime._loaded_models),
+        }
 
     @router.post("/generate", tags=["Generation"])
     async def generate(req: GenerateRequest):
@@ -751,6 +772,34 @@ def create_router(runtime: Runtime) -> Any:
         multi_agent_sessions[result["session_id"]] = result
         return result
 
+    @router.post("/multi_agent/spawn", tags=["Multi-Agent"])
+    async def spawn_multi_agent(req: MultiAgentSpawnRequest):
+        """Spawn an agent while explicitly preserving KV lineage when requested."""
+        session = multi_agent_sessions.get(req.session_id)
+        if session is None or not hasattr(session, "spawn_agent"):
+            raise HTTPException(status_code=404, detail="multi-agent session not found")
+        parent = None
+        if req.inherit_agent_id:
+            parent = getattr(session, "_agents", {}).get(req.inherit_agent_id)
+            if parent is None:
+                raise HTTPException(status_code=404, detail="inherited agent not found")
+        try:
+            agent = await session.spawn_agent(
+                req.model,
+                context=req.context,
+                inherit_kv_from=parent,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "session_id": req.session_id,
+            "agent_session_id": agent.session_id,
+            "model": agent.model_id,
+            "inherited_kv": parent is not None and agent.prefix_hash == parent.prefix_hash,
+            "prefix_hash": agent.prefix_hash,
+            "agent_count": session.get("agent_count", 0),
+        }
+
     @router.delete("/multi_agent/session/{session_id}", tags=["Multi-Agent"])
     async def delete_multi_agent(session_id: str):
         session = multi_agent_sessions.get(session_id)
@@ -1076,6 +1125,38 @@ def create_router(runtime: Runtime) -> Any:
             },
         }
 
+    @router.post("/kernels/generate", tags=["System"])
+    async def generate_kernel(req: KernelGenerateRequest):
+        """Generate a real executable kernel or return a controlled capability error."""
+        from aether.compiler.stage3_targeting.kernel_emitter import KernelEmitter
+        from aether.core.exceptions import KernelError
+
+        try:
+            artifact = KernelEmitter(req.target).emit_executable(req.op_name)
+        except KernelError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        record = artifact.to_dict()
+        record["verified"] = bool(artifact.artifact_path.is_file() and artifact.sha256)
+        kernel_artifacts[f"{req.target}/{req.op_name}"] = record
+        return record
+
+    @router.get("/kernels/{name:path}/verified", tags=["System"])
+    async def verify_kernel(name: str):
+        """Verify that a previously generated kernel artifact still matches its hash."""
+        import hashlib
+
+        record = kernel_artifacts.get(name)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"kernel {name!r} has not been generated")
+        artifact_path = Path(record["artifact_path"])
+        if not artifact_path.is_file():
+            raise HTTPException(status_code=410, detail="kernel artifact no longer exists")
+        digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        result = {**record, "verified": digest == record.get("sha256"), "current_sha256": digest}
+        if not result["verified"]:
+            raise HTTPException(status_code=409, detail=result)
+        return result
+
     @router.get("/metrics", tags=["System"])
     async def metrics():
         """Return Prometheus-compatible metrics."""
@@ -1085,11 +1166,6 @@ def create_router(runtime: Runtime) -> Any:
             "kv_cache_blocks": runtime.kv_cache.block_count,
             "kv_cache_hit_rate": runtime.kv_cache.hit_rate(),
         }
-
-    @router.get("/health", tags=["System"])
-    async def health():
-        """Health check."""
-        return {"status": "healthy", "version": AETHER_VERSION}
 
     # ── v4.0 NEW Routes ────────────────────────────────────────────────────────
 

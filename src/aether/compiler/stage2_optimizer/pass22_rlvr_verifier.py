@@ -93,6 +93,20 @@ class RLVRVerifierHeadInjectionPass(BasePass):
             logger.warning("Pass 22: Unknown verifier type %r. Using 'sympy'.", verifier_type)
             verifier_type = "sympy"
 
+        # Human feedback is not an executable compiler/runtime backend.  A
+        # callback/feedback service is required at training time, but this
+        # compiler configuration has no endpoint or authorization contract;
+        # emitting GRPO opcodes here would create a false applied claim.
+        if verifier_type == "human":
+            report.details = {
+                "reason": "human_feedback_backend_unconfigured",
+                "message": (
+                    "Pass 22 human verification requires an explicitly configured "
+                    "feedback service; no executable artifact was emitted"
+                ),
+            }
+            return graph, report
+
         K = config.rlvr_group_size
 
         try:

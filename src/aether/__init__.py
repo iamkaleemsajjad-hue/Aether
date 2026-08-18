@@ -30,6 +30,7 @@ from aether.runtime.config import RuntimeConfig
 from aether.compiler.compiler import Compiler
 from aether.compiler.config import CompilerConfig
 from aether.compiler.report import QualityReport
+from aether.sdk import AetherClient, AetherHub
 
 __version__ = AETHER_VERSION
 
@@ -58,4 +59,7 @@ __all__ = [
     "Compiler",
     "CompilerConfig",
     "QualityReport",
+    # SDK
+    "AetherClient",
+    "AetherHub",
 ]

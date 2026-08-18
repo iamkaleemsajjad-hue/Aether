@@ -208,6 +208,8 @@ class MDLMDrafter:
         self.context_layers = context_layers
         self._head: Any = None   # Loaded from .aeg/graph/mdlm_draft_head.*
         self._loaded = False
+        self.compiled_K: int | None = None
+        self.compiled_T: int | None = None
 
     def load(self, aeg_dir: str) -> bool:
         """Load compiled MDLM draft head from AEG artifact directory."""
@@ -217,6 +219,7 @@ class MDLMDrafter:
         aeg_path = Path(aeg_dir)
         head_config = aeg_path / "graph" / "mdlm_draft_head_config.json"
         head_weights = aeg_path / "graph" / "mdlm_draft_head.safetensors"
+        head_npz = aeg_path / "graph" / "mdlm_draft_head.npz"
 
         if not head_config.exists():
             logger.warning("R9: MDLM draft head config not found; pass 18 may not have run")
@@ -232,14 +235,38 @@ class MDLMDrafter:
             self.vocab_size = config.get("vocab_size", self.vocab_size)
             self.draft_hidden = config.get("draft_hidden", self.draft_hidden)
             self.context_layers = tuple(config.get("context_layers", list(self.context_layers)))
+            self.compiled_K = int(config.get("K_block", 0) or 0) or None
+            self.compiled_T = int(config.get("T_steps", 0) or 0) or None
 
-            if head_weights.exists():
+            if head_npz.exists():
+                import numpy as np
+
+                with np.load(head_npz, allow_pickle=False) as data:
+                    weights = {key: np.asarray(data[key], dtype=np.float32) for key in data.files}
+                self._head = _NumpyMDLMHead.from_weights(
+                    weights,
+                    vocab_size=int(self.vocab_size),
+                    hidden_size=int(config.get("hidden_size", self.hidden_size)),
+                    steps=int(config.get("T_steps", 1)),
+                )
+                logger.info("R9: NumPy CPU MDLM head loaded from %s", head_npz)
+            elif head_weights.exists():
                 try:
-                    import safetensors.torch as st
-                    self._weights = st.load_file(str(head_weights))
-                    logger.info("R9: MDLM draft head weights loaded from safetensors")
-                except ImportError:
-                    logger.warning("R9: safetensors not available; weights not loaded")
+                    from safetensors.numpy import load_file
+
+                    weights = load_file(str(head_weights))
+                    self._head = _NumpyMDLMHead.from_weights(
+                        weights,
+                        vocab_size=int(self.vocab_size),
+                        hidden_size=int(config.get("hidden_size", self.hidden_size)),
+                        steps=int(config.get("T_steps", 1)),
+                    )
+                    logger.info("R9: SafeTensors CPU MDLM head loaded")
+                except ImportError as exc:
+                    raise AetherRuntimeError("SafeTensors MDLM head requires safetensors") from exc
+            else:
+                logger.warning("R9: MDLM head config has no executable weight file")
+                return False
 
             self._loaded = True
             return True
@@ -256,8 +283,12 @@ class MDLMDrafter:
         Returns the noise level at denoising step t (out of T total steps).
         σ=1 is fully masked, σ=0 is fully denoised.
         """
-        # t counts from T down to 1; σ decreases as t decreases
-        return math.cos(math.pi / 2 * t / T) ** 2
+        if T <= 0 or t < 0 or t > T:
+            raise ValueError(f"invalid diffusion timestep t={t}, T={T}")
+        # Pass 18 stores alpha_t = cos²(pi*t/(2T)), the unmasked fraction.
+        # R9 iterates from t=T (all masked) down to t=1 (fully denoised), so
+        # this runtime API returns the complementary mask fraction.
+        return math.sin(math.pi / 2 * t / T) ** 2
 
     def unmask_logits(
         self,
@@ -346,7 +377,10 @@ class MDLMDrafter:
             # Determine how many positions to unmask at this step
             # Following MDLM absorbing mask process: unmask fraction (sigma - sigma_prev)
             unmasked_so_far = sum(1 for tok in block if tok != mask_token_id)
-            target_unmasked = max(0, int((1 - sigma) * K))
+            # The public loop ends at t=1; force the terminal denoising step
+            # to materialize every position so a mask sentinel can never
+            # leak into a supposedly complete draft block.
+            target_unmasked = K if t == 1 else max(0, int((1 - sigma) * K))
             to_unmask_count = max(0, target_unmasked - unmasked_so_far)
 
             if to_unmask_count == 0:
@@ -399,6 +433,103 @@ class MDLMDrafter:
             uncertainty=uncertainty_per_pos,
             latency_ms=(time.perf_counter() - t_start) * 1000,
         )
+
+
+class _NumpyMDLMHead:
+    """Small, deterministic CPU MDLM head used by persisted AEG bundles.
+
+    This is an actual neural computation, not a token or logit generator:
+    context states are projected, combined with the masked-token embedding and
+    timestep embedding, passed through ``tanh``, and projected to vocabulary
+    logits.  The weights are always supplied by the compiled artifact.
+    """
+
+    def __init__(self, weights: dict[str, Any], steps: int) -> None:
+        self.weights = weights
+        self.steps = steps
+
+    @classmethod
+    def from_weights(
+        cls,
+        weights: dict[str, Any],
+        *,
+        vocab_size: int,
+        hidden_size: int,
+        steps: int,
+    ) -> "_NumpyMDLMHead":
+        import numpy as np
+
+        required = {"token_embedding", "context_projection", "output_projection"}
+        missing = sorted(required - set(weights))
+        if missing:
+            raise ValueError(f"MDLM head missing tensors: {', '.join(missing)}")
+        normalized = {key: np.ascontiguousarray(value, dtype=np.float32) for key, value in weights.items()}
+        token = normalized["token_embedding"]
+        draft_hidden = int(token.shape[1]) if token.ndim == 2 else 0
+        if token.shape != (vocab_size, draft_hidden):
+            raise ValueError("MDLM token_embedding has invalid shape")
+        if normalized["context_projection"].shape != (hidden_size, draft_hidden):
+            raise ValueError("MDLM context_projection has invalid shape")
+        if normalized["output_projection"].shape != (draft_hidden, vocab_size):
+            raise ValueError("MDLM output_projection has invalid shape")
+        if "output_bias" in normalized and normalized["output_bias"].shape != (vocab_size,):
+            raise ValueError("MDLM output_bias has invalid shape")
+        if "time_embedding" in normalized:
+            shape = normalized["time_embedding"].shape
+            if shape not in {(steps + 1, draft_hidden), (draft_hidden,)}:
+                raise ValueError("MDLM time_embedding has invalid shape")
+        return cls(normalized, steps)
+
+    def forward(
+        self,
+        hidden_states: Any,
+        masked_block: list[int],
+        t: int,
+        T: int,
+        temperature: float,
+    ) -> list[list[float]]:
+        import numpy as np
+
+        states = np.asarray(hidden_states, dtype=np.float32)
+        if states.ndim == 3:
+            context = states[-1].mean(axis=0)
+        elif states.ndim == 2:
+            context = states.mean(axis=0)
+        elif states.ndim == 1:
+            context = states
+        else:
+            raise ValueError("hidden_states must have rank 1, 2, or 3")
+        projection = self.weights["context_projection"]
+        if context.shape != (projection.shape[0],):
+            raise ValueError(
+                f"MDLM hidden state width {context.shape[0]} does not match {projection.shape[0]}"
+            )
+        base = context @ projection
+        token_embedding = self.weights["token_embedding"]
+        timestep = self.weights.get("time_embedding")
+        if timestep is None:
+            time_vec = np.zeros(base.shape, dtype=np.float32)
+        elif timestep.ndim == 1:
+            time_vec = timestep
+        else:
+            time_vec = timestep[max(0, min(int(t), timestep.shape[0] - 1))]
+        output = self.weights["output_projection"]
+        bias = self.weights.get("output_bias")
+        result: list[list[float]] = []
+        for token_id in masked_block:
+            token_vec = (
+                np.zeros(base.shape, dtype=np.float32)
+                if token_id < 0 or token_id >= token_embedding.shape[0]
+                else token_embedding[token_id]
+            )
+            state = np.tanh(base + token_vec + time_vec)
+            logits = state @ output
+            if bias is not None:
+                logits = logits + bias
+            if temperature > 0 and temperature != 1.0:
+                logits = logits / float(temperature)
+            result.append(np.asarray(logits, dtype=np.float32).tolist())
+        return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -549,6 +680,14 @@ class DiffusionSpecEngine:
         loaded = self.drafter.load(aeg_dir)
         self._loaded = loaded
         if loaded:
+            # A compiled artifact owns the safe initial schedule.  Do not
+            # silently replace its K/T with runtime defaults after restart.
+            if self.drafter.compiled_K is not None:
+                self.scheduler.K = self.drafter.compiled_K
+                self.stats.current_K = self.drafter.compiled_K
+            if self.drafter.compiled_T is not None:
+                self.scheduler.T = self.drafter.compiled_T
+                self.stats.current_T = self.drafter.compiled_T
             logger.info("R9: DiffusionSpecEngine ready with MDLM draft head")
         else:
             logger.info("R9: DiffusionSpecEngine initialized without draft head (fallback mode)")

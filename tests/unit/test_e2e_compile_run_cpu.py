@@ -534,6 +534,10 @@ class TestFullCompilePipelineToCPU:
             optimization_level=1,
             targets=["cpu_avx512"],
             overwrite=True,
+            # This test deliberately uses a synthetic model id.  Do not turn
+            # a local unit test into an unbounded Hub/network integration
+            # test; real Hub ingestion is covered by the local artifact tests.
+            skip_download=True,
         )
         compiler = Compiler(config=config)
         pkg_path = tmp_path / "compiled.aeg"
@@ -562,7 +566,12 @@ class TestFullCompilePipelineToCPU:
         from aether.compiler.compiler import Compiler
         from aether.compiler.config import CompilerConfig
 
-        config = CompilerConfig(optimization_level=1, targets=["cpu_avx512"], overwrite=True)
+        config = CompilerConfig(
+            optimization_level=1,
+            targets=["cpu_avx512"],
+            overwrite=True,
+            skip_download=True,
+        )
         compiler = Compiler(config=config)
         pkg_path = tmp_path / "c2.aeg"
 

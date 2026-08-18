@@ -405,7 +405,7 @@ def detect_openvino() -> HardwareCapabilities:
             architecture="openvino",
             target_id="openvino_npu",
             reason="OpenVINO package not installed",
-            implemented=True,
+            implemented=False,
         )
 
 
@@ -774,6 +774,9 @@ def _unavailable_vendor_targets() -> list[HardwareCapabilities]:
             architecture=arch,
             target_id=target_id,
             reason=f"No {vendor} hardware or SDK present on this host",
-            implemented=True,
+            # These entries are capability placeholders only.  Marking them
+            # implemented made the detector overstate support even though no
+            # executable backend or vendor SDK was present.
+            implemented=False,
         ))
     return result

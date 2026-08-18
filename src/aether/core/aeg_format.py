@@ -49,6 +49,82 @@ def _safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
 
 
 @dataclass
+class ProvenanceInfo:
+    """Provenance information embedded in an AEG manifest.
+
+    Loaded from .aeg/provenance/manifest.json when present, otherwise
+    constructed from the manifest's own fields so the CLI safety command
+    always has a non-None provenance object to inspect.
+    """
+
+    source_model_id: str = ""
+    """Original source model identifier."""
+
+    compiler_version: str = ""
+    """Aether Runtime version that produced this AEG."""
+
+    compile_timestamp: float = 0.0
+    """Unix timestamp of compilation."""
+
+    model_hash: str = ""
+    """SHA-256 hash of the source model weights."""
+
+    aeg_hash: str = ""
+    """SHA-256 hash of the compiled AEG artifact."""
+
+    transformations: list[str] = field(default_factory=list)
+    """Names of optimizer passes applied during compilation."""
+
+    provenance_chain_hash: str = ""
+    """Hash of the full transformation chain."""
+
+    c2pa_binding: str = ""
+    """C2PA manifest URI for content authenticity."""
+
+    watermark_enabled: bool = False
+    """Whether the AEG carries an output watermark."""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_model_id": self.source_model_id,
+            "compiler_version": self.compiler_version,
+            "compile_timestamp": self.compile_timestamp,
+            "model_hash": self.model_hash,
+            "aeg_hash": self.aeg_hash,
+            "transformations": self.transformations,
+            "provenance_chain_hash": self.provenance_chain_hash,
+            "c2pa_binding": self.c2pa_binding,
+            "watermark_enabled": self.watermark_enabled,
+        }
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "ProvenanceInfo":
+        return ProvenanceInfo(
+            source_model_id=data.get("source_model_id", "") or data.get("source_model", {}).get("id", ""),
+            compiler_version=data.get("compiler_version", ""),
+            compile_timestamp=float(data.get("compile_timestamp", 0.0)),
+            model_hash=data.get("model_hash", "").replace("sha256:", ""),
+            aeg_hash=data.get("aeg_hash", "").replace("sha256:", ""),
+            transformations=list(data.get("transformations", [])),
+            provenance_chain_hash=data.get("provenance_chain_hash", ""),
+            c2pa_binding=data.get("c2pa_binding", ""),
+            watermark_enabled=bool(data.get("watermark", {}).get("enabled", data.get("watermark_enabled", False))),
+        )
+
+    @classmethod
+    def load_from_aeg(cls, aeg_root: "Path") -> "ProvenanceInfo":
+        """Load provenance from .aeg/provenance/manifest.json if it exists."""
+        p = aeg_root / "provenance" / "manifest.json"
+        if p.is_file():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                return cls.from_dict(data)
+            except Exception:  # noqa: BLE001
+                pass
+        return cls()
+
+
+@dataclass
 class OptimizationMetadata:
     """Metadata about the optimization applied during compilation."""
 
@@ -192,6 +268,14 @@ class AEGManifest:
     format_version: str = AEG_FORMAT_VERSION
     """AEG format version string."""
 
+    provenance: ProvenanceInfo = field(default_factory=ProvenanceInfo)
+    """Provenance metadata for this AEG artifact.
+
+    Populated from .aeg/provenance/manifest.json when the package is loaded.
+    Always non-None: defaults to an empty ProvenanceInfo if no provenance
+    file was recorded at compile time.
+    """
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "format_version": self.format_version,
@@ -205,6 +289,9 @@ class AEGManifest:
             "memory_requirements": self.memory_requirements.to_dict() if self.memory_requirements else None,
             "artifacts": self.artifacts,
             "manifest_hash": self.manifest_hash,
+            # NOTE: provenance is intentionally excluded here.
+            # It is stored in provenance/manifest.json and loaded at runtime;
+            # it must NOT be written into manifest.json to keep the hash stable.
         }
 
     def to_json(self, indent: int | None = None) -> str:
@@ -214,6 +301,8 @@ class AEGManifest:
     def from_dict(data: dict[str, Any]) -> AEGManifest:
         memory_data = data.get("memory_requirements")
         memory_requirements = MemoryRequirements.from_dict(memory_data) if memory_data else None
+        provenance_data = data.get("provenance")
+        provenance = ProvenanceInfo.from_dict(provenance_data) if provenance_data else ProvenanceInfo()
         return AEGManifest(
             model_id=data["model_id"],
             aether_version=data["aether_version"],
@@ -226,6 +315,7 @@ class AEGManifest:
             artifacts=dict(data.get("artifacts", {})),
             manifest_hash=data.get("manifest_hash"),
             format_version=data.get("format_version", AEG_FORMAT_VERSION),
+            provenance=provenance,
         )
 
     @staticmethod
@@ -454,6 +544,13 @@ class AEGPackage:
         # Tensors themselves stay lazy via weight_store(), keeping load() cheap
         # for large models.
         self._weight_store = None
+        # Load provenance from the dedicated provenance/manifest.json file if
+        # present.  The file has richer data than the lightweight summary stored
+        # in manifest.json, so prefer it; fall back to what from_dict already
+        # populated from the manifest when the file does not exist.
+        richer_prov = ProvenanceInfo.load_from_aeg(self.root)
+        if richer_prov.source_model_id or richer_prov.model_hash:
+            self.manifest.provenance = richer_prov
         # Load sharding plans
         parallelism_dir = self.root / "parallelism"
         if parallelism_dir.exists():
@@ -906,6 +1003,8 @@ class AEGPackage:
             elif pass_name == "mdlm_drafter_compilation":
                 payload = read_object("diffusion/drafter_config.json")
                 schedule = read_object("diffusion/schedule.json")
+                head = read_object("graph/mdlm_draft_head_config.json")
+                head_blob = require_file("graph/mdlm_draft_head.npz", nonempty=True)
                 if payload is not None:
                     if payload.get("type") != "mdlm_drafter":
                         errors.append("MDLM drafter payload has the wrong type")
@@ -914,6 +1013,14 @@ class AEGPackage:
                 if schedule is not None:
                     if not isinstance(schedule.get("alpha_t"), list) or not schedule["alpha_t"]:
                         errors.append("MDLM drafter schedule has no denoising coefficients")
+                if head is not None:
+                    require_format(head, "graph/mdlm_draft_head_config.json", "aether_mdlm_head_v1")
+                    if head.get("backend") != "numpy_cpu":
+                        errors.append("MDLM head does not declare the executable numpy_cpu backend")
+                    if head.get("weight_file") != "mdlm_draft_head.npz":
+                        errors.append("MDLM head has an invalid weight_file")
+                    if not isinstance(head.get("weight_keys"), list) or not head["weight_keys"]:
+                        errors.append("MDLM head has no declared weight keys")
             elif pass_name == "sub2bit_quantization":
                 payload = read_object("quantization/sub2bit_manifest.json")
                 if payload is not None:

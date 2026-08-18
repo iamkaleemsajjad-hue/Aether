@@ -379,10 +379,17 @@ class TestMultiProcessDistributed:
     @pytest.mark.timeout(15)
     def test_single_process_all_reduce(self):
         """Single-process case should work without any network setup."""
-        manager = multiprocessing.Manager()
+        # Use an explicit spawn context on Windows.  The implicit Manager
+        # context attempts to launch a helper process before the test has a
+        # usable inherited handle in restricted CI environments.
+        context = multiprocessing.get_context("spawn")
+        try:
+            manager = context.Manager()
+        except PermissionError as exc:
+            pytest.skip(f"process IPC is unavailable in this Windows environment: {exc}")
         results = manager.dict()
 
-        p = multiprocessing.Process(
+        p = context.Process(
             target=_worker_all_reduce,
             args=(0, 1, results)
         )
