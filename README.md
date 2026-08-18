@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo/logo.png" alt="Aether Runtime Logo" width="400">
+</p>
+
 # Aether Runtime
 
 > **Compile once. Run on any hardware, forever.**
