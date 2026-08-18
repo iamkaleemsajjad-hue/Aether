@@ -520,13 +520,17 @@ def test_cli_serve_exposes_real_tcp_api_for_local_aeg(
         assert body["text"]
         assert body["usage"]["completion_tokens"] == 2
     finally:
-        if process.poll() is None:
-            process.terminate()
+        if process.stdout:
             try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
+                process.stdout.close()
+            except Exception:
+                pass
+        if process.poll() is None:
+            process.kill()
+            try:
+                process.wait(timeout=5)
+            except Exception:
+                pass
 
 
 @pytest.mark.integration

@@ -135,7 +135,8 @@ class KernelEmitter:
             cuda_native = get_native_cuda_kernels(self.target_id)
             if not cuda_native._toolchain:
                 raise KernelError(
-                    f"CUDA compiler (nvcc) not available for target {self.target_id!r}",
+                    f"CUDA compiler (nvcc) not available for target {self.target_id!r}; "
+                    "executable kernel generation is not implemented on this host",
                     details={"target_id": self.target_id},
                 )
             if not cuda_native.compile() or cuda_native._library_path is None:

@@ -132,7 +132,7 @@ class HubClient:
         hub_url: str = DEFAULT_HUB_URL,
         auth_token: str | None = None,
         timeout_s: int = 30,
-        allow_local_cache: bool = False,
+        allow_local_cache: bool = True,
     ) -> None:
         self.hub_url = hub_url.rstrip("/")
         self.auth_token = auth_token

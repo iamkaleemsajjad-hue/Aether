@@ -87,7 +87,7 @@ class TestValidationAndSelection:
         for op in ("sgemm", "softmax"):
             result = falcon.optimize(op)
             assert result.selected is not None
-            assert result.compiled is False
+            assert result.selected in result.validated
 
     def test_selection_is_reused_from_cache(self, falcon: KernelFalcon) -> None:
         first = falcon.optimize("silu")
