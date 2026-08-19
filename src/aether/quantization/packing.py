@@ -44,6 +44,17 @@ class BitPacker:
             return np.zeros(0, dtype=np.uint8)
         if self.bit_width >= 8:
             return flat.copy()
+        
+        # For large arrays, pack in 1M element chunks to keep memory footprint minimal
+        chunk_size = 1_048_576
+        if flat.size > chunk_size:
+            out_chunks = []
+            for i in range(0, flat.size, chunk_size):
+                chunk = flat[i : i + chunk_size]
+                bits = np.unpackbits(chunk[:, None], axis=1, bitorder="little")[:, : self.bit_width]
+                out_chunks.append(np.packbits(bits.reshape(-1), bitorder="little"))
+            return np.concatenate(out_chunks)
+
         # Expand each byte to its 8 little-endian bits, keep the low bit_width.
         bits = np.unpackbits(flat[:, None], axis=1, bitorder="little")[:, : self.bit_width]
         return np.packbits(bits.reshape(-1), bitorder="little")
@@ -71,6 +82,37 @@ class BitPacker:
                 msg = f"packed buffer holds {buf.size} elements, need {count}"
                 raise ValueError(msg)
             return buf[:count].copy()
+
+        if self.bit_width == 4:
+            needed_bytes = (count + 1) // 2
+            slice_buf = buf[:needed_bytes]
+            low = slice_buf & np.uint8(0x0F)
+            high = (slice_buf >> np.uint8(4)) & np.uint8(0x0F)
+            return np.column_stack([low, high]).ravel()[:count]
+
+        if self.bit_width == 2:
+            needed_bytes = (count + 3) // 4
+            slice_buf = buf[:needed_bytes]
+            c0 = slice_buf & np.uint8(0x03)
+            c1 = (slice_buf >> np.uint8(2)) & np.uint8(0x03)
+            c2 = (slice_buf >> np.uint8(4)) & np.uint8(0x03)
+            c3 = (slice_buf >> np.uint8(6)) & np.uint8(0x03)
+            return np.column_stack([c0, c1, c2, c3]).ravel()[:count]
+
+        chunk_size = 1048576
+        if count > chunk_size:
+            out_chunks = []
+            for i in range(0, count, chunk_size):
+                curr_count = min(chunk_size, count - i)
+                curr_needed_bits = curr_count * self.bit_width
+                curr_byte_start = (i * self.bit_width) // 8
+                curr_byte_end = ((i + curr_count) * self.bit_width + 7) // 8
+                curr_buf = buf[curr_byte_start:curr_byte_end]
+                bits = np.unpackbits(curr_buf, bitorder="little")[:curr_needed_bits].reshape(curr_count, self.bit_width)
+                padded = np.zeros((curr_count, 8), dtype=np.uint8)
+                padded[:, : self.bit_width] = bits
+                out_chunks.append(np.packbits(padded, axis=1, bitorder="little").reshape(-1))
+            return np.concatenate(out_chunks)
 
         needed_bits = count * self.bit_width
         if buf.size * 8 < needed_bits:

@@ -181,7 +181,11 @@ class SafeTensorsLoader:
         import numpy as _np
 
         def _to_numpy(tensor: Any) -> Any:
-            return tensor if isinstance(tensor, _np.ndarray) else _np.asarray(tensor)
+            if isinstance(tensor, _np.ndarray):
+                return tensor
+            if hasattr(tensor, "float") and getattr(tensor, "dtype", None) is not None and str(tensor.dtype).endswith("bfloat16"):
+                tensor = tensor.float()
+            return tensor.numpy() if hasattr(tensor, "numpy") else _np.asarray(tensor)
 
         sample_keys = list(loaded_keys)[:10]  # Check first 10 tensors
         for key in sample_keys:

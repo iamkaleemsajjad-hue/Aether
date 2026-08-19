@@ -145,9 +145,14 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
             f"{manifest_vocab} but the embedding tensor has {int(embedding.shape[0])} rows"
         )
     for name, tensor in ((k, v) for k, v in tensors.items() if k[0] is not None):
-        if tensor.ndim == 2 and name[1] in ("q_proj", "k_proj", "v_proj", "o_proj") and tensor.shape[1] != hidden_size:
+        if tensor.ndim == 2 and name[1] in ("q_proj", "k_proj", "v_proj") and tensor.shape[1] != hidden_size:
             raise AEGLoadError(
                 f"Layer {name[0]} {name[1]} input feature dimension {tensor.shape[1]} "
+                f"does not match hidden size {hidden_size}"
+            )
+        if tensor.ndim == 2 and name[1] == "o_proj" and tensor.shape[0] != hidden_size:
+            raise AEGLoadError(
+                f"Layer {name[0]} o_proj output feature dimension {tensor.shape[0]} "
                 f"does not match hidden size {hidden_size}"
             )
 
@@ -472,11 +477,11 @@ def _build_layer(
     that look valid while no longer representing the source model, so malformed
     or partial artifacts fail closed.
     """
-    head_dim = hidden_size // num_heads
+    q_proj = tensors.get((index, "q_proj"))
+    head_dim = (q_proj.shape[0] // num_heads) if q_proj is not None and q_proj.ndim == 2 else (hidden_size // num_heads)
     kv_dim = num_kv_heads * head_dim
     intermediate = _infer_intermediate(tensors, index, hidden_size)
 
-    q_proj = tensors.get((index, "q_proj"))
     k_proj = tensors.get((index, "k_proj"))
     v_proj = tensors.get((index, "v_proj"))
     fused = tensors.get((index, "qkv"))

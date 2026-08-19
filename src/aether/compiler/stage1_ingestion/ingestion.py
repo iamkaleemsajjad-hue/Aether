@@ -477,13 +477,11 @@ class IngestionPipeline:
         unresolvable: list[str] = []
         for name, tensor in tensors.items():
             key = self._normalise_weight_name(name)
-            # A key without a component identifies nothing: several unrelated
-            # names reduce to (layer, None), which would match each other.
-            # Such tensors stay visible in the accounting instead of silently
-            # disappearing from both the bound and unbound counts.
             if key[1] is None:
                 unresolvable.append(name)
                 continue
+            if hasattr(tensor, "float") and getattr(tensor, "dtype", None) is not None and str(tensor.dtype).endswith("bfloat16"):
+                tensor = tensor.float()
             value = tensor.numpy() if hasattr(tensor, "numpy") else np.asarray(tensor)
             lookup.setdefault(key, []).append((name, value))
 
