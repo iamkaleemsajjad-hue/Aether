@@ -287,7 +287,10 @@ class CPUExecutionEngine:
                 f"num_kv_heads ({self.num_kv_heads}) for grouped-query attention"
             )
             raise ValueError(msg)
-        self.head_dim = weights.hidden_size // num_heads
+        if weights.layers and hasattr(weights.layers[0], "q_proj") and getattr(weights.layers[0], "q_proj") is not None:
+            self.head_dim = weights.layers[0].q_proj.shape[0] // num_heads
+        else:
+            self.head_dim = weights.hidden_size // num_heads
         if self.head_dim % 2 != 0:
             msg = f"head_dim must be even for RoPE, got {self.head_dim}"
             raise ValueError(msg)

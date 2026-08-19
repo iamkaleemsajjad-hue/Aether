@@ -692,8 +692,8 @@ class NativeCPUKernels:
         Returns:
             The product as a float32 array of shape ``(M, N)``.
         """
-        lhs = np.ascontiguousarray(a, dtype=np.float32)
-        rhs = np.ascontiguousarray(b, dtype=np.float32)
+        lhs = a if isinstance(a, np.ndarray) and a.dtype == np.float32 else np.asarray(a, dtype=np.float32)
+        rhs = b if isinstance(b, np.ndarray) and b.dtype == np.float32 else np.asarray(b, dtype=np.float32)
         if lhs.ndim != 2 or rhs.ndim != 2:
             msg = f"sgemm requires 2-D inputs, got {lhs.ndim}-D and {rhs.ndim}-D"
             raise ValueError(msg)
@@ -702,10 +702,12 @@ class NativeCPUKernels:
             raise ValueError(msg)
         if not force_native or not self.ensure_compiled():
             return (lhs @ rhs).astype(np.float32)
-        m, k = lhs.shape
-        n = rhs.shape[1]
+        lhs_c = np.ascontiguousarray(lhs)
+        rhs_c = np.ascontiguousarray(rhs)
+        m, k = lhs_c.shape
+        n = rhs_c.shape[1]
         out = np.empty((m, n), dtype=np.float32)
-        self._lib.aether_sgemm(lhs.reshape(-1), rhs.reshape(-1), out.reshape(-1), m, n, k)  # type: ignore[union-attr]
+        self._lib.aether_sgemm(lhs_c.reshape(-1), rhs_c.reshape(-1), out.reshape(-1), m, n, k)  # type: ignore[union-attr]
         return out
 
     def rope(

@@ -236,7 +236,25 @@ def quantize_tensor(weights: np.ndarray, precision: str, block_size: int = 32) -
         )
 
     blocks, n = _pad_to_blocks(arr.ravel(), block_size)
-    codes, scales, zero_points = codec.encode(blocks)
+    
+    # Process blocks in chunks to prevent large intermediate memory allocations
+    chunk_size = 32768
+    num_blocks = blocks.shape[0]
+    if num_blocks > chunk_size:
+        all_codes = []
+        all_scales = []
+        all_zp = []
+        for start_idx in range(0, num_blocks, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_blocks)
+            c, s, z = codec.encode(blocks[start_idx:end_idx])
+            all_codes.append(c)
+            all_scales.append(s)
+            all_zp.append(z)
+        codes = np.vstack(all_codes)
+        scales = np.concatenate(all_scales)
+        zero_points = np.concatenate(all_zp)
+    else:
+        codes, scales, zero_points = codec.encode(blocks)
 
     # Bit-pack sub-8-bit codes so compression is real rather than nominal.
     packed = False

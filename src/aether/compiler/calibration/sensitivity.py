@@ -126,14 +126,21 @@ class SensitivityCalibration:
             array = np.asarray(tensor, dtype=np.float32)
             if array.size < 2 or not np.isfinite(array).all():
                 continue
+            # For large checkpoint matrices, sample up to 16384 contiguous
+            # elements (64 full 256-element blocks) for fast Frobenius estimation
+            probe_array = array
+            if array.size > 16384:
+                n_blocks = min(64, array.size // 256)
+                if n_blocks > 0:
+                    probe_array = array.reshape(-1)[: n_blocks * 256]
             try:
-                reconstructed = dequantize_tensor(quantize_tensor(array, self.PROBE_PRECISION))
+                reconstructed = dequantize_tensor(quantize_tensor(probe_array, self.PROBE_PRECISION))
             except Exception:  # noqa: BLE001 - unsupported shape/precision: skip
                 continue
-            denominator = float(np.linalg.norm(array))
+            denominator = float(np.linalg.norm(probe_array))
             if denominator <= 0.0:
                 continue
-            errors.append(float(np.linalg.norm(array - reconstructed)) / denominator)
+            errors.append(float(np.linalg.norm(probe_array - reconstructed)) / denominator)
         return float(np.mean(errors)) if errors else 0.0
 
     def _normalize_delta(self, delta: float) -> float:
