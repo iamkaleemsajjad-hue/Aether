@@ -118,9 +118,9 @@ BACKEND_BY_TARGET: dict[str, list[str]] = {
     "rocm_cdna3": ["vllm", "pytorch"],
     "openvino_npu": ["onnxruntime", "pytorch"],
     "qualcomm_qnn": ["onnxruntime", "pytorch"],
-    "cpu_avx512": ["llama.cpp", "onnxruntime", "pytorch"],
+    "cpu_avx512": ["aether_cpu", "llama.cpp", "onnxruntime", "pytorch"],
     "cpu_avx2": ["llama.cpp", "onnxruntime", "aether_cpu"],
-    "cpu_neon": ["llama.cpp", "onnxruntime", "pytorch"],
+    "cpu_neon": ["aether_cpu", "llama.cpp", "onnxruntime", "pytorch"],
     # v4.0
     "cuda_sm130": ["vllm", "pytorch", "tensorrt-llm"],
     "cuda_sm100_tee": ["pytorch"],   # TEE requires dedicated backend
@@ -133,8 +133,8 @@ BACKEND_BY_TARGET: dict[str, list[str]] = {
     # v5.0
     "cuda_sm100_gb300": ["vllm", "pytorch", "tensorrt-llm"],
     "rocm_cdna5_mi455x": ["vllm", "pytorch"],
-    "cpu_avx512_ternary": ["bitnet.cpp", "llama.cpp"],
-    "cpu_neon_ternary": ["bitnet.cpp", "llama.cpp"],
+    "cpu_avx512_ternary": ["aether_cpu", "bitnet.cpp", "llama.cpp"],
+    "cpu_neon_ternary": ["aether_cpu", "bitnet.cpp", "llama.cpp"],
     "fpga_ternary": ["bitnet.cpp"],
     "riscv_cervell": ["onnxruntime"],
 }

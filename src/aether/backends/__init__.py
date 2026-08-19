@@ -28,12 +28,14 @@ from aether.backends.hardware_detector import (
     validate_backend_environment,
 )
 from aether.backends.registry import BackendRegistry
+from aether.backends.native_cpu_backend import NativeCPUBackend
 
 __all__ = [
     # Base
     "Backend",
     "BackendInfo",
     "BackendRegistry",
+    "NativeCPUBackend",
     "GenerationRequest",
     "GenerationResult",
     # Capability model (PRD §12)

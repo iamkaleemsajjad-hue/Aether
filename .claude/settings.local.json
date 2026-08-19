@@ -102,7 +102,11 @@
       "Bash(python -m pytest tests/ -v --co -q)",
       "Bash(python -m pytest tests/ --tb=no -q)",
       "Bash(python -m pytest tests/unit/test_gguf_kquant.py -v --tb=short)",
-      "Bash(awk '{print $9, \"\\(\" $5 \"\\)\"}')"
+      "Bash(awk '{print $9, \"\\(\" $5 \"\\)\"}')",
+      "Bash(pip list *)",
+      "Bash(aether *)",
+      "Bash(pip show *)",
+      "Bash(tee compile_test.log)"
     ]
   }
 }

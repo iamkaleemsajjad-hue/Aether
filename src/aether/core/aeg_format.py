@@ -573,10 +573,10 @@ class AEGPackage:
         if not self.manifest:
             msg = "Cannot save AEG package without a manifest"
             raise AEGFormatError(msg)
-        # Update timestamp
-        import datetime
-
-        self.manifest.compiled_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        # ``Compiler`` sets compiled_at from the real build start (or the
+        # reproducible SOURCE_DATE_EPOCH). Do not overwrite it on subsequent
+        # saves such as evaluation-gate finalization; doing so made identical
+        # builds differ merely because the package was saved twice.
         # Ensure directories
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "graph").mkdir(exist_ok=True)

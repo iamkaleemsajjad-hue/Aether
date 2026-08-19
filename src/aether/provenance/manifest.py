@@ -86,7 +86,10 @@ class HardwareCertification:
     """Hardware targets this AEG is certified to run on."""
     certified_targets: list[str] = field(default_factory=list)
     primary_target: str = "cuda"
-    eval_gate_passed: bool = True
+    # Certification is evidence, not a default. An artifact without measured
+    # evaluation remains explicitly uncertified until a real evaluator records
+    # benchmark results and the quality gate passes.
+    eval_gate_passed: bool = False
     eval_ppl_regression: float = 0.0    # measured PPL regression vs BF16 baseline
 
     def to_dict(self) -> dict[str, Any]:
@@ -115,7 +118,7 @@ class ProvenanceManifest:
 
     # Compiler
     compiler_version: str = "aether/3.1.0"
-    compile_timestamp: float = field(default_factory=time.time)
+    compile_timestamp: float | None = field(default_factory=time.time)
     transformations: list[TransformationRecord] = field(default_factory=list)
 
     # Content binding
@@ -139,7 +142,7 @@ class ProvenanceManifest:
     version: str = "provenance/1.0"
 
     def __post_init__(self) -> None:
-        if not self.compile_timestamp:
+        if self.compile_timestamp is None:
             self.compile_timestamp = time.time()
         if not self.model_hash:
             # An unset hash would serialize as a bare "sha256:" prefix. Derive a
@@ -230,6 +233,7 @@ class ProvenanceManifest:
                 pass_name=t.get("pass", ""),
                 version=t.get("version", "1.0"),
                 parameters=t.get("parameters", {}),
+                timestamp=float(t.get("timestamp", 0.0)),
             ))
         eu = d.get("eu_ai_act", {})
         pm.eu_ai_act = EUAIActRecord(
@@ -241,7 +245,7 @@ class ProvenanceManifest:
         pm.hardware_certification = HardwareCertification(
             certified_targets=hw.get("certified_targets", []),
             primary_target=hw.get("primary_target", "cuda"),
-            eval_gate_passed=hw.get("eval_gate_passed", True),
+            eval_gate_passed=hw.get("eval_gate_passed", False),
         )
         wm = d.get("watermark", {})
         pm.watermark_enabled = wm.get("enabled", False)
@@ -272,6 +276,7 @@ class ProvenanceManifest:
             hardware_certification=HardwareCertification(
                 certified_targets=certified_targets or ["cpu"],
                 primary_target=(certified_targets or ["cpu"])[0],
+                eval_gate_passed=bool(eval_results),
             ),
         )
 

@@ -33,11 +33,13 @@ def create_app(config: RuntimeConfig | None = None) -> Any:
         from fastapi.middleware.cors import CORSMiddleware
         from aether.server.middleware import (
             AuthMiddleware,
+            MetricsMiddleware,
             RequestIDMiddleware,
             TimingMiddleware,
         )
+        from aether.server.metrics import ServerMetrics
     except ImportError:
-        msg = "fastapi is required for the server. Install with: pip install aether-runtime"
+        msg = "fastapi is required for the server. Install with: pip install 'aether-runtime[server]'"
         raise ImportError(msg)
 
     runtime = Runtime(config)
@@ -52,6 +54,7 @@ def create_app(config: RuntimeConfig | None = None) -> Any:
     # and process supervisors) so REST and non-HTTP APIs share model/cache
     # state rather than silently constructing independent runtimes.
     app.state.aether_runtime = runtime
+    app.state.server_metrics = ServerMetrics()
 
     configured_origins = [origin.strip() for origin in os.environ.get(
         "AETHER_CORS_ORIGINS", "http://localhost,http://127.0.0.1"
@@ -69,6 +72,7 @@ def create_app(config: RuntimeConfig | None = None) -> Any:
     # clients.
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(TimingMiddleware)
+    app.add_middleware(MetricsMiddleware, metrics=app.state.server_metrics)
     api_keys = [key.strip() for key in os.environ.get("AETHER_API_KEYS", "").split(",") if key.strip()]
     app.add_middleware(AuthMiddleware, api_keys=api_keys)
 

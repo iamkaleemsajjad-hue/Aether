@@ -27,6 +27,7 @@ class BackendRegistry:
     def _discover_backends(self) -> None:
         """Discover backends from built-in list and entry points."""
         builtin_backends = [
+            "aether.backends.native_cpu_backend:NativeCPUBackend",
             "aether.backends.torch_backend:TorchBackend",
             "aether.backends.onnx_backend:ONNXBackend",
             "aether.backends.vllm_backend:vLLMBackend",
