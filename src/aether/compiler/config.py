@@ -67,6 +67,15 @@ class CompilerConfig:
     targets: list[str] = field(default_factory=lambda: ["auto"])
     """Target hardware identifiers. 'auto' means detect current hardware."""
 
+    reproducible_builds: bool = False
+    """Emit byte-identical artifacts when ``SOURCE_DATE_EPOCH`` is set.
+
+    Normal builds retain their real compilation timestamp. Reproducible
+    builds use the standard ``SOURCE_DATE_EPOCH`` value for persisted
+    provenance timestamps, allowing content-addressed AEGs to be rebuilt
+    deterministically without inventing timestamps in ordinary deployments.
+    """
+
     optimization_level: int = DEFAULT_OPTIMIZATION_LEVEL
     """Optimization level: 0=none, 1=basic, 2=full, 3=aggressive."""
 

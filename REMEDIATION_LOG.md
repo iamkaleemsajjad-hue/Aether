@@ -541,3 +541,78 @@ Verification after item 20:
    - Focused R9, Pass 22, SDK, CLI, REST, and GRPO tests remain green after
      the schedule and video dispatch changes.
    - The protected `audit v2.md` SHA-256 remains unchanged.
+
+22. Framework-free packaged AEG CPU backend
+   - Added `src/aether/backends/native_cpu_backend.py` and registered the
+     `aether_cpu` backend before optional framework backends. A packaged AEG
+     now loads its serialized tokenizer and executes through the native
+     `CPUExecutionEngine` without importing PyTorch or Transformers.
+   - CPU target selection in `Runtime` explicitly chooses this backend for
+     packaged AEGs unless the caller requests another backend. The base
+     package declares `tokenizers` because tokenizer execution is part of the
+     self-contained AEG contract.
+   - The packaged tokenizer exposes `len()` and `get_vocab_size()` so
+     tokenizer-aware grammar fingerprints are verified after process restart.
+
+Verification after item 22:
+  - Local SafeTensors -> AEG -> fresh runtime -> native CPU generation:
+    **passed**.
+  - Clean virtual environment import check: `torch` absent before and after
+    importing `aether`; packaged AEG generated real token IDs with backend
+    `aether_cpu`: **passed**.
+  - Persisted grammar/optimizer integration test: **1 passed** after fixing
+    the tokenizer contract regression.
+
+23. Truthful evaluation certification
+   - Compilation without a supplied evaluator marks the artifact
+     `evaluation_status=uncertified` and provenance `eval_gate_passed=false`;
+     an empty evaluation result cannot imply quality certification.
+   - A supplied evaluator persists benchmark results and only allows a
+     certified artifact when its configured gate passes. Failed-evaluation
+     artifacts are blocked by the native CPU loader as well as the compiler.
+
+Verification after item 23:
+  - Evaluation gate regression tests: **2 passed**.
+  - Failed-evaluation artifact load is rejected with a controlled integrity /
+    evaluation error: **passed**.
+
+24. Reproducible AEG builds
+   - Added `CompilerConfig.reproducible_builds`. When enabled, compilation
+     requires a valid `SOURCE_DATE_EPOCH`; provenance, transformation records,
+     manifest timestamps, and package saves use that fixed timestamp.
+   - Normal builds retain real build timestamps. Re-saving an AEG no longer
+     mutates its compilation timestamp, so metadata updates do not change the
+     build identity.
+
+Verification after item 24:
+  - Two independent fixed-epoch compilations produced identical directory
+    hashes and zero differing files: **passed**.
+  - `compileall` and `git diff --check`: **passed**.
+
+25. Production observability and installation diagnostics
+   - Attached `MetricsMiddleware` to the FastAPI application; the real app
+     exposes Prometheus-compatible metrics at `/v1/metrics`.
+   - The base CPU installation treats absent PyTorch as optional while
+     retaining the optional `aether-runtime[pytorch]` extra. `aether doctor`
+     reports 10/10 checks passed for a clean CPU install without claiming
+     PyTorch is present.
+
+Verification after item 25:
+  - FastAPI TestClient `/health` and `/v1/metrics`: HTTP **200**; middleware
+    attached and request metrics collected.
+  - Clean installed package `aether doctor --json`: **10/10 passed**.
+  - Clean installed package AEG-only generation without PyTorch:
+    **passed**, backend `aether_cpu`.
+
+26. Full regression and external-gate result
+   - Full repository suite after the tokenizer fix:
+     **2669 passed, 21 skipped, 3 warnings, 0 failures** in 544.69 seconds.
+   - The exact mandatory `Qwen/Qwen3-0.6B` acceptance model could not be
+     downloaded because Hugging Face returned HTTP 429 for repository
+     metadata and direct immutable file resolution. No alternate model was
+     substituted; this gate remains **UNVERIFIED — EXTERNAL NETWORK ACCESS
+     REQUIRED**.
+   - CUDA, ROCm, Metal, OpenVINO/NPU, QNN, RISC-V, FPGA, TEE hardware, CXL,
+     and RDMA/NIXL remain **UNVERIFIED — HARDWARE/SDK REQUIRED** on this
+     Windows CPU host. Simulations and capability profiles are not reported
+     as physical production validation.

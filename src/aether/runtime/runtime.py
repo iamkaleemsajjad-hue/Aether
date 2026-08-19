@@ -531,6 +531,23 @@ class Runtime:
                         "ONNX Runtime is required to execute .onnx models",
                         backend_name="onnx",
                     )
+            elif aeg_path is not None and self.config.backend_name is None:
+                # A packaged AEG is already the compiler's executable
+                # contract. On CPU, prefer Aether's framework-free engine so a
+                # clean base installation does not route a native artifact
+                # through an optional PyTorch wrapper.
+                target = self.fingerprint.target_id
+                if target.startswith("cpu_"):
+                    native = self.backend_registry.get_backend("aether_cpu")
+                    if native is None or not native.is_available():
+                        raise BackendNotAvailableError(
+                            "The base installation could not load its native CPU backend",
+                            backend_name="aether_cpu",
+                            target_id=target,
+                        )
+                    backend = native
+                else:
+                    backend = self._resolve_backend(model_id=model_id)
             else:
                 backend = self._resolve_backend(model_id=model_id)
             self._loaded_models[model_id] = backend.load_model(

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -421,8 +422,27 @@ class Compiler:
         Raises:
             CompilationError: If compilation fails.
         """
-        start_time = datetime.datetime.now(datetime.timezone.utc)
         config = self.config.clone()
+        if config.reproducible_builds:
+            raw_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+            if raw_epoch is None:
+                raise CompilationError(
+                    "reproducible_builds=True requires SOURCE_DATE_EPOCH",
+                    model_id=model,
+                    stage="configuration",
+                )
+            try:
+                start_time = datetime.datetime.fromtimestamp(
+                    int(raw_epoch), tz=datetime.timezone.utc
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise CompilationError(
+                    "SOURCE_DATE_EPOCH must be a valid integer Unix timestamp",
+                    model_id=model,
+                    stage="configuration",
+                ) from exc
+        else:
+            start_time = datetime.datetime.now(datetime.timezone.utc)
         if targets is not None:
             config.targets = targets
         if quality_budget is not None:
@@ -514,6 +534,18 @@ class Compiler:
 
         shutil.rmtree(pass_artifact_dir, ignore_errors=True)
 
+        # A missing evaluator is not a passing quality gate. Preserve a
+        # truthful uncertified state in the artifact until measured benchmark
+        # evidence is supplied below.
+        package.metadata["evaluation_status"] = "uncertified"
+        provenance_payload = package.metadata.get("provenance")
+        if isinstance(provenance_payload, dict):
+            hardware_payload = provenance_payload.setdefault("hardware_certification", {})
+            if isinstance(hardware_payload, dict):
+                hardware_payload["eval_gate_passed"] = False
+        package.save()
+        package.verify_integrity()
+
         if evaluation_evaluator is not None:
             if not callable(evaluation_evaluator):
                 raise CompilationError(
@@ -539,6 +571,23 @@ class Compiler:
                     evaluator=evaluation_evaluator,
                 ).run(list(benchmarks), baselines=eval_baselines)
                 package.metadata["eval_report"] = quality_report.to_dict()
+                package.metadata["evaluation_status"] = (
+                    "certified" if quality_report.gate_decision.passed else "rejected"
+                )
+                provenance_payload = package.metadata.get("provenance")
+                if isinstance(provenance_payload, dict):
+                    hardware_payload = provenance_payload.setdefault("hardware_certification", {})
+                    if isinstance(hardware_payload, dict):
+                        hardware_payload["eval_gate_passed"] = bool(
+                            quality_report.gate_decision.passed
+                        )
+                    benchmark_rows = quality_report.to_dict().get("benchmarks", [])
+                    if isinstance(benchmark_rows, list):
+                        provenance_payload["eval_results"] = {
+                            str(row.get("benchmark")): float(row.get("score", 0.0))
+                            for row in benchmark_rows
+                            if isinstance(row, dict) and row.get("benchmark") is not None
+                        }
                 # Re-save so the report is included in the manifest's declared
                 # artifact hashes and survives a process restart.
                 package.save()
@@ -850,10 +899,12 @@ class Compiler:
             source_model_id=model_id,
             model_architecture=architecture.family,
             compiler_version=f"aether/{AETHER_VERSION}",
+            compile_timestamp=start_time.timestamp(),
             transformations=[
                 TransformationRecord(
                     pass_name=report.pass_name,
                     parameters={"status": report.status},
+                    timestamp=start_time.timestamp(),
                 )
                 for report in pass_reports
             ],

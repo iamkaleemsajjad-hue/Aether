@@ -1894,8 +1894,11 @@ def doctor(as_json: bool) -> None:
     except ImportError:
         report["checks"].append({
             "name": "optional:torch",
-            "status": "warn",
-            "detail": "not installed; install aether-runtime[pytorch] for PyTorch model execution",
+            # Torch is an optional frontend/backend. Its absence is healthy
+            # for the framework-free CPU/AEG product path and must not make a
+            # clean CPU installation look broken.
+            "status": "pass",
+            "detail": "not installed; optional aether-runtime[pytorch] extra is available",
         })
 
     # Hardware detection
