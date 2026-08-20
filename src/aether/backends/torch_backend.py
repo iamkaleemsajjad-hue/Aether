@@ -76,6 +76,7 @@ class TorchBackend(Backend):
         self._models: dict[str, Any] = {}
         self._tokenizers: dict[str, Any] = {}
         self._device: str = "cpu"
+        self._runtime_family: str = "cpu"
         self._allow_remote_code = False
         self._try_detect_device()
 
@@ -85,12 +86,19 @@ class TorchBackend(Backend):
             import torch
             if torch.cuda.is_available():
                 self._device = "cuda"
+                # ROCm is exposed as torch.cuda in many PyTorch builds.  The
+                # tensor device remains ``cuda`` but dispatch must distinguish
+                # the vendor runtime.
+                self._runtime_family = "rocm" if getattr(torch.version, "hip", None) else "cuda"
             elif torch.backends.mps.is_available():
                 self._device = "mps"
+                self._runtime_family = "metal"
             else:
                 self._device = "cpu"
+                self._runtime_family = "cpu"
         except ImportError:
             self._device = "cpu"
+            self._runtime_family = "cpu"
 
     def is_available(self) -> bool:
         """Return True if PyTorch and transformers are installed."""
@@ -100,6 +108,20 @@ class TorchBackend(Backend):
             return True
         except ImportError:
             return False
+
+    def available_for_target(self, target_id: str) -> bool:
+        """Require an installed PyTorch package and a matching device runtime."""
+        if not self.is_available():
+            return False
+        if target_id.startswith("cpu_"):
+            return self._runtime_family == "cpu"
+        if target_id.startswith("cuda_"):
+            return self._runtime_family == "cuda"
+        if target_id.startswith("rocm_"):
+            return self._runtime_family == "rocm"
+        if target_id.startswith("metal_"):
+            return self._runtime_family == "metal"
+        return target_id in self.info.supported_targets
 
     def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
         """Load a model and tokenizer from HuggingFace or local path.
@@ -206,6 +228,39 @@ class TorchBackend(Backend):
             lora_adapters = load_compiled_lora_adapters(root)
             if package_is_runnable(package):
                 engine = load_engine_from_path(root)
+                if self._device != "cpu":
+                    if not package.supports_portable_backend("pytorch"):
+                        raise BackendError(
+                            "this AEG has no verified PyTorch portable execution contract "
+                            f"for device {self._device!r}; accelerator target plans are not executable kernels",
+                            backend_name=self.name,
+                        )
+                    from aether.runtime.torch_engine import TorchAEGEngine, TorchHybridAEGEngine
+                    from aether.runtime.torch_state_engine import (
+                        TorchMLAAEGEngine, TorchMambaAEGEngine,
+                        TorchMamba2AEGEngine, TorchRWKVAEGEngine,
+                    )
+                    from aether.runtime.torch_transformer_engine import (
+                        TorchEncoderAEGEngine, TorchSeq2SeqAEGEngine,
+                    )
+
+                    engine_kind = engine.__class__.__name__
+                    if engine_kind == "EncoderExecutionEngine":
+                        engine = TorchEncoderAEGEngine(engine, self._device)
+                    elif engine_kind == "Seq2SeqExecutionEngine":
+                        engine = TorchSeq2SeqAEGEngine(engine, self._device)
+                    elif engine_kind == "HybridExecutionEngine":
+                        engine = TorchHybridAEGEngine(engine, self._device)
+                    elif engine_kind == "MLAExecutionEngine":
+                        engine = TorchMLAAEGEngine(engine, self._device)
+                    elif engine_kind == "MambaExecutionEngine":
+                        engine = TorchMambaAEGEngine(engine, self._device)
+                    elif engine_kind == "Mamba2ExecutionEngine":
+                        engine = TorchMamba2AEGEngine(engine, self._device)
+                    elif engine_kind == "RWKVExecutionEngine":
+                        engine = TorchRWKVAEGEngine(engine, self._device)
+                    else:
+                        engine = TorchAEGEngine(engine, self._device)
                 tokenizer_root = root / "tokenizer"
                 if tokenizer_root.exists():
                     from transformers import AutoTokenizer
@@ -526,7 +581,7 @@ class TorchBackend(Backend):
                 metrics={
                     "ttft_ms": elapsed * 1000.0,
                     "throughput_tps": len(generated_ids) / max(elapsed, 1e-9),
-                    "device": "cpu",
+                    "device": str(getattr(execution_engine, "device", self._device)),
                     "kv_reuse": reused_tokens > 0,
                     "kv_reused_tokens": reused_tokens,
                     "multi_agent_kv_reuse": multi_agent_reused_tokens > 0,

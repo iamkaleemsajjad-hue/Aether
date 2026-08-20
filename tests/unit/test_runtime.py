@@ -140,7 +140,14 @@ class TestTreeSpeculativeEngine:
 
     def test_draft_model_selection(self) -> None:
         engine = TreeSpeculativeEngine(target_model_id="Qwen/Qwen3-72B")
-        assert engine.draft_model_id == "qwen3-1.5b"
+        assert engine.draft_model_id is None
+
+    def test_explicit_draft_model_is_preserved(self) -> None:
+        engine = TreeSpeculativeEngine(
+            target_model_id="any/family-model",
+            draft_model_id="local/compatible-draft",
+        )
+        assert engine.draft_model_id == "local/compatible-draft"
 
     def test_draft_model_selection_unknown(self) -> None:
         engine = TreeSpeculativeEngine(target_model_id="unknown/model")

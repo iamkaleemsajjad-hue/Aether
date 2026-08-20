@@ -461,6 +461,122 @@ def create_router(runtime: Runtime) -> Any:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+    @router.post("/chat/completions", tags=["Chat"])
+    async def chat_completions(req: ChatRequest):
+        """OpenAI Chat Completions compatibility endpoint.
+
+        ``/v1/chat`` remains Aether's compact response contract.  This route
+        uses the conventional OpenAI path and response envelope so existing
+        OpenAI-compatible clients can use a local AEG without an adapter.
+        """
+        try:
+            messages = [m.model_dump() for m in req.messages]
+            response_schema: dict[str, Any] | None = None
+            if req.response_format is not None:
+                if req.grammar:
+                    raise HTTPException(status_code=422, detail="grammar and response_format are mutually exclusive")
+                if req.response_format.get("type") != "json_schema":
+                    raise HTTPException(
+                        status_code=422,
+                        detail="response_format requires a tokenizer-aware json_schema constraint",
+                    )
+                schema_payload = req.response_format.get("json_schema")
+                if not isinstance(schema_payload, dict) or not isinstance(schema_payload.get("schema"), dict):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="response_format.json_schema.schema must be an object",
+                    )
+                response_schema = schema_payload["schema"]
+
+            if req.stream:
+                if req.grammar or response_schema is not None:
+                    stream = runtime.generate_constrained_stream(
+                        model_id=req.model,
+                        messages=messages,
+                        grammar=req.grammar,
+                        schema=response_schema,
+                        max_tokens=req.max_tokens,
+                        temperature=req.temperature,
+                        top_p=req.top_p,
+                        slo_deadline_ms=req.slo_deadline_ms,
+                    )
+                else:
+                    stream = runtime.generate_stream(
+                        model_id=req.model,
+                        messages=messages,
+                        max_tokens=req.max_tokens,
+                        temperature=req.temperature,
+                        top_p=req.top_p,
+                        slo_deadline_ms=req.slo_deadline_ms,
+                    )
+
+                completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+                created = int(time.time())
+
+                async def openai_event_stream() -> Any:
+                    try:
+                        for chunk in stream:
+                            payload = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": req.model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "content": chunk},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            yield f"data: {json.dumps(payload)}\n\n"
+                        payload = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": req.model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+                        yield "data: [DONE]\n\n"
+                    except Exception as exc:  # noqa: BLE001
+                        yield f"event: error\ndata: {json.dumps({'error': {'message': str(exc), 'type': 'server_error'}})}\n\n"
+
+                return StreamingResponse(openai_event_stream(), media_type="text/event-stream")
+
+            if req.grammar or response_schema is not None:
+                response = runtime.generate_constrained(
+                    model_id=req.model,
+                    messages=messages,
+                    grammar=req.grammar,
+                    schema=response_schema,
+                    max_tokens=req.max_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    slo_deadline_ms=req.slo_deadline_ms,
+                )
+            else:
+                response = runtime.chat(
+                    model_id=req.model,
+                    messages=messages,
+                    max_tokens=req.max_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    slo_deadline_ms=req.slo_deadline_ms,
+                )
+            return {
+                "id": f"chatcmpl-{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": req.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": response.text},
+                    "finish_reason": response.finish_reason,
+                }],
+                "usage": response.usage,
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     @router.post("/embeddings", tags=["Embeddings"])
     async def embeddings(req: EmbedRequest):
         """Embedding generation."""

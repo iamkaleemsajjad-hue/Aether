@@ -47,6 +47,7 @@ def aether_cache_dir(cache_dir: str | Path | None = None) -> Path:
         "config",
         "logs",
         "hub",
+        "safety",
     ]
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -56,8 +57,18 @@ def aether_cache_dir(cache_dir: str | Path | None = None) -> Path:
         # directory rather than failing before the model path is even known.
         root = Path(tempfile.gettempdir()) / "aether-runtime"
         root.mkdir(parents=True, exist_ok=True)
-    for subdir in subdirs:
-        (root / subdir).mkdir(parents=True, exist_ok=True)
+    try:
+        for subdir in subdirs:
+            (root / subdir).mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        # The root itself may exist while one of its application subfolders is
+        # ACL-protected (common in managed Windows profiles).  Treat that as
+        # the same cache failure and move the complete cache to a writable,
+        # process-independent fallback before returning.
+        root = Path(tempfile.gettempdir()) / "aether-runtime"
+        root.mkdir(parents=True, exist_ok=True)
+        for subdir in subdirs:
+            (root / subdir).mkdir(parents=True, exist_ok=True)
     return root
 
 

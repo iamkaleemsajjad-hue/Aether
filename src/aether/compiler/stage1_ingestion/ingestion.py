@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -144,7 +145,7 @@ class IngestionPipeline:
         arch_family = (getattr(architecture, "family", "") or "").lower()
         model_type = (config.get("model_type") or arch_family).lower()
 
-        def _qualified(result: dict[str, Any], loader_name: str) -> AEGGraph | None:
+        def _qualified(result: Any, loader_name: str) -> AEGGraph | None:
             """Wrap a specialised result and verify it can host the checkpoint.
 
             Returns the graph when it is runnable, otherwise ``None`` so the
@@ -153,6 +154,22 @@ class IngestionPipeline:
             guaranteeing compile-time invariants (every required tensor bound)
             never trade away the specialised loader's architectural insight.
             """
+            # Specialised loaders predate the AEGGraph API and a few of them
+            # still return a typed tuple (SSM) rather than the dictionary used
+            # by the graph-producing loaders.  Normalize that boundary here;
+            # otherwise a valid Mamba/RWKV config is silently treated as a
+            # loader failure and loses its capability metadata.
+            if isinstance(result, tuple) and len(result) == 2:
+                result = {
+                    "architecture": result[0],
+                    "nodes": result[1],
+                    "format": "ssm_model",
+                }
+            if not isinstance(result, dict):
+                raise IngestionError(
+                    f"{loader_name} returned an unsupported result type "
+                    f"{type(result).__name__}"
+                )
             candidate = self._wrap_specialised_result(result, architecture)
             attached = self._attach_checkpoint_weights(candidate, model, format_type)
             unbound = candidate.get_metadata("unbound_weight_names") or []
@@ -246,7 +263,7 @@ class IngestionPipeline:
             try:
                 from aether.compiler.stage1_ingestion.ssm_loader import SSMLoader
                 if path.exists():
-                    graph = _qualified(SSMLoader(path).load(), "SSMLoader")
+                    graph = _qualified(SSMLoader().load(path, config), "SSMLoader")
                     if graph is not None:
                         logger.info("Ingested via SSMLoader")
                         return graph
@@ -352,6 +369,13 @@ class IngestionPipeline:
         """
         if "graph" in result and isinstance(result["graph"], AEGGraph):
             graph = result["graph"]
+            # The specialised graph builders intentionally parse their own
+            # descriptor, but the compiler's source of truth is the
+            # architecture detected from the checkpoint config.  Preserve it
+            # on the graph so invariant checks, optimization and packaging do
+            # not operate on an architecture-less graph.
+            if getattr(graph, "architecture", None) is None:
+                graph.architecture = architecture
         else:
             # Fallback: construct a generic architecture graph
             graph = AEGGraph(
@@ -483,6 +507,7 @@ class IngestionPipeline:
             if hasattr(tensor, "float") and getattr(tensor, "dtype", None) is not None and str(tensor.dtype).endswith("bfloat16"):
                 tensor = tensor.float()
             value = tensor.numpy() if hasattr(tensor, "numpy") else np.asarray(tensor)
+            value = self._canonicalize_checkpoint_tensor(name, value, key[1], graph)
             lookup.setdefault(key, []).append((name, value))
 
         attached = 0
@@ -581,6 +606,18 @@ class IngestionPipeline:
                     ),
                 )
                 source_name, value = value_candidates[0]
+            packed_gate_up = (
+                key[1] == "gate_proj"
+                and "gate_up_proj" in source_name.lower()
+                and np.asarray(value).ndim == 2
+                and np.asarray(value).shape[0] % 2 == 0
+            )
+            if packed_gate_up:
+                packed = np.asarray(value)
+                split = packed.shape[0] // 2
+                value = packed[:split]
+                node.add_attribute("up_weight", packed[split:])
+                node.add_attribute("up_weight_source", source_name)
             node.add_attribute("weight", value)
             node.add_attribute("weight_shape", list(value.shape))
             node.add_attribute("weight_source", source_name)
@@ -603,12 +640,20 @@ class IngestionPipeline:
                 up_candidates = [
                     item
                     for item in candidates
-                    if "up_proj" in item[0].lower() or "ffn_up" in item[0].lower()
+                    if (
+                        "up_proj" in item[0].lower()
+                        or "ffn_up" in item[0].lower()
+                        or re.search(r"(?:^|[._])w3(?:[._]|$)", item[0].lower())
+                    )
                 ]
                 gate_candidates = [
                     item
                     for item in candidates
-                    if "gate_proj" in item[0].lower() or "ffn_gate" in item[0].lower()
+                    if (
+                        "gate_proj" in item[0].lower()
+                        or "ffn_gate" in item[0].lower()
+                        or re.search(r"(?:^|[._])w1(?:[._]|$)", item[0].lower())
+                    )
                 ]
                 if up_candidates and gate_candidates:
                     node.add_attribute("up_weight", up_candidates[0][1])
@@ -630,6 +675,31 @@ class IngestionPipeline:
         return attached
 
     @staticmethod
+    def _canonicalize_checkpoint_tensor(
+        name: str,
+        value: Any,
+        component: str | None,
+        graph: "AEGGraph",
+    ) -> Any:
+        """Convert known framework layouts to Aether's row-major convention.
+
+        Hugging Face's GPT-2 family stores ``Conv1D`` weights as
+        ``(in_features, out_features)`` while the rest of the Aether runtime
+        consumes linear weights as ``(out_features, in_features)``.  This is a
+        structural property of the checkpoint tensor name, not a model-name
+        special case, and is applied only to the GPT ``c_*`` layout.
+        """
+        import numpy as np
+
+        array = np.asarray(value)
+        lowered = name.lower()
+        if array.ndim != 2 or not any(marker in lowered for marker in ("c_attn", "c_fc", "c_proj")):
+            return value
+        if component in {"qkv", "gate_proj", "out_proj", "ffn"}:
+            return np.ascontiguousarray(array.T)
+        return value
+
+    @staticmethod
     def _attach_projection_biases(node: Any, candidates: list[tuple[str, Any]]) -> None:
         """Attach Q/K/V bias vectors to a fused projection node.
 
@@ -639,6 +709,27 @@ class IngestionPipeline:
         """
         for name, value in candidates:
             lowered = name.lower()
+            if "c_attn" in lowered or "query_key_value" in lowered or "qkv" in lowered:
+                import numpy as np
+                vector = np.asarray(value, dtype=np.float32).reshape(-1)
+                attrs = getattr(node, "attributes", {}) or {}
+                heads = int(attrs.get("num_heads", 0) or 0)
+                kv_heads = int(attrs.get("num_kv_heads", heads) or heads)
+                head_dim = int(attrs.get("head_dim", 0) or 0)
+                expected = (heads + 2 * kv_heads) * head_dim
+                if expected == vector.size and heads > 0 and kv_heads > 0 and head_dim > 0:
+                    q_width = heads * head_dim
+                    kv_width = kv_heads * head_dim
+                    node.add_attribute("q_bias", vector[:q_width])
+                    node.add_attribute("k_bias", vector[q_width : q_width + kv_width])
+                    node.add_attribute("v_bias", vector[q_width + kv_width :])
+                    continue
+                if vector.size % 3 == 0:
+                    width = vector.size // 3
+                    node.add_attribute("q_bias", vector[:width])
+                    node.add_attribute("k_bias", vector[width : 2 * width])
+                    node.add_attribute("v_bias", vector[2 * width :])
+                    continue
             projection = "q" if ".query." in lowered or "q_proj" in lowered else (
                 "k" if ".key." in lowered or "k_proj" in lowered else (
                     "v" if ".value." in lowered or "v_proj" in lowered else None
@@ -657,6 +748,8 @@ class IngestionPipeline:
         "q_proj": "qkv",
         "k_proj": "qkv",
         "v_proj": "qkv",
+        "q_norm": "q_norm",
+        "k_norm": "k_norm",
         "qkv_proj": "qkv",
         # Standard llama.cpp/GGUF spellings.
         "attn_q": "qkv",
@@ -666,21 +759,37 @@ class IngestionPipeline:
         "ln_1": "rmsnorm",
         "ln_2": "ffn_norm",
         "ln_f": "final_norm",
+        "norm_f": "final_norm",
+        "ln_out": "final_norm",
         "lnf": "final_norm",
         "o_proj": "out_proj",
         "attn_output": "out_proj",
         "embed_tokens": "embedding",
+        "embed_in": "embedding",
+        "word_embeddings": "embedding",
+        "embed_positions": "position_embedding",
+        "embed_out": "lm_head",
+        "head": "lm_head",
+        "tok_embeddings": "embedding",
+        "embeddings": "embedding",
         "token_embd": "embedding",
         "wte": "embedding",
+        "wpe": "position_embedding",
         "input_layernorm": "rmsnorm",
+        "ln1": "rmsnorm",
+        "ln2": "ffn_norm",
         "attn_norm": "rmsnorm",
         "post_attention_layernorm": "ffn_norm",
         "ffn_norm": "ffn_norm",
         "down_proj": "ffn",
         "ffn_down": "ffn",
         "up_proj": "gate_proj",
+        "gate_up_proj": "gate_proj",
         "ffn_up": "gate_proj",
         "ffn_gate": "gate_proj",
+        "w1": "gate_proj",
+        "w2": "ffn",
+        "w3": "gate_proj",
         # BERT / RoBERTa / DeBERTa / ELECTRA spellings:
         "query": "qkv",
         "key": "qkv",
@@ -698,9 +807,21 @@ class IngestionPipeline:
         "layer_norm": "rmsnorm",
         "attention_output_layernorm": "rmsnorm",
         "output_layernorm": "ffn_norm",
-        "embedding_layernorm": "rmsnorm",
+        # The global encoder embedding LayerNorm has a distinct runtime slot.
+        # Decoder blocks use ``rmsnorm``/``ffn_norm``; treating this name as a
+        # generic RMSNorm causes the real checkpoint tensor to collide with
+        # the embedding table and leaves the executable encoder artifact
+        # incomplete.
+        "embedding_layernorm": "embedding_norm",
+        "embedding_norm": "embedding_norm",
         # BERT attention output projection:
         "attention_output_dense": "out_proj",
+        "attn_output": "out_proj",
+        "attn_layernorm": "attention_norm",
+        "attention_norm": "attention_norm",
+        "intermediate_proj": "intermediate_proj",
+        "output_proj": "output_proj",
+        "output_norm": "output_norm",
         "ffn_intermediate": "gate_proj",
         "ffn_output": "ffn",
         # Pooler (sentence-transformers / BERT CLS):
@@ -734,6 +855,10 @@ class IngestionPipeline:
         "dense": "out_proj",
         "dense_h_to_4h": "gate_proj",
         "dense_4h_to_h": "ffn",
+        "wqkv": "qkv",
+        "wo": "out_proj",
+        "norm_1": "rmsnorm",
+        "norm_2": "ffn_norm",
         "ln_attn": "rmsnorm",
         "ln_mlp": "ffn_norm",
         # GPT-Neo / GPT-J:
@@ -745,6 +870,8 @@ class IngestionPipeline:
         "c_proj": "out_proj",
         "c_fc": "gate_proj",
         "mlp_c_proj": "ffn",
+        "fc_in": "gate_proj",
+        "fc_out": "ffn",
         # Phi-2 / Phi-3:
         "Wqkv": "qkv",
         "wqkv": "qkv",
@@ -756,11 +883,17 @@ class IngestionPipeline:
         "out_proj": "out_proj",
         "embedding": "embedding",
         "rmsnorm": "rmsnorm",
+        # Decoder-only checkpoints commonly name the terminal norm simply
+        # ``model.norm.weight`` (Qwen3, Llama, Mistral, ...).
+        "norm": "final_norm",
         "ffn_norm": "ffn_norm",
         "ffn": "ffn",
         "gate_proj": "gate_proj",
         "lm_head": "lm_head",
-        "output_norm": "final_norm",
+        # Encoder post-FFN LayerNorm has its own runtime slot; a decoder
+        # terminal ``output_norm`` is handled by the explicit global-name
+        # branch below, so it must not overwrite this component alias.
+        "output_norm": "output_norm",
         "final_norm": "final_norm",
     }
 
@@ -791,6 +924,290 @@ class IngestionPipeline:
         layer_index: int | None = None
         component: str | None = None
 
+        # GPT-2 uses the same ``c_proj`` spelling for attention output and
+        # MLP output.  Preserve the surrounding structural path before the
+        # generic alias table is consulted.
+        lowered_name = name.lower().replace(".", "_")
+        # Multi-head latent attention uses compressed query/KV projections
+        # rather than ordinary q/k/v matrices.  Normalize the framework
+        # spellings (including DeepSeek's ``kv_a_proj_with_mqa``) to a stable
+        # AEG vocabulary so the artifact can be executed without knowing the
+        # originating model class.
+        mla_layer_match = re.search(
+            r"(?:^|_)(?:layers?|blocks?|blk|h)[_](\d+)(?:_|$)", lowered_name
+        )
+        if mla_layer_match:
+            mla_components = (
+                ("q_a_proj", "q_a_proj"),
+                ("q_b_proj", "q_b_proj"),
+                ("kv_a_proj_with_mqa", "kv_a_proj"),
+                ("kv_a_proj", "kv_a_proj"),
+                ("kv_b_proj", "kv_b_proj"),
+                ("k_rope_proj", "k_rope_proj"),
+                ("k_pe_proj", "k_rope_proj"),
+                ("q_a_layernorm", "q_a_norm"),
+                ("kv_a_layernorm", "kv_a_norm"),
+                ("q_a_norm", "q_a_norm"),
+                ("kv_a_norm", "kv_a_norm"),
+            )
+            for marker, component_name in mla_components:
+                if re.search(rf"(?:^|_){re.escape(marker)}(?:_|$)", lowered_name):
+                    return int(mla_layer_match.group(1)), component_name
+            ssm_components = (
+                ("in_proj", "ssm_in_proj"),
+                ("conv1d", "ssm_conv1d"),
+                ("x_proj", "ssm_x_proj"),
+                ("dt_proj", "ssm_dt_proj"),
+                ("dt_bias", "ssm_dt"),
+                ("a_log", "ssm_a_log"),
+                ("d", "ssm_d"),
+                ("out_proj", "ssm_out_proj"),
+            )
+            rwkv_components = (
+                ("time_decay", "ssm_time_decay"),
+                ("time_first", "ssm_time_first"),
+                ("time_mix_k", "ssm_time_mix_k"),
+                ("time_mix_v", "ssm_time_mix_v"),
+                ("time_mix_r", "ssm_time_mix_r"),
+                ("time_mix_k", "ssm_ffn_time_mix_k"),
+                ("time_mix_r", "ssm_ffn_time_mix_r"),
+                ("key", "ssm_key"),
+                ("value", "ssm_value"),
+                ("receptance", "ssm_receptance"),
+                ("output", "ssm_output"),
+            )
+            is_rwkv_tensor = bool(re.search(r"(?:^|_)(?:att|ffn|ln[12])(?:_|$)", lowered_name))
+            if is_rwkv_tensor and re.search(r"(?:^|_)ln1(?:_|$)", lowered_name):
+                return int(mla_layer_match.group(1)), "ssm_norm"
+            if is_rwkv_tensor and re.search(r"(?:^|_)ln2(?:_|$)", lowered_name):
+                return int(mla_layer_match.group(1)), "ssm_ffn_norm"
+            for marker, component_name in (("time_mix_k", "ssm_ffn_time_mix_k"), ("time_mix_r", "ssm_ffn_time_mix_r")):
+                if is_rwkv_tensor and re.search(rf"(?:^|_)ffn_{re.escape(marker)}(?:_|$)", lowered_name):
+                    return int(mla_layer_match.group(1)), component_name
+            for marker, component_name in rwkv_components:
+                if is_rwkv_tensor and re.search(rf"(?:^|_)(?:att|attention)_{re.escape(marker)}(?:_|$)", lowered_name):
+                    return int(mla_layer_match.group(1)), component_name
+            for marker, component_name in (("key", "ssm_ffn_key"), ("value", "ssm_ffn_value"), ("receptance", "ssm_ffn_receptance")):
+                if is_rwkv_tensor and re.search(rf"(?:^|_)ffn_{re.escape(marker)}(?:_|$)", lowered_name):
+                    return int(mla_layer_match.group(1)), component_name
+            for marker, component_name in ssm_components:
+                if re.search(rf"(?:^|_)(?:mixer|mamba)_(?:{re.escape(marker)})(?:_|$)", lowered_name) or (
+                    marker != "out_proj" and re.search(rf"(?:^|_){re.escape(marker)}(?:_|$)", lowered_name)
+                ):
+                    return int(mla_layer_match.group(1)), component_name
+        # Generic routed-MoE checkpoint spellings.  Mixtral uses w1/w2/w3,
+        # while Qwen/OLMoE-style checkpoints expose gate/up/down_proj.  Both
+        # describe the same three affine projections and are normalized to a
+        # model-independent expert key.
+        layer_match = re.search(r"(?:^|_)(?:layers?|blocks?|blk|h)[_](\d+)(?:_|$)", lowered_name)
+        # Canonical graph IDs must win over source-layout context rules below.
+        # In particular, ``attention_norm`` is a valid encoder runtime slot;
+        # it must not be rewritten to the InternLM ``rmsnorm`` alias.
+        canonical_layer_component = re.match(
+            r"^layer_(\d+)_(attention_norm|ffn_norm|output_norm)$", lowered_name
+        )
+        if canonical_layer_component:
+            return int(canonical_layer_component.group(1)), canonical_layer_component.group(2)
+        # OPT stores the post-attention norm as ``final_layer_norm`` inside
+        # each decoder block, while the same spelling at model scope means
+        # the terminal norm.  Resolve the scoped form before the alias scan.
+        if layer_match and re.search(r"(?:^|_)final_layer_norm(?:_|$)", lowered_name):
+            return int(layer_match.group(1)), "ffn_norm"
+        if layer_match and re.search(r"(?:^|_)(?:attention_norm|attn_norm)(?:_|$)", lowered_name):
+            return int(layer_match.group(1)), "rmsnorm"
+        expert_match = re.search(r"(?:^|_)experts[_](\d+)(?:_|$)", lowered_name)
+        if layer_match and expert_match:
+            expert_projection = None
+            if re.search(r"(?:^|_)(?:w1|gate_proj|ffn_gate)(?:_|$)", lowered_name):
+                expert_projection = "gate_proj"
+            elif re.search(r"(?:^|_)(?:w2|down_proj|ffn_down)(?:_|$)", lowered_name):
+                expert_projection = "down_proj"
+            elif re.search(r"(?:^|_)(?:w3|up_proj|ffn_up)(?:_|$)", lowered_name):
+                expert_projection = "up_proj"
+            if expert_projection is not None:
+                return (
+                    int(layer_match.group(1)),
+                    f"expert_{int(expert_match.group(1))}_{expert_projection}",
+                )
+        if layer_match and (
+            "router" in lowered_name
+            or re.search(r"(?:^|_)(?:router|router_gate)[_]weight$", lowered_name)
+            or ("moe" in lowered_name and re.search(r"(?:^|_)gate[_]weight$", lowered_name))
+            # DeepSeek names the routed gate ``mlp.gate.weight``; it is
+            # distinct from an expert ``gate_proj`` and must be retained as
+            # the router rather than reported as an unbound source tensor.
+            or re.search(r"(?:^|_)(?:mlp|feed_forward)_gate_weight$", lowered_name)
+        ) and not expert_match:
+            return int(layer_match.group(1)), "moe_router"
+        canonical_moe = re.match(
+            r"^layer_(\d+)_(?:moe_router|expert_(\d+)_(gate_proj|up_proj|down_proj))$",
+            lowered_name,
+        )
+        if canonical_moe:
+            layer_index = int(canonical_moe.group(1))
+            if lowered_name.endswith("moe_router"):
+                return layer_index, "moe_router"
+            return layer_index, (
+                f"expert_{int(canonical_moe.group(2))}_{canonical_moe.group(3)}"
+            )
+        canonical_ssm = re.match(
+            r"^layer_(\d+)_((?:ssm_norm|ssm_in_proj|ssm_conv1d|ssm_x_proj|"
+            r"ssm_dt_proj|ssm_dt|ssm_a_log|ssm_d|ssm_out_proj|ssm_ffn_norm|"
+            r"ssm_time_decay|ssm_time_first|ssm_time_mix_k|ssm_time_mix_v|"
+            r"ssm_time_mix_r|ssm_ffn_time_mix_k|ssm_ffn_time_mix_r|ssm_key|"
+            r"ssm_value|ssm_receptance|ssm_output|ssm_ffn_key|ssm_ffn_value|"
+            r"ssm_ffn_receptance))(?:_bias)?$",
+            lowered_name,
+        )
+        if canonical_ssm:
+            return int(canonical_ssm.group(1)), canonical_ssm.group(2)
+        if layer_match and (
+            re.search(r"(?:^|_)backbone_layers_\d+_norm(?:_|$)", lowered_name)
+            or re.search(r"(?:^|_)layers_\d+_(?:mixer|mamba)_norm(?:_|$)", lowered_name)
+        ):
+            return int(layer_match.group(1)), "ssm_norm"
+        # BERT-family checkpoints expose semantic encoder paths rather than
+        # the canonical AEG node names.  Normalize them before the generic
+        # token scan so ``encoder.layer.0`` is never confused with the
+        # encoder namespace used by T5 (which intentionally uses negatives).
+        bert_match = re.match(
+            r"^(?:.*_)?encoder_layer_(\d+)_"
+            r"(attention_self_(?:query|key|value)|attention_output_(?:dense|layer_?norm)|"
+            r"intermediate_dense|output_(?:dense|layer_?norm))_(?:weight|bias)$",
+            lowered_name,
+        )
+        if bert_match:
+            index = int(bert_match.group(1))
+            suffix = bert_match.group(2)
+            component = {
+                "attention_self_query": "qkv",
+                "attention_self_key": "qkv",
+                "attention_self_value": "qkv",
+                "attention_output_dense": "out_proj",
+                "attention_output_layernorm": "attention_norm",
+                "attention_output_layer_norm": "attention_norm",
+                "intermediate_dense": "intermediate_proj",
+                "output_dense": "output_proj",
+                "output_layernorm": "output_norm",
+                "output_layer_norm": "output_norm",
+            }[suffix]
+            return index, component
+        # T5-family checkpoints use separate encoder/decoder blocks and may
+        # contain two attention modules in each decoder block. Encode the
+        # namespace in the component key rather than conflating them with a
+        # decoder-only layer. Encoder indices use -(index+1), while decoder
+        # indices remain non-negative; this keeps the existing tuple contract
+        # stable for all decoder-only callers.
+        seq_match = re.search(r"(?:^|_)((?:encoder|decoder))_block_(\d+)_layer_(\d+)_(.*)", lowered_name)
+        if seq_match:
+            namespace, block_index_text, sublayer_text, suffix = seq_match.groups()
+            block_index = int(block_index_text)
+            layer_index = -(block_index + 1) if namespace == "encoder" else block_index
+            if "relative_attention_bias" in suffix:
+                component = (
+                    "encoder_relative_attention_bias"
+                    if namespace == "encoder"
+                    else "decoder_self_relative_attention_bias"
+                )
+            elif namespace == "encoder" and sublayer_text == "0":
+                component = (
+                    "encoder_norm1" if "layer_norm" in suffix else
+                    next((f"{part}_proj" for part in ("q", "k", "v", "o") if re.search(rf"(?:^|_){part}(?:_|$)", suffix)), None)
+                )
+            elif namespace == "encoder" and sublayer_text == "1":
+                component = "encoder_norm2" if "layer_norm" in suffix else (
+                    "encoder_ffn_in_0" if "wi_0" in suffix else
+                    "encoder_ffn_in_1" if "wi_1" in suffix else
+                    "encoder_ffn_in" if "wi" in suffix or "fc1" in suffix else "encoder_ffn_out"
+                )
+            elif namespace == "decoder" and sublayer_text == "0":
+                component = (
+                    "decoder_self_norm" if "layer_norm" in suffix else
+                    next((f"self_{part}_proj" for part in ("q", "k", "v", "o") if re.search(rf"(?:^|_){part}(?:_|$)", suffix)), None)
+                )
+            elif namespace == "decoder" and sublayer_text == "1":
+                component = (
+                    "decoder_cross_norm" if "layer_norm" in suffix else
+                    next((f"cross_{part}_proj" for part in ("q", "k", "v", "o") if re.search(rf"(?:^|_){part}(?:_|$)", suffix)), None)
+                )
+            elif namespace == "decoder" and sublayer_text == "2":
+                component = "decoder_ffn_norm" if "layer_norm" in suffix else (
+                    "decoder_ffn_in_0" if "wi_0" in suffix else
+                    "decoder_ffn_in_1" if "wi_1" in suffix else
+                    "decoder_ffn_in" if "wi" in suffix or "fc1" in suffix else "decoder_ffn_out"
+                )
+            if component is not None:
+                return layer_index, component
+        if "encoder_final_layer_norm" in lowered_name or lowered_name.endswith("encoder_final_layer_norm_weight"):
+            return None, "encoder_final_norm"
+        if "decoder_final_layer_norm" in lowered_name or lowered_name.endswith("decoder_final_layer_norm_weight"):
+            return None, "final_norm"
+        if lowered_name in {"shared_weight", "encoder_embed_tokens_weight", "decoder_embed_tokens_weight"}:
+            return None, "embedding"
+        if lowered_name in {"lm_head_weight", "output_weight"}:
+            return None, "lm_head"
+        # Canonical seq2seq graph node IDs use the same explicit namespaces.
+        canonical = re.match(r"^(encoder|decoder)_layer_(\d+)_(.+)$", lowered_name)
+        if canonical:
+            namespace, index_text, suffix = canonical.groups()
+            index = int(index_text)
+            if namespace == "encoder":
+                index = -(index + 1)
+                suffix = {
+                    "norm1": "encoder_norm1",
+                    "norm2": "encoder_norm2",
+                    "ffn_in": "encoder_ffn_in",
+                    "ffn_in_0": "encoder_ffn_in_0",
+                    "ffn_in_1": "encoder_ffn_in_1",
+                    "ffn_out": "encoder_ffn_out",
+                    "relative_attention_bias": "encoder_relative_attention_bias",
+                }.get(suffix, suffix)
+            else:
+                suffix = {
+                    "self_norm": "decoder_self_norm",
+                    "cross_norm": "decoder_cross_norm",
+                    "ffn_norm": "decoder_ffn_norm",
+                    "ffn_in": "decoder_ffn_in",
+                    "ffn_in_0": "decoder_ffn_in_0",
+                    "ffn_in_1": "decoder_ffn_in_1",
+                    "ffn_out": "decoder_ffn_out",
+                    "self_relative_attention_bias": "decoder_self_relative_attention_bias",
+                }.get(suffix, suffix)
+            return index, suffix
+        if lowered_name in {"encoder_final_norm", "final_norm", "embedding", "lm_head"}:
+            return None, lowered_name
+        # Global names must be resolved before the token alias scan.  For
+        # example ``embeddings.position_embeddings.weight`` contains the
+        # generic ``embeddings`` token, but it is a position table, not the
+        # token embedding table.  The same rule makes GGUF's
+        # ``output_norm.weight`` map to the decoder terminal norm.
+        if re.search(r"(?:^|_)position_embeddings?_(?:weight|bias)$", lowered_name):
+            return None, "position_embedding"
+        if re.search(r"(?:^|_)token_type_embeddings?_(?:weight|bias)$", lowered_name):
+            return None, "token_type_embedding"
+        if re.search(r"(?:^|_)(?:word_embeddings?|token_embeddings?)_(?:weight|bias)$", lowered_name):
+            return None, "embedding"
+        if re.search(r"(?:^|_)emb_weight$", lowered_name):
+            return None, "embedding"
+        if re.search(r"(?:^|_)embeddings?_(?:layernorm|layer_norm)_(?:weight|bias)$", lowered_name):
+            return None, "embedding_norm"
+        if lowered_name in {"output_norm_weight", "output_norm_bias"}:
+            return None, "final_norm"
+        if "mlp_c_proj" in lowered_name or "mlp_c_proj_weight" in lowered_name:
+            component = "ffn"
+        elif "attn_c_proj" in lowered_name:
+            component = "out_proj"
+
+        # Resolve Qwen3's norms before aliases such as ``attn_q``.  In a
+        # checkpoint path like ``self_attn.q_norm`` the earlier ``attn_q``
+        # prefix is also a valid alias, but it is not the tensor we need.
+        qk_norm_match = re.search(r"(?:^|[._])([qk]_norm)(?:[._]|$)", name.lower())
+        if qk_norm_match:
+            layer_match = re.search(r"(?:^|[._])(layers?|blocks?|blk|h)[._](\d+)(?:[._]|$)", name.lower())
+            if layer_match:
+                layer_index = int(layer_match.group(2))
+            return layer_index, qk_norm_match.group(1)
+
         # GGUF uses ``output.weight`` for the LM head.  The bare graph node
         # ``output`` is structural and must remain unidentifiable, otherwise
         # it would be counted as a second attachment to ``lm_head``.
@@ -805,12 +1222,25 @@ class IngestionPipeline:
                 continue
             if token.isdigit() or token in cls._IGNORED_SEGMENTS:
                 continue
+            # Qwen3 uses ``q_norm``/``k_norm``.  Check these two-token
+            # components before the broader ``attn_q`` alias, otherwise the
+            # shared ``self_attn.q_norm`` prefix is misclassified as QKV.
+            if token in ("q", "k") and position + 1 < len(tokens) and tokens[position + 1] == "norm":
+                component = f"{token}_norm"
+                break
             # Rebuild multi-token component names such as "q" + "proj".
-            for width in (3, 2, 1):
-                candidate = "_".join(tokens[position : position + width])
-                if candidate in cls._COMPONENT_ALIASES:
-                    component = cls._COMPONENT_ALIASES[candidate]
-                    break
+            # A structural GPT-2 disambiguation above is authoritative; do
+            # not let the later generic ``c_proj`` alias overwrite it.
+            if component is None:
+                # Some decoder families encode the projection role as a
+                # four-token path (dense_h_to_4h).  Check the longest alias
+                # first so its leading ``dense`` token is not mistaken for
+                # an attention output projection.
+                for width in (4, 3, 2, 1):
+                    candidate = "_".join(tokens[position : position + width])
+                    if candidate in cls._COMPONENT_ALIASES:
+                        component = cls._COMPONENT_ALIASES[candidate]
+                        break
             if component is not None:
                 break
 
@@ -1043,9 +1473,307 @@ class IngestionPipeline:
         Dispatches to the encoder-specific builder for BERT-family models
         (is_encoder=True) and uses the decoder-only builder for causal LMs.
         """
+        if getattr(architecture, "is_encoder_decoder", False) or getattr(
+            architecture, "family", ""
+        ) == "encoder_decoder_family":
+            return self._build_encoder_decoder_graph(graph, architecture)
         if getattr(architecture, "is_encoder", False):
             return self._build_encoder_graph(graph, architecture)
+        if getattr(architecture, "ssm_variant", None) == "hybrid_selective_scan":
+            return self._build_hybrid_decoder_graph(graph, architecture)
+        if getattr(architecture, "ssm_variant", None) in {"selective_scan", "ssd", "rwkv_time_mix"}:
+            return self._build_ssm_decoder_graph(graph, architecture)
+        if str(getattr(architecture, "attention_type", "") or "").upper() == "MLA":
+            return self._build_mla_decoder_graph(graph, architecture)
         return self._build_decoder_graph(graph, architecture)
+
+    def _build_mla_decoder_graph(
+        self, graph: AEGGraph, architecture: ModelArchitecture
+    ) -> AEGGraph:
+        """Build the standard transformer contract plus MLA parameter slots.
+
+        MLA keeps the decoder residual/FFN structure identical to a causal
+        transformer, but replaces Q/K/V with compressed projections.  Reuse
+        the ordinary graph for residual and FFN nodes, then add explicit
+        parameter slots for the compressed attention tensors.  This keeps
+        ingestion model-generic and lets the artifact/runtime select MLA from
+        capability metadata rather than a DeepSeek name check.
+        """
+        from aether.core.graph import AEGGraphNode, AEGGraphNodeType
+
+        self._build_decoder_graph(graph, architecture)
+        hidden = int(architecture.hidden_size)
+        heads = int(architecture.num_attention_heads)
+        kv_rank = int(architecture.mla_kv_lora_rank or 0)
+        q_rank = int(architecture.mla_q_lora_rank or 0)
+        nope = int(architecture.mla_qk_nope_head_dim or architecture.head_dim or 1)
+        rope = int(architecture.mla_qk_rope_head_dim or max(16, nope // 2))
+        value = int(architecture.mla_v_head_dim or architecture.head_dim or 1)
+
+        slots: tuple[tuple[str, int, int, str], ...] = (
+            ("q_a_proj", q_rank, hidden, "linear"),
+            ("q_b_proj", heads * (nope + rope), q_rank, "linear"),
+            ("kv_a_proj", kv_rank, hidden, "linear"),
+            ("kv_b_proj", heads * (nope + value), kv_rank, "linear"),
+            ("k_rope_proj", heads * rope, hidden, "linear"),
+            ("q_a_norm", q_rank, q_rank, "rmsnorm"),
+            ("kv_a_norm", kv_rank, kv_rank, "rmsnorm"),
+        )
+        for layer in range(int(architecture.layers)):
+            for suffix, out_features, in_features, op_type in slots:
+                node = AEGGraphNode(
+                    id=f"layer_{layer}_{suffix}",
+                    node_type=AEGGraphNodeType.PARAMETER,
+                    name=suffix,
+                    op_type=op_type,
+                    layer_index=layer,
+                    attributes={
+                        "in_features": in_features,
+                        "out_features": out_features,
+                        "hidden_size": hidden,
+                    },
+                )
+                graph.add_node(node)
+        graph.set_metadata("mla_runtime_contract", "aether.mla.v1")
+        graph.set_metadata("mla_geometry", {
+            "kv_lora_rank": kv_rank,
+            "q_lora_rank": q_rank,
+            "qk_nope_head_dim": nope,
+            "qk_rope_head_dim": rope,
+            "v_head_dim": value,
+            "num_heads": heads,
+        })
+        return graph
+
+    def _build_ssm_decoder_graph(
+        self, graph: AEGGraph, architecture: ModelArchitecture
+    ) -> AEGGraph:
+        """Build the canonical Mamba selective-scan parameter contract."""
+        from aether.core.graph import AEGGraphNode, AEGGraphNodeType
+
+        hidden = int(architecture.hidden_size)
+        variant = str(getattr(architecture, "ssm_variant", "selective_scan") or "selective_scan")
+        inner = int(architecture.ssm_inner_size or hidden * 2)
+        state = int(architecture.ssm_state_size or 16)
+        dt_rank = int(architecture.ssm_dt_rank or max(1, (hidden + 15) // 16))
+        conv = int(architecture.ssm_conv_kernel or 4)
+        self._build_decoder_graph(graph, architecture)
+        # Remove ordinary attention/FFN parameter slots from the structural
+        # contract; the state-space runtime consumes these learned tensors.
+        for layer in range(int(architecture.layers)):
+            for suffix in (
+                "qkv", "out_proj", "rmsnorm", "ffn_norm", "gate_proj", "up_proj", "ffn",
+            ):
+                # Use the graph API so incident edges and its reverse-edge
+                # indexes stay consistent.  Directly popping nodes leaves
+                # dangling edges in the serialized AEG-IR, which is
+                # especially harmful for validators and alternate backends.
+                graph.remove_node(f"layer_{layer}_{suffix}")
+            if variant == "ssd":
+                heads = int(getattr(architecture, "ssm_num_heads", None) or 1)
+                groups = int(getattr(architecture, "ssm_num_groups", None) or 1)
+                slot_channels = inner + 2 * groups * state
+                slots = (
+                    ("ssm_norm", hidden, hidden, "rmsnorm"),
+                    ("ssm_ffn_norm", hidden, hidden, "rmsnorm"),
+                    ("ssm_in_proj", 2 * inner + 2 * groups * state + heads, hidden, "linear"),
+                    ("ssm_conv1d", slot_channels, conv, "linear"),
+                    ("ssm_a_log", heads, 1, "parameter"),
+                    ("ssm_d", heads, 1, "parameter"),
+                    ("ssm_dt", heads, 1, "parameter"),
+                    ("ssm_out_proj", hidden, inner, "linear"),
+                )
+            elif variant == "rwkv_time_mix":
+                slots = (
+                    ("ssm_norm", hidden, hidden, "rmsnorm"),
+                    ("ssm_ffn_norm", hidden, hidden, "rmsnorm"),
+                    ("ssm_time_decay", hidden, 1, "parameter"),
+                    ("ssm_time_first", hidden, 1, "parameter"),
+                    ("ssm_time_mix_k", hidden, 1, "parameter"),
+                    ("ssm_time_mix_v", hidden, 1, "parameter"),
+                    ("ssm_time_mix_r", hidden, 1, "parameter"),
+                    ("ssm_ffn_time_mix_k", hidden, 1, "parameter"),
+                    ("ssm_ffn_time_mix_r", hidden, 1, "parameter"),
+                    ("ssm_key", hidden, hidden, "linear"),
+                    ("ssm_value", hidden, hidden, "linear"),
+                    ("ssm_receptance", hidden, hidden, "linear"),
+                    ("ssm_output", hidden, hidden, "linear"),
+                    ("ssm_ffn_key", hidden * 4, hidden, "linear"),
+                    ("ssm_ffn_value", hidden, hidden * 4, "linear"),
+                    ("ssm_ffn_receptance", hidden, hidden, "linear"),
+                )
+            else:
+                slots = (
+                    ("ssm_norm", hidden, hidden, "rmsnorm"),
+                    ("ssm_in_proj", inner * 2, hidden, "linear"),
+                    ("ssm_conv1d", inner, conv, "linear"),
+                    ("ssm_x_proj", dt_rank + 2 * state, inner, "linear"),
+                    ("ssm_dt_proj", inner, dt_rank, "linear"),
+                    ("ssm_a_log", inner, state, "parameter"),
+                    ("ssm_d", inner, 1, "parameter"),
+                    ("ssm_out_proj", hidden, inner, "linear"),
+                )
+            for suffix, out_features, in_features, op_type in slots:
+                node = AEGGraphNode(
+                    id=f"layer_{layer}_{suffix}",
+                    node_type=AEGGraphNodeType.PARAMETER,
+                    name=suffix,
+                    op_type=op_type,
+                    layer_index=layer,
+                    attributes={
+                        "in_features": in_features,
+                        "out_features": out_features,
+                        "hidden_size": hidden,
+                        "d_state": state,
+                        "dt_rank": dt_rank,
+                        "conv_kernel": conv,
+                    },
+                )
+                graph.add_node(node)
+        graph.set_metadata(
+            "ssm_runtime_contract",
+            {
+                "selective_scan": "aether.mamba.selective_scan.v1",
+                "ssd": "aether.mamba.ssd.v1",
+                "rwkv_time_mix": "aether.rwkv.time_mix.v1",
+            }.get(variant, "aether.ssm.v1"),
+        )
+        return graph
+
+    def _build_hybrid_decoder_graph(
+        self, graph: AEGGraph, architecture: ModelArchitecture
+    ) -> AEGGraph:
+        """Build a mixed transformer/Mamba graph from an explicit schedule."""
+        hybrid_types = getattr(architecture, "hybrid_layer_types", None)
+        if not isinstance(hybrid_types, list) or len(hybrid_types) != int(architecture.layers):
+            raise IngestionError(
+                "hybrid_selective_scan requires one explicit hybrid_layer_types entry per layer"
+            )
+        self._build_decoder_graph(graph, architecture)
+        # Keep ordinary transformer slots for attention layers and replace
+        # only state-space layers with the canonical selective-scan slots.
+        from aether.core.graph import AEGGraphNode, AEGGraphNodeType
+        hidden = int(architecture.hidden_size)
+        inner = int(architecture.ssm_inner_size or hidden * 2)
+        state = int(architecture.ssm_state_size or 16)
+        dt_rank = int(architecture.ssm_dt_rank or max(1, (hidden + 15) // 16))
+        conv = int(architecture.ssm_conv_kernel or 4)
+        for layer, layer_type in enumerate(hybrid_types):
+            if str(layer_type).lower() != "ssm":
+                continue
+            for suffix in ("qkv", "out_proj", "rmsnorm", "ffn_norm", "gate_proj", "up_proj", "ffn"):
+                graph.remove_node(f"layer_{layer}_{suffix}")
+            slots = (
+                ("ssm_norm", hidden, hidden, "rmsnorm"),
+                ("ssm_in_proj", inner * 2, hidden, "linear"),
+                ("ssm_conv1d", inner, conv, "linear"),
+                ("ssm_x_proj", dt_rank + 2 * state, inner, "linear"),
+                ("ssm_dt_proj", inner, dt_rank, "linear"),
+                ("ssm_a_log", inner, state, "parameter"),
+                ("ssm_d", inner, 1, "parameter"),
+                ("ssm_out_proj", hidden, inner, "linear"),
+            )
+            for suffix, out_features, in_features, op_type in slots:
+                graph.add_node(AEGGraphNode(
+                    id=f"layer_{layer}_{suffix}",
+                    node_type=AEGGraphNodeType.PARAMETER,
+                    name=suffix,
+                    op_type=op_type,
+                    layer_index=layer,
+                    attributes={
+                        "in_features": in_features, "out_features": out_features,
+                        "hidden_size": hidden, "d_state": state,
+                        "dt_rank": dt_rank, "conv_kernel": conv,
+                    },
+                ))
+        graph.set_metadata("ssm_runtime_contract", "aether.hybrid.mamba_attention.v1")
+        graph.set_metadata("hybrid_layer_types", list(hybrid_types))
+        return graph
+
+    def _build_encoder_decoder_graph(self, graph: AEGGraph, architecture: ModelArchitecture) -> AEGGraph:
+        """Build the canonical T5-style encoder/decoder graph contract.
+
+        The graph deliberately uses family-neutral encoder/decoder attention
+        and FFN nodes.  T5, FLAN-T5, mT5, ByT5, and UL2 all expose this
+        encoder-decoder contract even though their tokenizer and activation
+        details differ.  The actual tensor names are normalized at ingestion;
+        dimensions always come from the source config.
+        """
+        from aether.core.graph import AEGGraphEdge, AEGGraphNode, AEGGraphNodeType
+
+        enc_layers = int(getattr(architecture, "encoder_layers", None) or architecture.layers)
+        dec_layers = int(getattr(architecture, "decoder_layers", None) or architecture.layers)
+        hidden = int(architecture.hidden_size)
+        intermediate = int(architecture.intermediate_size or hidden * 4)
+        heads = int(architecture.num_attention_heads)
+        head_dim = int(architecture.head_dim or hidden // max(heads, 1))
+
+        def add(node_id: str, op_type: str, layer_index: int | None = None, **attributes: Any) -> None:
+            node = AEGGraphNode(
+                id=node_id,
+                node_type=AEGGraphNodeType.OPERATION,
+                name=node_id,
+                op_type=op_type,
+                attributes=attributes,
+                layer_index=layer_index,
+            )
+            graph.add_node(node)
+
+        # The graph is a structural IR for the package and runtime. Inputs
+        # are represented explicitly so graph validation can distinguish the
+        # encoder source sequence from the decoder autoregressive sequence.
+        graph.add_node(AEGGraphNode(
+            id="encoder_input", node_type=AEGGraphNodeType.INPUT,
+            name="encoder_input_ids", op_type="input",
+        ))
+        graph.add_node(AEGGraphNode(
+            id="decoder_input", node_type=AEGGraphNodeType.INPUT,
+            name="decoder_input_ids", op_type="input",
+        ))
+        add("embedding", "embedding", vocab_size=architecture.vocab_size, hidden_size=hidden)
+        add("encoder_final_norm", "rmsnorm", hidden_size=hidden, eps=architecture.norm_eps)
+        add("final_norm", "rmsnorm", hidden_size=hidden, eps=architecture.norm_eps)
+        add("lm_head", "lm_head", vocab_size=architecture.vocab_size, hidden_size=hidden)
+
+        for i in range(enc_layers):
+            # Negative layer indices namespace encoder blocks without
+            # changing the existing decoder-only layer-index contract.  The
+            # compiler invariant and the weight normalizer use this same
+            # representation for encoder-decoder artifacts.
+            encoder_index = -(i + 1)
+            add(f"encoder_layer_{i}_norm1", "rmsnorm", encoder_index, hidden_size=hidden, eps=architecture.norm_eps)
+            for projection in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                add(f"encoder_layer_{i}_{projection}", "linear", encoder_index, in_features=hidden, out_features=heads * head_dim)
+            add(f"encoder_layer_{i}_relative_attention_bias", "relative_attention_bias", encoder_index, num_heads=heads)
+            add(f"encoder_layer_{i}_norm2", "rmsnorm", encoder_index, hidden_size=hidden, eps=architecture.norm_eps)
+            add(f"encoder_layer_{i}_ffn_in", "linear", encoder_index, in_features=hidden, out_features=intermediate)
+            add(f"encoder_layer_{i}_ffn_in_0", "linear", encoder_index, in_features=hidden, out_features=intermediate)
+            add(f"encoder_layer_{i}_ffn_in_1", "linear", encoder_index, in_features=hidden, out_features=intermediate)
+            add(f"encoder_layer_{i}_ffn_out", "linear", encoder_index, in_features=intermediate, out_features=hidden)
+
+        for i in range(dec_layers):
+            add(f"decoder_layer_{i}_self_norm", "rmsnorm", i, hidden_size=hidden, eps=architecture.norm_eps)
+            for projection in ("self_q_proj", "self_k_proj", "self_v_proj", "self_o_proj"):
+                add(f"decoder_layer_{i}_{projection}", "linear", i, in_features=hidden, out_features=heads * head_dim)
+            add(f"decoder_layer_{i}_self_relative_attention_bias", "relative_attention_bias", i, num_heads=heads)
+            add(f"decoder_layer_{i}_cross_norm", "rmsnorm", i, hidden_size=hidden, eps=architecture.norm_eps)
+            for projection in ("cross_q_proj", "cross_k_proj", "cross_v_proj", "cross_o_proj"):
+                add(f"decoder_layer_{i}_{projection}", "linear", i, in_features=hidden, out_features=heads * head_dim)
+            add(f"decoder_layer_{i}_ffn_norm", "rmsnorm", i, hidden_size=hidden, eps=architecture.norm_eps)
+            add(f"decoder_layer_{i}_ffn_in", "linear", i, in_features=hidden, out_features=intermediate)
+            add(f"decoder_layer_{i}_ffn_in_0", "linear", i, in_features=hidden, out_features=intermediate)
+            add(f"decoder_layer_{i}_ffn_in_1", "linear", i, in_features=hidden, out_features=intermediate)
+            add(f"decoder_layer_{i}_ffn_out", "linear", i, in_features=intermediate, out_features=hidden)
+
+        graph.set_metadata("is_encoder_decoder", True)
+        graph.set_metadata("encoder_layers", enc_layers)
+        graph.set_metadata("decoder_layers", dec_layers)
+        graph.set_metadata("seq2seq_family", architecture.family)
+        logger.info(
+            "Built encoder-decoder graph: encoder_layers=%d decoder_layers=%d hidden=%d",
+            enc_layers, dec_layers, hidden,
+        )
+        return graph
 
     def _build_encoder_graph(self, graph: AEGGraph, architecture: ModelArchitecture) -> AEGGraph:
         """Build an encoder-only (BERT-style) AEG graph.
@@ -1185,7 +1913,7 @@ class IngestionPipeline:
 
             # Attention output projection
             attn_out_node = AEGGraphNode(
-                id=f"{lp}_attn_output",
+                id=f"{lp}_o_proj",
                 node_type=AEGGraphNodeType.OPERATION,
                 name=f"Layer {layer} Attention Output",
                 op_type="linear",
@@ -1211,7 +1939,7 @@ class IngestionPipeline:
             graph.add_edge(AEGGraphEdge(source=attn_out_node.id, target=attn_res_node.id))
 
             attn_ln_node = AEGGraphNode(
-                id=f"{lp}_attn_layernorm",
+                id=f"{lp}_attention_norm",
                 node_type=AEGGraphNodeType.OPERATION,
                 name=f"Layer {layer} Attention LayerNorm",
                 op_type="layernorm",
@@ -1224,7 +1952,7 @@ class IngestionPipeline:
 
             # FFN: intermediate (GELU) + output
             ffn_int_node = AEGGraphNode(
-                id=f"{lp}_ffn_intermediate",
+                id=f"{lp}_intermediate_proj",
                 node_type=AEGGraphNodeType.OPERATION,
                 name=f"Layer {layer} FFN Intermediate",
                 op_type="linear",
@@ -1236,7 +1964,7 @@ class IngestionPipeline:
             graph.add_edge(AEGGraphEdge(source=attn_ln_node.id, target=ffn_int_node.id))
 
             ffn_out_node = AEGGraphNode(
-                id=f"{lp}_ffn_output",
+                id=f"{lp}_output_proj",
                 node_type=AEGGraphNodeType.OPERATION,
                 name=f"Layer {layer} FFN Output",
                 op_type="linear",
@@ -1262,7 +1990,7 @@ class IngestionPipeline:
             graph.add_edge(AEGGraphEdge(source=ffn_out_node.id, target=ffn_res_node.id))
 
             ffn_ln_node = AEGGraphNode(
-                id=f"{lp}_output_layernorm",
+                id=f"{lp}_output_norm",
                 node_type=AEGGraphNodeType.OPERATION,
                 name=f"Layer {layer} Output LayerNorm",
                 op_type="layernorm",
@@ -1352,18 +2080,68 @@ class IngestionPipeline:
         graph.add_edge(AEGGraphEdge(source=input_node.id, target=embedding_node.id))
 
         prev_node = embedding_node
+        if bool(getattr(architecture, "embedding_norm", False)):
+            embedding_norm_node = AEGGraphNode(
+                id="embedding_norm",
+                node_type=AEGGraphNodeType.OPERATION,
+                name="embedding_output_norm",
+                op_type="layernorm" if str(getattr(architecture, "norm_type", "RMSNorm")).lower() == "layernorm" else "rmsnorm",
+                inputs=[prev_node.id],
+                attributes={"eps": architecture.norm_eps, "hidden_size": h},
+                precision=None,
+                layer_index=0,
+            )
+            graph.add_node(embedding_norm_node)
+            graph.add_edge(AEGGraphEdge(source=prev_node.id, target=embedding_norm_node.id))
+            prev_node = embedding_norm_node
+        position_type = str(getattr(architecture, "position_type", "RoPE") or "RoPE").lower()
+        if position_type in {"absolute", "learned", "learned_absolute"}:
+            position_node = AEGGraphNode(
+                id="position_embedding",
+                node_type=AEGGraphNodeType.OPERATION,
+                name="learned_position_embedding",
+                op_type="embedding",
+                inputs=[input_node.id],
+                attributes={
+                    "vocab_size": architecture.context_length,
+                    "hidden_size": h,
+                    "embedding_type": "position",
+                },
+                precision=None,
+                layer_index=0,
+            )
+            graph.add_node(position_node)
+            graph.add_edge(AEGGraphEdge(source=input_node.id, target=position_node.id))
+            embedding_sum = AEGGraphNode(
+                id="embedding_with_position",
+                node_type=AEGGraphNodeType.OPERATION,
+                name="token_plus_position_embedding",
+                op_type="add",
+                inputs=[embedding_node.id, position_node.id],
+                attributes={},
+                precision=None,
+                layer_index=0,
+            )
+            graph.add_node(embedding_sum)
+            graph.add_edge(AEGGraphEdge(source=embedding_node.id, target=embedding_sum.id))
+            graph.add_edge(AEGGraphEdge(source=position_node.id, target=embedding_sum.id))
+            prev_node = embedding_sum
 
         # ── Transformer layers ──
         for layer in range(n_layers):
             layer_prefix = f"layer_{layer}"
-            ffn_tag = "ffn_moe" if architecture.is_moe else "ffn_swiglu"
+            moe_layers = getattr(architecture, "moe_layer_indices", None)
+            is_moe_layer = bool(
+                architecture.is_moe
+                and (moe_layers is None or layer in moe_layers)
+            )
 
             # RMSNorm
             norm_node = AEGGraphNode(
                 id=f"{layer_prefix}_rmsnorm",
                 node_type=AEGGraphNodeType.OPERATION,
                 name=f"Layer {layer} RMSNorm",
-                op_type="rmsnorm",
+                op_type="layernorm" if str(getattr(architecture, "norm_type", "RMSNorm")).lower() == "layernorm" else "rmsnorm",
                 inputs=[prev_node.id],
                 attributes={"eps": architecture.norm_eps, "hidden_size": h},
                 precision=None,
@@ -1379,26 +2157,67 @@ class IngestionPipeline:
                 name=f"Layer {layer} QKV Projection",
                 op_type="qkv_proj",
                 inputs=[norm_node.id],
-                attributes={"num_heads": n_heads, "num_kv_heads": n_kv_heads, "head_dim": head_dim},
+                attributes={
+                    "num_heads": n_heads,
+                    "num_kv_heads": n_kv_heads,
+                    "head_dim": head_dim,
+                    "qk_norm": architecture.qk_norm,
+                },
                 precision=None,
                 layer_index=layer,
             )
             graph.add_node(qkv_node)
             graph.add_edge(AEGGraphEdge(source=norm_node.id, target=qkv_node.id))
 
-            # RoPE
-            rope_node = AEGGraphNode(
-                id=f"{layer_prefix}_rope",
-                node_type=AEGGraphNodeType.OPERATION,
-                name=f"Layer {layer} RoPE",
-                op_type="rope",
-                inputs=[qkv_node.id],
-                attributes={"theta": architecture.rope_theta, "head_dim": head_dim},
-                precision=None,
-                layer_index=layer,
-            )
-            graph.add_node(rope_node)
-            graph.add_edge(AEGGraphEdge(source=qkv_node.id, target=rope_node.id))
+            # Qwen3 normalizes each query/key head after projection and before
+            # RoPE.  Keep these as real parameter-bearing nodes so the source
+            # weights survive graph binding and AEG quantization.  Models that
+            # do not declare qk_norm retain the ordinary QKV -> RoPE path.
+            rope_input_ids = [qkv_node.id]
+            if architecture.qk_norm:
+                for component in ("q_norm", "k_norm"):
+                    qk_norm_node = AEGGraphNode(
+                        id=f"{layer_prefix}_{component}",
+                        node_type=AEGGraphNodeType.OPERATION,
+                        name=f"Layer {layer} {component.upper()}",
+                        # Keep a distinct graph op type so Pass 1 does not
+                        # fuse this parameter node into the pre-attention
+                        # RMSNorm.  AEG-IR lowers it to RMS_NORM below.
+                        op_type="qk_norm",
+                        inputs=[qkv_node.id],
+                        attributes={"eps": architecture.norm_eps, "head_dim": head_dim},
+                        precision=None,
+                        layer_index=layer,
+                    )
+                    graph.add_node(qk_norm_node)
+                    graph.add_edge(AEGGraphEdge(source=qkv_node.id, target=qk_norm_node.id))
+                    rope_input_ids.append(qk_norm_node.id)
+
+            # Rotary position encoding is only one attention position scheme.
+            # Learned/absolute-position decoders (GPT-2/OPT-style) must not
+            # acquire a synthetic RoPE operation during lowering.
+            uses_rope = str(getattr(architecture, "position_type", "RoPE") or "RoPE").lower() in {
+                "rope", "rotary", "rotary_embedding"
+            }
+            attention_input_id = qkv_node.id
+            if uses_rope:
+                rope_node = AEGGraphNode(
+                    id=f"{layer_prefix}_rope",
+                    node_type=AEGGraphNodeType.OPERATION,
+                    name=f"Layer {layer} RoPE",
+                    op_type="rope",
+                    inputs=rope_input_ids,
+                    attributes={"theta": architecture.rope_theta, "head_dim": head_dim},
+                    precision=None,
+                    layer_index=layer,
+                )
+                graph.add_node(rope_node)
+                if architecture.qk_norm:
+                    graph.add_edge(AEGGraphEdge(source=f"{layer_prefix}_q_norm", target=rope_node.id))
+                    graph.add_edge(AEGGraphEdge(source=f"{layer_prefix}_k_norm", target=rope_node.id))
+                else:
+                    graph.add_edge(AEGGraphEdge(source=qkv_node.id, target=rope_node.id))
+                attention_input_id = rope_node.id
 
             # Attention
             attn_node = AEGGraphNode(
@@ -1406,7 +2225,7 @@ class IngestionPipeline:
                 node_type=AEGGraphNodeType.OPERATION,
                 name=f"Layer {layer} GQA Attention",
                 op_type="gqa",
-                inputs=[rope_node.id],
+                inputs=[attention_input_id],
                 attributes={
                     "num_heads": n_heads,
                     "num_kv_heads": n_kv_heads,
@@ -1417,7 +2236,7 @@ class IngestionPipeline:
                 layer_index=layer,
             )
             graph.add_node(attn_node)
-            graph.add_edge(AEGGraphEdge(source=rope_node.id, target=attn_node.id))
+            graph.add_edge(AEGGraphEdge(source=attention_input_id, target=attn_node.id))
 
             # Output projection
             out_proj_node = AEGGraphNode(
@@ -1433,7 +2252,9 @@ class IngestionPipeline:
             graph.add_node(out_proj_node)
             graph.add_edge(AEGGraphEdge(source=attn_node.id, target=out_proj_node.id))
 
-            # Residual add
+            # Residual add. Parallel-residual architectures retain this node
+            # for graph readability, but the final block add below combines
+            # both branches directly with the original residual.
             residual_add_node = AEGGraphNode(
                 id=f"{layer_prefix}_residual_1",
                 node_type=AEGGraphNodeType.OPERATION,
@@ -1453,17 +2274,21 @@ class IngestionPipeline:
                 id=f"{layer_prefix}_ffn_norm",
                 node_type=AEGGraphNodeType.OPERATION,
                 name=f"Layer {layer} FFN RMSNorm",
-                op_type="rmsnorm",
-                inputs=[residual_add_node.id],
+                op_type="layernorm" if str(getattr(architecture, "norm_type", "RMSNorm")).lower() == "layernorm" else "rmsnorm",
+                inputs=[norm_node.id] if bool(getattr(architecture, "parallel_residual", False)) else [residual_add_node.id],
                 attributes={"eps": architecture.norm_eps, "hidden_size": h},
                 precision=None,
                 layer_index=layer,
             )
             graph.add_node(ffn_norm_node)
-            graph.add_edge(AEGGraphEdge(source=residual_add_node.id, target=ffn_norm_node.id))
+            graph.add_edge(AEGGraphEdge(
+                source=(norm_node.id if bool(getattr(architecture, "parallel_residual", False)) else residual_add_node.id),
+                target=ffn_norm_node.id,
+            ))
 
-            if architecture.is_moe:
-                # MoE FFN with router
+            if is_moe_layer:
+                # MoE FFN with a real router parameter and separate expert
+                # projections. The artifact must retain every expert tensor.
                 moe_router_node = AEGGraphNode(
                     id=f"{layer_prefix}_moe_router",
                     node_type=AEGGraphNodeType.EXPERT_ROUTER,
@@ -1480,6 +2305,26 @@ class IngestionPipeline:
                 graph.add_node(moe_router_node)
                 graph.add_edge(AEGGraphEdge(source=ffn_norm_node.id, target=moe_router_node.id))
 
+                for expert_index in range(int(architecture.num_experts)):
+                    for projection in ("gate_proj", "up_proj", "down_proj"):
+                        graph.add_node(AEGGraphNode(
+                            id=f"{layer_prefix}_expert_{expert_index}_{projection}",
+                            node_type=AEGGraphNodeType.PARAMETER,
+                            name=(
+                                f"Layer {layer} Expert {expert_index} "
+                                f"{projection}"
+                            ),
+                            op_type="expert_weight",
+                            attributes={
+                                "expert_index": expert_index,
+                                "projection": projection,
+                                "num_experts": architecture.num_experts,
+                                "intermediate_size": i,
+                                "hidden_size": h,
+                            },
+                            layer_index=layer,
+                        ))
+
                 ffn_node = AEGGraphNode(
                     id=f"{layer_prefix}_moe_ffn",
                     node_type=AEGGraphNodeType.EXPERT_BANK,
@@ -1489,6 +2334,7 @@ class IngestionPipeline:
                     attributes={
                         "num_experts": architecture.num_experts,
                         "num_activated": architecture.num_activated_experts,
+                        "expert_intermediate_size": i,
                     },
                     precision=None,
                     layer_index=layer,
@@ -1496,7 +2342,11 @@ class IngestionPipeline:
                 graph.add_node(ffn_node)
                 graph.add_edge(AEGGraphEdge(source=moe_router_node.id, target=ffn_node.id))
             else:
-                # SwiGLU FFN
+                # GLU families use gate+up projections.  GPT-style GELU
+                # blocks use a single intermediate projection (mapped to the
+                # canonical gate_proj slot) and the down/output projection.
+                ffn_type = str(getattr(architecture, "ffn_type", "SwiGLU") or "SwiGLU")
+                classic_gelu = ffn_type.lower() in {"gelu", "relu", "relu2"}
                 gate_node = AEGGraphNode(
                     id=f"{layer_prefix}_gate_proj",
                     node_type=AEGGraphNodeType.OPERATION,
@@ -1513,10 +2363,15 @@ class IngestionPipeline:
                 ffn_node = AEGGraphNode(
                     id=f"{layer_prefix}_ffn",
                     node_type=AEGGraphNodeType.OPERATION,
-                    name=f"Layer {layer} SwiGLU FFN",
-                    op_type="swiglu_ffn",
-                    inputs=[gate_node.id, ffn_norm_node.id],
-                    attributes={"intermediate_size": i, "hidden_size": h},
+                    name=f"Layer {layer} {ffn_type} FFN",
+                    op_type="gelu_ffn" if classic_gelu else "swiglu_ffn",
+                    inputs=[gate_node.id] if classic_gelu else [gate_node.id, ffn_norm_node.id],
+                    attributes={
+                        "intermediate_size": i,
+                        "hidden_size": h,
+                        "ffn_type": ffn_type,
+                        "requires_up_projection": not classic_gelu,
+                    },
                     precision=None,
                     layer_index=layer,
                 )
@@ -1529,13 +2384,21 @@ class IngestionPipeline:
                 node_type=AEGGraphNodeType.OPERATION,
                 name=f"Layer {layer} Final Residual",
                 op_type="add",
-                inputs=[residual_add_node.id, ffn_node.id],
+                inputs=(
+                    [prev_node.id, out_proj_node.id, ffn_node.id]
+                    if bool(getattr(architecture, "parallel_residual", False))
+                    else [residual_add_node.id, ffn_node.id]
+                ),
                 attributes={},
                 precision=None,
                 layer_index=layer,
             )
             graph.add_node(final_residual_node)
-            graph.add_edge(AEGGraphEdge(source=residual_add_node.id, target=final_residual_node.id))
+            if bool(getattr(architecture, "parallel_residual", False)):
+                graph.add_edge(AEGGraphEdge(source=prev_node.id, target=final_residual_node.id))
+                graph.add_edge(AEGGraphEdge(source=out_proj_node.id, target=final_residual_node.id))
+            else:
+                graph.add_edge(AEGGraphEdge(source=residual_add_node.id, target=final_residual_node.id))
             graph.add_edge(AEGGraphEdge(source=ffn_node.id, target=final_residual_node.id))
 
             prev_node = final_residual_node
@@ -1545,7 +2408,7 @@ class IngestionPipeline:
             id="final_norm",
             node_type=AEGGraphNodeType.OPERATION,
             name="Final RMSNorm",
-            op_type="rmsnorm",
+            op_type="layernorm" if str(getattr(architecture, "norm_type", "RMSNorm")).lower() == "layernorm" else "rmsnorm",
             inputs=[prev_node.id],
             attributes={"eps": architecture.norm_eps, "hidden_size": h},
             precision=None,

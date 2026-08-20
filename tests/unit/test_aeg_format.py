@@ -173,6 +173,36 @@ class TestAEGPackage:
         size = minimal_aeg_package.compute_size()
         assert size > 0
 
+    def test_runtime_target_compatibility_is_explicit(self, minimal_aeg_package: AEGPackage) -> None:
+        minimal_aeg_package.manifest.kernels.targets = ["cpu_avx2"]
+        assert minimal_aeg_package.supports_runtime_target("cpu_avx2")
+        assert minimal_aeg_package.supports_runtime_target("cpu_avx512")
+        assert not minimal_aeg_package.supports_runtime_target("cuda_sm90")
+
+    def test_portable_backend_is_distinct_from_plan_only_target(self, minimal_aeg_package: AEGPackage) -> None:
+        kernels = minimal_aeg_package.manifest.kernels
+        kernels.targets = ["cpu_avx512", "cuda_sm90", "openvino_npu"]
+        kernels.variant_status = {
+            "cpu_avx512": "executable",
+            "cuda_sm90": "portable",
+            "openvino_npu": "plan_only",
+        }
+        kernels.portable_backends = ["pytorch"]
+        assert minimal_aeg_package.supports_runtime_target("cpu_avx512")
+        assert minimal_aeg_package.supports_runtime_target("cuda_sm90")
+        assert minimal_aeg_package.supports_runtime_target("rocm_cdna3")
+        assert minimal_aeg_package.supports_runtime_target("metal_m3")
+        assert not minimal_aeg_package.supports_runtime_target("openvino_npu")
+        assert not minimal_aeg_package.supports_runtime_target("fpga_xilinx_vu9p")
+        assert minimal_aeg_package.supports_portable_backend("pytorch")
+
+    def test_unknown_accelerator_target_is_not_implicitly_portable(self, minimal_aeg_package: AEGPackage) -> None:
+        kernels = minimal_aeg_package.manifest.kernels
+        kernels.targets = ["cuda_sm90"]
+        kernels.variant_status = {"cuda_sm90": "portable"}
+        kernels.portable_backends = ["pytorch"]
+        assert not minimal_aeg_package.supports_runtime_target("cuda_unknown")
+
 
 class TestShardingPlans:
     """Tests for default sharding plan creation."""

@@ -151,6 +151,22 @@ class Backend(ABC):
         """Return True if the backend is installed and can be used."""
         raise NotImplementedError
 
+    def available_for_target(self, target_id: str) -> bool:
+        """Return whether this backend can execute on ``target_id`` now.
+
+        Installation availability alone is insufficient for dispatch: an
+        installed CPU backend must not satisfy a CUDA, ROCm, or Metal request.
+        Vendor backends can override this method when they need a stronger
+        driver/device probe.
+        """
+        return bool(
+            self.is_available()
+            and (
+                not self.info.supported_targets
+                or target_id in self.info.supported_targets
+            )
+        )
+
     @abstractmethod
     def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
         """Load a model into the backend."""

@@ -236,7 +236,7 @@ def detect_rocm_devices() -> list[HardwareCapabilities]:
                     vendor="AMD",
                     device=name,
                     architecture="gfx_unknown",
-                    target_id="rocm",
+                    target_id=_rocm_target_id(str(name)),
                     runtime_version="amdsmi",
                     memory_bytes=mem_bytes,
                     supports_fp32=True,
@@ -253,6 +253,26 @@ def detect_rocm_devices() -> list[HardwareCapabilities]:
             amdsmi.amdsmi_shut_down()
             return devices
         amdsmi.amdsmi_shut_down()
+    except Exception:  # noqa: BLE001
+        pass
+
+    # PyTorch HIP fallback. ROCm is exposed as ``torch.hip`` by some builds
+    # and as an AMD-backed ``torch.cuda`` by others. Normalize either form to
+    # canonical Aether target IDs.
+    try:
+        import torch  # noqa: PLC0415
+        hip_available = bool(hasattr(torch, "hip") and torch.hip.is_available())
+        cuda_reports_amd = False
+        if not hip_available and hasattr(torch, "cuda") and torch.cuda.is_available():
+            cuda_reports_amd = any(
+                marker in str(torch.cuda.get_device_name(index)).upper()
+                for index in range(torch.cuda.device_count())
+                for marker in ("AMD", "RADEON", "INSTINCT", "MI100", "MI200", "MI300", "MI350")
+            )
+        if hip_available or cuda_reports_amd:
+            detected = _detect_rocm_via_hip(torch)
+            if detected:
+                return detected
     except Exception:  # noqa: BLE001
         pass
 
@@ -273,7 +293,7 @@ def detect_rocm_devices() -> list[HardwareCapabilities]:
                             vendor="AMD",
                             device=info.get("Card Series", "AMD GPU"),
                             architecture=info.get("GFX Version", "gfx_unknown"),
-                            target_id="rocm",
+                            target_id=_rocm_target_id(str(info.get("GFX Version", ""))),
                             runtime_version="rocm-smi",
                             implemented=True,
                             available=True,
@@ -295,7 +315,7 @@ def detect_rocm_devices() -> list[HardwareCapabilities]:
                     vendor="AMD",
                     device="AMD GPU (/dev/kfd present)",
                     architecture="gfx_unknown",
-                    target_id="rocm",
+                    target_id="rocm_cdna3",
                     runtime_version="kfd",
                     implemented=True,
                     available=True,
@@ -310,7 +330,7 @@ def detect_rocm_devices() -> list[HardwareCapabilities]:
         vendor="AMD",
         device="unknown",
         architecture="unknown",
-        target_id="rocm",
+        target_id="rocm_cdna3",
         reason="ROCm runtime not available on this host (amdsmi, rocm-smi, and /dev/kfd all failed)",
         implemented=True,
     )]
@@ -386,9 +406,23 @@ def detect_openvino() -> HardwareCapabilities:
     """Detect Intel OpenVINO / NPU."""
     try:
         import openvino  # type: ignore[import]
+        core = openvino.Core()
+        devices = list(core.available_devices)
+        if "NPU" not in devices:
+            return HardwareCapabilities.unavailable(
+                vendor="Intel",
+                device="Intel NPU",
+                architecture="openvino",
+                target_id="openvino_npu",
+                reason=(
+                    "OpenVINO is installed, but its device list contains no NPU; "
+                    f"available devices: {devices}"
+                ),
+                implemented=True,
+            )
         return HardwareCapabilities(
             vendor="Intel",
-            device="OpenVINO Runtime",
+            device="Intel NPU",
             architecture="openvino",
             target_id="openvino_npu",
             runtime_version=getattr(openvino, "__version__", "unknown"),
@@ -397,6 +431,7 @@ def detect_openvino() -> HardwareCapabilities:
             compile_tested=False,
             execution_tested=False,
             production_validated=False,
+            extra={"available_devices": devices},
         )
     except ImportError:
         return HardwareCapabilities.unavailable(
@@ -406,6 +441,15 @@ def detect_openvino() -> HardwareCapabilities:
             target_id="openvino_npu",
             reason="OpenVINO package not installed",
             implemented=False,
+        )
+    except Exception as exc:
+        return HardwareCapabilities.unavailable(
+            vendor="Intel",
+            device="Intel NPU",
+            architecture="openvino",
+            target_id="openvino_npu",
+            reason=f"OpenVINO device enumeration failed: {exc}",
+            implemented=True,
         )
 
 
@@ -538,7 +582,11 @@ def validate_backend_environment(target_id: str) -> ValidationResult:
     if target_id.startswith("cuda"):
         try:
             import torch
-            if torch.cuda.is_available():
+            # HIP builds intentionally expose ``torch.cuda`` for API
+            # compatibility.  Check the vendor runtime before reporting CUDA.
+            if getattr(torch.version, "hip", None):
+                checks_failed.append("PyTorch is a ROCm/HIP build, not NVIDIA CUDA")
+            elif torch.cuda.is_available():
                 checks_passed.append(f"CUDA available: {torch.cuda.get_device_name(0)}")
                 checks_passed.append(f"CUDA version: {torch.version.cuda}")
                 details["cuda_version"] = torch.version.cuda
@@ -739,11 +787,18 @@ def _infer_gfx_arch(device_name: str) -> str:
 
 
 def _rocm_target_id(device_name: str) -> str:
-    if "MI300" in device_name:
+    normalized = device_name.upper()
+    if "MI455" in normalized or "CDNA5" in normalized:
+        return "rocm_cdna5_mi455x"
+    if "MI350" in normalized or "CDNA4" in normalized:
+        return "amd_mi350x"
+    if "MI300" in normalized or "CDNA3" in normalized:
         return "rocm_cdna3"
-    if "MI250" in device_name or "MI200" in device_name:
-        return "rocm_cdna2"
-    if "7900" in device_name:
+    # Aether has no standalone CDNA2 target; use the compatible ROCm profile
+    # rather than emitting an identifier the target registry cannot resolve.
+    if "MI250" in normalized or "MI200" in normalized or "CDNA2" in normalized:
+        return "rocm_cdna3"
+    if "7900" in normalized or "RDNA3" in normalized:
         return "rocm_rdna3"
     return "rocm_cdna3"
 

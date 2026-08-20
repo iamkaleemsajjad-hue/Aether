@@ -103,7 +103,9 @@ class TestCascadeRouter:
     def _router_with_defaults(self):
         from aether.runtime.cascade_router import CascadeRouter
         r = CascadeRouter()
-        r.register_default_tiers()
+        r.register_default_tiers(
+            nano="nano.aeg", small="small.aeg", mid="mid.aeg", large="large.aeg"
+        )
         return r
 
     def test_routes_simple_to_tier0(self):

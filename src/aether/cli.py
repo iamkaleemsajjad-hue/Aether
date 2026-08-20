@@ -48,6 +48,26 @@ from aether.utils.logging import configure_logging
 console = Console()
 
 
+def _display_text(value: object) -> str:
+    """Return text that can be written by the active terminal encoding.
+
+    Windows installations can expose a legacy cp1252 stdout even when the
+    model emits Unicode.  Replacing only unencodable characters keeps the CLI
+    command successful and preserves all text that the terminal can display.
+    The runtime/API response remains unchanged; this is presentation-only.
+    """
+    text = str(value)
+    stream = getattr(console, "file", None)
+    encoding = getattr(stream, "encoding", None) or getattr(sys.stdout, "encoding", None)
+    if not encoding:
+        return text
+    try:
+        text.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+    return text
+
+
 def _require_applied_pass(aeg: Any, pass_name: str, feature: str) -> None:
     """Refuse to report a feature that the compiler did not apply.
 
@@ -70,6 +90,13 @@ def _require_applied_pass(aeg: Any, pass_name: str, feature: str) -> None:
 def cli(ctx: click.Context, verbose: bool, cache_dir: str | None) -> None:
     """Aether Runtime — compile any AI model, run it on any hardware."""
     configure_logging(level="DEBUG" if verbose else "INFO")
+    # Rich captures the stream that existed when this module was imported.
+    # Click (and test runners) replace stdout per invocation, so bind the
+    # console to the active Click stream for every command invocation.
+    try:
+        console.file = click.get_text_stream("stdout")
+    except (AttributeError, RuntimeError):
+        console.file = sys.stdout
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
     ctx.obj["cache_dir"] = cache_dir
@@ -267,7 +294,7 @@ def run(
             temperature=temperature,
             top_p=top_p,
         )
-    console.print(f"[bold]Response:[/bold] {response.text}")
+    console.print(f"[bold]Response:[/bold] {_display_text(response.text)}")
     console.print(f"[dim]Tokens: {response.usage}[/dim]")
     console.print(f"[dim]Metrics: {response.metrics.to_dict()}[/dim]")
 

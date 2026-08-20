@@ -411,7 +411,12 @@ class AetherClient:
         metrics = GenerationMetrics(
             ttft_ms=getattr(m, "ttft_ms", 0.0) if m else 0.0,
             total_ms=total_ms,
-            tokens_per_second=getattr(m, "tokens_per_second", 0.0) if m else 0.0,
+            # Runtime uses the canonical ``throughput_tps`` field; accept the
+            # legacy SDK spelling as a fallback for custom backends.
+            tokens_per_second=(
+                getattr(m, "throughput_tps", getattr(m, "tokens_per_second", 0.0))
+                if m else 0.0
+            ),
             backend=getattr(m, "backend_name", "unknown") if m else "unknown",
             hardware_target=self.hardware_target,
             cache_hit=getattr(m, "cache_hit", False) if m else False,

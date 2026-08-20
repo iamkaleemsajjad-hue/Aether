@@ -1,0 +1,49 @@
+{
+  "model": "Qwen3 0.6B",
+  "source_checkpoint": "qwen 0.6B/model.safetensors",
+  "artifact": "scratch/qwen_clean.aeg",
+  "target": "cpu_avx2",
+  "precision": "BF16",
+  "compile_wall_time_seconds_observed": 115.1,
+  "runtime_load_ms": 20784.07,
+  "runs": [
+    {
+      "prompt": "The capital of France is",
+      "prompt_tokens": 5,
+      "completion_tokens": 2,
+      "latency_ms": 4949.96,
+      "tokens_per_second": 0.404,
+      "generated_text": " Paris."
+    },
+    {
+      "prompt": "2 + 2 =",
+      "prompt_tokens": 5,
+      "completion_tokens": 2,
+      "latency_ms": 2045.73,
+      "tokens_per_second": 0.9776,
+      "generated_text": " 4"
+    },
+    {
+      "prompt": "Aether is",
+      "prompt_tokens": 3,
+      "completion_tokens": 2,
+      "latency_ms": 1671.66,
+      "tokens_per_second": 1.1964,
+      "generated_text": " a "
+    }
+  ],
+  "quality_probe": {
+    "reference": "Hugging Face Transformers, local checkpoint",
+    "prompt": "The capital of France is",
+    "top1_match": true,
+    "top5_overlap": 5,
+    "top10_overlap": 10,
+    "top50_overlap": 50,
+    "logits_cosine": 1.0
+  },
+  "notes": [
+    "Source config was used; Q/K head norms and final model.norm were packaged.",
+    "Sparse attention and pruning remain opt-in pending a real task/perplexity quality gate.",
+    "CPU measurements include native-kernel startup in the first load; they are not GPU claims."
+  ]
+}

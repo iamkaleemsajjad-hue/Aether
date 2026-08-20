@@ -392,6 +392,34 @@ class MLAAttention:
         exp_x = np.exp(shifted)
         return exp_x / (exp_x.sum(axis=-1, keepdims=True) + 1e-9)
 
+    @staticmethod
+    def _rms_norm(x: np.ndarray, weight: np.ndarray | None) -> np.ndarray:
+        if weight is None:
+            return x
+        vector = np.asarray(weight, dtype=np.float32).reshape(-1)
+        return x * np.reciprocal(np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + 1e-6)) * vector
+
+    @staticmethod
+    def _required_weight(
+        weights: dict[str, np.ndarray], key: str, *, layer_prefix: str
+    ) -> np.ndarray:
+        """Return an authenticated MLA tensor or fail closed.
+
+        MLA projections are learned model parameters.  Earlier versions used
+        random/identity fallbacks here, which could make a malformed artifact
+        appear to run while producing unrelated logits.  A compiler/runtime
+        boundary must never manufacture model weights.
+        """
+        value = weights.get(key)
+        if value is None:
+            raise ValueError(
+                f"MLA layer {layer_prefix or '<layer>'} is missing required weight {key!r}"
+            )
+        array = np.asarray(value, dtype=np.float32)
+        if array.ndim != 2 or array.size == 0:
+            raise ValueError(f"MLA weight {key!r} must be a non-empty matrix")
+        return array
+
     def forward_prefill(
         self,
         x: np.ndarray,              # (batch, seq, hidden_dim)
@@ -410,12 +438,15 @@ class MLAAttention:
         # --- Q projection ---
         W_q_a = weights.get(f"{layer_prefix}q_a_proj.weight")
         W_q_b = weights.get(f"{layer_prefix}q_b_proj.weight")
+        if (W_q_a is None) != (W_q_b is None):
+            raise ValueError(f"MLA layer {layer_prefix or '<layer>'} has only one query compression projection")
         if W_q_a is not None and W_q_b is not None:
             # Compressed Q path
             c_q = x.reshape(B * S, D) @ W_q_a.T     # (BS, q_lora_rank)
+            c_q = self._rms_norm(c_q, weights.get(f"{layer_prefix}q_a_norm.weight"))
             q_all = c_q @ W_q_b.T                    # (BS, num_heads * total_head_dim)
         else:
-            W_q = weights.get(f"{layer_prefix}q_proj.weight", np.eye(D)[:, :cfg.num_heads * cfg.total_head_dim])
+            W_q = self._required_weight(weights, f"{layer_prefix}q_proj.weight", layer_prefix=layer_prefix)
             q_all = x.reshape(B * S, D) @ W_q.T
 
         H = cfg.num_heads
@@ -429,24 +460,32 @@ class MLAAttention:
         q_rope = self._rope(q_rope.transpose(0, 2, 1, 3), position_offset).transpose(0, 2, 1, 3)
 
         # --- KV projection (latent) ---
-        W_kv_a = weights.get(f"{layer_prefix}kv_a_proj.weight",
-                              np.random.randn(D, cfg.kv_lora_rank).astype(np.float32) * 0.01)
-        W_kv_b = weights.get(f"{layer_prefix}kv_b_proj.weight",
-                              np.random.randn(cfg.kv_lora_rank, H * (D_nope + D_v)).astype(np.float32) * 0.01)
+        W_kv_a = self._required_weight(
+            weights, f"{layer_prefix}kv_a_proj.weight", layer_prefix=layer_prefix
+        )
+        W_kv_b = self._required_weight(
+            weights, f"{layer_prefix}kv_b_proj.weight", layer_prefix=layer_prefix
+        )
 
         latent = x.reshape(B * S, D) @ W_kv_a.T  # (BS, kv_lora_rank)
+        latent = self._rms_norm(latent, weights.get(f"{layer_prefix}kv_a_norm.weight"))
 
         # Reconstruct K/V
         nope_dim = H * D_nope
-        W_kv_b_nope = W_kv_b[:, :nope_dim]
-        W_kv_b_v    = W_kv_b[:, nope_dim:]
-
+        # AEG stores linear weights as (out_features, in_features), whereas
+        # the MLA equations use the mathematical (rank, output) view for
+        # W_kv_b.  Transpose once at the boundary and keep the equations
+        # faithful to DeepSeek-V2/V3.
+        W_kv_b_math = W_kv_b.T
+        W_kv_b_nope = W_kv_b_math[:, :nope_dim]
+        W_kv_b_v    = W_kv_b_math[:, nope_dim:]
         k_nope = (latent @ W_kv_b_nope).reshape(B, S, H, D_nope)  # (B, S, H, D_nope)
         v      = (latent @ W_kv_b_v).reshape(B, S, H, D_v)        # (B, S, H, D_v)
 
         # Decoupled RoPE K
-        W_k_rope = weights.get(f"{layer_prefix}k_rope_proj.weight",
-                                np.random.randn(D, H * D_rope).astype(np.float32) * 0.01)
+        W_k_rope = self._required_weight(
+            weights, f"{layer_prefix}k_rope_proj.weight", layer_prefix=layer_prefix
+        )
         k_rope = (x.reshape(B * S, D) @ W_k_rope.T).reshape(B, S, H, D_rope)
         k_rope = self._rope(k_rope.transpose(0, 2, 1, 3), position_offset).transpose(0, 2, 1, 3)
 
@@ -469,8 +508,9 @@ class MLAAttention:
         out = out.transpose(0, 2, 1, 3).reshape(B, S, H * D_v)
 
         # --- Output projection ---
-        W_o = weights.get(f"{layer_prefix}o_proj.weight",
-                           np.eye(H * D_v)[:, :D])
+        W_o = self._required_weight(
+            weights, f"{layer_prefix}o_proj.weight", layer_prefix=layer_prefix
+        )
         out = out.reshape(B * S, H * D_v) @ W_o.T
         return out.reshape(B, S, D)
 
@@ -499,11 +539,14 @@ class MLAAttention:
         # Q for new token
         W_q_a = weights.get(f"{layer_prefix}q_a_proj.weight")
         W_q_b = weights.get(f"{layer_prefix}q_b_proj.weight")
+        if (W_q_a is None) != (W_q_b is None):
+            raise ValueError(f"MLA layer {layer_prefix or '<layer>'} has only one query compression projection")
         if W_q_a is not None and W_q_b is not None:
             c_q = x.reshape(B, D) @ W_q_a.T
+            c_q = self._rms_norm(c_q, weights.get(f"{layer_prefix}q_a_norm.weight"))
             q_all = c_q @ W_q_b.T
         else:
-            W_q = weights.get(f"{layer_prefix}q_proj.weight", np.eye(D)[:, :H * (D_nope + D_rope)])
+            W_q = self._required_weight(weights, f"{layer_prefix}q_proj.weight", layer_prefix=layer_prefix)
             q_all = x.reshape(B, D) @ W_q.T
 
         q_all = q_all.reshape(B, H, D_nope + D_rope)
@@ -513,13 +556,16 @@ class MLAAttention:
         q_rope = self._rope(q_rope[:, np.newaxis, :, :], pos_offset).squeeze(1)
 
         # New latent KV
-        W_kv_a = weights.get(f"{layer_prefix}kv_a_proj.weight",
-                              np.zeros((D, cfg.kv_lora_rank), dtype=np.float32))
+        W_kv_a = self._required_weight(
+            weights, f"{layer_prefix}kv_a_proj.weight", layer_prefix=layer_prefix
+        )
         new_latent = x.reshape(B, D) @ W_kv_a.T  # (B, kv_lora_rank)
+        new_latent = self._rms_norm(new_latent, weights.get(f"{layer_prefix}kv_a_norm.weight"))
 
         # New RoPE K
-        W_k_rope = weights.get(f"{layer_prefix}k_rope_proj.weight",
-                                np.zeros((D, H * D_rope), dtype=np.float32))
+        W_k_rope = self._required_weight(
+            weights, f"{layer_prefix}k_rope_proj.weight", layer_prefix=layer_prefix
+        )
         new_k_rope = (x.reshape(B, D) @ W_k_rope.T).reshape(B, H, D_rope)
         new_k_rope = self._rope(new_k_rope[:, np.newaxis, :, :], pos_offset).squeeze(1)
 
@@ -527,8 +573,9 @@ class MLAAttention:
         kv_cache.append(request_id, new_latent[:1], new_k_rope[:1])
 
         # Reconstruct K/V from cached latents
-        W_kv_b = weights.get(f"{layer_prefix}kv_b_proj.weight",
-                              np.zeros((cfg.kv_lora_rank, H * (D_nope + D_v)), dtype=np.float32))
+        W_kv_b = self._required_weight(
+            weights, f"{layer_prefix}kv_b_proj.weight", layer_prefix=layer_prefix
+        )
         k_nope, k_rope, v = kv_cache.reconstruct(request_id, W_kv_b)  # (T, H, dim)
 
         T = k_nope.shape[0]
@@ -545,7 +592,9 @@ class MLAAttention:
         out = np.einsum("ht,htd->hd", attn, v)  # (H, D_v)
         out = out.reshape(1, H * D_v)          # (1, H*D_v)
 
-        W_o = weights.get(f"{layer_prefix}o_proj.weight", np.eye(H * D_v)[:, :D])
+        W_o = self._required_weight(
+            weights, f"{layer_prefix}o_proj.weight", layer_prefix=layer_prefix
+        )
         out = out @ W_o.T
         return out.reshape(1, 1, D)
 

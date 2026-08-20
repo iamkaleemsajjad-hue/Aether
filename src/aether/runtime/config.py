@@ -324,7 +324,16 @@ class RuntimeConfig:
         if "AETHER_OPTIMIZE_FOR" in os.environ:
             config.optimize_for = os.environ["AETHER_OPTIMIZE_FOR"]
         if "AETHER_SPECULATIVE_DECODING" in os.environ:
-            config.speculative_decoding = os.environ["AETHER_SPECULATIVE_DECODING"].lower() in ("1", "true", "yes")
+            raw_speculation = os.environ["AETHER_SPECULATIVE_DECODING"].strip().lower()
+            if raw_speculation in {"1", "true", "yes", "on"}:
+                config.speculative_decoding = True
+            elif raw_speculation in {"0", "false", "no", "off", "none", "disabled"}:
+                config.speculative_decoding = "none"
+            else:
+                # Preserve named engines such as eagle3/p_eagle/saguaro;
+                # coercing every non-boolean value to False silently disabled
+                # valid deployments configured through the environment.
+                config.speculative_decoding = raw_speculation
         if "AETHER_PREFILL_CHUNK_SIZE" in os.environ:
             config.prefill_chunk_size = int(os.environ["AETHER_PREFILL_CHUNK_SIZE"])
         if "AETHER_MAX_BATCH_SIZE" in os.environ:

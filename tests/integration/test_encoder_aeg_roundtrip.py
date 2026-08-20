@@ -85,12 +85,19 @@ def test_encoder_compile_reload_and_embedding(tmp_path: Path) -> None:
     artifact = tmp_path / "tiny-bert.aeg"
 
     package = Compiler(
-        CompilerConfig(pruning_target_sparsity=0.0)
+        CompilerConfig(
+            pruning_target_sparsity=0.0,
+            targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
+        )
     ).compile(str(source), output_path=artifact)
 
     assert package.manifest.architecture.is_encoder is True
     assert "position_embedding" in package.weights
     assert "pooler" in package.weights
+    assert package.manifest.kernels.variant_status["cuda_sm90"] == "portable"
+    assert package.manifest.kernels.variant_status["rocm_cdna3"] == "portable"
+    assert package.manifest.kernels.variant_status["metal_m3"] == "portable"
+    assert "pytorch" in package.manifest.kernels.portable_backends
     engine = load_engine_from_path(artifact)
     embedding = np.asarray(engine.embed([[1, 2, 3]]), dtype=np.float32)
     assert embedding.shape == (1, 8)
@@ -102,6 +109,14 @@ def test_encoder_compile_reload_and_embedding(tmp_path: Path) -> None:
     api_embedding = np.asarray(backend.embed("tiny-bert", ["tok1 tok2"]), dtype=np.float32)
     assert api_embedding.shape == (1, 8)
     assert np.isfinite(api_embedding).all()
+    pytest.importorskip("torch")
+    from aether.runtime.torch_transformer_engine import TorchEncoderAEGEngine
+
+    cpu_embedding = np.asarray(engine.embed([[1, 2, 3]]), dtype=np.float32)
+    portable_embedding = TorchEncoderAEGEngine(engine, "cpu").pooled(
+        np.asarray([[1, 2, 3]], dtype=np.int64)
+    )
+    np.testing.assert_allclose(portable_embedding, cpu_embedding, rtol=2e-5, atol=2e-5)
 
     result = CliRunner().invoke(
         cli,

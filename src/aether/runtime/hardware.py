@@ -57,6 +57,9 @@ class HardwareFingerprint:
     attributes: dict[str, Any] = field(default_factory=dict)
     """Additional attributes."""
 
+    capabilities: list[dict[str, Any]] = field(default_factory=list)
+    """Complete detector evidence for every vendor/backend pipeline."""
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "target_id": self.target_id,
@@ -71,6 +74,7 @@ class HardwareFingerprint:
             "driver_version": self.driver_version,
             "compute_capability": self.compute_capability,
             "attributes": self.attributes,
+            "capabilities": self.capabilities,
         }
 
 
@@ -83,6 +87,25 @@ class HardwareDetector:
 
     def detect(self) -> HardwareFingerprint:
         """Detect hardware and produce a fingerprint."""
+        from aether.backends.hardware_detector import detect_all_capabilities
+
+        capabilities = detect_all_capabilities()
+        available = [item for item in capabilities if item.available]
+        primary = next(
+            (
+                item for item in available
+                if item.vendor in {"NVIDIA", "AMD", "Apple", "Intel"}
+            ),
+            next((item for item in available if item.vendor == "CPU"), None),
+        )
+        if primary is not None:
+            try:
+                self.target = HardwareTarget.from_string(primary.target_id)
+            except ValueError:
+                # Keep the safe enum-selected target until a new vendor target
+                # is added to the canonical target registry.
+                self.target = HardwareTarget.auto()
+            self.profile = HardwareProfile.from_target_id(self.target.value)
         os_name = platform.system()
         cpu_arch = platform.machine()
         cpu_count = os.cpu_count() or 1
@@ -94,33 +117,16 @@ class HardwareDetector:
         driver_version = None
         compute_capability = None
 
-        if self.target.value.startswith("cuda"):
-            try:
-                import pynvml  # noqa: PLC0415
-                pynvml.nvmlInit()
-                gpu_count = pynvml.nvmlDeviceGetCount()
-                if gpu_count > 0:
-                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                    name = pynvml.nvmlDeviceGetName(handle)
-                    gpu_name = name.decode() if isinstance(name, bytes) else name
-                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                    gpu_memory_gb = mem_info.total / (1024 ** 3)
-                    major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
-                    compute_capability = f"({major}, {minor})"
-                    drv = pynvml.nvmlSystemGetDriverVersion()
-                    driver_version = drv.decode() if isinstance(drv, bytes) else drv
-                pynvml.nvmlShutdown()
-            except Exception:  # noqa: BLE001 — no NVIDIA GPU or pynvml not installed
-                pass
-        elif self.target.value.startswith("metal"):
-            try:
-                import platform as pf
-                gpu_name = pf.processor()
-                gpu_count = 1
-                gpu_memory_gb = total_ram_gb  # Unified memory on Apple
-                compute_capability = "metal"
-            except Exception:
-                pass
+        accelerator_caps = [
+            item for item in available if item.vendor in {"NVIDIA", "AMD", "Apple"}
+        ]
+        if accelerator_caps:
+            first = accelerator_caps[0]
+            gpu_count = len(accelerator_caps)
+            gpu_name = first.device
+            gpu_memory_gb = first.memory_bytes / (1024 ** 3) if first.memory_bytes else 0.0
+            compute_capability = str(first.extra.get("compute_capability", first.architecture))
+            driver_version = first.driver_version
 
         profile_name = self.profile.name if self.profile else self.target.value
         return HardwareFingerprint(
@@ -135,6 +141,11 @@ class HardwareDetector:
             gpu_memory_gb=gpu_memory_gb,
             driver_version=driver_version,
             compute_capability=compute_capability,
+            attributes={
+                "available_targets": [item.target_id for item in available],
+                "available_accelerator_count": len(accelerator_caps),
+            },
+            capabilities=[item.to_dict() for item in capabilities],
         )
 
     @staticmethod

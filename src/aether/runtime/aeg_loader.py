@@ -24,8 +24,21 @@ import numpy as np
 
 from aether.core.exceptions import AEGFormatError
 from aether.kernels.native_cpu import get_native_kernels
-from aether.runtime.cpu_engine import CPUExecutionEngine, LayerWeights, ModelWeights
+from aether.runtime.cpu_engine import (
+    CPUExecutionEngine,
+    ExpertWeights,
+    LayerWeights,
+    ModelWeights,
+)
+from aether.runtime.mla_engine import (
+    MLAExecutionEngine, MLAExpertWeights, MLALayerWeights, MLAModelWeights,
+)
+from aether.runtime.mamba_engine import MambaExecutionEngine, MambaLayerWeights, MambaModelWeights
+from aether.runtime.mamba2_engine import Mamba2ExecutionEngine, Mamba2LayerWeights, Mamba2ModelWeights
+from aether.runtime.rwkv_engine import RWKVExecutionEngine, RWKVLayerWeights, RWKVModelWeights
+from aether.runtime.hybrid_engine import HybridExecutionEngine, HybridLayerWeights, HybridModelWeights
 from aether.runtime.encoder_engine import EncoderExecutionEngine, EncoderLayerWeights, EncoderModelWeights
+from aether.runtime.seq2seq_engine import Seq2SeqDecoderLayer, Seq2SeqExecutionEngine, Seq2SeqLayer
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -58,6 +71,18 @@ def package_is_runnable(package: Any) -> bool:
     set can never be runnable.
     """
     try:
+        # This helper is part of the public loader surface, so accept the same
+        # path forms as ``load_engine_from_path``.  Previously callers had to
+        # know the internal AEGPackage type even though the function's name
+        # and documentation describe an artifact check.
+        if isinstance(package, (str, Path)):
+            from aether.core.aeg_format import AEGPackage
+
+            package_path = Path(package)
+            if package_path.is_file():
+                package = AEGPackage.load_from_archive(package_path)
+            else:
+                package = AEGPackage(package_path).load()
         manifest = getattr(package, "manifest", None)
         if manifest is not None:
             if getattr(manifest, "graph_hash", "") == "sha256:pending":
@@ -113,8 +138,20 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
         raise AEGLoadError(msg)
 
     architecture = _architecture_dict(package)
+    if bool(architecture.get("is_encoder_decoder", False)):
+        return _load_seq2seq_engine_from_package(package, architecture)
     if bool(architecture.get("is_encoder", False)):
         return _load_encoder_engine_from_package(package, architecture)
+    if str(architecture.get("attention_type", "") or "").upper() == "MLA":
+        return _load_mla_engine_from_package(package, architecture)
+    if architecture.get("ssm_variant") == "selective_scan":
+        return _load_mamba_engine_from_package(package, architecture)
+    if architecture.get("ssm_variant") == "hybrid_selective_scan":
+        return _load_hybrid_engine_from_package(package, architecture)
+    if architecture.get("ssm_variant") == "ssd":
+        return _load_mamba2_engine_from_package(package, architecture)
+    if architecture.get("ssm_variant") == "rwkv_time_mix":
+        return _load_rwkv_engine_from_package(package, architecture)
     num_layers = int(architecture.get("layers", 0) or 0)
     num_heads = int(architecture.get("num_attention_heads", 0) or 0)
     if num_layers <= 0 or num_heads <= 0:
@@ -158,7 +195,28 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
 
     layers: list[LayerWeights] = []
     for index in range(num_layers):
-        layers.append(_build_layer(tensors, index, hidden_size, num_heads, num_kv_heads))
+        layers.append(
+            _build_layer(
+                tensors,
+                index,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                ffn_type=str(architecture.get("ffn_type", "SwiGLU") or "SwiGLU"),
+                num_experts=int(architecture.get("num_experts", 0) or 0),
+                num_activated_experts=int(
+                    architecture.get("num_activated_experts", 0) or 0
+                ),
+                parallel_residual=bool(architecture.get("parallel_residual", False)),
+                is_moe_layer=(
+                    bool(architecture.get("is_moe", False))
+                    and (
+                        architecture.get("moe_layer_indices") is None
+                        or index in architecture.get("moe_layer_indices", [])
+                    )
+                ),
+            )
+        )
     if len(layers) != num_layers:  # defensive: loop above always satisfies this
         raise AEGLoadError(
             f"Layer count invariant violated: built {len(layers)} layers, "
@@ -185,14 +243,43 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
     final_norm = tensors.get((None, "final_norm"))
     if final_norm is None:
         final_norm = np.ones(hidden_size, dtype=np.float32)
+    final_norm_bias = tensors.get((None, "final_norm_bias"))
+    embedding_norm = tensors.get((None, "embedding_norm"))
+    embedding_norm_bias = tensors.get((None, "embedding_norm_bias"))
+    position_embedding = tensors.get((None, "position_embedding"))
+    position_type = str(architecture.get("position_type", "RoPE") or "RoPE").lower()
+    if position_type in {"absolute", "learned", "learned_absolute"} and position_embedding is None:
+        raise AEGLoadError("AEG package is missing the declared absolute position embedding")
+    if bool(architecture.get("embedding_norm", False)) and embedding_norm is None:
+        raise AEGLoadError("AEG package is missing the declared embedding normalization")
 
     weights = ModelWeights(
         embedding=embedding,
         layers=layers,
         final_norm=np.asarray(final_norm, dtype=np.float32).reshape(-1),
         lm_head=lm_head,
+        position_embedding=(
+            np.ascontiguousarray(position_embedding, dtype=np.float32)
+            if position_embedding is not None else None
+        ),
+        embedding_norm=(
+            np.asarray(embedding_norm, dtype=np.float32).reshape(-1)
+            if embedding_norm is not None else None
+        ),
+        embedding_norm_bias=(
+            np.asarray(embedding_norm_bias, dtype=np.float32).reshape(-1)
+            if embedding_norm_bias is not None else None
+        ),
+        final_norm_bias=(
+            np.asarray(final_norm_bias, dtype=np.float32).reshape(-1)
+            if final_norm_bias is not None else None
+        ),
         rope_theta=float(architecture.get("rope_theta", 10000.0) or 10000.0),
         norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+        norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
+        ffn_type=str(architecture.get("ffn_type", "SwiGLU") or "SwiGLU"),
+        position_type=str(architecture.get("position_type", "RoPE") or "RoPE"),
+        parallel_residual=bool(architecture.get("parallel_residual", False)),
     )
     kernels = get_native_kernels()
     _load_packaged_native_kernels(package, kernels)
@@ -214,6 +301,430 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
         num_kv_heads,
     )
     return engine
+
+
+def _load_mla_engine_from_package(
+    package: Any, architecture: dict[str, Any]
+) -> MLAExecutionEngine:
+    """Load the model-generic MLA CPU executor from authenticated tensors."""
+    from aether.attention.mla import MLAConfig
+
+    tensors = _dequantized_by_key(package)
+    embedding = _require(tensors, (None, "embedding"), "token embedding")
+    final_norm = _require(tensors, (None, "final_norm"), "final norm")
+    lm_head = tensors.get((None, "lm_head"), embedding)
+    layers: list[MLALayerWeights] = []
+    for index in range(int(architecture.get("layers", 0) or 0)):
+        prefix = (index, "")
+        required = {
+            "attention_norm": _require(tensors, (index, "attention_norm"), f"MLA layer {index} attention norm"),
+            "ffn_norm": _require(tensors, (index, "ffn_norm"), f"MLA layer {index} FFN norm"),
+            "o_proj": _require(tensors, (index, "o_proj"), f"MLA layer {index} output projection"),
+            "q_a_proj": _require(tensors, (index, "q_a_proj"), f"MLA layer {index} q_a projection"),
+            "q_b_proj": _require(tensors, (index, "q_b_proj"), f"MLA layer {index} q_b projection"),
+            "kv_a_proj": _require(tensors, (index, "kv_a_proj"), f"MLA layer {index} kv_a projection"),
+            "kv_b_proj": _require(tensors, (index, "kv_b_proj"), f"MLA layer {index} kv_b projection"),
+            "k_rope_proj": _require(tensors, (index, "k_rope_proj"), f"MLA layer {index} RoPE projection"),
+            "q_a_norm": _require(tensors, (index, "q_a_norm"), f"MLA layer {index} q_a norm"),
+            "kv_a_norm": _require(tensors, (index, "kv_a_norm"), f"MLA layer {index} kv_a norm"),
+        }
+        up = tensors.get((index, "up_proj"))
+        moe_indices = architecture.get("moe_layer_indices")
+        is_moe_layer = bool(architecture.get("is_moe", False)) and (
+            moe_indices is None or index in {int(value) for value in moe_indices}
+        )
+        router = tensors.get((index, "moe_router")) if is_moe_layer else None
+        experts: list[MLAExpertWeights] = []
+        if is_moe_layer:
+            if router is None:
+                raise AEGLoadError(f"MLA MoE layer {index} is missing its router tensor")
+            expert_count = int(architecture.get("num_experts", 0) or 0)
+            if expert_count <= 0:
+                raise AEGLoadError(f"MLA MoE layer {index} has no declared expert count")
+            for expert_index in range(expert_count):
+                gate = _require(tensors, (index, f"expert_{expert_index}_gate_proj"), f"MLA layer {index} expert {expert_index} gate projection")
+                expert_up = _require(tensors, (index, f"expert_{expert_index}_up_proj"), f"MLA layer {index} expert {expert_index} up projection")
+                down = _require(tensors, (index, f"expert_{expert_index}_down_proj"), f"MLA layer {index} expert {expert_index} down projection")
+                experts.append(MLAExpertWeights(
+                    gate_proj=np.asarray(gate, dtype=np.float32),
+                    up_proj=np.asarray(expert_up, dtype=np.float32),
+                    down_proj=np.asarray(down, dtype=np.float32),
+                ))
+            ffn_in = ffn_out = None
+        else:
+            ffn_in = _require(tensors, (index, "gate_proj"), f"MLA layer {index} FFN input")
+            ffn_out = _require(tensors, (index, "down_proj"), f"MLA layer {index} FFN output")
+        mla = {
+            "q_a_proj.weight": np.asarray(required["q_a_proj"], dtype=np.float32),
+            "q_b_proj.weight": np.asarray(required["q_b_proj"], dtype=np.float32),
+            "kv_a_proj.weight": np.asarray(required["kv_a_proj"], dtype=np.float32),
+            "kv_b_proj.weight": np.asarray(required["kv_b_proj"], dtype=np.float32),
+            "k_rope_proj.weight": np.asarray(required["k_rope_proj"], dtype=np.float32),
+            "q_a_norm.weight": _norm_vector(required["q_a_norm"], int(required["q_a_norm"].size)),
+            "kv_a_norm.weight": _norm_vector(required["kv_a_norm"], int(required["kv_a_norm"].size)),
+        }
+        layers.append(MLALayerWeights(
+            attention_norm=_norm_vector(required["attention_norm"], int(embedding.shape[1])),
+            ffn_norm=_norm_vector(required["ffn_norm"], int(embedding.shape[1])),
+            o_proj=np.asarray(required["o_proj"], dtype=np.float32),
+            ffn_in=None if ffn_in is None else np.asarray(ffn_in, dtype=np.float32),
+            ffn_out=None if ffn_out is None else np.asarray(ffn_out, dtype=np.float32),
+            ffn_up=None if up is None else np.asarray(up, dtype=np.float32),
+            mla=mla,
+            router=None if router is None else np.asarray(router, dtype=np.float32),
+            experts=experts,
+            num_activated_experts=int(architecture.get("num_activated_experts", 1) or 1),
+        ))
+    config = MLAConfig(
+        kv_lora_rank=int(architecture.get("mla_kv_lora_rank") or 0),
+        q_lora_rank=int(architecture.get("mla_q_lora_rank") or 0),
+        qk_nope_head_dim=int(architecture.get("mla_qk_nope_head_dim") or 0),
+        qk_rope_head_dim=int(architecture.get("mla_qk_rope_head_dim") or 0),
+        v_head_dim=int(architecture.get("mla_v_head_dim") or 0),
+        num_heads=int(architecture.get("num_attention_heads") or 0),
+        num_kv_heads=int(architecture.get("num_kv_heads") or architecture.get("num_attention_heads") or 0),
+        rope_theta=float(architecture.get("rope_theta", 10000.0) or 10000.0),
+    )
+    if min(config.kv_lora_rank, config.q_lora_rank, config.qk_nope_head_dim, config.qk_rope_head_dim, config.v_head_dim, config.num_heads) <= 0:
+        raise AEGLoadError("MLA manifest contains incomplete latent-attention geometry")
+    return MLAExecutionEngine(
+        MLAModelWeights(
+            embedding=np.asarray(embedding, dtype=np.float32),
+            layers=layers,
+            final_norm=_norm_vector(final_norm, int(embedding.shape[1])),
+            lm_head=np.asarray(lm_head, dtype=np.float32),
+            norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+            norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
+            ffn_type=str(architecture.get("ffn_type", "SwiGLU") or "SwiGLU"),
+        ),
+        config,
+    )
+
+
+def _load_mamba_engine_from_package(
+    package: Any, architecture: dict[str, Any]
+) -> MambaExecutionEngine:
+    """Load a Mamba selective-scan engine from the canonical AEG tensors."""
+    tensors = _dequantized_by_key(package)
+    embedding = _require(tensors, (None, "embedding"), "token embedding")
+    final_norm = _require(tensors, (None, "final_norm"), "final norm")
+    lm_head = tensors.get((None, "lm_head"), embedding)
+    hidden = int(embedding.shape[1])
+    layers: list[MambaLayerWeights] = []
+    for index in range(int(architecture.get("layers", 0) or 0)):
+        def required(component: str) -> np.ndarray:
+            return _require(tensors, (index, component), f"Mamba layer {index} {component}")
+        layers.append(MambaLayerWeights(
+            norm=_norm_vector(required("ssm_norm"), hidden),
+            in_proj=required("ssm_in_proj"),
+            conv1d=required("ssm_conv1d"),
+            x_proj=required("ssm_x_proj"),
+            dt_proj=required("ssm_dt_proj"),
+            a_log=required("ssm_a_log"),
+            d=required("ssm_d"),
+            out_proj=required("ssm_out_proj"),
+            conv_bias=tensors.get((index, "ssm_conv1d_bias")),
+            dt_bias=tensors.get((index, "ssm_dt_proj_bias")),
+        ))
+    return MambaExecutionEngine(
+        MambaModelWeights(
+            embedding=np.asarray(embedding, dtype=np.float32),
+            layers=layers,
+            final_norm=_norm_vector(final_norm, hidden),
+            lm_head=np.asarray(lm_head, dtype=np.float32),
+            norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+            norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
+        ),
+        state_size=int(architecture.get("ssm_state_size") or 16),
+        inner_size=int(architecture.get("ssm_inner_size") or hidden * 2),
+        dt_rank=int(architecture.get("ssm_dt_rank") or max(1, (hidden + 15) // 16)),
+        conv_kernel=int(architecture.get("ssm_conv_kernel") or 4),
+    )
+
+
+def _load_hybrid_engine_from_package(
+    package: Any, architecture: dict[str, Any]
+) -> HybridExecutionEngine:
+    """Load a Jamba-style mixed attention/selective-scan artifact.
+
+    The schedule is authenticated as architecture metadata and every layer is
+    required to provide the tensor contract for its declared block kind.  The
+    helper-only representation for the other block kind contains shape-valid
+    zero/identity arrays and is never executed; this lets the shared primitive
+    implementations be reused without weakening artifact validation.
+    """
+    tensors = _dequantized_by_key(package)
+    embedding = _require(tensors, (None, "embedding"), "token embedding")
+    final_norm = _require(tensors, (None, "final_norm"), "final norm")
+    lm_head = tensors.get((None, "lm_head"), embedding)
+    hidden = int(embedding.shape[1])
+    num_layers = int(architecture.get("layers", 0) or 0)
+    num_heads = int(architecture.get("num_attention_heads", 0) or 0)
+    num_kv_heads = int(architecture.get("num_kv_heads") or num_heads)
+    schedule = architecture.get("hybrid_layer_types")
+    if num_layers <= 0 or num_heads <= 0 or not isinstance(schedule, list) or len(schedule) != num_layers:
+        raise AEGLoadError("hybrid manifest has incomplete layer schedule or attention geometry")
+    schedule = [str(value).lower() for value in schedule]
+    if any(value not in {"attention", "ssm"} for value in schedule):
+        raise AEGLoadError("hybrid manifest contains an unknown layer schedule entry")
+
+    inner = int(architecture.get("ssm_inner_size") or hidden * 2)
+    state = int(architecture.get("ssm_state_size") or 16)
+    dt_rank = int(architecture.get("ssm_dt_rank") or max(1, (hidden + 15) // 16))
+    conv_kernel = int(architecture.get("ssm_conv_kernel") or 4)
+    ffn_type = str(architecture.get("ffn_type", "SwiGLU") or "SwiGLU")
+
+    def zero_matrix(rows: int, cols: int) -> np.ndarray:
+        return np.zeros((int(rows), int(cols)), dtype=np.float32)
+
+    def dummy_transformer() -> LayerWeights:
+        head_dim = int(architecture.get("head_dim") or (hidden // max(num_heads, 1)))
+        intermediate = int(architecture.get("intermediate_size") or hidden * 4)
+        return LayerWeights(
+            attention_norm=np.ones(hidden, dtype=np.float32),
+            q_proj=zero_matrix(num_heads * head_dim, hidden),
+            k_proj=zero_matrix(num_kv_heads * head_dim, hidden),
+            v_proj=zero_matrix(num_kv_heads * head_dim, hidden),
+            o_proj=zero_matrix(hidden, num_heads * head_dim),
+            ffn_norm=np.ones(hidden, dtype=np.float32),
+            gate_proj=zero_matrix(intermediate, hidden),
+            up_proj=zero_matrix(intermediate, hidden) if ffn_type.lower() not in {"gelu", "relu", "relu2"} else None,
+            down_proj=zero_matrix(hidden, intermediate),
+        )
+
+    def dummy_mamba() -> MambaLayerWeights:
+        return MambaLayerWeights(
+            norm=np.ones(hidden, dtype=np.float32),
+            in_proj=zero_matrix(2 * inner, hidden),
+            conv1d=zero_matrix(inner, conv_kernel),
+            x_proj=zero_matrix(dt_rank + 2 * state, inner),
+            dt_proj=zero_matrix(inner, dt_rank),
+            a_log=np.zeros((inner, state), dtype=np.float32),
+            d=np.zeros(inner, dtype=np.float32),
+            out_proj=zero_matrix(hidden, inner),
+        )
+
+    layers: list[HybridLayerWeights] = []
+    for index, kind in enumerate(schedule):
+        if kind == "attention":
+            actual = _build_layer(
+                tensors, index, hidden, num_heads, num_kv_heads,
+                ffn_type=ffn_type,
+            )
+            layers.append(HybridLayerWeights(kind=kind, transformer=actual, mamba=dummy_mamba()))
+        else:
+            def required(component: str) -> np.ndarray:
+                return _require(tensors, (index, component), f"hybrid SSM layer {index} {component}")
+            actual = MambaLayerWeights(
+                norm=_norm_vector(required("ssm_norm"), hidden),
+                in_proj=required("ssm_in_proj"),
+                conv1d=required("ssm_conv1d"),
+                x_proj=required("ssm_x_proj"),
+                dt_proj=required("ssm_dt_proj"),
+                a_log=required("ssm_a_log"),
+                d=required("ssm_d"),
+                out_proj=required("ssm_out_proj"),
+                conv_bias=tensors.get((index, "ssm_conv1d_bias")),
+                dt_bias=tensors.get((index, "ssm_dt_proj_bias")),
+            )
+            layers.append(HybridLayerWeights(kind=kind, transformer=dummy_transformer(), mamba=actual))
+
+    position_embedding = tensors.get((None, "position_embedding"))
+    embedding_norm = tensors.get((None, "embedding_norm"))
+    embedding_norm_bias = tensors.get((None, "embedding_norm_bias"))
+    final_norm_bias = tensors.get((None, "final_norm_bias"))
+    position_type = str(architecture.get("position_type", "RoPE") or "RoPE")
+    if position_type.lower() in {"absolute", "learned", "learned_absolute"} and position_embedding is None:
+        raise AEGLoadError("hybrid artifact declares learned positions but has no position embedding")
+    if bool(architecture.get("embedding_norm", False)) and embedding_norm is None:
+        raise AEGLoadError("hybrid artifact declares embedding normalization but has no tensor")
+    return HybridExecutionEngine(
+        HybridModelWeights(
+            embedding=np.asarray(embedding, dtype=np.float32),
+            layers=layers,
+            final_norm=_norm_vector(final_norm, hidden),
+            lm_head=np.asarray(lm_head, dtype=np.float32),
+            position_embedding=None if position_embedding is None else np.asarray(position_embedding, dtype=np.float32),
+            embedding_norm=None if embedding_norm is None else _norm_vector(embedding_norm, hidden),
+            embedding_norm_bias=None if embedding_norm_bias is None else _norm_vector(embedding_norm_bias, hidden),
+            final_norm_bias=None if final_norm_bias is None else _norm_vector(final_norm_bias, hidden),
+            position_type=position_type,
+            rope_theta=float(architecture.get("rope_theta", 10000.0) or 10000.0),
+            norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+            norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
+            ffn_type=ffn_type,
+        ),
+        layer_types=schedule,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        state_size=state,
+        inner_size=inner,
+        dt_rank=dt_rank,
+        conv_kernel=conv_kernel,
+    )
+
+
+def _load_mamba2_engine_from_package(
+    package: Any, architecture: dict[str, Any]
+) -> Mamba2ExecutionEngine:
+    """Load a Mamba-2/SSD engine from the canonical AEG tensors."""
+    tensors = _dequantized_by_key(package)
+    embedding = _require(tensors, (None, "embedding"), "token embedding")
+    final_norm = _require(tensors, (None, "final_norm"), "final norm")
+    lm_head = tensors.get((None, "lm_head"), embedding)
+    layers: list[Mamba2LayerWeights] = []
+    for index in range(int(architecture.get("layers", 0) or 0)):
+        def required(component: str) -> np.ndarray:
+            return _require(tensors, (index, component), f"Mamba-2 layer {index} {component}")
+        layers.append(Mamba2LayerWeights(
+            norm=_norm_vector(required("ssm_norm"), int(embedding.shape[1])),
+            in_proj=required("ssm_in_proj"),
+            conv1d=required("ssm_conv1d"),
+            a_log=required("ssm_a_log"),
+            d=required("ssm_d"),
+            dt=required("ssm_dt"),
+            out_proj=required("ssm_out_proj"),
+            in_proj_bias=tensors.get((index, "ssm_in_proj_bias")),
+            conv_bias=tensors.get((index, "ssm_conv1d_bias")),
+        ))
+    hidden = int(embedding.shape[1])
+    inner = int(architecture.get("ssm_inner_size") or hidden * 2)
+    heads = int(architecture.get("ssm_num_heads") or 0)
+    groups = int(architecture.get("ssm_num_groups") or 1)
+    head_dim = int(architecture.get("ssm_head_dim") or (inner // max(heads, 1)))
+    if heads <= 0:
+        raise AEGLoadError("Mamba-2 manifest is missing positive ssm_num_heads")
+    return Mamba2ExecutionEngine(
+        Mamba2ModelWeights(
+            embedding=np.asarray(embedding, dtype=np.float32),
+            layers=layers,
+            final_norm=_norm_vector(final_norm, hidden),
+            lm_head=np.asarray(lm_head, dtype=np.float32),
+            norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+            norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
+        ),
+        state_size=int(architecture.get("ssm_state_size") or 16),
+        inner_size=inner,
+        num_heads=heads,
+        num_groups=groups,
+        conv_kernel=int(architecture.get("ssm_conv_kernel") or 4),
+        head_dim=head_dim,
+    )
+
+
+def _load_rwkv_engine_from_package(
+    package: Any, architecture: dict[str, Any]
+) -> RWKVExecutionEngine:
+    """Load an RWKV time-mix engine from canonical recurrent tensors."""
+    tensors = _dequantized_by_key(package)
+    embedding = _require(tensors, (None, "embedding"), "token embedding")
+    final_norm = _require(tensors, (None, "final_norm"), "final norm")
+    lm_head = tensors.get((None, "lm_head"), embedding)
+    layers: list[RWKVLayerWeights] = []
+    hidden = int(embedding.shape[1])
+    for index in range(int(architecture.get("layers", 0) or 0)):
+        def required(component: str) -> np.ndarray:
+            return _require(tensors, (index, component), f"RWKV layer {index} {component}")
+        layers.append(RWKVLayerWeights(
+            norm=_norm_vector(required("ssm_norm"), hidden),
+            ffn_norm=_norm_vector(required("ssm_ffn_norm"), hidden),
+            time_decay=required("ssm_time_decay"), time_first=required("ssm_time_first"),
+            time_mix_k=required("ssm_time_mix_k"), time_mix_v=required("ssm_time_mix_v"),
+            time_mix_r=required("ssm_time_mix_r"),
+            ffn_time_mix_k=required("ssm_ffn_time_mix_k"),
+            ffn_time_mix_r=required("ssm_ffn_time_mix_r"),
+            key=required("ssm_key"),
+            value=required("ssm_value"), receptance=required("ssm_receptance"),
+            output=required("ssm_output"), ffn_key=required("ssm_ffn_key"),
+            ffn_value=required("ssm_ffn_value"), ffn_receptance=required("ssm_ffn_receptance"),
+        ))
+    return RWKVExecutionEngine(RWKVModelWeights(
+        embedding=np.asarray(embedding, dtype=np.float32), layers=layers,
+        final_norm=_norm_vector(final_norm, hidden), lm_head=np.asarray(lm_head, dtype=np.float32),
+        norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+    ))
+
+
+def _load_seq2seq_engine_from_package(package: Any, architecture: dict[str, Any]) -> Seq2SeqExecutionEngine:
+    """Load a T5-compatible encoder-decoder AEG from authenticated tensors."""
+    from aether.quantization.formats import dequantize_tensor
+
+    store = package.weight_store()
+    tensors: dict[str, np.ndarray] = {
+        name: dequantize_tensor(store.load_tensor(name)).astype(np.float32, copy=False)
+        for name in store.entries
+    }
+
+    def require(name: str) -> np.ndarray:
+        value = tensors.get(name)
+        if value is None:
+            raise AEGLoadError(f"AEG package is missing required seq2seq tensor {name!r}")
+        return np.asarray(value, dtype=np.float32)
+
+    def optional(name: str) -> np.ndarray | None:
+        value = tensors.get(name)
+        return None if value is None else np.asarray(value, dtype=np.float32)
+
+    enc_count = int(architecture.get("encoder_layers") or architecture.get("layers", 0))
+    dec_count = int(architecture.get("decoder_layers") or architecture.get("layers", 0))
+    heads = int(architecture.get("num_attention_heads", 0))
+    head_dim = int(architecture.get("head_dim") or (int(architecture.get("hidden_size", 0)) // max(heads, 1)))
+    ffn_type = str(architecture.get("ffn_type", "ReLU"))
+
+    embedding = require("embedding")
+    lm_head = optional("lm_head")
+    if lm_head is None:
+        if not bool(architecture.get("tie_word_embeddings", True)):
+            raise AEGLoadError("untied encoder-decoder AEG is missing lm_head")
+        lm_head = embedding
+
+    encoder_layers: list[Seq2SeqLayer] = []
+    for i in range(enc_count):
+        prefix = f"encoder_layer_{i}_"
+        encoder_layers.append(Seq2SeqLayer(
+            norm1=require(prefix + "norm1"),
+            q=require(prefix + "q_proj"), k=require(prefix + "k_proj"),
+            v=require(prefix + "v_proj"), o=require(prefix + "o_proj"),
+            norm2=require(prefix + "norm2"),
+            ffn_in=require(prefix + "ffn_in") if prefix + "ffn_in" in tensors else require(prefix + "ffn_in_0"),
+            ffn_out=require(prefix + "ffn_out"),
+            relative_bias=optional(prefix + "relative_attention_bias"),
+            ffn_in_0=optional(prefix + "ffn_in_0"),
+            ffn_in_1=optional(prefix + "ffn_in_1"),
+        ))
+
+    decoder_layers: list[Seq2SeqDecoderLayer] = []
+    for i in range(dec_count):
+        prefix = f"decoder_layer_{i}_"
+        decoder_layers.append(Seq2SeqDecoderLayer(
+            self_norm=require(prefix + "self_norm"),
+            self_q=require(prefix + "self_q_proj"), self_k=require(prefix + "self_k_proj"),
+            self_v=require(prefix + "self_v_proj"), self_o=require(prefix + "self_o_proj"),
+            cross_norm=require(prefix + "cross_norm"),
+            cross_q=require(prefix + "cross_q_proj"), cross_k=require(prefix + "cross_k_proj"),
+            cross_v=require(prefix + "cross_v_proj"), cross_o=require(prefix + "cross_o_proj"),
+            ffn_norm=require(prefix + "ffn_norm"),
+            ffn_in=require(prefix + "ffn_in") if prefix + "ffn_in" in tensors else require(prefix + "ffn_in_0"),
+            ffn_out=require(prefix + "ffn_out"),
+            relative_bias=optional(prefix + "self_relative_attention_bias"),
+            ffn_in_0=optional(prefix + "ffn_in_0"),
+            ffn_in_1=optional(prefix + "ffn_in_1"),
+        ))
+
+    return Seq2SeqExecutionEngine(
+        embedding,
+        encoder_layers,
+        decoder_layers,
+        require("encoder_final_norm"),
+        require("final_norm"),
+        lm_head,
+        num_heads=heads,
+        head_dim=head_dim,
+        norm_eps=float(architecture.get("norm_eps", 1e-6)),
+        ffn_type=ffn_type,
+        tie_word_embeddings=bool(architecture.get("tie_word_embeddings", True)),
+        relative_attention_num_buckets=int(architecture.get("relative_attention_num_buckets", 32)),
+    )
 
 
 def _load_encoder_engine_from_package(
@@ -432,15 +943,33 @@ def _dequantized_by_key(package: Any) -> dict[tuple[int | None, str | None], np.
         # The ingestion normalizer intentionally groups checkpoint q/k/v names
         # under ``qkv``.  The persisted AEG store has already split those
         # projections, so preserve their exact component names here.
-        match = re.match(r"^layer_(\d+)_(q_proj|k_proj|v_proj|o_proj|attention_norm|ffn_norm|gate_proj|up_proj|down_proj)$", name)
+        match = re.match(
+            r"^layer_(\d+)_((?:q_proj|k_proj|v_proj|q_norm|k_norm|o_proj|"
+            r"attention_norm|ffn_norm|gate_proj|up_proj|down_proj|moe_router|"
+            r"expert_\d+_(?:gate_proj|up_proj|down_proj)|q_a_proj|q_b_proj|"
+            r"kv_a_proj|kv_b_proj|k_rope_proj|q_a_norm|kv_a_norm|ssm_norm|"
+            r"ssm_in_proj|ssm_conv1d|ssm_x_proj|ssm_dt_proj|ssm_dt|ssm_a_log|ssm_d|"
+            r"ssm_out_proj|ssm_time_decay|ssm_time_first|ssm_time_mix_k|"
+            r"ssm_time_mix_v|ssm_time_mix_r|ssm_ffn_norm|ssm_ffn_time_mix_k|"
+            r"ssm_ffn_time_mix_r|ssm_key|ssm_value|ssm_receptance|"
+            r"ssm_output|ssm_ffn_key|ssm_ffn_value|ssm_ffn_receptance))(?:_bias)?$",
+            name,
+        )
         if match:
-            key = (int(match.group(1)), match.group(2))
+            suffix = match.group(2)
+            key = (int(match.group(1)), f"{suffix}_bias" if name.endswith("_bias") else suffix)
         elif name == "embedding":
             key = (None, "embedding")
         elif name == "lm_head":
             key = (None, "lm_head")
-        elif name == "final_norm":
+        elif name == "position_embedding":
+            key = (None, "position_embedding")
+        elif name in {"embedding_norm", "embedding_norm_bias"}:
+            key = (None, name)
+        elif name in {"final_norm", "final_norm_bias"}:
             key = (None, "final_norm")
+            if name.endswith("_bias"):
+                key = (None, "final_norm_bias")
         else:
             key = IngestionPipeline._normalise_weight_name(name)
         if key[1] is None:
@@ -469,6 +998,11 @@ def _build_layer(
     hidden_size: int,
     num_heads: int,
     num_kv_heads: int,
+    ffn_type: str = "SwiGLU",
+    num_experts: int = 0,
+    num_activated_experts: int = 0,
+    is_moe_layer: bool = False,
+    parallel_residual: bool = False,
 ) -> LayerWeights:
     """Assemble one :class:`LayerWeights` from the tensor index.
 
@@ -492,20 +1026,95 @@ def _build_layer(
             q_proj = fused[:q_rows]
             k_proj = fused[q_rows : q_rows + kv_dim]
             v_proj = fused[q_rows + kv_dim :]
+    if is_moe_layer:
+        common = {
+            "q_proj": q_proj,
+            "k_proj": k_proj,
+            "v_proj": v_proj,
+            "o_proj": tensors.get((index, "o_proj")),
+            "attention_norm": tensors.get((index, "attention_norm")),
+            "ffn_norm": tensors.get((index, "ffn_norm")),
+            "router": tensors.get((index, "moe_router")),
+        }
+        missing = [name for name, value in common.items() if value is None]
+        if missing:
+            raise AEGLoadError(
+                f"AEG package is missing required MoE layer {index} tensors: "
+                f"{', '.join(missing)}"
+            )
+        experts: list[ExpertWeights] = []
+        for expert_index in range(int(num_experts)):
+            prefix = (index, f"expert_{expert_index}_")
+            gate = tensors.get((index, f"expert_{expert_index}_gate_proj"))
+            up = tensors.get((index, f"expert_{expert_index}_up_proj"))
+            down = tensors.get((index, f"expert_{expert_index}_down_proj"))
+            if gate is None or up is None or down is None:
+                raise AEGLoadError(
+                    f"AEG package is missing MoE layer {index} expert "
+                    f"{expert_index} projections"
+                )
+            experts.append(ExpertWeights(
+                gate_proj=np.ascontiguousarray(gate, dtype=np.float32),
+                up_proj=np.ascontiguousarray(up, dtype=np.float32),
+                down_proj=np.ascontiguousarray(down, dtype=np.float32),
+                gate_proj_bias=tensors.get((index, f"expert_{expert_index}_gate_proj_bias")),
+                up_proj_bias=tensors.get((index, f"expert_{expert_index}_up_proj_bias")),
+                down_proj_bias=tensors.get((index, f"expert_{expert_index}_down_proj_bias")),
+            ))
+        return LayerWeights(
+            attention_norm=_norm_vector(common["attention_norm"], hidden_size),
+            q_proj=np.ascontiguousarray(common["q_proj"], dtype=np.float32),
+            k_proj=np.ascontiguousarray(common["k_proj"], dtype=np.float32),
+            v_proj=np.ascontiguousarray(common["v_proj"], dtype=np.float32),
+            o_proj=np.ascontiguousarray(common["o_proj"], dtype=np.float32),
+            ffn_norm=_norm_vector(common["ffn_norm"], hidden_size),
+            gate_proj=None,
+            up_proj=None,
+            down_proj=None,
+            q_proj_bias=tensors.get((index, "q_proj_bias")),
+            k_proj_bias=tensors.get((index, "k_proj_bias")),
+            v_proj_bias=tensors.get((index, "v_proj_bias")),
+            o_proj_bias=tensors.get((index, "o_proj_bias")),
+            attention_norm_bias=tensors.get((index, "attention_norm_bias")),
+            ffn_norm_bias=tensors.get((index, "ffn_norm_bias")),
+            router=np.ascontiguousarray(common["router"], dtype=np.float32),
+            experts=experts,
+            num_activated_experts=int(num_activated_experts or 1),
+            q_norm=(
+                _norm_vector(tensors.get((index, "q_norm")), head_dim)
+                if tensors.get((index, "q_norm")) is not None else None
+            ),
+            k_norm=(
+                _norm_vector(tensors.get((index, "k_norm")), head_dim)
+                if tensors.get((index, "k_norm")) is not None else None
+            ),
+        )
+    attention_norm_tensor = tensors.get((index, "attention_norm"))
+    ffn_norm_tensor = tensors.get((index, "ffn_norm"))
+    if ffn_norm_tensor is None and parallel_residual:
+        ffn_norm_tensor = attention_norm_tensor
+    attention_norm_bias = tensors.get((index, "attention_norm_bias"))
+    ffn_norm_bias = tensors.get((index, "ffn_norm_bias"))
+    if ffn_norm_bias is None and parallel_residual:
+        ffn_norm_bias = attention_norm_bias
     required = {
         "q_proj": q_proj,
         "k_proj": k_proj,
         "v_proj": v_proj,
         "o_proj": tensors.get((index, "o_proj")),
-        "attention_norm": tensors.get((index, "attention_norm")),
-        "ffn_norm": tensors.get((index, "ffn_norm")),
+        "attention_norm": attention_norm_tensor,
+        "ffn_norm": ffn_norm_tensor,
         "gate_proj": tensors.get((index, "gate_proj")),
         "up_proj": tensors.get((index, "up_proj")),
         "down_proj": tensors.get((index, "down_proj"))
         if tensors.get((index, "down_proj")) is not None
         else tensors.get((index, "ffn")),
     }
-    missing = [name for name, value in required.items() if value is None]
+    classic_gelu = str(ffn_type or "SwiGLU").lower() in {"gelu", "relu", "relu2"}
+    missing = [
+        name for name, value in required.items()
+        if value is None and not (name == "up_proj" and classic_gelu)
+    ]
     if missing:
         raise AEGLoadError(f"AEG package is missing required layer {index} tensors: {', '.join(missing)}")
 
@@ -516,9 +1125,33 @@ def _build_layer(
         v_proj=np.ascontiguousarray(required["v_proj"], dtype=np.float32),
         o_proj=np.ascontiguousarray(required["o_proj"], dtype=np.float32),
         ffn_norm=_norm_vector(required["ffn_norm"], hidden_size),
+        attention_norm_bias=_norm_vector(attention_norm_bias, hidden_size)
+        if attention_norm_bias is not None else None,
+        ffn_norm_bias=_norm_vector(ffn_norm_bias, hidden_size)
+        if ffn_norm_bias is not None else None,
+        q_proj_bias=tensors.get((index, "q_proj_bias")),
+        k_proj_bias=tensors.get((index, "k_proj_bias")),
+        v_proj_bias=tensors.get((index, "v_proj_bias")),
+        o_proj_bias=tensors.get((index, "o_proj_bias")),
+        gate_proj_bias=tensors.get((index, "gate_proj_bias")),
+        up_proj_bias=tensors.get((index, "up_proj_bias")),
+        down_proj_bias=tensors.get((index, "down_proj_bias")),
         gate_proj=np.ascontiguousarray(required["gate_proj"], dtype=np.float32),
-        up_proj=np.ascontiguousarray(required["up_proj"], dtype=np.float32),
+        up_proj=(
+            np.ascontiguousarray(required["up_proj"], dtype=np.float32)
+            if required["up_proj"] is not None else None
+        ),
         down_proj=np.ascontiguousarray(required["down_proj"], dtype=np.float32),
+        q_norm=(
+            _norm_vector(tensors.get((index, "q_norm")), head_dim)
+            if tensors.get((index, "q_norm")) is not None
+            else None
+        ),
+        k_norm=(
+            _norm_vector(tensors.get((index, "k_norm")), head_dim)
+            if tensors.get((index, "k_norm")) is not None
+            else None
+        ),
     )
 
 

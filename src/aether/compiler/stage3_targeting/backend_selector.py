@@ -61,7 +61,7 @@ class BackendSelector:
 
         for backend_name in unique:
             backend = self.registry.get_backend(backend_name)
-            if backend is not None and backend.is_available():
+            if backend is not None and backend.available_for_target(profile.target_id):
                 logger.info(f"Selected backend '{backend_name}' for target {profile.target_id}")
                 return backend
 

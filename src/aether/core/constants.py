@@ -257,6 +257,23 @@ SUPPORTED_ARCHITECTURES: dict[str, dict[str, str | bool]] = {
         "is_moe": False,
         "is_encoder": True,
     },
+    # Capability-based family for standard decoder-only checkpoints whose
+    # names/configs differ but whose computation contract is the ordinary
+    # transformer decoder (RMSNorm/LayerNorm, MHA/GQA/MQA, RoPE/ALiBi, and a
+    # gated or classic FFN).  The concrete tensor geometry still comes from
+    # config.json and the checkpoint, never from this registry entry.
+    "generic_decoder_family": {
+        "attn": "config_declared_attention",
+        "ffn": "config_declared_ffn",
+        "norm": "config_declared_norm",
+        "rope": "config_declared_position_encoding",
+        "is_moe": False,
+    },
+    "encoder_decoder_family": {
+        "encoder": True,
+        "decoder": True,
+        "cross_attn": True,
+    },
 }
 """Architecture detection patterns keyed by family name."""
 
@@ -285,6 +302,71 @@ ARCHITECTURE_BY_MODEL_PREFIX: dict[str, str] = {
     "gpt_neo": "gpt_family",
     "gpt_neox": "gpt_family",
     "gpt": "gpt_family",
+    # Standard decoder families covered by the capability-driven path.
+    "olmo": "generic_decoder_family",
+    "olmoe": "generic_decoder_family",
+    "command": "generic_decoder_family",
+    "cohere": "generic_decoder_family",
+    "hyperclova": "generic_decoder_family",
+    "granite": "generic_decoder_family",
+    "dbrx": "generic_decoder_family",
+    "yi": "generic_decoder_family",
+    "internlm": "generic_decoder_family",
+    "minicpm": "generic_decoder_family",
+    "smollm": "generic_decoder_family",
+    "pythia": "generic_decoder_family",
+    "gptj": "generic_decoder_family",
+    "gpt_bigcode": "generic_decoder_family",
+    "bloom": "generic_decoder_family",
+    "mpt": "generic_decoder_family",
+    "redpajama": "generic_decoder_family",
+    "openelm": "generic_decoder_family",
+    "stablelm": "generic_decoder_family",
+    "starcoder": "generic_decoder_family",
+    "codegen": "generic_decoder_family",
+    "codegeex": "generic_decoder_family",
+    "codestral": "generic_decoder_family",
+    "wizard": "generic_decoder_family",
+    "vicuna": "generic_decoder_family",
+    "xgen": "generic_decoder_family",
+    "opt": "generic_decoder_family",
+    "gpt_oss": "generic_decoder_family",
+    "glm": "generic_decoder_family",
+    "kimi": "generic_decoder_family",
+    "hunyuan": "generic_decoder_family",
+    "minimax": "generic_decoder_family",
+    "exaone": "generic_decoder_family",
+    "solar": "generic_decoder_family",
+    "jais": "generic_decoder_family",
+    "seallm": "generic_decoder_family",
+    "aya": "generic_decoder_family",
+    "nous": "generic_decoder_family",
+    "openchat": "generic_decoder_family",
+    "zephyr": "generic_decoder_family",
+    "dolphin": "generic_decoder_family",
+    "tulu": "generic_decoder_family",
+    "tinyllama": "generic_decoder_family",
+    "mobilellm": "generic_decoder_family",
+    "liquid": "generic_decoder_family",
+    "lfm": "generic_decoder_family",
+    "recurrentgemma": "generic_decoder_family",
+    "bitnet": "generic_decoder_family",
+    "nemotron": "generic_decoder_family",
+    "megatron": "generic_decoder_family",
+    "apertus": "generic_decoder_family",
+    "sarvam": "generic_decoder_family",
+    "step": "generic_decoder_family",
+    "stepfun": "generic_decoder_family",
+    "arctic": "generic_decoder_family",
+    "grok": "generic_decoder_family",
+    "nvidia": "generic_decoder_family",
+    # Encoder-decoder families are detected distinctly and must not enter the
+    # decoder-only runtime without an encoder/decoder graph implementation.
+    "t5": "encoder_decoder_family",
+    "mt5": "encoder_decoder_family",
+    "byt5": "encoder_decoder_family",
+    "ul2": "encoder_decoder_family",
+    "xlnet": "bert_family",
 }
 """Model name prefix to architecture family mapping."""
 
@@ -364,10 +446,17 @@ DEFAULT_REASONING_GRAPH_PASS: bool = True
 """Whether reasoning graph compilation is enabled by default."""
 
 DEFAULT_SPARSE_ATTENTION_PASS: bool = True
-"""Whether sparse attention pattern compilation is enabled by default."""
+"""Whether long-context sparse-attention planning is enabled by default.
 
-DEFAULT_PRUNING_PASS: bool = True
-"""Whether pruning and sparsity mask planning is enabled by default."""
+The runtime activates the persisted plan only at its recorded context
+threshold; ordinary short prompts therefore retain dense-reference behavior.
+"""
+
+DEFAULT_PRUNING_PASS: bool = False
+"""Whether lossy pruning/sparsity masks are enabled by default.
+
+Pruning is opt-in until task/perplexity validation certifies the generated mask.
+"""
 
 # ── PRD v4.0 compiler pass defaults ───────────────────────────────────────────
 
@@ -595,18 +684,13 @@ MOE_HOT_ACTIVATION_LIMIT: int = 1024
 
 # ── Speculative decoding ───────────────────────────────────────────────────────
 
-DRAFT_FAMILIES: dict[str, str] = {
-    "qwen3-72b": "qwen3-1.5b",
-    "qwen3-8b": "qwen3-0.6b",
-    "llama3.3-70b": "llama3.2-1b",
-    "llama3.1-8b": "llama3.2-1b",
-    "deepseek-r1-671b": "deepseek-r1-8b",
-    "deepseek-v3": "deepseek-r1-8b",
-    "gemma-2-27b": "gemma-2-2b",
-    "gemma-2-9b": "gemma-2-2b",
-    "mixtral-8x22b": "mixtral-8x7b",
-}
-"""Suggested draft model for each target model."""
+DRAFT_FAMILIES: dict[str, str] = {}
+"""Deprecated compatibility symbol; draft models are explicit configuration.
+
+An installed target checkpoint does not imply a compatible draft checkpoint.
+The speculative runtime therefore refuses to infer one from model-family
+names.  Keep this empty mapping for callers that imported the old symbol.
+"""
 
 MINIMUM_ACCEPTANCE_RATE: float = 0.70
 """Minimum draft acceptance rate before falling back to standard decoding."""

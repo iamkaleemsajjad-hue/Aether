@@ -26,10 +26,20 @@ from aether.core.constants import (
     AEG_MANIFEST_FILENAME,
     AEG_QUANT_FILE_EXTENSION,
     DEFAULT_MODEL_CACHE_SUBDIR,
+    SUPPORTED_TARGET_IDS,
 )
 from aether.core.exceptions import AEGFormatError, AEGIntegrityError, AEGVersionError
 from aether.core.hash_utils import compute_content_hash, compute_directory_hash, compute_file_hash, verify_file_hash
 from aether.core.types import AEGVersion, ModelArchitecture, Precision, ShardingPlan
+
+
+def _has_portable_target(target_id: str) -> bool:
+    """Return whether a portable AEG backend is defined for ``target_id``."""
+    return bool(
+        target_id in SUPPORTED_TARGET_IDS
+        and target_id != "cuda_sm100_tee"
+        and target_id.startswith(("cuda_", "rocm_", "metal_"))
+    )
 
 
 def _safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
@@ -181,11 +191,25 @@ class KernelSetMetadata:
     backend_plans: dict[str, str] = field(default_factory=dict)
     """Map of target_id to backend plan descriptor."""
 
+    portable_backends: list[str] = field(default_factory=list)
+    """Framework-backed execution contracts that can materialize the AEG IR.
+
+    A target entry is not, by itself, proof that executable code exists.  A
+    portable backend entry means the artifact contains the canonical graph and
+    weights required by that backend and the runtime may select it on a
+    compatible destination (for example PyTorch CUDA, ROCm, or MPS).
+    """
+
+    variant_status: dict[str, str] = field(default_factory=dict)
+    """Per-target status: ``executable``, ``portable``, or ``plan_only``."""
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "targets": self.targets,
             "flash_attention_variant": self.flash_attention_variant,
             "backend_plans": self.backend_plans,
+            "portable_backends": self.portable_backends,
+            "variant_status": self.variant_status,
         }
 
     @staticmethod
@@ -194,6 +218,8 @@ class KernelSetMetadata:
             targets=list(data.get("targets", [])),
             flash_attention_variant=data.get("flash_attention_variant", "flash_attention_3"),
             backend_plans=dict(data.get("backend_plans", {})),
+            portable_backends=list(data.get("portable_backends", [])),
+            variant_status=dict(data.get("variant_status", {})),
         )
 
 
@@ -1257,6 +1283,54 @@ class AEGPackage:
         if not self.manifest:
             return None
         return self.manifest.kernels.backend_plans.get(target_id)
+
+    def supports_runtime_target(self, target_id: str) -> bool:
+        """Return whether this artifact contains a variant for ``target_id``.
+
+        AEG is portable at the IR/weight level, but executable kernel and
+        backend variants remain target-specific.  CPU variants share the
+        framework-free reference contract; accelerator execution requires an
+        explicitly emitted matching target.  This prevents a GPU request from
+        silently running a CPU artifact through an optional frontend backend.
+        """
+        if not self.manifest:
+            return False
+        kernels = self.manifest.kernels
+        targets = set(kernels.targets)
+        status = kernels.variant_status
+
+        # New artifacts distinguish a real executable variant from a target
+        # profile that was only used for planning.  Older AEGs did not carry
+        # this field, so retain their historical exact-target behavior.
+        if status:
+            if status.get(target_id) == "executable":
+                return True
+            if status.get(target_id) == "portable" and _has_portable_target(target_id):
+                return True
+            if target_id.startswith("cpu_") and any(
+                key.startswith("cpu_") and value in {"executable", "portable"}
+                for key, value in status.items()
+            ):
+                return True
+        elif target_id in targets:
+            return True
+        elif target_id.startswith("cpu_") and any(item.startswith("cpu_") for item in targets):
+            return True
+
+        # The graph/weight contract can be materialized by a real PyTorch
+        # installation on CUDA, ROCm, or Apple MPS.  This is deliberately
+        # limited to those device families; it must never make an NPU/FPGA/
+        # TEE target appear executable without its vendor runtime.
+        # A portable contract still has to name a target that Aether knows how
+        # to map to a real device runtime.  Prefix matching alone would make
+        # arbitrary values such as ``cuda_fake`` appear executable.
+        if "pytorch" in kernels.portable_backends and _has_portable_target(target_id):
+            return True
+        return False
+
+    def supports_portable_backend(self, backend_name: str) -> bool:
+        """Return whether the artifact declares a portable backend contract."""
+        return bool(self.manifest and backend_name in self.manifest.kernels.portable_backends)
 
     def get_sharding_plan(self, num_gpus: int) -> ShardingPlan | None:
         """Return the sharding plan for a specific GPU count."""

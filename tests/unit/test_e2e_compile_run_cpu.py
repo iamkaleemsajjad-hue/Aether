@@ -420,6 +420,9 @@ class TestAEGLoaderToCPUEngine:
         reloaded = AEGPackage(package.root)
         reloaded.load()
         assert package_is_runnable(reloaded)
+        # The public helper also accepts an artifact path, which is the form
+        # used by CLI/API callers that have not constructed an AEGPackage.
+        assert package_is_runnable(package.root)
 
     def test_load_engine_from_package_succeeds(self, tmp_path: Path) -> None:
         package, _ = _compile_and_save(tmp_path)

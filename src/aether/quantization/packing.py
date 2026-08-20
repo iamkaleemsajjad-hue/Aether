@@ -83,6 +83,14 @@ class BitPacker:
                 raise ValueError(msg)
             return buf[:count].copy()
 
+        needed_bytes = (count * self.bit_width + 7) // 8
+        if buf.size < needed_bytes:
+            msg = (
+                f"packed buffer holds {buf.size * 8} bits, need {count * self.bit_width} "
+                f"for {count} elements at {self.bit_width}-bit"
+            )
+            raise ValueError(msg)
+
         if self.bit_width == 4:
             needed_bytes = (count + 1) // 2
             slice_buf = buf[:needed_bytes]

@@ -661,12 +661,14 @@ class AEGIRModule:
         mapping = {
             "input": AEGOpCode.ARGUMENT,
             "parameter": AEGOpCode.PARAMETER,
+            "expert_weight": AEGOpCode.PARAMETER,
             "output": AEGOpCode.LOGITS,
             "kv_cache": AEGOpCode.KV_CACHE_STORE,
             "expert_router": AEGOpCode.MOE_ROUTER,
             "fused": AEGOpCode.FUSED_LAYER,
             "embedding": AEGOpCode.EMBEDDING,
             "rmsnorm": AEGOpCode.RMS_NORM,
+            "qk_norm": AEGOpCode.RMS_NORM,
             "layernorm": AEGOpCode.LAYER_NORM,
             "linear": AEGOpCode.LINEAR,
             # Encoder-only and generic attention graph nodes.  These entries
@@ -684,13 +686,19 @@ class AEGIRModule:
             "rope": AEGOpCode.ROPE,
             "ffn": AEGOpCode.FFN,
             "swiglu_ffn": AEGOpCode.SWIGLU_FFN,
+            "geglu_ffn": AEGOpCode.GEGLU_FFN,
+            "gelu_ffn": AEGOpCode.GELU_FFN,
             "expert_ffn": AEGOpCode.EXPERT_FFN,
+            "moe_router": AEGOpCode.MOE_ROUTER,
             "gemm": AEGOpCode.QUANTIZED_GEMM,
             "add": AEGOpCode.ADD,
             "matmul": AEGOpCode.MATMUL,
             "softmax": AEGOpCode.SOFTMAX,
             "lm_head": AEGOpCode.LM_HEAD,
             "mtp_head": AEGOpCode.MTP_HEAD,
+            # T5 relative-position bias is an authenticated parameter table;
+            # it is not an executable primitive by itself.
+            "relative_attention_bias": AEGOpCode.PARAMETER,
         }
         for node in graph:
             aeg_op = mapping.get(node.op_type or "", node.op_type or "aeg.tensor")

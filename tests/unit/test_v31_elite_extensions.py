@@ -290,10 +290,14 @@ class TestSelfDistillationConfig:
 # ---------------------------------------------------------------------------
 
 class TestAEGModelFingerprint:
+    @staticmethod
+    def _runner(trigger: str) -> str:
+        return f"model-response:{trigger}"
+
     def test_embed_returns_dict(self):
         from aether.provenance.fingerprint import AEGModelFingerprint
         fp = AEGModelFingerprint()
-        result = fp.embed("model.aeg", "owner-123", n_triggers=10)
+        result = fp.embed("model.aeg", "owner-123", n_triggers=10, generate=self._runner)
         assert "n_triggers" in result
         assert result["n_triggers"] == 10
         assert len(result["trigger_records"]) == 10
@@ -301,24 +305,24 @@ class TestAEGModelFingerprint:
     def test_verify_same_model_matches(self):
         from aether.provenance.fingerprint import AEGModelFingerprint
         fp = AEGModelFingerprint()
-        fingerprint = fp.embed("model.aeg", "owner-123", n_triggers=10)
-        result = fp.verify("model.aeg", "owner-123", fingerprint)
+        fingerprint = fp.embed("model.aeg", "owner-123", n_triggers=10, generate=self._runner)
+        result = fp.verify("model.aeg", "owner-123", fingerprint, generate=self._runner)
         assert result.is_derived
         assert result.match_rate == 1.0
 
     def test_verify_wrong_owner_no_match(self):
         from aether.provenance.fingerprint import AEGModelFingerprint
         fp = AEGModelFingerprint()
-        fingerprint = fp.embed("model.aeg", "owner-123", n_triggers=10)
-        result = fp.verify("model.aeg", "wrong-owner", fingerprint)
+        fingerprint = fp.embed("model.aeg", "owner-123", n_triggers=10, generate=self._runner)
+        result = fp.verify("model.aeg", "wrong-owner", fingerprint, generate=self._runner)
         assert not result.is_derived
         assert result.match_rate == 0.0
 
     def test_fingerprint_result_to_dict(self):
         from aether.provenance.fingerprint import AEGModelFingerprint
         fp = AEGModelFingerprint()
-        fingerprint = fp.embed("model.aeg", "owner-abc", n_triggers=5)
-        result = fp.verify("model.aeg", "owner-abc", fingerprint)
+        fingerprint = fp.embed("model.aeg", "owner-abc", n_triggers=5, generate=self._runner)
+        result = fp.verify("model.aeg", "owner-abc", fingerprint, generate=self._runner)
         d = result.to_dict()
         assert "is_derived" in d
         assert "verdict" in d
@@ -328,7 +332,7 @@ class TestAEGModelFingerprint:
         from aether.provenance.fingerprint import AEGModelFingerprint
         with tempfile.TemporaryDirectory() as tmpdir:
             fp = AEGModelFingerprint()
-            path = fp.write(tmpdir, "owner-456", n_triggers=5)
+            path = fp.write(tmpdir, "owner-456", n_triggers=5, generate=self._runner)
             assert path.exists()
             data = json.loads(path.read_text())
             assert data["n_triggers"] == 5

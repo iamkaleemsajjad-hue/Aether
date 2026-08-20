@@ -1046,11 +1046,24 @@ class ModelArchitecture:
     is_encoder: bool = False
     """Whether this is an encoder-only architecture (e.g. BERT, RoBERTa)."""
 
+    is_encoder_decoder: bool = False
+    """Whether this architecture requires separate encoder and decoder graphs."""
+
+    is_multimodal: bool = False
+    """Whether the checkpoint includes a vision/audio/video modality branch."""
+
     num_experts: int = 0
     """Total number of experts (MoE only)."""
 
     num_activated_experts: int = 0
     """Number of experts activated per token (top-K) (MoE only)."""
+
+    moe_layer_indices: list[int] | None = None
+    """Indices of decoder layers containing routed experts.
+
+    ``None`` means all decoder layers.  The explicit pattern is needed for
+    hybrid checkpoints that retain dense layers before or between MoE layers.
+    """
 
     mtp_heads: int = 0
     """Number of native multi-token-prediction heads, when declared by the checkpoint."""
@@ -1058,8 +1071,62 @@ class ModelArchitecture:
     attention_type: str = "GQA"
     """Attention type: GQA, MLA, or MHA."""
 
+    # Multi-head latent attention (DeepSeek/Kimi/GLM-compatible) geometry.
+    # These are optional because ordinary attention does not define them; when
+    # present they are copied from config.json and become part of the AEG
+    # execution contract rather than being inferred from a model name.
+    mla_kv_lora_rank: int | None = None
+    mla_q_lora_rank: int | None = None
+    mla_qk_nope_head_dim: int | None = None
+    mla_qk_rope_head_dim: int | None = None
+    mla_v_head_dim: int | None = None
+
+    # Stateful sequence-model geometry (Mamba selective scan/RWKV adapters).
+    # ``None`` means this is an ordinary transformer decoder.
+    ssm_variant: str | None = None
+    ssm_state_size: int | None = None
+    ssm_inner_size: int | None = None
+    ssm_dt_rank: int | None = None
+    ssm_conv_kernel: int | None = None
+    ssm_num_heads: int | None = None
+    ssm_num_groups: int | None = None
+    ssm_head_dim: int | None = None
+    hybrid_layer_types: list[str] | None = None
+
     ffn_type: str = "SwiGLU"
     """FFN activation/type: SwiGLU, GeGLU, GELU."""
+
+    norm_type: str = "RMSNorm"
+    """Normalization used by the decoder blocks (RMSNorm or LayerNorm)."""
+
+    position_type: str = "RoPE"
+    """Position encoding used by the decoder (RoPE, ALiBi, or none)."""
+
+    embedding_norm: bool = False
+    """Whether the token embedding output has a learned normalization."""
+
+    qk_norm: bool = False
+    """Whether attention applies separate RMSNorm weights to Q and K heads."""
+
+    parallel_residual: bool = False
+    """Whether attention and FFN branches share the same pre-norm input.
+
+    GPT-J uses a parallel residual block rather than the sequential
+    attention-then-FFN block used by most decoder families.  This is a
+    checkpoint-declared execution capability, not a model-name shortcut.
+    """
+
+    encoder_layers: int | None = None
+    """Encoder depth for encoder-decoder architectures."""
+
+    decoder_layers: int | None = None
+    """Decoder depth for encoder-decoder architectures."""
+
+    tie_word_embeddings: bool = True
+    """Whether the decoder LM head shares the input embedding matrix."""
+
+    relative_attention_num_buckets: int = 32
+    """Number of T5 relative-position buckets when declared by the source."""
 
     def __post_init__(self) -> None:
         """Auto-compute derived fields."""
@@ -1067,6 +1134,10 @@ class ModelArchitecture:
             self.head_dim = (self.hidden_size // max(self.num_attention_heads, 1)) if self.num_attention_heads else 1
         if self.num_kv_heads is None:
             self.num_kv_heads = self.num_attention_heads
+        if self.decoder_layers is None:
+            self.decoder_layers = self.layers
+        if self.encoder_layers is None:
+            self.encoder_layers = self.layers
         if self.params_billion == 0.0 and self.layers > 0 and self.hidden_size > 0:
             self.params_billion = self._estimate_params()
         # A positive expert count *is* what makes a model MoE. Keeping the flag
@@ -1097,6 +1168,10 @@ class ModelArchitecture:
             "family": self.family,
             "params_billion": self.params_billion,
             "layers": self.layers,
+            "encoder_layers": self.encoder_layers,
+            "decoder_layers": self.decoder_layers,
+            "tie_word_embeddings": self.tie_word_embeddings,
+            "relative_attention_num_buckets": self.relative_attention_num_buckets,
             "hidden_size": self.hidden_size,
             "num_attention_heads": self.num_attention_heads,
             "num_kv_heads": self.num_kv_heads,
@@ -1108,11 +1183,33 @@ class ModelArchitecture:
             "rope_theta": self.rope_theta,
             "is_moe": self.is_moe,
             "is_encoder": self.is_encoder,
+            "is_encoder_decoder": self.is_encoder_decoder,
+            "is_multimodal": self.is_multimodal,
             "num_experts": self.num_experts,
             "num_activated_experts": self.num_activated_experts,
+            "moe_layer_indices": self.moe_layer_indices,
             "mtp_heads": self.mtp_heads,
             "attention_type": self.attention_type,
+            "mla_kv_lora_rank": self.mla_kv_lora_rank,
+            "mla_q_lora_rank": self.mla_q_lora_rank,
+            "mla_qk_nope_head_dim": self.mla_qk_nope_head_dim,
+            "mla_qk_rope_head_dim": self.mla_qk_rope_head_dim,
+            "mla_v_head_dim": self.mla_v_head_dim,
+            "ssm_variant": self.ssm_variant,
+            "ssm_state_size": self.ssm_state_size,
+            "ssm_inner_size": self.ssm_inner_size,
+            "ssm_dt_rank": self.ssm_dt_rank,
+            "ssm_conv_kernel": self.ssm_conv_kernel,
+            "ssm_num_heads": self.ssm_num_heads,
+            "ssm_num_groups": self.ssm_num_groups,
+            "ssm_head_dim": self.ssm_head_dim,
+            "hybrid_layer_types": self.hybrid_layer_types,
             "ffn_type": self.ffn_type,
+            "norm_type": self.norm_type,
+            "position_type": self.position_type,
+            "embedding_norm": self.embedding_norm,
+            "qk_norm": self.qk_norm,
+            "parallel_residual": self.parallel_residual,
         }
 
     @staticmethod
@@ -1122,6 +1219,10 @@ class ModelArchitecture:
             family=data["family"],
             params_billion=data.get("params_billion", 0.0),
             layers=data["layers"],
+            encoder_layers=data.get("encoder_layers"),
+            decoder_layers=data.get("decoder_layers"),
+            tie_word_embeddings=bool(data.get("tie_word_embeddings", True)),
+            relative_attention_num_buckets=int(data.get("relative_attention_num_buckets", 32)),
             hidden_size=data["hidden_size"],
             num_attention_heads=data["num_attention_heads"],
             num_kv_heads=data.get("num_kv_heads"),
@@ -1133,11 +1234,39 @@ class ModelArchitecture:
             rope_theta=data.get("rope_theta", 10000.0),
             is_moe=data.get("is_moe", False),
             is_encoder=data.get("is_encoder", False),
+            is_encoder_decoder=data.get("is_encoder_decoder", False),
+            is_multimodal=bool(data.get("is_multimodal", False)),
             num_experts=data.get("num_experts", 0),
             num_activated_experts=data.get("num_activated_experts", 0),
+            moe_layer_indices=(
+                [int(index) for index in data["moe_layer_indices"]]
+                if data.get("moe_layer_indices") is not None else None
+            ),
             mtp_heads=data.get("mtp_heads", 0),
             attention_type=data.get("attention_type", "GQA"),
+            mla_kv_lora_rank=data.get("mla_kv_lora_rank"),
+            mla_q_lora_rank=data.get("mla_q_lora_rank"),
+            mla_qk_nope_head_dim=data.get("mla_qk_nope_head_dim"),
+            mla_qk_rope_head_dim=data.get("mla_qk_rope_head_dim"),
+            mla_v_head_dim=data.get("mla_v_head_dim"),
+            ssm_variant=data.get("ssm_variant"),
+            ssm_state_size=data.get("ssm_state_size"),
+            ssm_inner_size=data.get("ssm_inner_size"),
+            ssm_dt_rank=data.get("ssm_dt_rank"),
+            ssm_conv_kernel=data.get("ssm_conv_kernel"),
+            ssm_num_heads=data.get("ssm_num_heads"),
+            ssm_num_groups=data.get("ssm_num_groups"),
+            ssm_head_dim=data.get("ssm_head_dim"),
+            hybrid_layer_types=(
+                [str(value) for value in data["hybrid_layer_types"]]
+                if data.get("hybrid_layer_types") is not None else None
+            ),
             ffn_type=data.get("ffn_type", "SwiGLU"),
+            norm_type=data.get("norm_type", "RMSNorm"),
+            position_type=data.get("position_type", "RoPE"),
+            embedding_norm=bool(data.get("embedding_norm", False)),
+            qk_norm=bool(data.get("qk_norm", False)),
+            parallel_residual=bool(data.get("parallel_residual", False)),
         )
 
     def __repr__(self) -> str:

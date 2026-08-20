@@ -65,8 +65,10 @@ _NODE_ID_TO_WEIGHT_KEY: dict[str, str] = {
     "embedding": "embedding",
     "token_embeddings": "embedding",
     "position_embeddings": "position_embedding",
+    "position_embedding": "position_embedding",
     "token_type_embeddings": "token_type_embedding",
     "embedding_layernorm": "embedding_norm",
+    "embedding_norm": "embedding_norm",
     "lm_head": "lm_head",
     "final_norm": "final_norm",
     "pooler": "pooler",
@@ -79,14 +81,55 @@ _LAYER_NODE_RE = re.compile(r"^layer_(\d+)_(.+)$")
 _LAYER_SUFFIX_MAP: dict[str, str] = {
     "rmsnorm": "attention_norm",
     "qkv": None,            # fused QKV → expanded to q/k/v below
+    "q_norm": "q_norm",
+    "k_norm": "k_norm",
     "out_proj": "o_proj",
     "ffn_norm": "ffn_norm",
     "gate_proj": "gate_proj",
     "ffn": "down_proj",
+    "gelu_ffn": "down_proj",
     # Dense SwiGLU up projection is stored separately by the ingestion pipeline.
     "up_proj": "up_proj",
+    # Multi-head latent attention projections.
+    "q_a_proj": "q_a_proj",
+    "q_b_proj": "q_b_proj",
+    "kv_a_proj": "kv_a_proj",
+    "kv_b_proj": "kv_b_proj",
+    "k_rope_proj": "k_rope_proj",
+    "q_a_norm": "q_a_norm",
+    "kv_a_norm": "kv_a_norm",
+    # Mamba selective-scan parameters.
+    "ssm_norm": "ssm_norm",
+    "ssm_in_proj": "ssm_in_proj",
+    "ssm_conv1d": "ssm_conv1d",
+    "ssm_x_proj": "ssm_x_proj",
+    "ssm_dt_proj": "ssm_dt_proj",
+    "ssm_dt": "ssm_dt",
+    "ssm_a_log": "ssm_a_log",
+    "ssm_d": "ssm_d",
+    "ssm_out_proj": "ssm_out_proj",
+    "ssm_time_decay": "ssm_time_decay",
+    "ssm_time_first": "ssm_time_first",
+    "ssm_time_mix_k": "ssm_time_mix_k",
+    "ssm_time_mix_v": "ssm_time_mix_v",
+    "ssm_time_mix_r": "ssm_time_mix_r",
+    "ssm_ffn_norm": "ssm_ffn_norm",
+    "ssm_ffn_time_mix_k": "ssm_ffn_time_mix_k",
+    "ssm_ffn_time_mix_r": "ssm_ffn_time_mix_r",
+    "ssm_key": "ssm_key",
+    "ssm_value": "ssm_value",
+    "ssm_receptance": "ssm_receptance",
+    "ssm_output": "ssm_output",
+    "ssm_ffn_key": "ssm_ffn_key",
+    "ssm_ffn_value": "ssm_ffn_value",
+    "ssm_ffn_receptance": "ssm_ffn_receptance",
     # BERT-style encoder blocks.
     "attn_output": "o_proj",
+    "o_proj": "o_proj",
+    "attention_norm": "attention_norm",
+    "intermediate_proj": "intermediate_proj",
+    "output_proj": "output_proj",
+    "output_norm": "output_norm",
     "attn_layernorm": "attention_norm",
     "ffn_intermediate": "intermediate_proj",
     "ffn_output": "output_proj",
@@ -167,13 +210,15 @@ class GraphWeightQuantizer:
         for node in nodes:
             stats.total_nodes += 1
 
-            # Skip structural ops that never carry parameters.
+            # Structural router/bank nodes normally carry no tensors.  A
+            # routed-MoE router is the exception: when ingestion attached its
+            # real gate matrix, it must be serialized rather than discarded.
             op_type = getattr(node, "op_type", "")
-            if op_type in _STRUCTURAL_OPS:
+            weight = self._extract_weight(node)
+            if op_type in _STRUCTURAL_OPS and weight is None:
                 stats.skipped_structural += 1
                 continue
 
-            weight = self._extract_weight(node)
             if weight is None:
                 stats.skipped_no_weight += 1
                 continue
@@ -313,7 +358,7 @@ class GraphWeightQuantizer:
             if v > 0 and h > 0:
                 return (v, h) if op == "embedding" else (v, h)
 
-        if op in ("rmsnorm",):
+        if op in ("rmsnorm", "layernorm"):
             h = attrs.get("hidden_size", 0)
             if h > 0:
                 return (h,)
@@ -332,7 +377,7 @@ class GraphWeightQuantizer:
             if out_f > 0 and in_f > 0:
                 return (out_f, in_f)
 
-        if op in ("gate_proj", "swiglu_ffn", "ffn"):
+        if op in ("gate_proj", "swiglu_ffn", "gelu_ffn", "ffn"):
             out_f = attrs.get("out_features", attrs.get("intermediate_size", 0))
             in_f = attrs.get("in_features", attrs.get("hidden_size", 0))
             if out_f > 0 and in_f > 0:
@@ -357,6 +402,13 @@ class GraphWeightQuantizer:
         self, node_id: str, op_type: str, layer_index: int | None
     ) -> str | None:
         """Convert a graph node id to a canonical weight-store key name."""
+        # Encoder-decoder namespaces must remain distinct from decoder-only
+        # layer_N names: T5 decoder blocks contain both self- and cross-
+        # attention projections, while encoder and decoder depths may differ.
+        if re.match(r"^(encoder|decoder)_layer_\d+_.+$", node_id):
+            return node_id
+        if node_id in {"encoder_final_norm", "final_norm", "embedding", "lm_head"}:
+            return {"encoder_final_norm": "encoder_final_norm"}.get(node_id, node_id)
         # Global nodes.
         if node_id in _NODE_ID_TO_WEIGHT_KEY:
             return _NODE_ID_TO_WEIGHT_KEY[node_id]

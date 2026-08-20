@@ -89,6 +89,42 @@ class TestArchitectureDetector:
         assert arch.family == "qwen_family"
         assert arch.layers == 24
 
+    def test_from_config_preserves_non_derived_qwen_geometry(self) -> None:
+        """Qwen3's head dimension and numerical constants come from config."""
+        arch = ArchitectureDetector()._from_config(
+            {
+                "architectures": ["Qwen3ForCausalLM"],
+                "model_type": "qwen3",
+                "num_hidden_layers": 28,
+                "hidden_size": 1024,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1_000_000.0,
+                "vocab_size": 151936,
+                "max_position_embeddings": 40960,
+                "intermediate_size": 3072,
+            }
+        )
+        assert arch.head_dim == 128
+        assert arch.norm_eps == 1e-6
+        assert arch.rope_theta == 1_000_000.0
+        assert arch.qk_norm is True
+
+    def test_qwen_checkpoint_norm_names_are_bound_to_runtime_components(self) -> None:
+        from aether.compiler.stage1_ingestion.ingestion import IngestionPipeline
+
+        normalise = IngestionPipeline._normalise_weight_name
+        assert normalise("model.layers.0.self_attn.q_norm.weight") == (0, "q_norm")
+        assert normalise("model.layers.0.self_attn.k_norm.weight") == (0, "k_norm")
+        assert normalise("model.norm.weight") == (None, "final_norm")
+
+    def test_approximate_quality_sensitive_passes_are_opt_in(self) -> None:
+        config = CompilerConfig()
+        assert config.enable_sparse_attention is True
+        assert config.enable_pruning is False
+
     @pytest.mark.parametrize(
         ("model_type", "expected_family"),
         [

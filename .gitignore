@@ -149,3 +149,8 @@ temp/
 scratch/
 qwen*/
 *qwen*
+
+# Keep small, reproducible benchmark evidence even when the model/checkpoint
+# name contains "qwen".
+!benchmarks/results/
+!benchmarks/results/*.json

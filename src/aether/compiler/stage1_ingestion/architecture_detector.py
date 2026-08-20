@@ -85,6 +85,19 @@ class ArchitectureDetector:
         Returns:
             A `ModelArchitecture` instance describing the detected architecture.
         """
+        # A local checkpoint's config is authoritative.  Do this before the
+        # convenience table below so a directory named like a known model can
+        # never receive stale hard-coded geometry (Qwen3's head_dim, Q/K norms,
+        # vocabulary, and layer count are concrete examples).
+        local_config = Path(model) / "config.json"
+        if local_config.is_file():
+            try:
+                config = self._load_config_json(model)
+                if config:
+                    return self._from_config(config)
+            except Exception as exc:  # noqa: BLE001 - continue to bounded fallbacks
+                logger.warning("local config detection failed for %s: %s", model, exc)
+
         # 1. Try known model specs by normalized name match
         normalized_name = self._normalize_model_name(model)
         spec = self._known_specs_by_normalized.get(normalized_name)
@@ -104,7 +117,6 @@ class ArchitectureDetector:
         # repositories can opt into config discovery explicitly; otherwise
         # fail fast and let the caller report an actionable unsupported-model
         # error.
-        local_config = Path(model) / "config.json"
         has_local_config = local_config.is_file()
         if (
             self._match_family(model) is None
@@ -207,35 +219,6 @@ class ArchitectureDetector:
                 name = name[len(normalized_prefix):]
         return name
 
-    def _detect_family_from_arch_type(self, arch_type: str) -> str | None:
-        """Map GGUF/config architecture type to family."""
-        arch_lower = arch_type.lower()
-
-        # Common model type aliases
-        family_mapping = {
-            "llama": "llama_family",
-            "qwen": "qwen_family", "qwen2": "qwen_family",
-            "gemma": "gemma_family", "gemma2": "gemma_family",
-            "mistral": "mistral_family",
-            "mixtral": "moe_family",
-            "deepseek": "deepseek_family", "deepseek_v2": "deepseek_family",
-            "phi": "phi_family", "phi3": "phi_family",
-            "mamba": "hybrid_ssm_family",
-            "jamba": "hybrid_ssm_family",
-            "rwkv": "hybrid_ssm_family",
-            "falcon": "falcon_family",
-            "bloom": "bloom_family",
-            "gpt2": "gpt_family", "gpt_neox": "gpt_family",
-            "opt": "opt_family",
-            "stablelm": "stablelm_family",
-        }
-
-        for key, family in family_mapping.items():
-            if key in arch_lower:
-                return family
-
-        return None
-
     def _spec_to_architecture(self, model: str, spec: dict[str, Any]) -> ModelArchitecture:
         """Convert a known spec to a ModelArchitecture."""
         architecture_model = ModelArchitecture(
@@ -250,6 +233,8 @@ class ArchitectureDetector:
             intermediate_size=spec.get("intermediate_size"),
             is_moe=spec.get("is_moe", False),
             is_encoder=spec.get("is_encoder", False),
+            is_encoder_decoder=spec.get("is_encoder_decoder", False),
+            is_multimodal=spec.get("is_multimodal", False),
             num_experts=spec.get("num_experts", 0),
             num_activated_experts=spec.get("num_activated_experts", 0),
         )
@@ -283,6 +268,11 @@ class ArchitectureDetector:
         if not arch_type:
             raise ArchitectureDetectionError("Local config.json does not declare an architecture")
         family = self._detect_family_from_arch_type(arch_type)
+        if family is None and self._is_generic_decoder_config(config, str(arch_type)):
+            # Aether is an open compiler, not a closed allow-list of current
+            # Hub class names. A new family may still expose the standard
+            # decoder contract; dimensions remain configuration-driven.
+            family = "generic_decoder_family"
         if family is None:
             raise ArchitectureDetectionError(
                 f"Unsupported Hugging Face architecture {arch_type!r}; refusing to assume Llama"
@@ -302,7 +292,7 @@ class ArchitectureDetector:
         )
         num_attention_heads = config.get(
             "num_attention_heads",
-            config.get("num_heads", config.get("n_head", 32)),
+            config.get("num_heads", config.get("n_head", config.get("n_heads", 32))),
         )
         num_kv_heads = config.get(
             "num_key_value_heads",
@@ -317,12 +307,145 @@ class ArchitectureDetector:
             "intermediate_size",
             config.get("n_inner", int(hidden_size) * 4),
         )
+        encoder_layers = config.get("num_layers", config.get("num_encoder_layers", num_hidden_layers))
+        decoder_layers = config.get("num_decoder_layers", num_hidden_layers)
+
+        # These values are not derivable from hidden_size / num_attention_heads
+        # for every supported architecture.  Qwen3 is a concrete example:
+        # query projections use a 128-wide head while hidden_size / heads is
+        # 64.  Preserve checkpoint-declared execution constants so the AEG
+        # manifest and runtime use the source model's geometry and numerics.
+        head_dim = config.get(
+            "head_dim",
+            config.get("attention_head_dim", config.get("d_head", config.get("d_kv"))),
+        )
+        norm_eps = config.get(
+            "rms_norm_eps",
+            config.get("layer_norm_eps", config.get("layer_norm_epsilon", 1e-5)),
+        )
+        rope_theta = config.get(
+            "rope_theta",
+            config.get("rotary_emb_base", config.get("rotary_embedding_base", 10000.0)),
+        )
+        try:
+            head_dim = int(head_dim) if head_dim is not None else None
+        except (TypeError, ValueError):
+            head_dim = None
+        try:
+            norm_eps = float(norm_eps)
+        except (TypeError, ValueError):
+            norm_eps = 1e-5
+        try:
+            rope_theta = float(rope_theta)
+        except (TypeError, ValueError):
+            rope_theta = 10000.0
+        architecture_name = str(arch_type).lower()
+        model_type = str(config.get("model_type", "")).lower()
+        hidden_act = str(
+            config.get("hidden_act", config.get("hidden_activation", config.get("activation_function", config.get("feed_forward_proj", ""))))
+        ).lower()
+        if "geglu" in hidden_act or "geglu" in architecture_name or model_type.startswith("gemma"):
+            ffn_type = "GeGLU"
+        elif any(marker in hidden_act for marker in ("gated-gelu", "gated_gelu", "gatedgelu")) or model_type in {"t5", "mt5"} and config.get("is_gated_act", False):
+            ffn_type = "GatedGELU"
+        elif model_type in {"t5", "mt5", "byt5", "ul2"} and "relu" in hidden_act and "gated" not in hidden_act:
+            ffn_type = "ReLU"
+        elif any(marker in hidden_act for marker in ("gelu", "quick_gelu")) or model_type in {
+            "gpt2", "gpt_neo", "gpt_neox", "bert", "roberta", "deberta", "electra", "albert",
+        }:
+            ffn_type = "GELU"
+        else:
+            ffn_type = "SwiGLU"
+        norm_type = str(config.get("norm_type", "")).strip()
+        if not norm_type:
+            norm_type = "LayerNorm" if any(
+                marker in model_type or marker in architecture_name
+                for marker in ("bert", "roberta", "deberta", "electra", "albert", "gpt2", "gpt_neo", "gpt_neox")
+            ) else "RMSNorm"
+        position_type = str(config.get("position_type", "")).strip()
+        if not position_type:
+            if bool(config.get("alibi", False)):
+                position_type = "ALiBi"
+            elif any(marker in model_type or marker in architecture_name for marker in ("gpt2", "gpt_neo", "opt", "bloom")):
+                position_type = "absolute"
+            else:
+                position_type = "RoPE"
+        embedding_norm = bool(
+            config.get("embedding_norm", False)
+            or model_type == "bloom"
+            or "bloom" in architecture_name
+        )
+        attention_type = str(config.get("attention_type", "")).strip()
+        if not attention_type:
+            if config.get("kv_lora_rank") is not None or "mla" in architecture_name or "mla" in model_type:
+                attention_type = "MLA"
+            elif num_kv_heads == num_attention_heads:
+                attention_type = "MHA"
+            else:
+                attention_type = "GQA"
+        qk_norm = bool(
+            config.get("qk_norm", config.get("use_qk_norm", False))
+            or "qwen3" in architecture_name
+            or model_type == "qwen3"
+        )
+        # GPT-J's published block computes attention and MLP from one shared
+        # LayerNorm output and adds both branches to the residual together.
+        # Preserve this structural capability in the AEG contract.
+        parallel_residual = bool(
+            config.get("parallel_residual", False)
+            or model_type in {"gptj", "gpt-j"}
+            or "gptj" in architecture_name.lower().replace("_", "")
+        )
 
         # Detect MoE
-        num_experts = config.get("num_local_experts", config.get("num_experts", 0))
-        num_activated_experts = config.get("num_experts_per_tok", config.get("top_k", 0))
+        # HF model families use several names for the routed expert bank.
+        # DeepSeek uses ``n_routed_experts`` while Mixtral/OLMoE commonly use
+        # ``num_local_experts``.  Normalize them at the capability boundary so
+        # downstream graph/runtime code never needs a family-name branch.
+        num_experts = config.get(
+            "num_local_experts",
+            config.get("n_routed_experts", config.get("num_experts", 0)),
+        )
+        num_activated_experts = config.get(
+            "num_experts_per_tok",
+            config.get("num_experts_per_token", config.get("top_k", 0)),
+        )
+        try:
+            num_experts = max(0, int(num_experts or 0))
+        except (TypeError, ValueError):
+            num_experts = 0
+        try:
+            num_activated_experts = max(0, int(num_activated_experts or 0))
+        except (TypeError, ValueError):
+            num_activated_experts = 0
         is_moe = num_experts > 0
+        # Mixtral-style checkpoints are all-MoE; Jamba/DeepSeek-style
+        # checkpoints can replace only a subset of layers.  Preserve the
+        # declared pattern in the architecture contract instead of making
+        # the runtime guess from a family name.
+        if is_moe:
+            first_dense = int(config.get("first_k_dense_replace", 0) or 0)
+            frequency = int(config.get("moe_layer_frequency", 1) or 1)
+            explicit_layers = config.get("moe_layer_indices", config.get("moe_layers"))
+            if isinstance(explicit_layers, list):
+                moe_layer_indices = [int(index) for index in explicit_layers]
+            elif frequency > 1:
+                moe_layer_indices = [
+                    index for index in range(int(num_hidden_layers))
+                    if index >= first_dense and index % frequency == 0
+                ]
+            else:
+                moe_layer_indices = list(range(first_dense, int(num_hidden_layers)))
+        else:
+            moe_layer_indices = None
         is_encoder = family in ("bert_family", "roberta_family", "deberta_family", "electra_family", "albert_family")
+        is_encoder_decoder = family == "encoder_decoder_family"
+        is_multimodal = bool(
+            config.get("vision_config") is not None
+            or config.get("visual_config") is not None
+            or any(marker in architecture_name for marker in ("vision", "vl", "visual", "audio"))
+            or any(marker in model_type for marker in ("vision", "vl", "visual", "audio"))
+        )
         mtp_declared = config.get(
             "mtp_heads",
             config.get("num_mtp_heads", config.get("num_nextn_predict_layers", 0)),
@@ -334,6 +457,72 @@ class ArchitectureDetector:
         except (TypeError, ValueError):
             mtp_heads = 0
 
+        ssm_variant: str | None = None
+        ssm_state_size: int | None = None
+        ssm_inner_size: int | None = None
+        ssm_dt_rank: int | None = None
+        ssm_conv_kernel: int | None = None
+        ssm_num_heads: int | None = None
+        ssm_num_groups: int | None = None
+        ssm_head_dim: int | None = None
+        hybrid_layer_types: list[str] | None = None
+        if family == "hybrid_ssm_family" or any(
+            marker in model_type for marker in ("mamba", "rwkv", "jamba")
+        ):
+            if "rwkv" in model_type:
+                ssm_variant = "rwkv_time_mix"
+            elif "mamba2" in model_type or "mamba_2" in model_type:
+                ssm_variant = "ssd"
+            else:
+                ssm_variant = "selective_scan"
+            if "jamba" in model_type or "jamba" in architecture_name:
+                # Jamba publishes either an explicit block schedule or an
+                # attention period/offset. Preserve the schedule in the AEG;
+                # the runtime must never guess a layer type from a family
+                # name after compilation.
+                explicit_schedule = config.get("layers_block_type", config.get("layer_types"))
+                attention_indices = config.get("attention_layer_indices", config.get("attn_layer_indices"))
+                if isinstance(explicit_schedule, list) and len(explicit_schedule) == int(num_hidden_layers):
+                    hybrid_layer_types = [
+                        "attention" if str(value).lower() in {"attention", "attn", "transformer"} else "ssm"
+                        for value in explicit_schedule
+                    ]
+                else:
+                    if isinstance(attention_indices, list):
+                        attention_set = {int(value) for value in attention_indices}
+                    else:
+                        period = int(config.get("attn_layer_period", config.get("attention_layer_period", 8)) or 8)
+                        offset = int(config.get("attn_layer_offset", max(0, period - 1)) or 0)
+                        attention_set = set(range(offset, int(num_hidden_layers), max(period, 1)))
+                    hybrid_layer_types = [
+                        "attention" if index in attention_set else "ssm"
+                        for index in range(int(num_hidden_layers))
+                    ]
+                ssm_variant = "hybrid_selective_scan"
+            ssm_state_size = int(config.get("d_state", config.get("state_size", 16)) or 16)
+            # Mamba-2 names its expanded channel geometry ``n_heads`` ×
+            # ``headdim``; Mamba-1 uses the simpler ``d_inner`` contract.
+            # Preserve both forms in the artifact instead of making the
+            # runtime infer a Qwen/transformer-shaped dimension.
+            ssm_num_heads = int(config.get("n_heads", config.get("num_ssm_heads", num_attention_heads)) or 0)
+            ssm_num_groups = int(config.get("n_groups", config.get("num_ssm_groups", 1)) or 1)
+            ssm_head_dim = config.get("headdim", config.get("ssm_head_dim"))
+            try:
+                ssm_head_dim = int(ssm_head_dim) if ssm_head_dim is not None else None
+            except (TypeError, ValueError):
+                ssm_head_dim = None
+            configured_inner = config.get("d_inner")
+            if configured_inner is None and ssm_head_dim and ssm_num_heads:
+                configured_inner = ssm_head_dim * ssm_num_heads
+            if configured_inner is None:
+                configured_inner = config.get("intermediate_size")
+            ssm_inner_size = int(configured_inner or int(hidden_size) * 2)
+            if ssm_head_dim is None and ssm_num_heads > 0 and ssm_inner_size % ssm_num_heads == 0:
+                ssm_head_dim = ssm_inner_size // ssm_num_heads
+            raw_dt_rank = config.get("dt_rank", config.get("time_step_rank", "auto"))
+            ssm_dt_rank = (int(hidden_size) + 15) // 16 if raw_dt_rank == "auto" else int(raw_dt_rank)
+            ssm_conv_kernel = int(config.get("d_conv", config.get("conv_kernel", 4)) or 4)
+
         return ModelArchitecture(
             family=family,
             params_billion=0.0,
@@ -341,14 +530,76 @@ class ArchitectureDetector:
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
             context_length=context_length,
             vocab_size=vocab_size,
+            norm_eps=norm_eps,
+            rope_theta=rope_theta,
+            qk_norm=qk_norm,
+            parallel_residual=parallel_residual,
             intermediate_size=intermediate_size,
             is_moe=is_moe,
             is_encoder=is_encoder,
+            is_encoder_decoder=is_encoder_decoder,
+            is_multimodal=is_multimodal,
+            encoder_layers=int(encoder_layers) if is_encoder_decoder else None,
+            decoder_layers=int(decoder_layers) if is_encoder_decoder else None,
+            tie_word_embeddings=bool(config.get("tie_word_embeddings", True)),
+            relative_attention_num_buckets=int(config.get("relative_attention_num_buckets", 32)),
             num_experts=num_experts,
             num_activated_experts=num_activated_experts,
+            moe_layer_indices=moe_layer_indices,
             mtp_heads=mtp_heads,
+            attention_type=attention_type,
+            mla_kv_lora_rank=(
+                int(config["kv_lora_rank"]) if config.get("kv_lora_rank") is not None else None
+            ),
+            mla_q_lora_rank=(
+                int(config["q_lora_rank"]) if config.get("q_lora_rank") is not None else None
+            ),
+            mla_qk_nope_head_dim=(
+                int(config["qk_nope_head_dim"])
+                if config.get("qk_nope_head_dim") is not None else None
+            ),
+            mla_qk_rope_head_dim=(
+                int(config["qk_rope_head_dim"])
+                if config.get("qk_rope_head_dim") is not None else None
+            ),
+            mla_v_head_dim=(
+                int(config["v_head_dim"]) if config.get("v_head_dim") is not None else None
+            ),
+            ssm_variant=ssm_variant,
+            ssm_state_size=ssm_state_size,
+            ssm_inner_size=ssm_inner_size,
+            ssm_dt_rank=ssm_dt_rank,
+            ssm_conv_kernel=ssm_conv_kernel,
+            ssm_num_heads=ssm_num_heads,
+            ssm_num_groups=ssm_num_groups,
+            ssm_head_dim=ssm_head_dim,
+            hybrid_layer_types=hybrid_layer_types,
+            ffn_type=ffn_type,
+            norm_type=norm_type,
+            position_type=position_type,
+            embedding_norm=embedding_norm,
+        )
+
+    @staticmethod
+    def _is_generic_decoder_config(config: dict[str, Any], arch_type: str) -> bool:
+        """Return whether an unknown config explicitly declares a decoder LM.
+
+        This is intentionally conservative.  It accepts only causal language
+        model class names or an explicit decoder flag, and rejects multimodal
+        and encoder/decoder class contracts that require a different graph.
+        """
+        normalized_arch = arch_type.lower().replace("_", "")
+        model_type = str(config.get("model_type", "")).lower()
+        if any(marker in normalized_arch for marker in ("vision", "vl", "conditionalgeneration", "encoderdecoder")):
+            return False
+        return bool(
+            "causallm" in normalized_arch
+            or normalized_arch.endswith("lmheadmodel")
+            or config.get("is_decoder") is True
+            or config.get("is_encoder_decoder") is False and model_type.endswith("lm")
         )
 
     def _detect_family_from_arch_type(self, arch_type: str) -> str | None:
@@ -442,22 +693,36 @@ class ArchitectureDetector:
         normalized = arch_type.lower().replace("-", "_").replace(".", "_")
         if normalized in mapping:
             return mapping[normalized]
+        # Keep the registry extensible without duplicating every Hugging Face
+        # class spelling (for example OLMoForCausalLM, GraniteForCausalLM,
+        # Starcoder2ForCausalLM, and code-model variants).  The family is a
+        # capability classification; all dimensions still come from config.
+        normalized_compact = normalized.replace("_", "")
+        for key, fam in sorted(
+            ARCHITECTURE_BY_MODEL_PREFIX.items(),
+            key=lambda item: len(item[0].replace("_", "")),
+            reverse=True,
+        ):
+            if key.replace("_", "") in normalized_compact:
+                return fam
+        # Keep explicit class-name aliases as a last fallback.  Broad aliases
+        # such as ``phi`` must not match an unrelated class name accidentally.
         for key, fam in mapping.items():
-            if key.lower() in arch_type.lower():
+            key_compact = key.lower().replace("-", "").replace("_", "")
+            if key_compact and key_compact in normalized_compact:
                 return fam
         return None
 
     def _match_family(self, model: str) -> str | None:
         """Match a model name to an architecture family."""
         lower = model.lower().replace("-", "").replace("_", "")
-        for name_part in [
-            "llama", "qwen", "gemma", "deepseek", "mixtral", "mistral",
-            "phi", "falcon", "whisper", "vit", "mamba", "jamba", "bamba", "rwkv",
-            "bert", "roberta", "deberta", "electra", "albert", "mpnet", "distilbert",
-            "gpt2", "gpt_neo", "gpt-neox",
-        ]:
-            if name_part in lower:
-                return ARCHITECTURE_BY_MODEL_PREFIX.get(name_part, "llama_family")
+        for name_part, family in sorted(
+            ARCHITECTURE_BY_MODEL_PREFIX.items(),
+            key=lambda item: len(item[0].replace("_", "")),
+            reverse=True,
+        ):
+            if name_part.replace("_", "") in lower:
+                return family
         return None
 
     def list_known_models(self) -> list[tuple[str, float, int]]:
