@@ -465,19 +465,21 @@ class Runtime:
     ) -> Backend:
         """Resolve and return the best available backend for the target."""
         with self._lock:
+            target = target_id or self.fingerprint.target_id
+            profile = HardwareProfile.from_target_id(target) or HardwareProfile.auto()
             explicit_backend = self.config.backend_name is not None
             is_onnx_model = bool(
                 model_id and Path(model_id).suffix.lower() == ".onnx"
             )
             if self.config.backend_name:
                 backend = self.backend_registry.get_backend(self.config.backend_name)
-                if backend is not None and backend.is_available():
+                if backend is not None and backend.available_for_target(profile.target_id):
                     return backend
-                msg = f"Configured backend '{self.config.backend_name}' is not available"
+                msg = (
+                    f"Configured backend '{self.config.backend_name}' is not available "
+                    f"for target {profile.target_id}"
+                )
                 raise BackendNotAvailableError(msg, backend_name=self.config.backend_name)
-
-            target = target_id or self.fingerprint.target_id
-            profile = HardwareProfile.from_target_id(target) or HardwareProfile.auto()
             # Prefer cached backend
             if profile.target_id in self._loaded_backends:
                 cached = self._loaded_backends[profile.target_id]
@@ -489,15 +491,16 @@ class Runtime:
                 if backend_name in {"onnx", "onnxruntime"} and not is_onnx_model:
                     continue
                 backend = self.backend_registry.get_backend(backend_name)
-                if backend is not None and backend.is_available():
+                if backend is not None and backend.available_for_target(profile.target_id):
                     self._loaded_backends[profile.target_id] = backend
                     return backend
-            # Fallback to any available backend
+            # A backend for another device is not a valid fallback.
             for backend in self.backend_registry.get_available_backends():
                 if backend.name == "onnx" and not is_onnx_model:
                     continue
-                self._loaded_backends[profile.target_id] = backend
-                return backend
+                if backend.available_for_target(profile.target_id):
+                    self._loaded_backends[profile.target_id] = backend
+                    return backend
 
             msg = f"No backend available for target {target}"
             raise BackendNotAvailableError(msg, target_id=target)
@@ -521,6 +524,32 @@ class Runtime:
                     f"AEG artifact does not exist or has no manifest: {model_id}",
                     model_id=model_id,
                 )
+            if aeg_path is not None:
+                # An AEG is a portable graph/weight container, not a license
+                # to execute an incompatible target variant.  Validate the
+                # current target before backend selection so a GPU/accelerator
+                # request cannot silently fall back to the CPU reference path.
+                portable_pytorch = False
+                try:
+                    from aether.core.aeg_format import AEGPackage
+
+                    package = AEGPackage(Path(aeg_path)).load()
+                    portable_pytorch = package.supports_portable_backend("pytorch")
+                    if not package.supports_runtime_target(self.fingerprint.target_id):
+                        compiled_targets = list(package.manifest.kernels.targets) if package.manifest else []
+                        raise BackendNotAvailableError(
+                            "AEG artifact has no executable variant for the detected target "
+                            f"{self.fingerprint.target_id!r}; compiled variants: {compiled_targets}. "
+                            "Compile the same source model for this target or include both targets "
+                            "in one AEG package.",
+                            target_id=self.fingerprint.target_id,
+                        )
+                except BackendNotAvailableError:
+                    raise
+                except Exception as exc:
+                    raise AetherRuntimeError(
+                        f"Unable to validate AEG target compatibility for {aeg_path}: {exc}"
+                    ) from exc
             # A local ONNX file has an explicit execution contract. Do not
             # route it to the generic PyTorch backend merely because that
             # backend is available on the host.
@@ -547,7 +576,21 @@ class Runtime:
                         )
                     backend = native
                 else:
-                    backend = self._resolve_backend(model_id=model_id)
+                    # A portable PyTorch AEG must stay on the backend that
+                    # implements its graph/weight contract.  Selecting vLLM
+                    # or another frontend here would either ignore the AEG or
+                    # silently execute a different model path.
+                    if portable_pytorch and self.fingerprint.target_id.startswith(("cuda_", "rocm_", "metal_")):
+                        backend = self.backend_registry.get_backend("pytorch")
+                        if backend is None or not backend.available_for_target(self.fingerprint.target_id):
+                            raise BackendNotAvailableError(
+                                "portable AEG execution requires an installed PyTorch backend "
+                                f"for target {self.fingerprint.target_id}",
+                                backend_name="pytorch",
+                                target_id=self.fingerprint.target_id,
+                            )
+                    else:
+                        backend = self._resolve_backend(model_id=model_id)
             else:
                 backend = self._resolve_backend(model_id=model_id)
             self._loaded_models[model_id] = backend.load_model(
@@ -631,6 +674,8 @@ class Runtime:
             "aether_version": aeg.manifest.aether_version,
             "architecture": aeg.manifest.architecture.to_dict(),
             "targets": aeg.manifest.kernels.targets,
+            "variant_status": dict(aeg.manifest.kernels.variant_status),
+            "portable_backends": list(aeg.manifest.kernels.portable_backends),
             "precision_map": aeg.get_precision_map(),
             "memory": aeg.manifest.memory_requirements.to_dict(),
             "sharding_plans": {k: v.to_dict() for k, v in aeg.sharding_plans.items()},
@@ -1807,7 +1852,9 @@ class Runtime:
     def _init_v5_layers(self, aeg_path: str | None = None) -> None:
         """Initialize v5.0 runtime layers: R9 diffusion spec, R11 semantic cache, R12 CXL pool."""
         # R9 Diffusion Speculative Engine
-        if not hasattr(self, "_diffusion_engine"):
+        if not self.config.enable_diffusion_spec:
+            self._diffusion_engine = None
+        elif not hasattr(self, "_diffusion_engine"):
             try:
                 from aether.runtime.r9_diffusion_spec_engine import DiffusionSpecEngine
                 vocab_size = getattr(self.config, "vocab_size", 128000)
@@ -1815,9 +1862,24 @@ class Runtime:
                     vocab_size=vocab_size,
                     use_adaptive_scheduling=True,
                 )
-                if aeg_path:
-                    self._diffusion_engine.load_from_aeg(aeg_path)
-                logger.info("R9: DiffusionSpecEngine initialized")
+                # A drafter is executable only when its persisted weights
+                # load successfully.  Keep ordinary AR serving on the normal
+                # path instead of retaining an engine that can only report a
+                # synthetic/fallback draft.
+                draft_root = Path(aeg_path) / "graph" if aeg_path else None
+                has_draft_payload = bool(
+                    draft_root
+                    and (
+                        (draft_root / "mdlm_draft_head_config.json").is_file()
+                        or (draft_root / "mdlm_draft_head.npz").is_file()
+                        or (draft_root / "mdlm_draft_head.safetensors").is_file()
+                    )
+                )
+                if not has_draft_payload or not self._diffusion_engine.load_from_aeg(aeg_path):
+                    self._diffusion_engine = None
+                    logger.info("R9: MDLM drafter unavailable; using autoregressive decoding")
+                else:
+                    logger.info("R9: DiffusionSpecEngine initialized with executable draft head")
             except Exception as exc:
                 self._diffusion_engine = None
                 logger.warning(f"R9 init failed: {exc}")

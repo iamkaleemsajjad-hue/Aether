@@ -13,7 +13,7 @@ from typing import Any
 
 from aether.compiler.config import CompilerConfig
 from aether.compiler.report import PassReport
-from aether.core.exceptions import CompilerPassError
+from aether.core.exceptions import CalibrationError, CompilerPassError
 from aether.utils.logging import get_logger
 
 # PRD v4.0 + v5.0 pass imports
@@ -119,6 +119,31 @@ class OperatorFusionPass(BasePass):
                     else:
                         # All ops in sequence found — fuse them.
                         if len(candidates) >= 2:
+                            # Matching operation types in the same layer is not
+                            # enough: a layer contains two RMSNorms, and choosing
+                            # the first one for the FFN pattern can fuse the
+                            # attention branch into the later residual branch.
+                            # Require each adjacent pair to be a real data edge.
+                            # This also keeps Qwen3's Q/K norm nodes between QKV
+                            # and RoPE instead of manufacturing an invalid cycle.
+                            if any(
+                                not any(
+                                    edge.source == getattr(candidates[index], "id", "")
+                                    and edge.target == getattr(candidates[index + 1], "id", "")
+                                    for edge in graph.get_output_edges(getattr(candidates[index], "id", ""))
+                                )
+                                for index in range(len(candidates) - 1)
+                            ):
+                                continue
+                            # Qwen3 applies parameterized Q/K head norms
+                            # between QKV projection and RoPE. Fusing across
+                            # those nodes changes graph topology and can create
+                            # a cycle when the norm parameters are retained.
+                            if any(
+                                bool(getattr(candidate, "attributes", {}).get("qk_norm"))
+                                for candidate in candidates
+                            ):
+                                continue
                             candidate_ids = [getattr(c, "id", f"node_{i}") for i, c in enumerate(candidates)]
                             first_op = candidates[0].op_type or "op"
                             last_op = candidates[-1].op_type or "op"
@@ -218,7 +243,16 @@ class SensitivityAnalysisPass(BasePass):
                     "summary": summary,
                     "method": method,
                     "dataset": dataset.name,
-                    "calibration_tokens": dataset.token_count() if hasattr(dataset, "token_count") else 0,
+                    # Weight-backed calibration uses measured reconstruction
+                    # error and does not consume text.  Do not force a named
+                    # corpus lookup merely to populate an informational
+                    # counter; text calibration remains explicit for
+                    # weightless graphs.
+                    "calibration_tokens": (
+                        dataset.token_count()
+                        if not layer_weights and hasattr(dataset, "token_count")
+                        else 0
+                    ),
                     "high_sensitivity_layers": sum(1 for v in sensitivity_map.values() if v > 0.7),
                     "low_sensitivity_layers": sum(1 for v in sensitivity_map.values() if v < 0.4),
                 },
@@ -229,6 +263,20 @@ class SensitivityAnalysisPass(BasePass):
                 method,
             )
         except Exception as exc:
+            # A named calibration corpus is an optional input for graphs that
+            # carry no measurable tensors.  If it is unavailable locally,
+            # skip this pass rather than failing compilation or inventing
+            # benchmark prose; real weight-backed graphs use the measured
+            # reconstruction path above and do not need text samples.
+            if isinstance(exc, CalibrationError):
+                report = PassReport(
+                    pass_name=self.name,
+                    status="skipped",
+                    duration_ms=(time.perf_counter() - start) * 1000,
+                    details={"reason": str(exc), "calibration_required": True},
+                )
+                logger.warning("Pass 2 skipped: %s", exc)
+                return graph, report
             report = PassReport(
                 pass_name=self.name,
                 status="failed",
@@ -320,12 +368,6 @@ class PrecisionAssignmentPass(BasePass):
     description = "Assign mixed precision using sensitivity map."
 
     def run(self, graph: Any, architecture: Any, config: CompilerConfig) -> tuple[Any, PassReport]:
-        from aether.core.constants import (
-            SENSITIVITY_CRITICAL_THRESHOLD,
-            SENSITIVITY_HIGH_THRESHOLD,
-            SENSITIVITY_MEDIUM_THRESHOLD,
-        )
-
         start = time.perf_counter()
         precision_map: dict[str, str] = {}
         try:
@@ -352,19 +394,21 @@ class PrecisionAssignmentPass(BasePass):
                             )
                 if not sensitivity_map:
                     for i in range(architecture.layers):
-                        precision_map[f"layer_{i}"] = "Q4_K_M"
+                        # Weight-reconstruction sensitivity is not a model
+                        # quality evaluation.  Until a perplexity/task gate has
+                        # actually run, keep the source precision rather than
+                        # silently accumulating lossy Q4/Q3 error across all
+                        # transformer layers.
+                        precision_map[f"layer_{i}"] = "BF16"
                 else:
                     for i in range(architecture.layers):
                         layer_key = f"layer_{i}"
-                        sensitivity = sensitivity_map.get(layer_key, 0.5)
-                        if sensitivity >= SENSITIVITY_CRITICAL_THRESHOLD:
-                            precision_map[layer_key] = "BF16"
-                        elif sensitivity >= SENSITIVITY_HIGH_THRESHOLD:
-                            precision_map[layer_key] = "FP8"
-                        elif sensitivity >= SENSITIVITY_MEDIUM_THRESHOLD:
-                            precision_map[layer_key] = "Q4_K_M"
-                        else:
-                            precision_map[layer_key] = "Q3_K"
+                        # The current sensitivity signal measures weight
+                        # reconstruction only; it does not establish the PRD's
+                        # perplexity/task-quality budget.  Approximate formats
+                        # are therefore reserved for explicit manual/uniform
+                        # requests until a real evaluation gate is available.
+                        precision_map[layer_key] = "BF16"
 
             # Always keep embedding and LM head at BF16
             precision_map["embedding"] = "BF16"
@@ -373,7 +417,7 @@ class PrecisionAssignmentPass(BasePass):
             # Annotate nodes with precision
             if hasattr(graph, "iter_layers"):
                 for i, node_group in enumerate(graph.iter_layers()):
-                    precision = precision_map.get(f"layer_{i}", "Q4_K_M")
+                    precision = precision_map.get(f"layer_{i}", "BF16")
                     for node in node_group:
                         if node.attributes and "precision" not in node.attributes:
                             node.set_precision(__import__("aether.core.types", fromlist=["Precision"]).Precision.from_string(precision))
@@ -1219,6 +1263,19 @@ class OptimizerPipeline:
 
         for pass_instance in self._passes:
             if not self._pass_enabled.get(pass_instance.name, True):
+                # Keep the metadata contract stable when an approximate pass is
+                # disabled for quality safety.  Consumers can distinguish an
+                # explicit no-op from a missing/old artifact without assuming
+                # that the optimizer silently ran the pass.
+                if pass_instance.name == "pruning_sparsity" and hasattr(current_graph, "set_metadata"):
+                    current_graph.set_metadata(
+                        "sparsity_plan",
+                        {
+                            "enabled": False,
+                            "reason": "disabled_pending_quality_gate",
+                            "masks": {"status": "not_applied"},
+                        },
+                    )
                 pass_reports.append(
                     PassReport(
                         pass_name=pass_instance.name,

@@ -40,3 +40,15 @@ Each benchmark run reports:
 - `ttft_ms`: time to first token
 - `prompt_tokens`: input token count
 - `completion_tokens`: generated token count
+
+## Verified local checkpoint
+
+The repository includes a measured real-checkpoint result at
+`benchmarks/results/qwen3_0.6b_cpu_avx2_2026-08-19.json`. It compiles the
+provided Qwen3 0.6B SafeTensors checkpoint for `cpu_avx2`, runs three greedy
+generation probes, and compares the next-token logits against the local Hugging
+Face reference. The quality probe matched top-1 and all top-50 candidates.
+
+Approximate pruning and sparse-attention plans are not enabled by default until
+they have a task/perplexity quality gate; explicit precision modes can still be
+used for experiments.

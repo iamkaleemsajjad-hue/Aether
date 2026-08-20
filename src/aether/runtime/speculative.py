@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from aether.core.constants import DRAFT_FAMILIES, MINIMUM_ACCEPTANCE_RATE
+from aether.core.constants import MINIMUM_ACCEPTANCE_RATE
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -59,11 +59,14 @@ class TreeSpeculativeEngine:
         self._total_count = 0
 
     def _select_draft_model(self, target_model_id: str) -> str | None:
-        """Select a draft model from the target model family."""
-        normalized = target_model_id.lower().replace("/", "-").replace("_", "-")
-        for prefix, draft in DRAFT_FAMILIES.items():
-            if prefix in normalized:
-                return draft
+        """Return no implicit draft model.
+
+        A target identifier does not tell the runtime which compatible draft
+        checkpoint is installed, tokenizer-compatible, or licensed for use.
+        Selecting one from a family-name table was both Qwen-biased and unsafe
+        for arbitrary open models.  Callers must pass an explicit
+        ``draft_model_id`` (or bind a model-aware scheduler) instead.
+        """
         return None
 
     def build_draft_tree(self, prefix_tokens: list[int], max_depth: int = 4, branching_factor: int = 3) -> DraftTreeNode:

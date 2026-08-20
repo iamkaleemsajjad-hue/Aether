@@ -504,9 +504,13 @@ class TestZKOwnershipProof:
 # ---------------------------------------------------------------------------
 
 class TestAEGModelFingerprint:
+    @staticmethod
+    def _runner(trigger: str) -> str:
+        return f"model-response:{trigger}"
+
     def test_embed_produces_manifest(self):
         fp = AEGModelFingerprint()
-        manifest = fp.embed("test_model", owner_id="owner_x", n_triggers=10)
+        manifest = fp.embed("test_model", owner_id="owner_x", n_triggers=10, generate=self._runner)
         assert manifest["version"] == "fingerprint/1.0"
         assert manifest["n_triggers"] == 10
         assert len(manifest["trigger_records"]) == 10
@@ -514,23 +518,23 @@ class TestAEGModelFingerprint:
 
     def test_verify_same_model_matches(self):
         fp = AEGModelFingerprint()
-        manifest = fp.embed("my_model", owner_id="owner_y", n_triggers=20)
-        result = fp.verify("my_model", "owner_y", manifest)
+        manifest = fp.embed("my_model", owner_id="owner_y", n_triggers=20, generate=self._runner)
+        result = fp.verify("my_model", "owner_y", manifest, generate=self._runner)
         assert result.is_derived is True
         assert result.match_rate >= AEGModelFingerprint.MATCH_THRESHOLD
         assert result.triggers_tested == 20
 
     def test_verify_different_model_no_match(self):
         fp = AEGModelFingerprint()
-        manifest = fp.embed("original_model", owner_id="owner_a", n_triggers=20)
-        result = fp.verify("stolen_model", "owner_a", manifest)
+        manifest = fp.embed("original_model", owner_id="owner_a", n_triggers=20, generate=self._runner)
+        result = fp.verify("stolen_model", "owner_a", manifest, generate=lambda trigger: "different")
         assert result.is_derived is False
         assert result.match_rate == 0.0
 
     def test_verify_wrong_owner_fails(self):
         fp = AEGModelFingerprint()
-        manifest = fp.embed("model_z", owner_id="real_owner", n_triggers=10)
-        result = fp.verify("model_z", "fake_owner", manifest)
+        manifest = fp.embed("model_z", owner_id="real_owner", n_triggers=10, generate=self._runner)
+        result = fp.verify("model_z", "fake_owner", manifest, generate=self._runner)
         assert result.is_derived is False
         assert result.match_rate == 0.0
 
@@ -542,8 +546,8 @@ class TestAEGModelFingerprint:
 
     def test_result_to_dict(self):
         fp = AEGModelFingerprint()
-        manifest = fp.embed("model", owner_id="owner", n_triggers=5)
-        result = fp.verify("model", "owner", manifest)
+        manifest = fp.embed("model", owner_id="owner", n_triggers=5, generate=self._runner)
+        result = fp.verify("model", "owner", manifest, generate=self._runner)
         d = result.to_dict()
         assert "is_derived" in d
         assert "match_rate" in d
@@ -554,7 +558,7 @@ class TestAEGModelFingerprint:
     def test_write_creates_fingerprint_json(self):
         fp = AEGModelFingerprint()
         with tempfile.TemporaryDirectory() as tmpdir:
-            out_path = fp.write(tmpdir, owner_id="owner_file", n_triggers=5)
+            out_path = fp.write(tmpdir, owner_id="owner_file", n_triggers=5, generate=self._runner)
             assert out_path.exists()
             manifest = json.loads(out_path.read_text())
             assert manifest["version"] == "fingerprint/1.0"
@@ -562,8 +566,8 @@ class TestAEGModelFingerprint:
 
     def test_trigger_generation_deterministic(self):
         fp = AEGModelFingerprint()
-        m1 = fp.embed("model", owner_id="owner_det", n_triggers=10)
-        m2 = fp.embed("model", owner_id="owner_det", n_triggers=10)
+        m1 = fp.embed("model", owner_id="owner_det", n_triggers=10, generate=self._runner)
+        m2 = fp.embed("model", owner_id="owner_det", n_triggers=10, generate=self._runner)
         # Triggers should be deterministic
         assert m1["trigger_records"] == m2["trigger_records"]
 

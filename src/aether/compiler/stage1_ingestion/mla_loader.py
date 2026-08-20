@@ -178,8 +178,11 @@ def _parse_mla_config(config: dict[str, Any]) -> MLAArchitecture:
         qk_nope_head_dim=int(_get("qk_nope_head_dim", 128)),
         v_head_dim=int(_get("v_head_dim", 128)),
         is_moe=bool(_get("n_routed_experts", 0)) or bool(_get("num_experts", 0)),
-        num_experts=int(_get("n_routed_experts", _get("num_experts", 1))),
-        num_experts_per_token=int(_get("num_experts_per_tok", _get("num_experts_per_token", 1))),
+        # Dense MLA checkpoints do not become MoE merely because the loader
+        # has no explicit expert metadata.  Treat absent counts as zero and
+        # let the source config decide whether routing is present.
+        num_experts=int(_get("n_routed_experts", _get("num_experts", 0))),
+        num_experts_per_token=int(_get("num_experts_per_tok", _get("num_experts_per_token", 0))),
         moe_intermediate_size=int(_get("moe_intermediate_size", 0)),
         num_shared_experts=int(_get("n_shared_experts", _get("num_shared_experts", 0))),
         first_k_dense_replace=int(_get("first_k_dense_replace", 1)),

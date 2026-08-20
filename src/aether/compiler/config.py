@@ -545,7 +545,35 @@ class CompilerConfig:
         resolved: list[str] = []
         for target in self.targets:
             if target == "auto":
-                resolved.append(HardwareTarget.auto().value)
+                # Use the canonical capability detector so compiler target
+                # selection sees CUDA, ROCm, Metal, and NPU evidence from the
+                # same pipeline exposed by ``aether hardware detect``.
+                try:
+                    from aether.backends.hardware_detector import detect_all_capabilities
+
+                    available = [item for item in detect_all_capabilities() if item.available]
+                    known_targets = {member.value for member in HardwareTarget}
+                    selected = next(
+                        (
+                            item for item in available
+                            if item.target_id in known_targets
+                            and item.vendor in {"NVIDIA", "AMD", "Apple", "Intel"}
+                        ),
+                        next(
+                            (
+                                item for item in available
+                                if item.target_id in known_targets
+                                and item.vendor == "CPU"
+                            ),
+                            None,
+                        ),
+                    )
+                    resolved.append(selected.target_id if selected is not None else HardwareTarget.auto().value)
+                except Exception:
+                    # Hardware detection must never make configuration
+                    # construction fail; the enum detector remains a safe
+                    # CPU-capable fallback.
+                    resolved.append(HardwareTarget.auto().value)
             else:
                 resolved.append(target)
         # Deduplicate preserving order

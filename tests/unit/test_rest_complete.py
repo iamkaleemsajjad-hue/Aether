@@ -90,6 +90,7 @@ def test_openapi_exposes_the_extended_routes(client) -> None:
         "/v1/health",
         "/v1/generate",
         "/v1/chat",
+        "/v1/chat/completions",
         "/v1/embeddings",
         "/v1/rerank",
         "/v1/compile",

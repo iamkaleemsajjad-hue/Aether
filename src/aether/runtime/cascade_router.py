@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import re
 import time
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -248,10 +249,10 @@ class CascadeRouter:
 
     Usage:
         router = CascadeRouter()
-        router.register_tier(ModelTier(0, "qwen3-0.6b", max_complexity=0.25))
-        router.register_tier(ModelTier(1, "qwen3-7b",   max_complexity=0.55))
-        router.register_tier(ModelTier(2, "qwen3-32b",  max_complexity=0.80))
-        router.register_tier(ModelTier(3, "qwen3-235b", max_complexity=1.00))
+        router.register_default_tiers(
+            nano="path/to/nano.aeg", small="path/to/small.aeg",
+            mid="path/to/mid.aeg", large="path/to/large.aeg",
+        )
 
         decision = router.route("What is 2+2?")
         # → routes to qwen3-0.6b (simple)
@@ -284,16 +285,43 @@ class CascadeRouter:
 
     def register_default_tiers(
         self,
-        nano: str = "qwen3-0.6b",
-        small: str = "qwen3-7b",
-        mid: str = "qwen3-32b",
-        large: str = "qwen3-235b",
+        nano: str | None = None,
+        small: str | None = None,
+        mid: str | None = None,
+        large: str | None = None,
     ) -> None:
-        """Register a standard 4-tier cascade."""
-        self.register_tier(ModelTier(0, nano,  max_complexity=0.25, max_tokens=2048,  cost_per_token=0.1))
-        self.register_tier(ModelTier(1, small, max_complexity=0.55, max_tokens=8192,  cost_per_token=1.0))
-        self.register_tier(ModelTier(2, mid,   max_complexity=0.80, max_tokens=32768, cost_per_token=4.0, supports_reasoning=True))
-        self.register_tier(ModelTier(3, large, max_complexity=1.00, max_tokens=131072,cost_per_token=16.0, supports_reasoning=True))
+        """Register configured cascade tiers.
+
+        There is deliberately no model-family default.  The compiler/runtime
+        cannot know which checkpoints exist on a user's machine, and an
+        implicit Qwen registry made this feature appear model-specialized.
+        Values may be supplied directly or through the corresponding
+        ``AETHER_CASCADE_*_MODEL`` environment variables.
+        """
+        values = (
+            nano or os.environ.get("AETHER_CASCADE_NANO_MODEL"),
+            small or os.environ.get("AETHER_CASCADE_SMALL_MODEL"),
+            mid or os.environ.get("AETHER_CASCADE_MID_MODEL"),
+            large or os.environ.get("AETHER_CASCADE_LARGE_MODEL"),
+        )
+        if not any(values):
+            raise ValueError(
+                "cascade tiers require configured model IDs; pass them to "
+                "register_default_tiers() or set AETHER_CASCADE_*_MODEL"
+            )
+        tier_specs = (
+            (0, values[0], 0.25, 2048, 0.1, False),
+            (1, values[1], 0.55, 8192, 1.0, False),
+            (2, values[2], 0.80, 32768, 4.0, True),
+            (3, values[3], 1.00, 131072, 16.0, True),
+        )
+        for tier_id, model_id, limit, max_tokens, cost, reasoning in tier_specs:
+            if model_id:
+                self.register_tier(ModelTier(
+                    tier_id, model_id, max_complexity=limit,
+                    max_tokens=max_tokens, cost_per_token=cost,
+                    supports_reasoning=reasoning,
+                ))
 
     def route(
         self,

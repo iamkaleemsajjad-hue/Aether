@@ -105,6 +105,294 @@ def _write_tiny_llama(
     ).save_pretrained(str(path))
 
 
+def _write_tiny_gpt2(path: Path) -> None:
+    """Write a real GPT-2-style checkpoint, including Conv1D layouts/biases."""
+    safetensors = pytest.importorskip("safetensors.numpy")
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    vocab_size, hidden, intermediate, positions = 32, 16, 32, 32
+    (path / "config.json").write_text(json.dumps({
+        "architectures": ["GPT2LMHeadModel"],
+        "model_type": "gpt2",
+        "n_layer": 1,
+        "n_embd": hidden,
+        "n_head": 2,
+        "n_inner": intermediate,
+        "n_positions": positions,
+        "vocab_size": vocab_size,
+        "activation_function": "gelu_new",
+        "layer_norm_epsilon": 1e-5,
+        "torch_dtype": "float32",
+    }), encoding="utf-8")
+    rng = np.random.default_rng(19)
+    tensors = {
+        "transformer.wte.weight": rng.normal(size=(vocab_size, hidden)).astype("float32"),
+        "transformer.wpe.weight": rng.normal(size=(positions, hidden)).astype("float32"),
+        "transformer.ln_f.weight": np.ones(hidden, dtype="float32"),
+        "transformer.ln_f.bias": np.zeros(hidden, dtype="float32"),
+        "lm_head.weight": rng.normal(size=(vocab_size, hidden)).astype("float32"),
+        "transformer.h.0.ln_1.weight": np.ones(hidden, dtype="float32"),
+        "transformer.h.0.ln_1.bias": np.zeros(hidden, dtype="float32"),
+        "transformer.h.0.ln_2.weight": np.ones(hidden, dtype="float32"),
+        "transformer.h.0.ln_2.bias": np.zeros(hidden, dtype="float32"),
+        # GPT-2 Conv1D stores matrices as (in_features, out_features).
+        "transformer.h.0.attn.c_attn.weight": rng.normal(size=(hidden, 3 * hidden)).astype("float32"),
+        "transformer.h.0.attn.c_attn.bias": rng.normal(size=(3 * hidden,)).astype("float32"),
+        "transformer.h.0.attn.c_proj.weight": rng.normal(size=(hidden, hidden)).astype("float32"),
+        "transformer.h.0.attn.c_proj.bias": rng.normal(size=(hidden,)).astype("float32"),
+        "transformer.h.0.mlp.c_fc.weight": rng.normal(size=(hidden, intermediate)).astype("float32"),
+        "transformer.h.0.mlp.c_fc.bias": rng.normal(size=(intermediate,)).astype("float32"),
+        "transformer.h.0.mlp.c_proj.weight": rng.normal(size=(intermediate, hidden)).astype("float32"),
+        "transformer.h.0.mlp.c_proj.bias": rng.normal(size=(hidden,)).astype("float32"),
+    }
+    safetensors.save_file(tensors, str(path / "model.safetensors"))
+    vocab = {"<unk>": 0, "hello": 1, "world": 2}
+    vocab.update({f"tok{i}": i + 3 for i in range(vocab_size - 3)})
+    tokenizer = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocab=vocab, unk_token="<unk>"))
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    tokenizer.save(str(path / "tokenizer.json"))
+    transformers.PreTrainedTokenizerFast(
+        tokenizer_file=str(path / "tokenizer.json"), unk_token="<unk>"
+    ).save_pretrained(str(path))
+
+
+def _write_tiny_t5(path: Path) -> None:
+    """Write a minimal, real T5-style encoder-decoder SafeTensors checkpoint."""
+    safetensors = pytest.importorskip("safetensors.numpy")
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    vocab_size, hidden, heads, head_dim, intermediate = 32, 8, 2, 4, 16
+    (path / "config.json").write_text(json.dumps({
+        "architectures": ["T5ForConditionalGeneration"],
+        "model_type": "t5",
+        "vocab_size": vocab_size,
+        "d_model": hidden,
+        "d_kv": head_dim,
+        "d_ff": intermediate,
+        "num_layers": 1,
+        "num_decoder_layers": 1,
+        "num_heads": heads,
+        "relative_attention_num_buckets": 8,
+        "relative_attention_max_distance": 32,
+        "layer_norm_epsilon": 1e-6,
+        "feed_forward_proj": "relu",
+        "tie_word_embeddings": True,
+        "torch_dtype": "float32",
+    }), encoding="utf-8")
+    rng = np.random.default_rng(23)
+    def matrix(rows: int, cols: int) -> np.ndarray:
+        return rng.normal(size=(rows, cols)).astype("float32")
+    def norm() -> np.ndarray:
+        return np.ones(hidden, dtype="float32")
+    tensors = {
+        "shared.weight": matrix(vocab_size, hidden),
+        "encoder.final_layer_norm.weight": norm(),
+        "decoder.final_layer_norm.weight": norm(),
+        "encoder.block.0.layer.0.SelfAttention.q.weight": matrix(hidden, hidden),
+        "encoder.block.0.layer.0.SelfAttention.k.weight": matrix(hidden, hidden),
+        "encoder.block.0.layer.0.SelfAttention.v.weight": matrix(hidden, hidden),
+        "encoder.block.0.layer.0.SelfAttention.o.weight": matrix(hidden, hidden),
+        "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight": matrix(8, heads),
+        "encoder.block.0.layer.0.layer_norm.weight": norm(),
+        "encoder.block.0.layer.1.DenseReluDense.wi.weight": matrix(intermediate, hidden),
+        "encoder.block.0.layer.1.DenseReluDense.wo.weight": matrix(hidden, intermediate),
+        "encoder.block.0.layer.1.layer_norm.weight": norm(),
+        "decoder.block.0.layer.0.SelfAttention.q.weight": matrix(hidden, hidden),
+        "decoder.block.0.layer.0.SelfAttention.k.weight": matrix(hidden, hidden),
+        "decoder.block.0.layer.0.SelfAttention.v.weight": matrix(hidden, hidden),
+        "decoder.block.0.layer.0.SelfAttention.o.weight": matrix(hidden, hidden),
+        "decoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight": matrix(8, heads),
+        "decoder.block.0.layer.0.layer_norm.weight": norm(),
+        "decoder.block.0.layer.1.EncDecAttention.q.weight": matrix(hidden, hidden),
+        "decoder.block.0.layer.1.EncDecAttention.k.weight": matrix(hidden, hidden),
+        "decoder.block.0.layer.1.EncDecAttention.v.weight": matrix(hidden, hidden),
+        "decoder.block.0.layer.1.EncDecAttention.o.weight": matrix(hidden, hidden),
+        "decoder.block.0.layer.1.layer_norm.weight": norm(),
+        "decoder.block.0.layer.2.DenseReluDense.wi.weight": matrix(intermediate, hidden),
+        "decoder.block.0.layer.2.DenseReluDense.wo.weight": matrix(hidden, intermediate),
+        "decoder.block.0.layer.2.layer_norm.weight": norm(),
+    }
+    safetensors.save_file(tensors, str(path / "model.safetensors"))
+    vocab = {"<pad>": 0, "</s>": 1, "<unk>": 2, "hello": 3, "world": 4}
+    vocab.update({f"tok{i}": i + 5 for i in range(vocab_size - 5)})
+    tokenizer = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocab=vocab, unk_token="<unk>"))
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    tokenizer.save(str(path / "tokenizer.json"))
+    transformers.PreTrainedTokenizerFast(
+        tokenizer_file=str(path / "tokenizer.json"), unk_token="<unk>", pad_token="<pad>", eos_token="</s>"
+    ).save_pretrained(str(path))
+
+
+def _write_tiny_mixtral(path: Path) -> None:
+    """Write a minimal Mixtral-style sparse MoE checkpoint.
+
+    The tensor names intentionally use the canonical Hugging Face Mixtral
+    layout (w1/w2/w3 expert projections plus block_sparse_moe.gate) so this
+    test exercises model-generic normalization rather than an Aether-only
+    naming convention.
+    """
+    safetensors = pytest.importorskip("safetensors.numpy")
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    vocab_size, hidden, heads, intermediate, experts = 32, 8, 2, 12, 2
+    (path / "config.json").write_text(json.dumps({
+        "architectures": ["MixtralForCausalLM"],
+        "model_type": "mixtral",
+        "num_hidden_layers": 1,
+        "hidden_size": hidden,
+        "intermediate_size": intermediate,
+        "num_attention_heads": heads,
+        "num_key_value_heads": heads,
+        "vocab_size": vocab_size,
+        "num_local_experts": experts,
+        "num_experts_per_tok": 1,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10000.0,
+        "torch_dtype": "float32",
+    }), encoding="utf-8")
+    rng = np.random.default_rng(37)
+    tensors = {
+        "model.embed_tokens.weight": rng.normal(size=(vocab_size, hidden)).astype("float32"),
+        "model.norm.weight": np.ones(hidden, dtype="float32"),
+        "lm_head.weight": rng.normal(size=(vocab_size, hidden)).astype("float32"),
+        "model.layers.0.input_layernorm.weight": np.ones(hidden, dtype="float32"),
+        "model.layers.0.post_attention_layernorm.weight": np.ones(hidden, dtype="float32"),
+        "model.layers.0.self_attn.q_proj.weight": rng.normal(size=(hidden, hidden)).astype("float32"),
+        "model.layers.0.self_attn.k_proj.weight": rng.normal(size=(hidden, hidden)).astype("float32"),
+        "model.layers.0.self_attn.v_proj.weight": rng.normal(size=(hidden, hidden)).astype("float32"),
+        "model.layers.0.self_attn.o_proj.weight": rng.normal(size=(hidden, hidden)).astype("float32"),
+        "model.layers.0.block_sparse_moe.gate.weight": rng.normal(size=(experts, hidden)).astype("float32"),
+    }
+    for expert in range(experts):
+        tensors.update({
+            f"model.layers.0.block_sparse_moe.experts.{expert}.w1.weight": rng.normal(size=(intermediate, hidden)).astype("float32"),
+            f"model.layers.0.block_sparse_moe.experts.{expert}.w2.weight": rng.normal(size=(hidden, intermediate)).astype("float32"),
+            f"model.layers.0.block_sparse_moe.experts.{expert}.w3.weight": rng.normal(size=(intermediate, hidden)).astype("float32"),
+        })
+    safetensors.save_file(tensors, str(path / "model.safetensors"))
+    vocab = {"<unk>": 0, "hello": 1, "world": 2}
+    vocab.update({f"tok{i}": i + 3 for i in range(vocab_size - 3)})
+    tokenizer = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocab=vocab, unk_token="<unk>"))
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    tokenizer.save(str(path / "tokenizer.json"))
+    transformers.PreTrainedTokenizerFast(
+        tokenizer_file=str(path / "tokenizer.json"), unk_token="<unk>"
+    ).save_pretrained(str(path))
+
+
+def _write_tiny_mla(path: Path, *, moe: bool = False) -> None:
+    """Write a dense or routed DeepSeek-style MLA checkpoint."""
+    safetensors = pytest.importorskip("safetensors.numpy")
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    vocab, hidden, heads = 32, 8, 2
+    q_rank, kv_rank, nope, rope, value, intermediate = 4, 3, 2, 2, 2, 12
+    config = {
+        "architectures": ["DeepseekV2ForCausalLM"],
+        "model_type": "deepseek_v2",
+        "num_hidden_layers": 1,
+        "hidden_size": hidden,
+        "intermediate_size": intermediate,
+        "num_attention_heads": heads,
+        "num_key_value_heads": heads,
+        "vocab_size": vocab,
+        "kv_lora_rank": kv_rank,
+        "q_lora_rank": q_rank,
+        "qk_nope_head_dim": nope,
+        "qk_rope_head_dim": rope,
+        "v_head_dim": value,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10000.0,
+        "torch_dtype": "float32",
+    }
+    if moe:
+        config.update({"n_routed_experts": 2, "num_experts_per_tok": 1, "first_k_dense_replace": 0})
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    rng = np.random.default_rng(43)
+    def matrix(rows: int, cols: int) -> np.ndarray:
+        return rng.normal(size=(rows, cols)).astype("float32")
+    tensors = {
+        "model.embed_tokens.weight": matrix(vocab, hidden),
+        "model.norm.weight": np.ones(hidden, dtype="float32"),
+        "lm_head.weight": matrix(vocab, hidden),
+        "model.layers.0.input_layernorm.weight": np.ones(hidden, dtype="float32"),
+        "model.layers.0.post_attention_layernorm.weight": np.ones(hidden, dtype="float32"),
+        "model.layers.0.self_attn.q_a_proj.weight": matrix(q_rank, hidden),
+        "model.layers.0.self_attn.q_a_layernorm.weight": np.ones(q_rank, dtype="float32"),
+        "model.layers.0.self_attn.q_b_proj.weight": matrix(heads * (nope + rope), q_rank),
+        "model.layers.0.self_attn.kv_a_proj_with_mqa.weight": matrix(kv_rank, hidden),
+        "model.layers.0.self_attn.kv_a_layernorm.weight": np.ones(kv_rank, dtype="float32"),
+        "model.layers.0.self_attn.kv_b_proj.weight": matrix(heads * (nope + value), kv_rank),
+        "model.layers.0.self_attn.k_rope_proj.weight": matrix(heads * rope, hidden),
+        "model.layers.0.self_attn.o_proj.weight": matrix(hidden, heads * value),
+    }
+    if moe:
+        tensors["model.layers.0.mlp.gate.weight"] = matrix(2, hidden)
+        for expert in range(2):
+            tensors.update({
+                f"model.layers.0.mlp.experts.{expert}.gate_proj.weight": matrix(intermediate, hidden),
+                f"model.layers.0.mlp.experts.{expert}.up_proj.weight": matrix(intermediate, hidden),
+                f"model.layers.0.mlp.experts.{expert}.down_proj.weight": matrix(hidden, intermediate),
+            })
+    else:
+        tensors.update({
+            "model.layers.0.mlp.gate_proj.weight": matrix(intermediate, hidden),
+            "model.layers.0.mlp.up_proj.weight": matrix(intermediate, hidden),
+            "model.layers.0.mlp.down_proj.weight": matrix(hidden, intermediate),
+        })
+    safetensors.save_file(tensors, str(path / "model.safetensors"))
+    vocab_map = {"<unk>": 0, "hello": 1, "world": 2}
+    vocab_map.update({f"tok{i}": i + 3 for i in range(vocab - 3)})
+    tokenizer = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocab=vocab_map, unk_token="<unk>"))
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    tokenizer.save(str(path / "tokenizer.json"))
+    transformers.PreTrainedTokenizerFast(
+        tokenizer_file=str(path / "tokenizer.json"), unk_token="<unk>"
+    ).save_pretrained(str(path))
+
+
+def _write_tiny_mamba(path: Path) -> None:
+    """Write a minimal Mamba-1 selective-scan checkpoint."""
+    safetensors = pytest.importorskip("safetensors.numpy")
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    vocab, hidden, inner, state, dt_rank, kernel = 32, 8, 16, 2, 1, 3
+    (path / "config.json").write_text(json.dumps({
+        "architectures": ["MambaForCausalLM"], "model_type": "mamba",
+        "num_hidden_layers": 1, "hidden_size": hidden, "d_model": hidden,
+        "d_inner": inner, "d_state": state, "dt_rank": dt_rank,
+        "d_conv": kernel, "num_attention_heads": 1, "vocab_size": vocab,
+        "rms_norm_eps": 1e-5, "torch_dtype": "float32",
+    }), encoding="utf-8")
+    rng = np.random.default_rng(47)
+    def matrix(rows: int, cols: int) -> np.ndarray:
+        return rng.normal(size=(rows, cols)).astype("float32")
+    tensors = {
+        "backbone.embeddings.weight": matrix(vocab, hidden),
+        "backbone.norm_f.weight": np.ones(hidden, dtype="float32"),
+        "lm_head.weight": matrix(vocab, hidden),
+        "backbone.layers.0.norm.weight": np.ones(hidden, dtype="float32"),
+        "backbone.layers.0.mixer.in_proj.weight": matrix(2 * inner, hidden),
+        "backbone.layers.0.mixer.conv1d.weight": matrix(inner, kernel),
+        "backbone.layers.0.mixer.conv1d.bias": np.zeros(inner, dtype="float32"),
+        "backbone.layers.0.mixer.x_proj.weight": matrix(dt_rank + 2 * state, inner),
+        "backbone.layers.0.mixer.dt_proj.weight": matrix(inner, dt_rank),
+        "backbone.layers.0.mixer.dt_proj.bias": np.zeros(inner, dtype="float32"),
+        "backbone.layers.0.mixer.A_log": matrix(inner, state),
+        "backbone.layers.0.mixer.D": np.ones(inner, dtype="float32"),
+        "backbone.layers.0.mixer.out_proj.weight": matrix(hidden, inner),
+    }
+    safetensors.save_file(tensors, str(path / "model.safetensors"))
+    vocab_map = {"<unk>": 0, "hello": 1, "world": 2}
+    vocab_map.update({f"tok{i}": i + 3 for i in range(vocab - 3)})
+    tokenizer = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocab=vocab_map, unk_token="<unk>"))
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    tokenizer.save(str(path / "tokenizer.json"))
+    transformers.PreTrainedTokenizerFast(
+        tokenizer_file=str(path / "tokenizer.json"), unk_token="<unk>"
+    ).save_pretrained(str(path))
+
+
 @pytest.mark.integration
 def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
     source = tmp_path / "tiny-llama"
@@ -114,7 +402,10 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
 
     compiler = Compiler(
         CompilerConfig(
-            targets=["cpu_avx512"],
+            # Request one AEG build covering the portable CPU contract and
+            # accelerator destination profiles.  Accelerator entries must be
+            # reported as portable/plan-only unless real device code exists.
+            targets=["cpu_avx512", "cuda_sm90", "rocm_cdna3", "metal_m3", "openvino_npu"],
             overwrite=True,
             calibration_tokens=16,
             cache_dir=str(tmp_path / "compiler-cache"),
@@ -125,6 +416,18 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
     package = load_aeg_package(artifact)
     package.verify_integrity()
     assert package.has_weights
+    assert package.manifest is not None
+    assert package.manifest.kernels.variant_status["cpu_avx512"] == "executable"
+    assert package.manifest.kernels.variant_status["cuda_sm90"] == "portable"
+    assert package.manifest.kernels.variant_status["rocm_cdna3"] == "portable"
+    assert package.manifest.kernels.variant_status["metal_m3"] == "portable"
+    assert package.manifest.kernels.variant_status["openvino_npu"] == "plan_only"
+    assert "pytorch" in package.manifest.kernels.portable_backends
+    assert package.supports_runtime_target("cpu_avx512")
+    assert package.supports_runtime_target("cuda_sm90")
+    assert package.supports_runtime_target("rocm_cdna3")
+    assert package.supports_runtime_target("metal_m3")
+    assert not package.supports_runtime_target("openvino_npu")
 
     archive = tmp_path / "tiny.aeg.tar.gz"
     package.save_as_archive(archive)
@@ -152,6 +455,27 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
     cached = runtime.generate(str(artifact), prompt="hello world", max_tokens=3, temperature=0.0)
     assert cached.text == response.text
     assert cached.metrics.extra.get("cache_hit") is True
+
+    # Compile-once/use-everywhere contract: disabling the response cache must
+    # still reuse the authenticated executable engine for repeated requests,
+    # while a fresh Runtime process can reload the same persisted AEG.
+    reusable = Runtime(
+        RuntimeConfig(
+            hf_offline=True,
+            default_max_tokens=1,
+            enable_semantic_cache=False,
+        )
+    )
+    first_reuse = reusable.generate(str(artifact), prompt="hello", max_tokens=1, temperature=0.0)
+    loaded_handle = reusable._loaded_models[str(artifact)]
+    second_reuse = reusable.generate(str(artifact), prompt="world", max_tokens=1, temperature=0.0)
+    assert first_reuse.text and second_reuse.text
+    assert reusable._loaded_models[str(artifact)] is loaded_handle
+    reloaded = Runtime(
+        RuntimeConfig(hf_offline=True, default_max_tokens=1, enable_semantic_cache=False)
+    )
+    reloaded_response = reloaded.generate(str(artifact), prompt="reload", max_tokens=1, temperature=0.0)
+    assert reloaded_response.text
     slo_runtime = Runtime(
         RuntimeConfig(hf_offline=True, default_max_tokens=2, scheduler="slo_aware")
     )
@@ -239,6 +563,294 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
         Runtime(RuntimeConfig(hf_offline=True)).generate(
             str(artifact), prompt="hello", max_tokens=1, temperature=0.0
         )
+
+
+@pytest.mark.integration
+def test_non_qwen_gemma_family_uses_generic_decoder_path(tmp_path: Path) -> None:
+    """A non-Qwen family must compile and execute through the same public path."""
+    source = tmp_path / "tiny-gemma"
+    source.mkdir()
+    _write_tiny_llama(
+        source,
+        architecture_name="GemmaForCausalLM",
+        model_type="gemma2",
+    )
+    artifact = tmp_path / "tiny-gemma.aeg"
+    compiler = Compiler(
+        CompilerConfig(
+            targets=["cpu_avx2"],
+            overwrite=True,
+            calibration_tokens=8,
+            cache_dir=str(tmp_path / "compiler-cache"),
+        )
+    )
+    compiler.compile(str(source), output_path=artifact)
+    package = load_aeg_package(artifact)
+    assert package.manifest.architecture.family == "gemma_family"
+    assert package.manifest.architecture.ffn_type == "GeGLU"
+    assert package.manifest.architecture.family != "qwen_family"
+    engine = load_engine_from_path(artifact)
+    logits, _ = engine.forward(np.asarray([1, 2], dtype=np.int64))
+    assert logits.shape == (2, 32)
+    response = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
+        str(artifact), prompt="hello world", max_tokens=2, temperature=0.0
+    )
+    assert response.text
+
+
+@pytest.mark.integration
+def test_gpt2_conv1d_absolute_position_path_is_generic(tmp_path: Path) -> None:
+    """GPT-2 layout, LayerNorm, GELU and learned positions must be executable."""
+    source = tmp_path / "tiny-gpt2"
+    source.mkdir()
+    _write_tiny_gpt2(source)
+    artifact = tmp_path / "tiny-gpt2.aeg"
+    Compiler(CompilerConfig(
+        targets=["cpu_avx2"],
+        overwrite=True,
+        calibration_tokens=8,
+        cache_dir=str(tmp_path / "compiler-cache"),
+    )).compile(str(source), output_path=artifact)
+    package = load_aeg_package(artifact)
+    architecture = package.manifest.architecture
+    assert architecture.family == "gpt_family"
+    assert architecture.norm_type == "LayerNorm"
+    assert architecture.ffn_type == "GELU"
+    assert architecture.position_type == "absolute"
+    logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2], dtype=np.int64))
+    assert logits.shape == (2, 32)
+
+
+@pytest.mark.integration
+def test_t5_encoder_decoder_compiles_and_generates(tmp_path: Path) -> None:
+    """T5-family checkpoints use a real encoder-decoder runtime, not decoder fallback."""
+    source = tmp_path / "tiny-t5"
+    source.mkdir()
+    _write_tiny_t5(source)
+    artifact = tmp_path / "tiny-t5.aeg"
+    Compiler(CompilerConfig(
+        targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
+        overwrite=True,
+        calibration_tokens=8,
+        cache_dir=str(tmp_path / "compiler-cache"),
+    )).compile(str(source), output_path=artifact)
+    package = load_aeg_package(artifact)
+    assert package.manifest is not None
+    architecture = package.manifest.architecture
+    assert architecture.is_encoder_decoder
+    assert architecture.encoder_layers == 1
+    assert architecture.decoder_layers == 1
+    assert architecture.ffn_type == "ReLU"
+    assert package.manifest.kernels.variant_status["cuda_sm90"] == "portable"
+    assert package.manifest.kernels.variant_status["rocm_cdna3"] == "portable"
+    assert package.manifest.kernels.variant_status["metal_m3"] == "portable"
+    assert "pytorch" in package.manifest.kernels.portable_backends
+    engine = load_engine_from_path(artifact)
+    logits, _ = engine.forward(np.asarray([3, 4], dtype=np.int64))
+    assert logits.shape == (1, 32)
+    response = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
+        str(artifact), prompt="hello world", max_tokens=2, temperature=0.0
+    )
+    assert response.text
+    pytest.importorskip("torch")
+    from aether.runtime.torch_transformer_engine import TorchSeq2SeqAEGEngine
+
+    cpu_logits, _ = load_engine_from_path(artifact).forward(np.asarray([3, 4], dtype=np.int64))
+    portable_logits, _ = TorchSeq2SeqAEGEngine(engine, "cpu").forward(np.asarray([3, 4], dtype=np.int64))
+    np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.integration
+def test_mixtral_moe_compiles_serializes_experts_and_generates(tmp_path: Path) -> None:
+    """Mixtral routing must execute from authenticated expert tensors."""
+    source = tmp_path / "tiny-mixtral"
+    source.mkdir()
+    _write_tiny_mixtral(source)
+    artifact = tmp_path / "tiny-mixtral.aeg"
+    Compiler(CompilerConfig(
+        targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
+        overwrite=True,
+        calibration_tokens=8,
+        cache_dir=str(tmp_path / "compiler-cache"),
+    )).compile(str(source), output_path=artifact)
+    package = load_aeg_package(artifact)
+    assert package.manifest is not None
+    assert package.manifest.architecture.is_moe
+    assert package.manifest.architecture.num_experts == 2
+    assert package.manifest.kernels.variant_status["cuda_sm90"] == "portable"
+    assert package.manifest.kernels.variant_status["rocm_cdna3"] == "portable"
+    assert package.manifest.kernels.variant_status["metal_m3"] == "portable"
+    assert "pytorch" in package.manifest.kernels.portable_backends
+    store_names = set(package.weight_store().entries)
+    for expert in range(2):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            assert f"layer_0_expert_{expert}_{projection}" in store_names
+    assert "layer_0_moe_router" in store_names
+    engine = load_engine_from_path(artifact)
+    logits, _ = engine.forward(np.asarray([1, 2], dtype=np.int64))
+    assert logits.shape == (2, 32)
+    assert np.isfinite(logits).all()
+    pytest.importorskip("torch")
+    from aether.runtime.torch_engine import TorchAEGEngine
+
+    cpu_logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2, 3], dtype=np.int64))
+    portable_logits, _ = TorchAEGEngine(engine, "cpu").forward(np.asarray([1, 2, 3], dtype=np.int64))
+    np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
+    response = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
+        str(artifact), prompt="hello world", max_tokens=2, temperature=0.0
+    )
+    assert response.text
+
+
+@pytest.mark.integration
+def test_deepseek_style_mla_compiles_and_runs_without_standard_qkv(tmp_path: Path) -> None:
+    """MLA must use its compressed projections, not a Qwen/Llama QKV fallback."""
+    source = tmp_path / "tiny-mla"
+    source.mkdir()
+    _write_tiny_mla(source)
+    artifact = tmp_path / "tiny-mla.aeg"
+    Compiler(CompilerConfig(
+        targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
+        overwrite=True, calibration_tokens=8,
+        cache_dir=str(tmp_path / "compiler-cache"),
+    )).compile(str(source), output_path=artifact)
+    package = load_aeg_package(artifact)
+    architecture = package.manifest.architecture
+    assert architecture.attention_type == "MLA"
+    assert package.manifest.kernels.variant_status["cpu_avx2"] == "executable"
+    assert package.manifest.kernels.variant_status["cuda_sm90"] == "portable"
+    assert package.manifest.kernels.variant_status["rocm_cdna3"] == "portable"
+    assert package.manifest.kernels.variant_status["metal_m3"] == "portable"
+    assert "pytorch" in package.manifest.kernels.portable_backends
+    entries = set(package.weight_store().entries)
+    assert "layer_0_kv_a_proj" in entries
+    assert "layer_0_kv_b_proj" in entries
+    engine = load_engine_from_path(artifact)
+    logits, _ = engine.forward(np.asarray([1, 2], dtype=np.int64))
+    assert logits.shape == (2, 32)
+    assert np.isfinite(logits).all()
+    generated = engine.generate(np.asarray([1], dtype=np.int64), max_tokens=2, temperature=0.0)
+    assert len(generated) == 2
+    pytest.importorskip("torch")
+    from aether.runtime.torch_state_engine import TorchMLAAEGEngine
+
+    cpu_logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2, 3], dtype=np.int64))
+    portable_logits, _ = TorchMLAAEGEngine(engine, "cpu").forward(np.asarray([1, 2, 3], dtype=np.int64))
+    np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.integration
+def test_deepseek_style_mla_moe_compiles_and_runs_with_routed_ffn(tmp_path: Path) -> None:
+    """The MLA contract also carries routed expert FFNs without dense fallback."""
+    source = tmp_path / "tiny-mla-moe"
+    source.mkdir()
+    _write_tiny_mla(source, moe=True)
+    artifact = tmp_path / "tiny-mla-moe.aeg"
+    Compiler(CompilerConfig(
+        targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
+        overwrite=True, calibration_tokens=8,
+        cache_dir=str(tmp_path / "compiler-cache"),
+    )).compile(str(source), output_path=artifact)
+    package = load_aeg_package(artifact)
+    assert package.manifest.architecture.is_moe
+    assert package.manifest.architecture.num_experts == 2
+    assert package.manifest.kernels.variant_status["cuda_sm90"] == "portable"
+    assert package.manifest.kernels.variant_status["rocm_cdna3"] == "portable"
+    assert package.manifest.kernels.variant_status["metal_m3"] == "portable"
+    assert "pytorch" in package.manifest.kernels.portable_backends
+    names = set(package.weight_store().entries)
+    assert "layer_0_moe_router" in names
+    assert "layer_0_expert_0_gate_proj" in names
+    assert "layer_0_expert_1_down_proj" in names
+    engine = load_engine_from_path(artifact)
+    cpu_logits, _ = engine.forward(np.asarray([1, 2, 3], dtype=np.int64))
+    assert cpu_logits.shape == (3, 32)
+    pytest.importorskip("torch")
+    from aether.runtime.torch_state_engine import TorchMLAAEGEngine
+
+    portable_logits, _ = TorchMLAAEGEngine(engine, "cpu").forward(np.asarray([1, 2, 3], dtype=np.int64))
+    np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.integration
+def test_mamba_selective_scan_compiles_and_runs_with_recurrent_state(tmp_path: Path) -> None:
+    """Mamba uses the selective-scan state contract, not transformer QKV."""
+    source = tmp_path / "tiny-mamba"
+    source.mkdir()
+    _write_tiny_mamba(source)
+    artifact = tmp_path / "tiny-mamba.aeg"
+    Compiler(CompilerConfig(
+        targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
+        overwrite=True, calibration_tokens=8,
+        cache_dir=str(tmp_path / "compiler-cache"),
+    )).compile(str(source), output_path=artifact)
+    package = load_aeg_package(artifact)
+    assert package.manifest.architecture.ssm_variant == "selective_scan"
+    assert package.manifest.kernels.variant_status["cuda_sm90"] == "portable"
+    assert package.manifest.kernels.variant_status["rocm_cdna3"] == "portable"
+    assert package.manifest.kernels.variant_status["metal_m3"] == "portable"
+    assert "pytorch" in package.manifest.kernels.portable_backends
+    entries = set(package.weight_store().entries)
+    assert "layer_0_ssm_a_log" in entries
+    assert "layer_0_ssm_x_proj" in entries
+    engine = load_engine_from_path(artifact)
+    logits, cache = engine.forward(np.asarray([1, 2], dtype=np.int64))
+    assert logits.shape == (2, 32)
+    assert cache.length == 2
+    generated = engine.generate(np.asarray([], dtype=np.int64), max_tokens=2, cache=cache, temperature=0.0)
+    assert len(generated) == 2
+    pytest.importorskip("torch")
+    from aether.runtime.torch_state_engine import TorchMambaAEGEngine
+
+    cpu_logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2, 3], dtype=np.int64))
+    portable_logits, _ = TorchMambaAEGEngine(engine, "cpu").forward(np.asarray([1, 2, 3], dtype=np.int64))
+    np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.integration
+def test_generic_registry_decoder_family_compiles_and_runs(tmp_path: Path) -> None:
+    """An OLMo-style registry family uses the same capability-driven decoder."""
+    source = tmp_path / "tiny-olmo"
+    source.mkdir()
+    _write_tiny_llama(
+        source,
+        architecture_name="OlmoForCausalLM",
+        model_type="olmo",
+    )
+    artifact = tmp_path / "tiny-olmo.aeg"
+    Compiler(CompilerConfig(
+        targets=["cpu_avx2"],
+        overwrite=True,
+        calibration_tokens=8,
+        cache_dir=str(tmp_path / "compiler-cache"),
+    )).compile(str(source), output_path=artifact)
+    package = load_aeg_package(artifact)
+    assert package.manifest.architecture.family == "generic_decoder_family"
+    logits, _ = load_engine_from_path(artifact).forward(np.asarray([1], dtype=np.int64))
+    assert logits.shape == (1, 32)
+
+
+@pytest.mark.integration
+def test_unknown_standard_decoder_contract_compiles_and_runs(tmp_path: Path) -> None:
+    """A new unregistered causal-LM family must use the generic contract."""
+    source = tmp_path / "tiny-acme"
+    source.mkdir()
+    _write_tiny_llama(
+        source,
+        architecture_name="AcmeTransformerForCausalLM",
+        model_type="acme_transformer",
+    )
+    artifact = tmp_path / "tiny-acme.aeg"
+    Compiler(CompilerConfig(
+        targets=["cpu_avx2"],
+        overwrite=True,
+        calibration_tokens=8,
+        cache_dir=str(tmp_path / "compiler-cache"),
+    )).compile(str(source), output_path=artifact)
+    package = load_aeg_package(artifact)
+    assert package.manifest.architecture.family == "generic_decoder_family"
+    logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2], dtype=np.int64))
+    assert logits.shape == (2, 32)
 
 
 @pytest.mark.integration

@@ -44,7 +44,7 @@ from aether.compiler.report import (
 from aether.compiler.stage2_optimizer.optimizer import OptimizerPipeline
 from aether.compiler.stage3_targeting.hardware_profile import HardwareProfile
 from aether.core.aeg_format import AEGManifest, AEGPackage, KernelSetMetadata, MemoryRequirements, OptimizationMetadata
-from aether.core.constants import AEG_FORMAT_VERSION, AETHER_VERSION, DEFAULT_HUB_URL
+from aether.core.constants import AEG_FORMAT_VERSION, AETHER_VERSION, DEFAULT_HUB_URL, SUPPORTED_TARGET_IDS
 from aether.core.exceptions import CompilationError, CompilerConfigError
 from aether.core.hash_utils import compute_aeg_cache_key, compute_graph_hash
 from aether.core.types import HardwareTarget, ModelArchitecture, Precision
@@ -58,12 +58,26 @@ logger = get_logger(__name__)
 _REQUIRED_LAYER_TENSORS: tuple[str, ...] = (
     "q_proj", "k_proj", "v_proj", "o_proj",
     "attention_norm", "ffn_norm",
-    "gate_proj", "up_proj", "down_proj",
+    "gate_proj", "down_proj",
 )
 
 #: Logical global tensors required regardless of layer count. ``lm_head`` is
 #: absent when the source model ties its output projection to the embedding.
 _OPTIONAL_GLOBAL_TENSORS: frozenset[str] = frozenset({"lm_head", "final_norm"})
+
+
+def _has_portable_torch_contract(target_id: str) -> bool:
+    """Return whether the packaged PyTorch contract can represent a target.
+
+    TEE targets deliberately do not qualify: a normal PyTorch graph cannot
+    provide enclave isolation or attestation merely because it can execute
+    tensors on a CUDA device.
+    """
+    return bool(
+        target_id in SUPPORTED_TARGET_IDS
+        and target_id != "cuda_sm100_tee"
+        and target_id.startswith(("cuda_", "rocm_", "metal_"))
+    )
 
 
 def _copy_tokenizer_files(source_model_path: str, destination: Path) -> bool:
@@ -115,7 +129,12 @@ def _verify_layer_invariants(
             getattr(node, "layer_index", None)
             for node in (getattr(graph, "nodes", {}) or {}).values()
         ]
-        declared = int(architecture.layers)
+        declared = int(
+            getattr(architecture, "decoder_layers", None)
+            or architecture.layers
+            if bool(getattr(architecture, "is_encoder_decoder", False))
+            else architecture.layers
+        )
         # Global nodes (final_norm, lm_head) carry the sentinel index
         # ``n_layers``; only indices below n_layers are transformer layers.
         transformer_indices = {idx for idx in layer_ids if idx is not None and 0 <= idx < declared}
@@ -129,7 +148,20 @@ def _verify_layer_invariants(
                 model_id=model_id,
                 stage="stage1_ingestion",
             )
-        graph_layers = declared
+            graph_layers = declared
+        if bool(getattr(architecture, "is_encoder_decoder", False)):
+            encoder_declared = int(getattr(architecture, "encoder_layers", None) or declared)
+            encoder_indices = {idx for idx in layer_ids if idx is not None and idx < 0}
+            expected_encoder = {-index - 1 for index in range(encoder_declared)}
+            missing_encoder = sorted(expected_encoder - encoder_indices)
+            if missing_encoder:
+                raise CompilationError(
+                    "Encoder layer count invariant violated: source architecture declares "
+                    f"{encoder_declared} encoder layers but the extracted graph is missing "
+                    f"layers {missing_encoder}.",
+                    model_id=model_id,
+                    stage="stage1_ingestion",
+                )
     if graph_layers is not None and int(graph_layers) != int(architecture.layers):
         raise CompilationError(
             f"Layer count invariant violated: source architecture declares "
@@ -169,7 +201,42 @@ def _verify_weight_accounting(
     three logical tensors it stands for.
     """
     serialized = set(package.weights)
-    if bool(getattr(architecture, "is_encoder", False)):
+    if bool(getattr(architecture, "is_encoder_decoder", False)):
+        required = {"embedding", "encoder_final_norm", "final_norm"}
+        # lm_head may be tied to the shared embedding in T5 checkpoints.
+        # The runtime uses the authenticated shared matrix only when the
+        # source config declares tied embeddings; an untied head is required.
+        if not bool(getattr(architecture, "tie_word_embeddings", True)):
+            required.add("lm_head")
+        encoder_layers = int(getattr(architecture, "encoder_layers", None) or architecture.layers)
+        decoder_layers = int(getattr(architecture, "decoder_layers", None) or architecture.layers)
+        gated_seq2seq = str(getattr(architecture, "ffn_type", "")).lower() in {"gatedgelu", "geglu"}
+        for i in range(encoder_layers):
+            required.update({
+                f"encoder_layer_{i}_{component}"
+                for component in (
+                    "norm1", "q_proj", "k_proj", "v_proj", "o_proj",
+                    "norm2", "ffn_out",
+                )
+            })
+            if gated_seq2seq:
+                required.update({f"encoder_layer_{i}_ffn_in_{suffix}" for suffix in ("0", "1")})
+            else:
+                required.add(f"encoder_layer_{i}_ffn_in")
+        for i in range(decoder_layers):
+            required.update({
+                f"decoder_layer_{i}_{component}"
+                for component in (
+                    "self_norm", "self_q_proj", "self_k_proj", "self_v_proj", "self_o_proj",
+                    "cross_norm", "cross_q_proj", "cross_k_proj", "cross_v_proj", "cross_o_proj",
+                    "ffn_norm", "ffn_out",
+                )
+            })
+            if gated_seq2seq:
+                required.update({f"decoder_layer_{i}_ffn_in_{suffix}" for suffix in ("0", "1")})
+            else:
+                required.add(f"decoder_layer_{i}_ffn_in")
+    elif bool(getattr(architecture, "is_encoder", False)):
         # Encoder artifacts use the BERT/RoBERTa execution vocabulary.  They
         # do not have decoder-only RMSNorm/SwiGLU/lm_head tensors, so applying
         # the causal-LM invariant here would reject valid checkpoints after
@@ -190,9 +257,88 @@ def _verify_weight_accounting(
                 required.add(f"layer_{i}_{component}")
     else:
         required = {"embedding"}
+        if bool(getattr(architecture, "embedding_norm", False)):
+            required.add("embedding_norm")
+        if str(getattr(architecture, "position_type", "RoPE") or "RoPE").lower() in {
+            "absolute", "learned", "learned_absolute"
+        }:
+            required.add("position_embedding")
+        ffn_type = str(getattr(architecture, "ffn_type", "SwiGLU") or "SwiGLU").lower()
+        moe_layers = getattr(architecture, "moe_layer_indices", None)
+        is_mla = str(getattr(architecture, "attention_type", "") or "").upper() == "MLA"
+        is_ssm = getattr(architecture, "ssm_variant", None) in {
+            "selective_scan", "ssd", "rwkv_time_mix", "hybrid_selective_scan",
+        }
+        hybrid_types = getattr(architecture, "hybrid_layer_types", None)
         for i in range(int(architecture.layers)):
-            for component in _REQUIRED_LAYER_TENSORS:
+            is_moe_layer = bool(
+                architecture.is_moe
+                and (moe_layers is None or i in moe_layers)
+            )
+            layer_components = _REQUIRED_LAYER_TENSORS
+            if bool(getattr(architecture, "parallel_residual", False)):
+                # Parallel-residual blocks reuse attention_norm for the FFN
+                # branch; no second norm tensor exists in GPT-J checkpoints.
+                layer_components = tuple(
+                    component for component in layer_components
+                    if component != "ffn_norm"
+                )
+            is_state_layer = getattr(architecture, "ssm_variant", None) == "selective_scan" or (
+                getattr(architecture, "ssm_variant", None) == "hybrid_selective_scan"
+                and isinstance(hybrid_types, list)
+                and i < len(hybrid_types)
+                and str(hybrid_types[i]).lower() == "ssm"
+            )
+            if is_state_layer:
+                layer_components = (
+                    "ssm_norm", "ssm_in_proj", "ssm_conv1d", "ssm_x_proj",
+                    "ssm_dt_proj", "ssm_a_log", "ssm_d", "ssm_out_proj",
+                )
+            elif getattr(architecture, "ssm_variant", None) == "ssd":
+                layer_components = (
+                    "ssm_norm", "ssm_in_proj", "ssm_conv1d", "ssm_a_log",
+                    "ssm_d", "ssm_dt", "ssm_out_proj",
+                )
+            elif getattr(architecture, "ssm_variant", None) == "rwkv_time_mix":
+                layer_components = (
+                    "ssm_norm", "ssm_ffn_norm", "ssm_time_decay", "ssm_time_first",
+                    "ssm_time_mix_k", "ssm_time_mix_v", "ssm_time_mix_r",
+                    "ssm_ffn_time_mix_k", "ssm_ffn_time_mix_r",
+                    "ssm_key", "ssm_value", "ssm_receptance", "ssm_output",
+                    "ssm_ffn_key", "ssm_ffn_value", "ssm_ffn_receptance",
+                )
+            elif is_mla:
+                # MLA layers replace ordinary q/k/v projections with the
+                # compressed query/KV contract.  The output projection remains
+                # a normal hidden-space projection.
+                layer_components = (
+                    "o_proj", "attention_norm", "ffn_norm",
+                    "q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj",
+                    "k_rope_proj", "q_a_norm", "kv_a_norm", "gate_proj", "down_proj",
+                )
+            for component in layer_components:
+                # Routed layers have no dense gate/up/down projections; their
+                # authenticated expert bank is checked below instead.
+                if is_moe_layer and component in {"gate_proj", "down_proj", "up_proj"}:
+                    continue
                 required.add(f"layer_{i}_{component}")
+            if is_moe_layer:
+                required.add(f"layer_{i}_moe_router")
+                for expert in range(int(architecture.num_experts)):
+                    required.update({
+                        f"layer_{i}_expert_{expert}_{projection}"
+                        for projection in ("gate_proj", "up_proj", "down_proj")
+                    })
+            # GLU families have two input projections; classic GELU decoder
+            # blocks (GPT-2/Neo/NeoX) have one intermediate projection.
+            elif (
+                not is_state_layer
+                and getattr(architecture, "ssm_variant", None) not in {"ssd", "rwkv_time_mix"}
+                and ffn_type not in {"gelu", "relu", "relu2"}
+            ):
+                required.add(f"layer_{i}_up_proj")
+            if bool(getattr(architecture, "qk_norm", False)) and not is_state_layer:
+                required.update({f"layer_{i}_q_norm", f"layer_{i}_k_norm"})
     missing = sorted(required - serialized)
 
     metadata = getattr(graph, "metadata", {}) or {}
@@ -928,7 +1074,10 @@ class Compiler:
             if report.pass_name == "precision_assignment":
                 precision_map.update(report.details.get("precision_map", {}))
         if not precision_map:
-            precision_map = {f"layer_{i}": "Q4_K_M" for i in range(architecture.layers)}
+            # No quality-certified precision plan means preserve source
+            # precision.  Lossy Q4/Q3 assignment is available through an
+            # explicit precision mode, never as a silent fallback.
+            precision_map = {f"layer_{i}": "BF16" for i in range(architecture.layers)}
         sub2bit_report = next(
             (
                 report
@@ -977,7 +1126,7 @@ class Compiler:
                     graph=graph,
                     package=package,
                     precision_map=precision_map,
-                    default_precision="Q4_K_M",
+                    default_precision="BF16",
                     block_size=32,
                 )
                 if quant_stats.tensors_written == 0:
@@ -1019,12 +1168,70 @@ class Compiler:
         for num_gpus, plan in sharding_plans.items():
             package.set_sharding_plan(num_gpus, plan)
 
-        # Backend plans per target
+        # Backend plans per target.  A target profile is a compilation request,
+        # not evidence that an executable vendor binary was produced.  Mark
+        # only CPU targets as executable here; accelerator targets receive a
+        # portable PyTorch contract when this is a standard decoder graph.
         kernels = KernelSetMetadata(targets=[p.target_id for p in target_profiles])
         for profile in target_profiles:
             backend_name = profile.recommended_backend or "pytorch"
             package.set_backend_plan(profile.target_id, backend_name)
         kernels.backend_plans = {t: package.get_backend_plan(t) for t in kernels.targets if package.get_backend_plan(t)}
+        kernels.variant_status = {
+            profile.target_id: (
+                "executable" if profile.target_id.startswith("cpu_") else "plan_only"
+            )
+            for profile in target_profiles
+        }
+        # The AEG graph and authenticated weight store are the portable source
+        # contract. PyTorch can execute dense and routed standard decoder
+        # blocks directly on CUDA, ROCm, and MPS without recompiling weights.
+        # Distinct SSM, encoder, and encoder-decoder contracts remain gated
+        # below; dense MLA has its own device executor and portable contract.
+        family_lower = str(architecture.family or "").lower()
+        portable_decoder = (
+            not architecture.is_encoder
+            and not architecture.is_encoder_decoder
+            and not getattr(architecture, "is_multimodal", False)
+            and not any(token in family_lower for token in ("mamba", "rwkv", "retnet", "ssm", "jamba"))
+        )
+        portable_mla = (
+            str(architecture.attention_type or "").upper() == "MLA"
+            and not architecture.is_encoder
+            and not architecture.is_encoder_decoder
+            and not getattr(architecture, "is_multimodal", False)
+        )
+        portable_encoder = (
+            architecture.is_encoder
+            and not architecture.is_encoder_decoder
+            and not getattr(architecture, "is_multimodal", False)
+        )
+        portable_seq2seq = (
+            architecture.is_encoder_decoder
+            and not getattr(architecture, "is_multimodal", False)
+        )
+        # Each non-standard contract has a dedicated executor.  Pure
+        # SSM/Mamba and RWKV remain separate from standard decoder routing;
+        # the flags below prevent a capability mismatch from being hidden by
+        # a generic fallback.
+        portable_hybrid = (
+            getattr(architecture, "ssm_variant", None) == "hybrid_selective_scan"
+            and not architecture.is_moe
+        )
+        portable_state = (
+            getattr(architecture, "ssm_variant", None) in {"selective_scan", "ssd", "rwkv_time_mix"}
+            and not architecture.is_moe
+        )
+        if (
+            portable_decoder or portable_mla or portable_hybrid or portable_state
+            or portable_encoder or portable_seq2seq
+        ):
+            kernels.portable_backends = ["pytorch"]
+            for profile in target_profiles:
+                if _has_portable_torch_contract(profile.target_id):
+                    kernels.variant_status[profile.target_id] = "portable"
+                elif not profile.target_id.startswith("cpu_"):
+                    kernels.variant_status[profile.target_id] = "plan_only"
         package.manifest.kernels = kernels
 
         # Embed the real native CPU library when a host toolchain is available.

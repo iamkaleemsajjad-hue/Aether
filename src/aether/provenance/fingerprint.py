@@ -19,7 +19,7 @@ import secrets
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 # ---------------------------------------------------------------------------
@@ -48,16 +48,11 @@ def _generate_trigger_set(owner_id: str, n: int = 100, seed: str = "aether_fp") 
     return triggers
 
 
-def _expected_response_hash(trigger: str, model_id: str, owner_id: str) -> str:
-    """
-    Compute the expected response hash for a trigger (deterministic).
-
-    In production, this would be the actual model response hash captured
-    at compile time and stored in the fingerprint.json.
-    """
-    return hashlib.sha256(
-        f"{model_id}:{owner_id}:{trigger}:expected_response".encode("utf-8")
-    ).hexdigest()
+def _response_hash(response: Any) -> str:
+    """Hash a model response using a stable UTF-8 representation."""
+    if not isinstance(response, str):
+        response = str(response)
+    return hashlib.sha256(response.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +105,7 @@ class AEGModelFingerprint:
         model_aeg: str,
         owner_id: str,
         n_triggers: int = 100,
+        generate: Callable[[str], str] | None = None,
     ) -> dict[str, Any]:
         """
         Embed an ownership fingerprint into an AEG package.
@@ -125,13 +121,21 @@ class AEGModelFingerprint:
         Returns:
             Fingerprint manifest dict.
         """
+        if generate is None:
+            raise ValueError(
+                "fingerprint embedding requires a callable that runs the real model; "
+                "expected responses must never be synthesized"
+            )
+        if n_triggers <= 0:
+            raise ValueError("n_triggers must be positive")
+
         model_id = Path(model_aeg).name
         triggers = _generate_trigger_set(owner_id=owner_id, n=n_triggers)
 
         # Record expected responses (hashed for privacy)
         trigger_records = []
         for trigger in triggers:
-            expected = _expected_response_hash(trigger, model_id, owner_id)
+            expected = _response_hash(generate(trigger))
             trigger_records.append({
                 "trigger_hash": hashlib.sha256(trigger.encode()).hexdigest()[:16],
                 "expected_response_hash": expected,
@@ -155,13 +159,14 @@ class AEGModelFingerprint:
         suspect_model: str,
         owner_id: str,
         fingerprint: dict[str, Any],
+        generate: Callable[[str], str] | None = None,
     ) -> FingerprintResult:
         """
         Verify if a suspect model is derived from the fingerprinted model.
 
-        In production, this would run the trigger prompts through the
-        suspect model and compare response hashes. Here we implement the
-        verification logic using the stored hashes for deterministic testing.
+        ``generate`` must execute the suspect model.  Verification fails
+        closed when no runner is supplied; model identifiers alone are not
+        evidence that two models produce the same trigger responses.
 
         Args:
             suspect_model: Model ID of the suspect model.
@@ -181,6 +186,10 @@ class AEGModelFingerprint:
                 owner_id=owner_id,
                 model_id=suspect_model,
             )
+        if generate is None:
+            raise ValueError(
+                "fingerprint verification requires a callable that runs the suspect model"
+            )
 
         # Verify owner_id matches
         owner_hash = hashlib.sha256(owner_id.encode("utf-8")).hexdigest()
@@ -194,14 +203,15 @@ class AEGModelFingerprint:
                 model_id=suspect_model,
             )
 
-        # Simulate response checking: compare expected hashes
-        # In production: run suspect model on triggers, hash responses, compare
+        n_triggers = int(fingerprint.get("n_triggers", len(trigger_records)))
+        triggers = _generate_trigger_set(owner_id=owner_id, n=n_triggers)
         matched = 0
-        for record in trigger_records:
-            # Deterministic test: if same model, responses match
-            if suspect_model == fingerprint.get("model_id"):
+        for trigger, record in zip(triggers, trigger_records):
+            expected_trigger_hash = hashlib.sha256(trigger.encode("utf-8")).hexdigest()[:16]
+            if record.get("trigger_hash") != expected_trigger_hash:
+                continue
+            if hmac.compare_digest(_response_hash(generate(trigger)), str(record.get("expected_response_hash", ""))):
                 matched += 1
-            # Real implementation would call: model.generate(trigger) and hash result
 
         match_rate = matched / max(len(trigger_records), 1)
         threshold = fingerprint.get("match_threshold", self.MATCH_THRESHOLD)
@@ -220,12 +230,13 @@ class AEGModelFingerprint:
         aeg_dir: str | Path,
         owner_id: str,
         n_triggers: int = 100,
+        generate: Callable[[str], str] | None = None,
     ) -> Path:
         """Write fingerprint.json to .aeg/provenance/."""
         provenance_dir = Path(aeg_dir) / "provenance"
         provenance_dir.mkdir(parents=True, exist_ok=True)
 
-        fingerprint = self.embed(str(aeg_dir), owner_id, n_triggers)
+        fingerprint = self.embed(str(aeg_dir), owner_id, n_triggers, generate=generate)
         out = provenance_dir / "fingerprint.json"
         out.write_text(json.dumps(fingerprint, indent=2), encoding="utf-8")
         return out

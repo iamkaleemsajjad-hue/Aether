@@ -85,6 +85,33 @@ class TestHardwareCapabilitiesContract:
         assert cpu.vendor == "CPU"
         assert cpu.target_id.startswith("cpu")
 
+    def test_available_accelerator_targets_are_canonical(self) -> None:
+        """Detection must return IDs understood by the compiler target registry."""
+        from aether.backends.hardware_detector import detect_all_capabilities
+        from aether.core.types import HardwareTarget
+
+        known = {member.value for member in HardwareTarget}
+        for capability in detect_all_capabilities():
+            if capability.available:
+                assert capability.target_id in known, capability.to_dict()
+
+    @pytest.mark.parametrize(
+        ("device_name", "expected"),
+        [
+            ("AMD Instinct MI300X", "rocm_cdna3"),
+            ("AMD Instinct MI250", "rocm_cdna3"),
+            ("AMD Radeon RX 7900 XTX", "rocm_rdna3"),
+            ("AMD MI350X", "amd_mi350x"),
+            ("AMD MI455X CDNA5", "rocm_cdna5_mi455x"),
+        ],
+    )
+    def test_rocm_device_mapping_uses_supported_targets(
+        self, device_name: str, expected: str
+    ) -> None:
+        from aether.backends.hardware_detector import _rocm_target_id
+
+        assert _rocm_target_id(device_name) == expected
+
     def test_to_dict_is_json_serializable(self) -> None:
         from aether.backends.hardware_detector import detect_all_capabilities
         caps = detect_all_capabilities()
@@ -171,6 +198,29 @@ class TestBackendInterfaceContract:
             assert hasattr(b, "get_capabilities")
             caps = b.get_capabilities()
             assert caps is not None
+
+    def test_torch_backend_requires_matching_physical_target(self) -> None:
+        """Installed CPU PyTorch must not satisfy accelerator dispatch."""
+        from aether.backends.torch_backend import TorchBackend
+
+        backend = TorchBackend()
+        assert backend.available_for_target("cpu_avx2")
+        if backend._runtime_family == "cpu":  # noqa: SLF001 - contract probe
+            assert not backend.available_for_target("cuda_sm90")
+            assert not backend.available_for_target("rocm_cdna3")
+            assert not backend.available_for_target("metal_m3")
+
+    def test_cuda_and_rocm_backends_do_not_cross_claim_hip_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """PyTorch's CUDA-compatible HIP namespace must be classified as ROCm."""
+        import torch
+        from aether.backends.hardware_backends import CUDABackend, ROCmBackend
+
+        monkeypatch.setattr(torch.version, "hip", "6.2", raising=False)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda _index: "AMD Instinct MI300X")
+
+        assert not CUDABackend("cuda_sm90").is_available()
+        assert ROCmBackend("rocm_cdna3").is_available()
 
 
 # ---------------------------------------------------------------------------

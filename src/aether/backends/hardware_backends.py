@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -90,6 +91,11 @@ class CUDABackend(Backend):
     def _detect_cuda(self) -> bool:
         try:
             import torch
+            # PyTorch exposes HIP through the ``torch.cuda`` namespace for
+            # compatibility.  That must not make an AMD runtime look like an
+            # NVIDIA CUDA device to backend dispatch.
+            if getattr(torch.version, "hip", None):
+                return False
             if torch.cuda.is_available():
                 self._device = "cuda"
                 return True
@@ -203,6 +209,9 @@ class ROCmBackend(Backend):
     def _detect_rocm(self) -> bool:
         try:
             import torch
+            if getattr(torch.version, "hip", None):
+                self._device = "cuda"  # PyTorch's HIP build uses cuda tensors
+                return bool(torch.cuda.is_available())
             if hasattr(torch, "hip") and torch.hip.is_available():
                 self._device = "hip"
                 return True
@@ -504,7 +513,11 @@ class RISCVNPUBackend(Backend):
             return False
 
     def is_available(self) -> bool:
-        return self._ort_available
+        # ONNX Runtime alone is not evidence that a RISC-V NPU exists.  A
+        # portable host may compile an IR plan, but execution requires the
+        # matching ISA/vendor runtime on a RISC-V machine.
+        machine = platform.machine().lower()
+        return self._ort_available and ("riscv" in machine or "risc-v" in machine)
 
     def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
         if not self._ort_available:
@@ -685,6 +698,75 @@ class QualcommBackend(Backend):
             del self._torch_backend
 
 
+class OpenVINOBackend(Backend):
+    """Intel OpenVINO execution adapter with real NPU capability detection.
+
+    Aether does not convert an AEG into an arbitrary OpenVINO graph at load
+    time.  This adapter accepts a pre-emitted ONNX/OpenVINO model bundle and
+    fails clearly for an AEG that has no such target artifact.
+    """
+
+    def __init__(self, target_id: str = "openvino_npu") -> None:
+        self.target_id = target_id
+        super().__init__(BackendInfo(
+            name="openvino",
+            version="runtime",
+            supported_targets=[target_id],
+            capabilities=["generate", "onnx_runtime", "intel_npu"],
+        ))
+        self._core = None
+        self._available = False
+        try:
+            import openvino
+            self._core = openvino.Core()
+            self._available = "NPU" in list(self._core.available_devices)
+        except Exception:
+            self._available = False
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
+        if not self._available or self._core is None:
+            raise BackendError("OpenVINO NPU runtime is unavailable", backend_name=self.name)
+        path = Path(model_path)
+        onnx = path if path.suffix.lower() == ".onnx" else path / "kernels" / "openvino" / "model.onnx"
+        if not onnx.is_file():
+            raise BackendError(
+                "OpenVINO execution requires an emitted ONNX/OpenVINO target artifact; "
+                f"none was found at {onnx}", backend_name=self.name,
+            )
+        self._compiled_model = self._core.compile_model(str(onnx), "NPU")
+        return True
+
+    def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
+        self.load(aeg_path or model_id, kwargs or None)
+        return aeg_path or model_id
+
+    def generate(self, request: GenerationRequest) -> GenerationResult:
+        raise BackendError("OpenVINO generation adapter requires a task-specific compiled model runner", backend_name=self.name)
+
+    def generate_stream(self, request: GenerationRequest) -> Iterator[GenerationResult]:
+        raise BackendError("OpenVINO streaming requires a task-specific compiled model runner", backend_name=self.name)
+
+    def get_capabilities(self) -> list[str]:
+        return self.info.capabilities
+
+    def unload(self) -> None:
+        self._compiled_model = None
+
+
+# Public names retained for target-specific callers.  They are concrete
+# adapters, not mocks: availability and load still require the real SDK.
+class QNNBackend(QualcommBackend):
+    def __init__(self, target_id: str = "qualcomm_qnn") -> None:
+        super().__init__(target_id)
+
+
+class RISCVBackend(RISCVNPUBackend):
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Backend factory
 # ---------------------------------------------------------------------------
@@ -722,7 +804,7 @@ _BACKEND_REGISTRY: dict[str, type] = {
     "qualcomm_cloud_ai100": QualcommBackend,
     "qualcomm_qnn": QualcommBackend,
     # OpenVINO / Intel NPU
-    "openvino_npu": RISCVNPUBackend,  # Routes through ONNX Runtime
+    "openvino_npu": OpenVINOBackend,
 }
 
 
@@ -748,6 +830,6 @@ def create_backend(target_id: str) -> Backend:
         msg = f"No backend registered for target: {target_id!r}"
         raise ValueError(msg)
 
-    if backend_cls in (CUDABackend, ROCmBackend, MetalBackend, RISCVNPUBackend, FPGABackend, QualcommBackend):
+    if backend_cls in (CUDABackend, ROCmBackend, MetalBackend, RISCVNPUBackend, RISCVBackend, FPGABackend, QualcommBackend, QNNBackend, OpenVINOBackend):
         return backend_cls(target_id)
     return backend_cls()

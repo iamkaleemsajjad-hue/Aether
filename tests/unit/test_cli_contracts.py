@@ -9,6 +9,17 @@ from click.testing import CliRunner
 from aether.cli import cli
 
 
+def test_run_replaces_terminal_incompatible_model_text(monkeypatch) -> None:
+    """The CLI must not fail when a model emits Unicode on cp1252 stdout."""
+    from aether.cli import _display_text
+
+    class LegacyStream:
+        encoding = "cp1252"
+
+    monkeypatch.setattr("aether.cli.console.file", LegacyStream(), raising=False)
+    assert "?" in _display_text("녕녕")
+
+
 def test_compile_accepts_documented_v5_option_values(monkeypatch, tmp_path) -> None:
     captured = {}
 

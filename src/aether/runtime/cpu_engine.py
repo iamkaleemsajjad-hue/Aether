@@ -26,11 +26,46 @@ from typing import Any
 import numpy as np
 
 from aether.kernels.native_cpu import NativeCPUKernels, get_native_kernels
+from aether.runtime.positional import alibi_slopes
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-__all__ = ["LayerWeights", "ModelWeights", "KVCache", "CPUExecutionEngine"]
+__all__ = [
+    "ExpertWeights", "LayerWeights", "ModelWeights", "KVCache",
+    "CPUExecutionEngine",
+]
+
+
+@dataclass
+class ExpertWeights:
+    """One routed expert's SwiGLU projections.
+
+    Matrices use the same ``(out_features, in_features)`` orientation as the
+    dense transformer projections.  This is the executable representation of
+    the top-k MoE contract described by Switch/Mixtral-style models.
+    """
+
+    gate_proj: np.ndarray
+    up_proj: np.ndarray
+    down_proj: np.ndarray
+    gate_proj_bias: np.ndarray | None = None
+    up_proj_bias: np.ndarray | None = None
+    down_proj_bias: np.ndarray | None = None
+
+    def validate(self, layer_index: int, expert_index: int, hidden_size: int) -> None:
+        if self.gate_proj.ndim != 2 or self.gate_proj.shape[1] != hidden_size:
+            raise ValueError(
+                f"layer {layer_index} expert {expert_index}: invalid gate projection"
+            )
+        if self.up_proj.shape != self.gate_proj.shape:
+            raise ValueError(
+                f"layer {layer_index} expert {expert_index}: gate/up shapes differ"
+            )
+        if self.down_proj.ndim != 2 or self.down_proj.shape[1] != self.gate_proj.shape[0]:
+            raise ValueError(
+                f"layer {layer_index} expert {expert_index}: invalid down projection"
+            )
 
 
 @dataclass
@@ -47,9 +82,23 @@ class LayerWeights:
     v_proj: np.ndarray
     o_proj: np.ndarray
     ffn_norm: np.ndarray
-    gate_proj: np.ndarray
-    up_proj: np.ndarray
-    down_proj: np.ndarray
+    gate_proj: np.ndarray | None
+    up_proj: np.ndarray | None
+    down_proj: np.ndarray | None
+    attention_norm_bias: np.ndarray | None = None
+    ffn_norm_bias: np.ndarray | None = None
+    q_proj_bias: np.ndarray | None = None
+    k_proj_bias: np.ndarray | None = None
+    v_proj_bias: np.ndarray | None = None
+    o_proj_bias: np.ndarray | None = None
+    gate_proj_bias: np.ndarray | None = None
+    up_proj_bias: np.ndarray | None = None
+    down_proj_bias: np.ndarray | None = None
+    q_norm: np.ndarray | None = None
+    k_norm: np.ndarray | None = None
+    router: np.ndarray | None = None
+    experts: list[ExpertWeights] = field(default_factory=list)
+    num_activated_experts: int = 1
 
     def validate(self, layer_index: int, hidden_size: int) -> None:
         """Check that the projections compose into a valid layer."""
@@ -65,12 +114,26 @@ class LayerWeights:
                 f"v_proj {self.v_proj.shape} must match"
             )
             raise ValueError(msg)
-        if self.gate_proj.shape != self.up_proj.shape:
+        if self.experts:
+            if self.router is None or self.router.ndim != 2 or self.router.shape[1] != hidden_size:
+                raise ValueError(f"layer {layer_index}: MoE router must have shape (experts, hidden)")
+            if not 0 < self.num_activated_experts <= len(self.experts):
+                raise ValueError(f"layer {layer_index}: invalid MoE top-k")
+            for expert_index, expert in enumerate(self.experts):
+                expert.validate(layer_index, expert_index, hidden_size)
+            return
+        if self.gate_proj is None or self.down_proj is None:
+            raise ValueError(f"layer {layer_index}: dense FFN projections are incomplete")
+        if self.up_proj is not None and self.gate_proj.shape != self.up_proj.shape:
             msg = (
                 f"layer {layer_index}: gate_proj {self.gate_proj.shape} and "
                 f"up_proj {self.up_proj.shape} must match"
             )
             raise ValueError(msg)
+        if self.q_norm is not None and self.q_norm.ndim != 1:
+            raise ValueError(f"layer {layer_index}: q_norm must be a vector")
+        if self.k_norm is not None and self.k_norm.ndim != 1:
+            raise ValueError(f"layer {layer_index}: k_norm must be a vector")
 
 
 @dataclass
@@ -81,10 +144,21 @@ class ModelWeights:
     layers: list[LayerWeights]
     final_norm: np.ndarray
     lm_head: np.ndarray
+    position_embedding: np.ndarray | None = None
+    embedding_norm: np.ndarray | None = None
+    embedding_norm_bias: np.ndarray | None = None
+    final_norm_bias: np.ndarray | None = None
+    position_type: str = "RoPE"
     #: RoPE base frequency.
     rope_theta: float = 10000.0
     #: RMSNorm epsilon.
     norm_eps: float = 1e-5
+    #: Decoder normalization family.
+    norm_type: str = "RMSNorm"
+    #: FFN activation family.
+    ffn_type: str = "SwiGLU"
+    #: Whether attention and FFN branches share one pre-norm input.
+    parallel_residual: bool = False
 
     @property
     def hidden_size(self) -> int:
@@ -115,6 +189,22 @@ class ModelWeights:
                 f"expected hidden_size {self.hidden_size}"
             )
             raise ValueError(msg)
+        if self.position_embedding is not None and (
+            self.position_embedding.ndim != 2
+            or self.position_embedding.shape[1] != self.hidden_size
+        ):
+            raise ValueError(
+                "position_embedding must have shape (context_length, hidden_size)"
+            )
+        if self.embedding_norm is not None and self.embedding_norm.size != self.hidden_size:
+            raise ValueError("embedding_norm must have hidden_size elements")
+        if self.embedding_norm_bias is not None and self.embedding_norm_bias.size != self.hidden_size:
+            raise ValueError("embedding_norm_bias must have hidden_size elements")
+        if self.final_norm_bias is not None and self.final_norm_bias.size != self.hidden_size:
+            raise ValueError(
+                f"final_norm_bias has {self.final_norm_bias.size} elements, "
+                f"expected hidden_size {self.hidden_size}"
+            )
         for index, layer in enumerate(self.layers):
             layer.validate(index, self.hidden_size)
 
@@ -300,6 +390,7 @@ class CPUExecutionEngine:
         self.sparse_attention_plan = sparse_attention_plan
         self.semantic_kv_plan = self._validate_semantic_kv_plan(semantic_kv_plan)
         self.cross_layer_kv_plan = self._validate_cross_layer_kv_plan(cross_layer_kv_plan, len(weights.layers))
+        self._alibi_slopes = alibi_slopes(self.num_heads)
         self._speculative_stats = {
             "draft_tokens": 0,
             "accepted_tokens": 0,
@@ -330,7 +421,11 @@ class CPUExecutionEngine:
         if not deltas:
             return self
 
-        def updated(name: str, value: np.ndarray) -> np.ndarray:
+        def updated(name: str, value: np.ndarray | None) -> np.ndarray | None:
+            if value is None:
+                if name in deltas:
+                    raise ValueError(f"task delta {name!r} targets a missing base tensor")
+                return None
             delta = deltas.get(name)
             if delta is None:
                 return np.array(value, dtype=np.float32, copy=True)
@@ -350,17 +445,62 @@ class CPUExecutionEngine:
                 )
                 for field_name in (
                     "attention_norm", "q_proj", "k_proj", "v_proj", "o_proj",
-                    "ffn_norm", "gate_proj", "up_proj", "down_proj",
+                "ffn_norm", "gate_proj", "up_proj", "down_proj",
+                "attention_norm_bias", "ffn_norm_bias",
+                "q_proj_bias", "k_proj_bias", "v_proj_bias", "o_proj_bias",
+                "gate_proj_bias", "up_proj_bias", "down_proj_bias",
                 )
             }
+            if layer.experts:
+                fields["router"] = updated(f"layer_{index}_moe_router", layer.router)
+                fields["experts"] = [
+                    ExpertWeights(
+                        gate_proj=updated(
+                            f"layer_{index}_expert_{expert_index}_gate_proj",
+                            expert.gate_proj,
+                        ),
+                        up_proj=updated(
+                            f"layer_{index}_expert_{expert_index}_up_proj",
+                            expert.up_proj,
+                        ),
+                        down_proj=updated(
+                            f"layer_{index}_expert_{expert_index}_down_proj",
+                            expert.down_proj,
+                        ),
+                    )
+                    for expert_index, expert in enumerate(layer.experts)
+                ]
+                fields["num_activated_experts"] = layer.num_activated_experts
             layers.append(LayerWeights(**fields))
         weights = ModelWeights(
             embedding=updated("embedding", self.weights.embedding),
             layers=layers,
             final_norm=updated("final_norm", self.weights.final_norm),
             lm_head=updated("lm_head", self.weights.lm_head),
+            position_embedding=(
+                updated("position_embedding", self.weights.position_embedding)
+                if self.weights.position_embedding is not None
+                else None
+            ),
+            embedding_norm=(
+                updated("embedding_norm", self.weights.embedding_norm)
+                if self.weights.embedding_norm is not None else None
+            ),
+            embedding_norm_bias=(
+                updated("embedding_norm_bias", self.weights.embedding_norm_bias)
+                if self.weights.embedding_norm_bias is not None else None
+            ),
+            final_norm_bias=(
+                updated("final_norm_bias", self.weights.final_norm_bias)
+                if self.weights.final_norm_bias is not None
+                else None
+            ),
             rope_theta=self.weights.rope_theta,
             norm_eps=self.weights.norm_eps,
+            norm_type=self.weights.norm_type,
+            ffn_type=self.weights.ffn_type,
+            position_type=self.weights.position_type,
+            parallel_residual=self.weights.parallel_residual,
         )
         return CPUExecutionEngine(
             weights,
@@ -536,10 +676,13 @@ class CPUExecutionEngine:
         x: np.ndarray,
         weight: np.ndarray,
         target: tuple[int, str] | None = None,
+        bias: np.ndarray | None = None,
     ) -> np.ndarray:
         """Apply a base linear projection and the selected real LoRA delta."""
         x32 = np.ascontiguousarray(x, dtype=np.float32)
         output = self.kernels.sgemm(x32, weight.T)
+        if bias is not None:
+            output = output + np.asarray(bias, dtype=np.float32)
         if self.active_lora_adapter is None or target is None:
             return output
         adapter = self.lora_adapters.get(self.active_lora_adapter)
@@ -551,6 +694,82 @@ class CPUExecutionEngine:
             np.asarray(B, dtype=np.float32).T,
         )
         return np.ascontiguousarray(output + delta * np.float32(scale), dtype=np.float32)
+
+    def _norm(self, x: np.ndarray, weight: np.ndarray, bias: np.ndarray | None = None) -> np.ndarray:
+        """Apply the source model's declared normalization."""
+        if str(self.weights.norm_type).lower() == "layernorm":
+            arr = np.asarray(x, dtype=np.float32)
+            mean = np.mean(arr, axis=-1, keepdims=True)
+            variance = np.mean((arr - mean) ** 2, axis=-1, keepdims=True)
+            result = (arr - mean) / np.sqrt(variance + self.weights.norm_eps)
+            result = result * np.asarray(weight, dtype=np.float32)
+            if bias is not None:
+                result = result + np.asarray(bias, dtype=np.float32)
+            return np.ascontiguousarray(result, dtype=np.float32)
+        return self.kernels.rmsnorm(x, weight, self.weights.norm_eps)
+
+    def _ffn_activation(self, gate: np.ndarray, up: np.ndarray | None) -> np.ndarray:
+        """Evaluate the declared FFN variant without substituting weights."""
+        ffn_type = str(self.weights.ffn_type or "SwiGLU").lower()
+        if up is None:
+            # Classic GPT-style blocks have one intermediate projection.
+            if ffn_type in {"gelu", "relu", "relu2"}:
+                if ffn_type == "relu":
+                    return np.maximum(gate, 0.0).astype(np.float32)
+                if ffn_type == "relu2":
+                    return np.square(np.maximum(gate, 0.0)).astype(np.float32)
+                return (0.5 * gate * (1.0 + np.tanh(
+                    np.sqrt(2.0 / np.pi) * (gate + 0.044715 * gate**3)
+                ))).astype(np.float32)
+            raise ValueError(f"FFN type {self.weights.ffn_type!r} requires an up projection")
+        if ffn_type in {"geglu", "gelu"}:
+            activated = 0.5 * gate * (1.0 + np.tanh(
+                np.sqrt(2.0 / np.pi) * (gate + 0.044715 * gate**3)
+            ))
+            return np.asarray(activated * up, dtype=np.float32)
+        return self.kernels.swiglu(gate, up)
+
+    def _moe_ffn(self, hidden: np.ndarray, layer: LayerWeights) -> np.ndarray:
+        """Execute top-k routed SwiGLU experts for a token batch.
+
+        The router computes logits ``x W_router^T`` and selects the declared
+        top-k experts per token.  Softmax is applied over the selected logits,
+        then each selected expert contributes its weighted FFN output.  This
+        is the reference dispatch equation used by sparse MoE transformers;
+        it intentionally favors transparent correctness over fused kernels.
+        """
+        if layer.router is None or not layer.experts:
+            raise ValueError("MoE layer is missing its router or expert bank")
+        source = np.asarray(hidden, dtype=np.float32)
+        router_logits = self._linear(source, layer.router)
+        top_k = min(int(layer.num_activated_experts), len(layer.experts))
+        if top_k <= 0:
+            raise ValueError("MoE top-k must be positive")
+        # argpartition avoids a full expert sort while retaining exact top-k
+        # membership. Sorting the selected columns gives deterministic ties.
+        selected = np.argpartition(router_logits, -top_k, axis=-1)[:, -top_k:]
+        selected_logits = np.take_along_axis(router_logits, selected, axis=-1)
+        order = np.argsort(-selected_logits, axis=-1, kind="stable")
+        selected = np.take_along_axis(selected, order, axis=-1)
+        selected_logits = np.take_along_axis(selected_logits, order, axis=-1)
+        selected_logits -= np.max(selected_logits, axis=-1, keepdims=True)
+        routing = np.exp(selected_logits)
+        routing /= np.maximum(routing.sum(axis=-1, keepdims=True), 1e-12)
+
+        output = np.zeros_like(source, dtype=np.float32)
+        for expert_index, expert in enumerate(layer.experts):
+            rows, slots = np.where(selected == expert_index)
+            if rows.size == 0:
+                continue
+            expert_input = source[rows]
+            gate = self._linear(expert_input, expert.gate_proj, bias=expert.gate_proj_bias)
+            up = self._linear(expert_input, expert.up_proj, bias=expert.up_proj_bias)
+            activated = self._ffn_activation(gate, up)
+            expert_output = self._linear(
+                activated, expert.down_proj, bias=expert.down_proj_bias
+            )
+            output[rows] += expert_output * routing[rows, slots, None]
+        return np.ascontiguousarray(output, dtype=np.float32)
 
     def _apply_ttt_slot(self, hidden: np.ndarray, slot: dict[str, Any] | None) -> np.ndarray:
         """Apply one request-local R5 fast-weight slot to normalized states."""
@@ -611,6 +830,12 @@ class CPUExecutionEngine:
         k = np.ascontiguousarray(keys_full.transpose(1, 2, 0), dtype=np.float32)
         scores = np.matmul(q, k) * scale
 
+        if str(self.weights.position_type or "RoPE").lower() in {"alibi", "alibi_bias"}:
+            # ALiBi's causal bias is slope * (key_position - query_position),
+            # which is non-positive for permitted causal keys.
+            distance = key_positions[None, :] - query_positions[:, None]
+            scores = scores + self._alibi_slopes[:, None, None] * distance[None, :, :]
+
         # Causal mask uses original token positions, not compressed row indices.
         allowed = key_positions[None, :] <= query_positions[:, None]
         sparse_allowed = self._sparse_allowed_mask(
@@ -645,6 +870,13 @@ class CPUExecutionEngine:
         """Build the actual per-head mask described by the persisted Pass 8 plan."""
         plan = self.sparse_attention_plan
         if not isinstance(plan, dict) or not bool(plan.get("enabled")):
+            return None
+        # Pass 8 is a long-context optimization.  Its persisted patterns must
+        # not alter ordinary short prompts, otherwise a compiled model silently
+        # diverges from the dense reference model.  The compiler records the
+        # activation threshold alongside the plan for this runtime decision.
+        activation_threshold = int(plan.get("activation_context_length", 0) or 0)
+        if activation_threshold > 0 and total < activation_threshold:
             return None
         patterns = plan.get("patterns")
         if not isinstance(patterns, list) or len(patterns) != heads:
@@ -737,19 +969,40 @@ class CPUExecutionEngine:
         cache = cache or KVCache(num_layers=self.weights.num_layers)
         past = cache.length
         seq_len = int(ids.size)
-        self._ensure_rope_capacity(past + seq_len)
+        uses_rope = str(self.weights.position_type or "RoPE").lower() in {
+            "rope", "rotary", "rotary_embedding"
+        }
+        if uses_rope:
+            self._ensure_rope_capacity(past + seq_len)
 
         hidden = self.weights.embedding[ids].astype(np.float32)
+        if self.weights.embedding_norm is not None:
+            hidden = self._norm(
+                hidden,
+                self.weights.embedding_norm,
+                self.weights.embedding_norm_bias,
+            )
+        if self.weights.position_embedding is not None:
+            end = past + seq_len
+            if end > self.weights.position_embedding.shape[0]:
+                raise ValueError(
+                    f"sequence end {end} exceeds learned position embedding capacity "
+                    f"{self.weights.position_embedding.shape[0]}"
+                )
+            hidden = hidden + self.weights.position_embedding[past:end]
 
         for index, layer in enumerate(self.weights.layers):
             # ── Attention block ──
-            normed = self.kernels.rmsnorm(hidden, layer.attention_norm, self.weights.norm_eps)
+            normed = self._norm(hidden, layer.attention_norm, layer.attention_norm_bias)
             if ttt_slots is not None:
                 normed = self._apply_ttt_slot(
                     normed, ttt_slots[index] if index < len(ttt_slots) else None
                 )
-            q = self._linear(normed, layer.q_proj, (index, "q_proj")).reshape(seq_len, self.num_heads, self.head_dim)
-            q = self.kernels.rope(q, self._cos, self._sin, position_offset=past)
+            q = self._linear(normed, layer.q_proj, (index, "q_proj"), layer.q_proj_bias).reshape(seq_len, self.num_heads, self.head_dim)
+            if layer.q_norm is not None:
+                q = self.kernels.rmsnorm(q, layer.q_norm, self.weights.norm_eps)
+            if uses_rope:
+                q = self.kernels.rope(q, self._cos, self._sin, position_offset=past)
 
             shared_source = self._cross_layer_kv_source(index)
             if shared_source is not None:
@@ -764,13 +1017,16 @@ class CPUExecutionEngine:
                 # sharing, not a copied approximation of the source cache.
                 keys, values, key_positions = source_keys, source_values, source_positions
             else:
-                k = self._linear(normed, layer.k_proj, (index, "k_proj")).reshape(
+                k = self._linear(normed, layer.k_proj, (index, "k_proj"), layer.k_proj_bias).reshape(
                     seq_len, self.num_kv_heads, self.head_dim
                 )
-                v = self._linear(normed, layer.v_proj, (index, "v_proj")).reshape(
+                if layer.k_norm is not None:
+                    k = self.kernels.rmsnorm(k, layer.k_norm, self.weights.norm_eps)
+                v = self._linear(normed, layer.v_proj, (index, "v_proj"), layer.v_proj_bias).reshape(
                     seq_len, self.num_kv_heads, self.head_dim
                 )
-                k = self.kernels.rope(k, self._cos, self._sin, position_offset=past)
+                if uses_rope:
+                    k = self.kernels.rope(k, self._cos, self._sin, position_offset=past)
                 keys, values, key_positions = cache.append(
                     index,
                     k,
@@ -801,17 +1057,33 @@ class CPUExecutionEngine:
                 cache.values[index] = cache.values[shared_source]
                 cache.positions[index] = cache.positions[shared_source]
             attention_out = self._linear(
-                context.reshape(seq_len, self.num_heads * self.head_dim), layer.o_proj, (index, "o_proj")
+                context.reshape(seq_len, self.num_heads * self.head_dim), layer.o_proj, (index, "o_proj"), layer.o_proj_bias
             )
-            hidden = hidden + attention_out
+            if self.weights.parallel_residual:
+                # GPT-J computes both branches from one normalized state.
+                ffn_normed = normed
+            else:
+                hidden = hidden + attention_out
+                ffn_normed = self._norm(hidden, layer.ffn_norm, layer.ffn_norm_bias)
 
             # ── FFN block ──
-            normed = self.kernels.rmsnorm(hidden, layer.ffn_norm, self.weights.norm_eps)
-            gate = self._linear(normed, layer.gate_proj, (index, "gate_proj"))
-            up = self._linear(normed, layer.up_proj, (index, "up_proj"))
-            hidden = hidden + self._linear(self.kernels.swiglu(gate, up), layer.down_proj, (index, "down_proj"))
+            if layer.experts:
+                ffn_out = self._moe_ffn(ffn_normed, layer)
+            else:
+                if layer.gate_proj is None or layer.down_proj is None:
+                    raise ValueError(f"layer {index} has incomplete dense FFN weights")
+                gate = self._linear(ffn_normed, layer.gate_proj, (index, "gate_proj"), layer.gate_proj_bias)
+                up = (
+                    self._linear(ffn_normed, layer.up_proj, (index, "up_proj"), layer.up_proj_bias)
+                    if layer.up_proj is not None
+                    else None
+                )
+                ffn_out = self._linear(
+                    self._ffn_activation(gate, up), layer.down_proj, (index, "down_proj"), layer.down_proj_bias
+                )
+            hidden = hidden + attention_out + ffn_out if self.weights.parallel_residual else hidden + ffn_out
 
-        hidden = self.kernels.rmsnorm(hidden, self.weights.final_norm, self.weights.norm_eps)
+        hidden = self._norm(hidden, self.weights.final_norm, self.weights.final_norm_bias)
         cache.last_hidden = np.asarray(hidden[-1], dtype=np.float32).copy()
         logits = self._linear(hidden, self.weights.lm_head)
         cache.advance(seq_len)

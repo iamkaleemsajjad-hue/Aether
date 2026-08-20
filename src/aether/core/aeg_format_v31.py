@@ -239,12 +239,14 @@ class AEGPackageV31:
         provenance: ProvenanceManifest | None = None,
         watermark: WatermarkConfig | None = None,
         compute: InferenceComputeConfig | None = None,
+        fingerprint_runner: Any | None = None,
     ) -> None:
         self.model_id = model_id
         self.target = target
         self.provenance = provenance or ProvenanceManifest.from_compile_run(model_id)
         self.watermark = watermark or WatermarkConfig()
         self.compute = compute or InferenceComputeConfig()
+        self.fingerprint_runner = fingerprint_runner
 
     def build(self, output_dir: str | Path) -> Path:
         """
@@ -386,10 +388,28 @@ class AEGPackageV31:
         provenance_dir.mkdir(exist_ok=True)
         prov_path = provenance_dir / "manifest.json"
         prov_path.write_text(json.dumps(self.provenance.to_dict(), indent=2), encoding="utf-8")
-        # Write fingerprint
-        from aether.provenance.fingerprint import AEGModelFingerprint
-        fp = AEGModelFingerprint()
-        fp.write(aeg_dir, owner_id=f"owner:{self.model_id}", n_triggers=20)
+        # A metadata skeleton has no executable model, so it cannot capture
+        # real trigger responses.  Emit an explicit disabled record unless a
+        # caller supplies a runner; never synthesize ownership evidence.
+        fingerprint_path = provenance_dir / "fingerprint.json"
+        if self.fingerprint_runner is not None:
+            from aether.provenance.fingerprint import AEGModelFingerprint
+
+            AEGModelFingerprint().write(
+                aeg_dir,
+                owner_id=f"owner:{self.model_id}",
+                n_triggers=20,
+                generate=self.fingerprint_runner,
+            )
+        else:
+            fingerprint_path.write_text(
+                json.dumps({
+                    "version": "fingerprint/1.0",
+                    "enabled": False,
+                    "status": "not embedded: metadata skeleton has no executable model runner",
+                }, indent=2),
+                encoding="utf-8",
+            )
         written["provenance"] = ["manifest.json", "fingerprint.json"]
 
         # watermark/ [3.1 NEW]

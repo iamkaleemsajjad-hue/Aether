@@ -724,10 +724,13 @@ class TestHardwareBackends:
         assert caps["supports_fp4"] is True
 
     def test_riscv_backend_availability_matches_onnxruntime(self) -> None:
+        import platform
+
         from aether.backends.hardware_backends import RISCVNPUBackend
 
         backend = RISCVNPUBackend("riscv_mips_s8200")
-        assert backend.is_available() is backend._ort_available
+        host_is_riscv = platform.machine().lower() in {"riscv", "riscv64", "risc-v"}
+        assert backend.is_available() is (backend._ort_available and host_is_riscv)
 
     def test_cuda_backend_info(self) -> None:
         from aether.backends.hardware_backends import CUDABackend
