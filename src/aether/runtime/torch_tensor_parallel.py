@@ -62,6 +62,32 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         self.devices = [torch.device(value) for value in devices]
         self.device = self.devices[0]
         self._shard_weights = self._calibrate_mixed_mesh()
+
+        # ── Hardware topology + collective strategy ────────────────────────
+        # Detect NVLink / PCIe / XGMI interconnects and log the recommended
+        # AllReduce algorithm.  This is informational at init; the actual
+        # collectives use torch.distributed or explicit device copies.
+        # Reference: Megatron-LM §3.3 (Shoeybi et al. 2019, arXiv:1909.08053).
+        try:
+            from aether.parallelism.hardware_topology import detect_hardware_topology
+            _device_strs = [str(d) for d in devices]
+            self._topology = detect_hardware_topology(_device_strs)
+            _strat = self._topology.recommend_strategy()
+            # Estimate allreduce cost for a typical hidden_size=4096 layer
+            # payload = 2 * hidden_size * 4 bytes (float32)
+            _sample_payload = 2 * 4096 * 4
+            _latency_ms = self._topology.allreduce_latency_ms(_sample_payload)
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "TP collective strategy: %s | %s | "
+                "estimated allreduce latency per layer (H=4096): %.3f ms",
+                _strat.value,
+                self._topology.summary(),
+                _latency_ms,
+            )
+        except Exception:  # noqa: BLE001 — topology is advisory, never fatal
+            self._topology = None
+
         source_weights = cpu_engine.weights
         # Keep only scalar graph metadata after sharding. Holding the CPU
         # engine or its weight container would retain a complete second model

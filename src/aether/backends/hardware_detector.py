@@ -56,26 +56,38 @@ def detect_all_capabilities() -> list[HardwareCapabilities]:
     available=False and an unavailable_reason.
 
     This is the master detection function called by ``aether hardware detect``.
+    Detection order matches backend priority: best accelerator first, then
+    specialized NPU/ANE pipelines, then CPU fallback.
     """
     caps: list[HardwareCapabilities] = []
 
-    # 1. CPU (always available)
+    # 1. CPU (always available — never raises)
     caps.append(detect_cpu())
 
-    # 2. CUDA (NVIDIA GPUs)
+    # 2. CUDA (NVIDIA GPUs) — one capability per physical device
     caps.extend(detect_cuda_devices())
 
-    # 3. ROCm (AMD GPUs)
+    # 3. ROCm (AMD GPUs) — one capability per physical device
     caps.extend(detect_rocm_devices())
 
-    # 4. Metal (Apple Silicon)
+    # 4. Metal (Apple Silicon GPU unified memory)
     caps.append(detect_metal())
 
-    # 5. OpenVINO / Intel NPU and GPU
+    # 5. Apple Neural Engine (ANE) — separate from Metal GPU, always present
+    #    on Apple Silicon but requires Core ML for any execution.
+    caps.append(detect_apple_ane())
+
+    # 6. OpenVINO / Intel NPU and iGPU
     caps.append(detect_openvino())
     caps.append(detect_openvino_gpu())
 
-    # 6. Vendor-specific targets (always unavailable on this host)
+    # 7. DirectML — Windows vendor-agnostic GPU (any GPU on Windows)
+    caps.append(detect_directml())
+
+    # 8. Qualcomm NPU via QNN / SNPE (Snapdragon ARM Windows + Android)
+    caps.append(detect_qualcomm_npu())
+
+    # 9. Vendor-specific targets (always unavailable on this host)
     caps.extend(_unavailable_vendor_targets())
 
     return caps
@@ -897,8 +909,6 @@ def _rocm_target_id(device_name: str) -> str:
 def _unavailable_vendor_targets() -> list[HardwareCapabilities]:
     """Return stub capabilities for targets that have no runtime on this host."""
     stubs = [
-        ("Qualcomm", "Cloud AI 100", "qnn", "qualcomm_cloud_ai100"),
-        ("Qualcomm", "QNN NPU", "qnn", "qualcomm_qnn"),
         ("SiFive", "X160", "riscv", "riscv_sifive_x160"),
         ("MIPS/Wave", "S8200", "riscv", "riscv_mips_s8200"),
         ("XuanTie", "C930", "riscv", "riscv_xuantie_c930"),
@@ -926,3 +936,292 @@ def _unavailable_vendor_targets() -> list[HardwareCapabilities]:
             implemented=False,
         ))
     return result
+
+
+def detect_directml() -> HardwareCapabilities:
+    """Detect Windows DirectML GPU acceleration.
+
+    DirectML is Microsoft's vendor-agnostic GPU inference layer for Windows.
+    It works on any GPU (NVIDIA, AMD, Intel) without vendor-specific SDKs.
+    Detection is done via onnxruntime-directml or Win32 DXGI enumeration.
+
+    PRD §41: Required for Windows heterogeneous GPU support.
+    """
+    import platform
+    if platform.system() != "Windows":
+        return HardwareCapabilities.unavailable(
+            vendor="Microsoft",
+            device="DirectML GPU",
+            architecture="directml",
+            target_id="directml",
+            reason="DirectML is only available on Windows",
+            implemented=False,
+        )
+
+    # Try onnxruntime-directml first (the proper SDK detection path).
+    try:
+        import onnxruntime as ort  # type: ignore[import]
+        providers = ort.get_available_providers()
+        if "DmlExecutionProvider" not in providers:
+            return HardwareCapabilities.unavailable(
+                vendor="Microsoft",
+                device="DirectML GPU",
+                architecture="directml",
+                target_id="directml",
+                reason=(
+                    "onnxruntime is installed but DmlExecutionProvider is not available; "
+                    "install onnxruntime-directml for DirectML support"
+                ),
+                implemented=True,
+            )
+        # Enumerate the first DirectML device via DXGI if pywin32 is available.
+        device_name = "DirectML GPU"
+        try:
+            import subprocess
+            result_proc = subprocess.run(
+                ["powershell", "-Command",
+                 "(Get-WmiObject Win32_VideoController | Select-Object -First 1 -ExpandProperty Caption)"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result_proc.returncode == 0 and result_proc.stdout.strip():
+                device_name = result_proc.stdout.strip()
+        except Exception:  # noqa: BLE001
+            pass
+        return HardwareCapabilities(
+            vendor="Microsoft",
+            device=device_name,
+            architecture="directml",
+            target_id="directml",
+            runtime_version=ort.__version__,
+            supports_fp32=True,
+            supports_fp16=True,
+            supports_int8=True,
+            implemented=True,
+            available=True,
+            compile_tested=False,
+            execution_tested=False,
+            production_validated=False,
+            extra={"ort_providers": providers},
+        )
+    except ImportError:
+        pass
+
+    # Fallback: try ctypes/WinRT DXGI enumeration if onnxruntime is absent.
+    try:
+        import ctypes
+        d3d12 = ctypes.WinDLL("d3d12", use_last_error=True)
+        dxgi = ctypes.WinDLL("dxgi", use_last_error=True)
+        # If both DLLs load, DirectML capable hardware is likely present.
+        del d3d12, dxgi  # just a probe — not calling any API yet
+        return HardwareCapabilities(
+            vendor="Microsoft",
+            device="DirectML GPU (DLL probe)",
+            architecture="directml",
+            target_id="directml",
+            runtime_version="native",
+            supports_fp32=True,
+            supports_fp16=True,
+            implemented=True,
+            available=True,
+            compile_tested=False,
+            execution_tested=False,
+            production_validated=False,
+            extra={"detection_method": "d3d12_dll_probe"},
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return HardwareCapabilities.unavailable(
+        vendor="Microsoft",
+        device="DirectML GPU",
+        architecture="directml",
+        target_id="directml",
+        reason="onnxruntime-directml not installed and D3D12 DLL probe failed",
+        implemented=False,
+    )
+
+
+def detect_qualcomm_npu() -> HardwareCapabilities:
+    """Detect Qualcomm QNN / SNPE NPU on Snapdragon SoCs.
+
+    Qualcomm Neural Processing Units are present in Snapdragon ARM devices
+    (Windows on ARM laptops, Android). Detection probes the QNN SDK Python
+    wrapper, then falls back to checking qnn-net-run on PATH.
+
+    PRD §41: Required for Qualcomm NPU hardware support.
+    """
+    # Primary: QNN Python SDK
+    try:
+        import qnn  # type: ignore[import] - Qualcomm QNN Python SDK
+        version = getattr(qnn, "__version__", "unknown")
+        return HardwareCapabilities(
+            vendor="Qualcomm",
+            device="Qualcomm QNN NPU",
+            architecture="qnn",
+            target_id="qualcomm_qnn",
+            runtime_version=version,
+            supports_fp32=True,
+            supports_fp16=True,
+            supports_int8=True,
+            implemented=True,
+            available=True,
+            compile_tested=False,
+            execution_tested=False,
+            production_validated=False,
+            extra={"detection_method": "qnn_python_sdk"},
+        )
+    except ImportError:
+        pass
+
+    # Fallback: SNPE Python SDK
+    try:
+        import snpe  # type: ignore[import] - Qualcomm SNPE SDK
+        version = getattr(snpe, "__version__", "unknown")
+        return HardwareCapabilities(
+            vendor="Qualcomm",
+            device="Qualcomm SNPE NPU",
+            architecture="snpe",
+            target_id="qualcomm_qnn",
+            runtime_version=version,
+            supports_fp32=True,
+            supports_fp16=True,
+            supports_int8=True,
+            implemented=True,
+            available=True,
+            compile_tested=False,
+            execution_tested=False,
+            production_validated=False,
+            extra={"detection_method": "snpe_python_sdk"},
+        )
+    except ImportError:
+        pass
+
+    # Fallback: probe qnn-net-run on PATH (indicates QNN SDK installed)
+    try:
+        import subprocess
+        result_proc = subprocess.run(
+            ["qnn-net-run", "--version"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result_proc.returncode == 0:
+            version_line = (result_proc.stdout or result_proc.stderr).strip().splitlines()[0]
+            return HardwareCapabilities(
+                vendor="Qualcomm",
+                device="Qualcomm QNN NPU",
+                architecture="qnn",
+                target_id="qualcomm_qnn",
+                runtime_version=version_line,
+                supports_fp32=True,
+                supports_fp16=True,
+                supports_int8=True,
+                implemented=True,
+                available=True,
+                compile_tested=False,
+                execution_tested=False,
+                production_validated=False,
+                extra={"detection_method": "qnn_net_run_probe"},
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return HardwareCapabilities.unavailable(
+        vendor="Qualcomm",
+        device="Qualcomm QNN NPU",
+        architecture="qnn",
+        target_id="qualcomm_qnn",
+        reason="Qualcomm QNN/SNPE SDK not found on this host",
+        implemented=False,
+    )
+
+
+def detect_apple_ane() -> HardwareCapabilities:
+    """Detect Apple Neural Engine (ANE) via Core ML.
+
+    The ANE is a dedicated accelerator present on all Apple Silicon chips.
+    It is not directly programmable; Core ML is the only public API that
+    can target it. coremltools is required for AEG compilation to ANE.
+
+    PRD §41: Required for Apple Silicon full-pipeline support (GPU + ANE).
+    """
+    import platform
+    if platform.system() != "Darwin":
+        return HardwareCapabilities.unavailable(
+            vendor="Apple",
+            device="Apple Neural Engine",
+            architecture="ane",
+            target_id="apple_ane",
+            reason="Apple Neural Engine is only available on macOS/Apple Silicon",
+            implemented=False,
+        )
+
+    machine = platform.machine()
+    if machine != "arm64":
+        return HardwareCapabilities.unavailable(
+            vendor="Apple",
+            device="Apple Neural Engine",
+            architecture="ane",
+            target_id="apple_ane",
+            reason=f"Apple Neural Engine requires Apple Silicon (arm64); this host is {machine}",
+            implemented=False,
+        )
+
+    # Core ML is the only public API to target the ANE.
+    try:
+        import coremltools  # type: ignore[import]
+        version = getattr(coremltools, "__version__", "unknown")
+        # Probe that the ANE compute unit is reachable via CoreML.
+        try:
+            from coremltools.models.utils import _get_available_compute_units  # type: ignore
+            units = _get_available_compute_units()
+            ane_available = any("neural_engine" in str(u).lower() for u in units)
+        except Exception:  # noqa: BLE001
+            # If the private API is unavailable, assume ANE is present on arm64.
+            ane_available = True
+        if not ane_available:
+            return HardwareCapabilities.unavailable(
+                vendor="Apple",
+                device="Apple Neural Engine",
+                architecture="ane",
+                target_id="apple_ane",
+                reason="coremltools could not enumerate Neural Engine compute unit",
+                implemented=True,
+            )
+        return HardwareCapabilities(
+            vendor="Apple",
+            device="Apple Neural Engine",
+            architecture="ane",
+            target_id="apple_ane",
+            runtime_version=f"coremltools {version}",
+            supports_fp32=True,
+            supports_fp16=True,
+            supports_int8=True,
+            supports_unified_memory=True,  # ANE shares unified memory with GPU/CPU
+            implemented=True,
+            available=True,
+            compile_tested=False,
+            execution_tested=False,
+            production_validated=False,
+            extra={"detection_method": "coremltools"},
+        )
+    except ImportError:
+        # coremltools is optional; the ANE hardware is still physically present.
+        # Mark it as detected (hardware exists) but not ready for execution.
+        mac_ver = platform.mac_ver()[0]
+        return HardwareCapabilities(
+            vendor="Apple",
+            device="Apple Neural Engine",
+            architecture="ane",
+            target_id="apple_ane",
+            runtime_version=f"macOS {mac_ver} (coremltools not installed)",
+            supports_fp32=True,
+            supports_fp16=True,
+            implemented=True,
+            available=False,
+            compile_tested=False,
+            execution_tested=False,
+            production_validated=False,
+            extra={
+                "detection_method": "platform_probe",
+                "unavailable_reason": "coremltools not installed; install it to enable ANE execution",
+            },
+        )

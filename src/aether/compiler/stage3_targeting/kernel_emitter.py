@@ -197,7 +197,7 @@ class KernelEmitter:
             kernel_name=op_name,
             artifact_path=destination,
             sha256=digest,
-            symbols=(symbol,),
+            symbols=tuple(native.available_kernels()),  # ALL 13 symbols — one DLL covers all
             backend="native_cpu",
         )
 
@@ -205,25 +205,48 @@ class KernelEmitter:
         return f"KernelEmitter({self.target_id})"
 
 
+# ── Op → native symbol map ─────────────────────────────────────────────────
+# One shared library exports all of these.  Each entry makes the operation
+# eligible for bundled-kernel fast-path in KernelEmitter.emit_executable.
 _CPU_OP_SYMBOLS = {
+    # Layer norms
     "rmsnorm": "aether_rmsnorm",
     "aeg.rmsnorm": "aether_rmsnorm",
+    # Fused RMSNorm+Linear (ClusterFusion Pass 1 — Dao et al. 2022, §3.2 fused kernels)
+    "rmsnorm_linear": "aether_rmsnorm_linear",
+    "aeg.rmsnorm_linear": "aether_rmsnorm_linear",
+    # Activations
     "silu": "aether_silu",
     "aeg.silu": "aether_silu",
     "swiglu": "aether_swiglu",
     "aeg.swiglu": "aether_swiglu",
+    # Attention
     "softmax": "aether_softmax",
     "aeg.softmax": "aether_softmax",
+    # FlashAttention-2 online softmax (Dao 2023, arXiv:2307.08691)
+    "flash_attn": "aether_flash_attn",
+    "aeg.flash_attn": "aether_flash_attn",
+    "attention": "aether_flash_attn",
+    "aeg.attention": "aether_flash_attn",
+    # Matrix operations
     "gemm": "aether_sgemm",
+    "sgemm": "aether_sgemm",
     "linear": "aether_sgemm",
     "aeg.linear": "aether_sgemm",
+    # SGEMV fast decode path (M=1, avoids tile-setup — Dongarra et al., BLAS Level 2)
+    "sgemv": "aether_sgemv",
+    "gemv": "aether_sgemv",
+    "aeg.sgemv": "aether_sgemv",
+    # Positional encoding
     "rope": "aether_rope",
     "aeg.rope": "aether_rope",
-    "argmax": "aether_argmax",
-    "aeg.argmax": "aether_argmax",
+    # Quantization ops
     "qgemv_affine": "aether_qgemv_affine",
     "dequantize_affine": "aether_dequantize_affine",
     "dequantize_symmetric": "aether_dequantize_symmetric",
+    # Token selection
+    "argmax": "aether_argmax",
+    "aeg.argmax": "aether_argmax",
 }
 
 
@@ -235,3 +258,4 @@ def _cpu_symbol_for_op(op_name: str) -> str:
         raise KernelError(
             f"no audited native CPU implementation exists for operation {op_name!r}",
         ) from exc
+
