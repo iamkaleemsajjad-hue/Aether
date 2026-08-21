@@ -264,7 +264,7 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e "[test]"
+          pip install -e ".[test]"
       - name: Run AEG Format 2.0 tests
         run: |
           pytest tests/unit/test_aeg_format_v2.py \
@@ -315,7 +315,7 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e "[test]"
+          pip install -e ".[test]"
       - name: Run RISC-V backend and hardware profile tests
         run: |
           pytest tests/unit/test_riscv_and_hardware.py \
@@ -399,7 +399,7 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e "[test]"
+          pip install -e ".[test]"
       - name: Run Runtime v4.0 extension tests
         run: |
           pytest tests/unit/test_runtime_v4_extensions.py \
