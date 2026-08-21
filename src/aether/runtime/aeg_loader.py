@@ -888,36 +888,97 @@ def _runtime_cross_layer_kv_plan(metadata: Any, num_layers: int) -> dict[str, An
 
 
 def _load_packaged_native_kernels(package: Any, kernels: Any) -> None:
-    """Load the authenticated native CPU library embedded in an AEG, if any."""
+    """Load the authenticated native CPU library embedded in an AEG, if any.
+
+    Three-tier fallback chain (Compile-Once, Run-Anywhere):
+
+    1. **Packaged DLL** – The compiled shared library that was authenticated and
+       bundled by the AEG compiler at compile time.  Its SHA-256 digest is stored
+       in ``metadata.kernel_artifacts`` and verified before loading.  When this
+       succeeds the host requires *no* C++ compiler or build toolchain.
+
+    2. **Host recompile** – If the packaged library is absent (older AEG/1.x),
+       mismatches the expected digest, or cannot be loaded (wrong OS/ISA), we
+       fall back to ``kernels.ensure_compiled()``.  The result is written to the
+       host kernel cache so subsequent loads skip compilation.
+
+    3. **NumPy reference path** – If the host has no compiler either, the engine
+       continues with pure-NumPy implementations.  Performance is lower but
+       inference is fully functional on any Python installation.
+
+    This design is inspired by ONNX Runtime's EP fallback hierarchy (Microsoft
+    2019) and matches the Aether PRD §compile-once-run-everywhere requirement.
+    """
     metadata = getattr(package, "metadata", {})
     descriptors = metadata.get("kernel_artifacts", []) if isinstance(metadata, dict) else []
-    if not descriptors:
-        # Older AEG/1.x packages may not carry a packaged library.  Preserve
-        # their existing host-cache/reference-kernel behavior.
-        return
-    if not isinstance(descriptors, list):
-        raise AEGLoadError("AEG kernel_artifacts metadata must be a list")
-    for descriptor in descriptors:
-        if not isinstance(descriptor, dict) or descriptor.get("backend") != "native_cpu":
-            continue
-        relative_path = descriptor.get("path")
-        if (
-            not isinstance(relative_path, str)
-            or Path(relative_path).is_absolute()
-            or ".." in Path(relative_path).parts
-        ):
-            raise AEGLoadError("AEG packaged kernel path is unsafe")
-        path = (Path(package.root) / relative_path).resolve()
-        expected = descriptor.get("sha256")
-        if not isinstance(expected, str):
-            raise AEGLoadError(f"AEG packaged kernel {relative_path!r} has no SHA-256 digest")
-        if not path.is_relative_to(Path(package.root).resolve()):
-            raise AEGLoadError("AEG packaged kernel escapes package root")
-        if not kernels.load_library(path, expected_sha256=expected):
-            raise AEGLoadError(
-                f"unable to load packaged native CPU kernel {relative_path!r}: {kernels.build_error}"
+
+    # ── Tier 1: bundled library ────────────────────────────────────────────
+    if descriptors:
+        if not isinstance(descriptors, list):
+            raise AEGLoadError("AEG kernel_artifacts metadata must be a list")
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict) or descriptor.get("backend") != "native_cpu":
+                continue
+            relative_path = descriptor.get("path")
+            if (
+                not isinstance(relative_path, str)
+                or Path(relative_path).is_absolute()
+                or ".." in Path(relative_path).parts
+            ):
+                raise AEGLoadError("AEG packaged kernel path is unsafe")
+            path = (Path(package.root) / relative_path).resolve()
+            if not path.is_relative_to(Path(package.root).resolve()):
+                raise AEGLoadError("AEG packaged kernel escapes package root")
+            expected = descriptor.get("sha256")
+            if not isinstance(expected, str):
+                raise AEGLoadError(
+                    f"AEG packaged kernel {relative_path!r} has no SHA-256 digest"
+                )
+            if not path.exists():
+                logger.warning(
+                    "Packaged native kernel %r not found on disk; falling back to host recompile",
+                    relative_path,
+                )
+                break  # fall through to Tier 2
+            if kernels.load_library(path, expected_sha256=expected):
+                logger.info(
+                    "Loaded bundled native CPU kernel from AEG package (%s) — "
+                    "no host compiler required",
+                    path.name,
+                )
+                return  # ✓ Tier 1 succeeded
+            # load_library sets kernels.build_error on failure
+            logger.warning(
+                "Bundled native kernel %r failed to load (%s); falling back to host recompile",
+                relative_path,
+                kernels.build_error,
             )
-        return
+            break  # fall through to Tier 2
+
+    # ── Tier 2: host recompile ─────────────────────────────────────────────
+    if kernels.ensure_compiled():
+        if descriptors:
+            logger.info(
+                "Native CPU kernel recompiled on host (bundled library was unavailable). "
+                "Result cached at: %s",
+                kernels.library_path,
+            )
+        else:
+            logger.debug(
+                "No bundled kernel in AEG (pre-v1.1); compiled from host toolchain: %s",
+                kernels.library_path,
+            )
+        return  # ✓ Tier 2 succeeded
+
+    # ── Tier 3: NumPy reference path (always available) ───────────────────
+    logger.warning(
+        "Native CPU kernels unavailable (no bundled library and no host compiler). "
+        "Running on NumPy reference path. Performance will be lower. "
+        "Install a C++ compiler (GCC/Clang/MSVC) to enable AVX2/OpenMP acceleration."
+    )
+    # kernels.is_native == False → engine uses kernels.rmsnorm_ref etc. automatically
+
+
 
 
 def _architecture_dict(package: Any) -> dict[str, Any]:

@@ -98,8 +98,18 @@ class TestCompilation:
 
     @requires_compiler
     def test_all_declared_symbols_are_present(self, native: NativeCPUKernels) -> None:
-        """_bind_signatures raises if a symbol is missing, so this must pass."""
-        assert len(native.available_kernels()) == 10
+        """_bind_signatures raises if a symbol is missing, so this must pass.
+
+        Expected symbols (13):
+          aether_rmsnorm, aether_rmsnorm_linear (fused Pass-1 kernel),
+          aether_silu, aether_swiglu, aether_softmax,
+          aether_sgemm, aether_sgemv (M=1 decode fast path),
+          aether_flash_attn (FlashAttention-2 online softmax),
+          aether_rope,
+          aether_dequantize_symmetric, aether_dequantize_affine,
+          aether_qgemv_affine, aether_argmax.
+        """
+        assert len(native.available_kernels()) == 13
 
     @requires_compiler
     def test_repeated_calls_reuse_the_cached_library(self, native: NativeCPUKernels) -> None:

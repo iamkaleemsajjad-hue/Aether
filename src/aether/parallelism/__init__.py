@@ -27,6 +27,13 @@ from aether.parallelism.collective_backends import (
     SocketCollectiveBackend,
     get_collective_backend,
 )
+from aether.parallelism.hardware_topology import (
+    CollectiveStrategy,
+    HardwareTopology,
+    InterconnectType,
+    TopologyEdge,
+    detect_hardware_topology,
+)
 
 
 __all__ = [
@@ -42,4 +49,10 @@ __all__ = [
     "ParallelismConfig",
     "CollectiveBackend",
     "CommunicationGroup",
+    # Hardware topology
+    "CollectiveStrategy",
+    "HardwareTopology",
+    "InterconnectType",
+    "TopologyEdge",
+    "detect_hardware_topology",
 ]

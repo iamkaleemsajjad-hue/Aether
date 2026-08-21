@@ -748,7 +748,35 @@ class NativeCPUKernels:
             return False
 
         try:
-            self._lib = ctypes.CDLL(str(library))
+            # On Windows, ctypes.CDLL may fail with "Could not find module" if
+            # the DLL has transitive dependencies (OpenMP runtime: vcomp.dll or
+            # libgomp.dll) not on the DLL search path.  Python 3.8+ exposes
+            # os.add_dll_directory() for exactly this purpose.  We also pass
+            # winmode=0 to force the standard Windows DLL search order instead
+            # of ctypes' custom restricted loader.
+            _dll_dirs: list = []
+            try:
+                if hasattr(os, "add_dll_directory"):
+                    _dll_dirs.append(os.add_dll_directory(str(library.parent)))
+                    # Also add the toolchain's bin directory (where libgomp.dll lives).
+                    if self.toolchain is not None and self.toolchain.executable:
+                        tc_bin = Path(self.toolchain.executable).parent
+                        if tc_bin.is_dir():
+                            _dll_dirs.append(os.add_dll_directory(str(tc_bin)))
+            except (AttributeError, OSError):
+                pass
+            try:
+                import platform as _platform
+                if _platform.system() == "Windows":
+                    self._lib = ctypes.CDLL(str(library), winmode=0)
+                else:
+                    self._lib = ctypes.CDLL(str(library))
+            finally:
+                for _d in _dll_dirs:
+                    try:
+                        _d.close()
+                    except Exception:  # noqa: BLE001
+                        pass
         except OSError as exc:
             self._build_error = f"could not load {library}: {exc}"
             logger.warning("Failed to load native kernels: %s", exc)
@@ -780,7 +808,26 @@ class NativeCPUKernels:
                 self._build_error = f"native kernel library hash mismatch for {path}"
                 return False
         try:
-            library = ctypes.CDLL(str(path))
+            # Apply the same Windows-safe DLL loading used in ensure_compiled():
+            # add_dll_directory lets the loader find OpenMP/MSVCRT dependencies.
+            _dll_dirs2: list = []
+            try:
+                if hasattr(os, "add_dll_directory"):
+                    _dll_dirs2.append(os.add_dll_directory(str(path.parent)))
+            except (AttributeError, OSError):
+                pass
+            try:
+                import platform as _platform2
+                if _platform2.system() == "Windows":
+                    library = ctypes.CDLL(str(path), winmode=0)
+                else:
+                    library = ctypes.CDLL(str(path))
+            finally:
+                for _d in _dll_dirs2:
+                    try:
+                        _d.close()
+                    except Exception:  # noqa: BLE001
+                        pass
             previous = self._lib
             self._lib = library
             try:

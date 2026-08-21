@@ -277,9 +277,22 @@ class TorchBackend(Backend):
                     )
 
                     engine_kind = engine.__class__.__name__
-                    if engine_kind == "CPUExecutionEngine" and len(self._devices) > 1:
+                    # ── Multi-GPU tensor-parallel dispatch ─────────────────────
+                    # For standard dense decoders (CPUExecutionEngine is what
+                    # load_engine_from_path returns for decoder-only AEGs), use
+                    # TorchTensorParallelAEGEngine when ≥2 devices are available.
+                    # This gives equal-weight sharding across all GPUs with no
+                    # manual configuration required (PRD §multi-gpu-equal-sharing).
+                    # Specialised architectures (MLA, SSM, encoder, seq2seq) have
+                    # their own cross-device wrappers and are dispatched below.
+                    _TP_ELIGIBLE_ENGINES = {"CPUExecutionEngine"}
+                    if engine_kind in _TP_ELIGIBLE_ENGINES and len(self._devices) > 1:
                         from aether.runtime.torch_tensor_parallel import TorchTensorParallelAEGEngine
-
+                        logger.info(
+                            "Activating tensor-parallel execution across %d GPUs: %s",
+                            len(self._devices),
+                            self._devices,
+                        )
                         engine = TorchTensorParallelAEGEngine(engine, self._devices)
                     elif engine_kind == "EncoderExecutionEngine":
                         engine = TorchEncoderAEGEngine(engine, self._device, self._devices)
