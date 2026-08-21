@@ -230,6 +230,10 @@ class KVCache:
     last_logits: np.ndarray | None = None
     #: Final normalized hidden state for an optional MTP drafter.
     last_hidden: np.ndarray | None = None
+    #: Allocated capacity and logical row count are tracked separately so
+    #: decode does not concatenate the complete KV history every token.
+    stored_lengths: list[int] = field(default_factory=list)
+    reserve_length: int = 0
 
     def __post_init__(self) -> None:
         if not self.keys:
@@ -237,6 +241,10 @@ class KVCache:
             self.values = [None] * self.num_layers
         if not self.positions:
             self.positions = [None] * self.num_layers
+        if not self.stored_lengths:
+            self.stored_lengths = [0] * self.num_layers
+        elif len(self.stored_lengths) != self.num_layers:
+            raise ValueError("stored_lengths must match num_layers")
 
     @property
     def length(self) -> int:
@@ -246,8 +254,23 @@ class KVCache:
     @property
     def stored_length(self) -> int:
         """Number of physically stored KV rows in the first layer."""
-        first = self.keys[0] if self.keys else None
-        return 0 if first is None else int(first.shape[0])
+        return self.stored_lengths[0] if self.stored_lengths else 0
+
+    def reserve(self, length: int) -> None:
+        """Request a future capacity without changing the logical cache."""
+        if length < 0:
+            raise ValueError("cache reserve length must be non-negative")
+        self.reserve_length = max(self.reserve_length, int(length))
+
+    def layer_view(self, layer: int) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        """Return valid KV rows, excluding geometric spare capacity."""
+        key = self.keys[layer]
+        value = self.values[layer]
+        positions = self.positions[layer]
+        if key is None or value is None or positions is None:
+            return None, None, None
+        length = self.stored_lengths[layer]
+        return key[:length], value[:length], positions[:length]
 
     def append(
         self,
@@ -276,17 +299,33 @@ class KVCache:
             positions = np.ascontiguousarray(positions, dtype=np.int64).reshape(-1)
             if positions.size != key.shape[0]:
                 raise ValueError("KV position count must match key/value sequence length")
+        current = self.stored_lengths[layer]
+        required = current + key.shape[0]
         if self.keys[layer] is None:
-            self.keys[layer] = key
-            self.values[layer] = value
-            self.positions[layer] = positions
-        else:
-            self.keys[layer] = np.concatenate([self.keys[layer], key], axis=0)
-            self.values[layer] = np.concatenate([self.values[layer], value], axis=0)
-            existing_positions = self.positions[layer]
-            if existing_positions is None:
-                raise ValueError("KV cache has values without token positions")
-            self.positions[layer] = np.concatenate([existing_positions, positions], axis=0)
+            capacity = max(required, self.reserve_length)
+            self.keys[layer] = np.empty((capacity, *key.shape[1:]), dtype=np.float32)
+            self.values[layer] = np.empty((capacity, *value.shape[1:]), dtype=np.float32)
+            self.positions[layer] = np.empty(capacity, dtype=np.int64)
+        elif required > self.keys[layer].shape[0]:
+            capacity = max(required, max(1, self.keys[layer].shape[0] * 2))
+            old_key, old_value, old_positions = self.layer_view(layer)
+            if old_key is None or old_value is None or old_positions is None:
+                raise ValueError("KV cache has incomplete layer state")
+            new_key = np.empty((capacity, *key.shape[1:]), dtype=np.float32)
+            new_value = np.empty((capacity, *value.shape[1:]), dtype=np.float32)
+            new_positions = np.empty(capacity, dtype=np.int64)
+            new_key[:current] = old_key
+            new_value[:current] = old_value
+            new_positions[:current] = old_positions
+            self.keys[layer], self.values[layer], self.positions[layer] = (
+                new_key, new_value, new_positions
+            )
+        if self.keys[layer] is None or self.values[layer] is None or self.positions[layer] is None:
+            raise ValueError("KV cache allocation failed")
+        self.keys[layer][current:required] = key
+        self.values[layer][current:required] = value
+        self.positions[layer][current:required] = positions
+        self.stored_lengths[layer] = required
         if update_length:
             self.logical_length = max(
                 self.logical_length,
@@ -295,7 +334,10 @@ class KVCache:
         stored_positions = self.positions[layer]
         if stored_positions is None:
             raise ValueError("KV cache append did not produce token positions")
-        return self.keys[layer], self.values[layer], stored_positions
+        stored_key, stored_value, stored_positions = self.layer_view(layer)
+        if stored_key is None or stored_value is None or stored_positions is None:
+            raise ValueError("KV cache append did not produce stored positions")
+        return stored_key, stored_value, stored_positions
 
     def replace_layer(
         self,
@@ -315,6 +357,7 @@ class KVCache:
         self.keys[layer] = key
         self.values[layer] = value
         self.positions[layer] = positions
+        self.stored_lengths[layer] = int(positions.size)
 
     def advance(self, token_count: int) -> None:
         """Advance the shared logical sequence length after a forward pass."""
@@ -332,6 +375,8 @@ class KVCache:
             logical_length=self.logical_length,
             last_logits=None if self.last_logits is None else self.last_logits.copy(),
             last_hidden=None if self.last_hidden is None else self.last_hidden.copy(),
+            stored_lengths=list(self.stored_lengths),
+            reserve_length=self.reserve_length,
         )
 
     def reset(self) -> None:
@@ -339,6 +384,8 @@ class KVCache:
         self.keys = [None] * self.num_layers
         self.values = [None] * self.num_layers
         self.positions = [None] * self.num_layers
+        self.stored_lengths = [0] * self.num_layers
+        self.reserve_length = 0
         self.logical_length = 0
         self.last_logits = None
         self.last_hidden = None
@@ -821,14 +868,27 @@ class CPUExecutionEngine:
         scale = 1.0 / np.sqrt(self.head_dim)
         repeats = self.num_heads // self.num_kv_heads
 
-        # Broadcast each KV head across the query heads that share it.
-        keys_full = np.repeat(keys, repeats, axis=1)
-        values_full = np.repeat(values, repeats, axis=1)
-
-        # (heads, seq, dim) @ (heads, dim, total) -> (heads, seq, total)
-        q = np.ascontiguousarray(query.transpose(1, 0, 2), dtype=np.float32)
-        k = np.ascontiguousarray(keys_full.transpose(1, 2, 0), dtype=np.float32)
-        scores = np.matmul(q, k) * scale
+        # Decode is memory-bandwidth bound.  For GQA, repeating K/V from
+        # ``num_kv_heads`` to ``num_heads`` allocates two full temporary
+        # tensors on every token.  Compute each query group against its shared
+        # KV head directly instead.  This is algebraically identical to the
+        # broadcast form but avoids O(T * H * D) copies in the hot loop.
+        if seq_len == 1 and repeats > 1:
+            q_grouped = np.ascontiguousarray(
+                query.transpose(1, 0, 2).reshape(self.num_kv_heads, repeats, self.head_dim),
+                dtype=np.float32,
+            )
+            keys_grouped = np.ascontiguousarray(keys, dtype=np.float32)
+            scores_grouped = np.einsum(
+                "hrd,thd->hrt", q_grouped, keys_grouped, optimize=True
+            )
+            scores = scores_grouped.reshape(self.num_heads, 1, total) * scale
+        else:
+            # (heads, seq, dim) @ (heads, dim, total) -> (heads, seq, total)
+            keys_full = np.repeat(keys, repeats, axis=1)
+            q = np.ascontiguousarray(query.transpose(1, 0, 2), dtype=np.float32)
+            k = np.ascontiguousarray(keys_full.transpose(1, 2, 0), dtype=np.float32)
+            scores = np.matmul(q, k) * scale
 
         if str(self.weights.position_type or "RoPE").lower() in {"alibi", "alibi_bias"}:
             # ALiBi's causal bias is slope * (key_position - query_position),
@@ -853,6 +913,14 @@ class CPUExecutionEngine:
         scores = np.where(allowed, scores, np.float32(-np.inf))
 
         weights = self.kernels.softmax(scores.reshape(-1, total)).reshape(scores.shape)
+        if seq_len == 1 and repeats > 1:
+            weights_grouped = weights.reshape(self.num_kv_heads, repeats, 1, total)[:, :, 0, :]
+            context_grouped = np.einsum(
+                "hrt,thd->hrd", weights_grouped, np.ascontiguousarray(values, dtype=np.float32),
+                optimize=True,
+            )
+            return context_grouped.reshape(1, self.num_heads, self.head_dim)
+        values_full = np.repeat(values, repeats, axis=1)
         v = np.ascontiguousarray(values_full.transpose(1, 0, 2), dtype=np.float32)
         context = np.matmul(weights, v)
         return context.transpose(1, 0, 2)
@@ -993,12 +1061,27 @@ class CPUExecutionEngine:
 
         for index, layer in enumerate(self.weights.layers):
             # ── Attention block ──
-            normed = self._norm(hidden, layer.attention_norm, layer.attention_norm_bias)
-            if ttt_slots is not None:
-                normed = self._apply_ttt_slot(
-                    normed, ttt_slots[index] if index < len(ttt_slots) else None
-                )
-            q = self._linear(normed, layer.q_proj, (index, "q_proj"), layer.q_proj_bias).reshape(seq_len, self.num_heads, self.head_dim)
+            # For decode (seq_len == 1) with no LoRA: use the fused
+            # rmsnorm_linear kernel to eliminate the intermediate normed buffer.
+            # With LoRA active we must keep the separate path so the delta can
+            # be applied after projection.
+            if (
+                seq_len == 1
+                and self.active_lora_adapter is None
+                and ttt_slots is None
+                and self.kernels.is_native
+            ):
+                q = self.kernels.rmsnorm_linear(
+                    hidden, layer.attention_norm, layer.q_proj, self.weights.norm_eps,
+                ).reshape(seq_len, self.num_heads, self.head_dim)
+                normed = self._norm(hidden, layer.attention_norm, layer.attention_norm_bias)
+            else:
+                normed = self._norm(hidden, layer.attention_norm, layer.attention_norm_bias)
+                if ttt_slots is not None:
+                    normed = self._apply_ttt_slot(
+                        normed, ttt_slots[index] if index < len(ttt_slots) else None
+                    )
+                q = self._linear(normed, layer.q_proj, (index, "q_proj"), layer.q_proj_bias).reshape(seq_len, self.num_heads, self.head_dim)
             if layer.q_norm is not None:
                 q = self.kernels.rmsnorm(q, layer.q_norm, self.weights.norm_eps)
             if uses_rope:
@@ -1006,9 +1089,7 @@ class CPUExecutionEngine:
 
             shared_source = self._cross_layer_kv_source(index)
             if shared_source is not None:
-                source_keys = cache.keys[shared_source]
-                source_values = cache.values[shared_source]
-                source_positions = cache.positions[shared_source]
+                source_keys, source_values, source_positions = cache.layer_view(shared_source)
                 if source_keys is None or source_values is None or source_positions is None:
                     raise ValueError(
                         f"cross-layer KV source {shared_source} has no computed cache"
@@ -1034,14 +1115,30 @@ class CPUExecutionEngine:
                     positions=np.arange(past, past + seq_len, dtype=np.int64),
                     update_length=False,
                 )
-            context = self._attention(
-                q,
-                keys,
-                values,
-                causal_offset=past,
-                key_positions=key_positions,
-                query_positions=np.arange(past, past + seq_len, dtype=np.int64),
-            )
+            # ── Attention computation ──
+            # For decode (seq_len == 1) with no sparse attention plan: use the
+            # native FlashAttention-2 kernel — O(seq*d) memory, no QKᵀ buffer.
+            if (
+                seq_len == 1
+                and self.sparse_attention_plan is None
+                and self.kernels.is_native
+                and str(self.weights.position_type or "RoPE").lower() not in {"alibi", "alibi_bias"}
+            ):
+                context = self.kernels.flash_attn(
+                    q.reshape(self.num_heads, self.head_dim),
+                    keys,
+                    values,
+                    num_kv_heads=self.num_kv_heads,
+                ).reshape(1, self.num_heads, self.head_dim)
+            else:
+                context = self._attention(
+                    q,
+                    keys,
+                    values,
+                    causal_offset=past,
+                    key_positions=key_positions,
+                    query_positions=np.arange(past, past + seq_len, dtype=np.int64),
+                )
             compressed_keys, compressed_values, compressed_positions = self._compress_semantic_kv(
                 cache, index, keys, values, key_positions
             )
@@ -1056,6 +1153,7 @@ class CPUExecutionEngine:
                 cache.keys[index] = cache.keys[shared_source]
                 cache.values[index] = cache.values[shared_source]
                 cache.positions[index] = cache.positions[shared_source]
+                cache.stored_lengths[index] = cache.stored_lengths[shared_source]
             attention_out = self._linear(
                 context.reshape(seq_len, self.num_heads * self.head_dim), layer.o_proj, (index, "o_proj"), layer.o_proj_bias
             )
@@ -1210,6 +1308,8 @@ class CPUExecutionEngine:
         if cache is None:
             if ids.size == 0:
                 raise ValueError("generate_iter() requires prompt tokens for a new cache")
+            cache = KVCache(num_layers=self.weights.num_layers)
+            cache.reserve(int(ids.size) + max(0, int(max_tokens)))
             logits, cache = self.forward(ids, ttt_slots=ttt_slots, adapter_id=adapter_id)
         elif ids.size:
             logits, cache = self.forward(ids, cache, ttt_slots=ttt_slots, adapter_id=adapter_id)

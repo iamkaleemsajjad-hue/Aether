@@ -35,6 +35,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import math
+import platform
 import sys
 import time
 from pathlib import Path
@@ -48,6 +51,10 @@ def _add_src_to_path() -> None:
 
 
 _add_src_to_path()
+
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 BOLD  = "\033[1m"
 DIM   = "\033[2m"
@@ -90,16 +97,19 @@ def _naive_tokenize(text: str, vocab_size: int = 50257) -> list[int]:
 
 
 def _try_load_tokenizer(package):
-    """Attempt to load the HuggingFace tokenizer for the compiled model."""
+    """Load the packaged tokenizer.json without importing Transformers."""
+    # A compiled artifact is self-contained.  The low-level ``tokenizers``
+    # package is enough for encode/decode and does not pull in PyTorch.  This
+    # keeps the CLI framework-free even when optional Transformers is installed.
+    tokenizer_root = getattr(package, "root", None)
+    tokenizer_path = None if tokenizer_root is None else Path(tokenizer_root) / "tokenizer" / "tokenizer.json"
+    if tokenizer_path is None or not tokenizer_path.exists():
+        return None
     try:
-        from transformers import AutoTokenizer  # type: ignore
-        manifest = package.manifest
-        if manifest is None:
-            return None
-        model_id = manifest.model_id
-        print(f"  {DIM}·{RESET} Loading tokenizer for {model_id}...")
-        tok = AutoTokenizer.from_pretrained(model_id)
-        print(f"  {GREEN}✓{RESET} Tokenizer loaded  (vocab={tok.vocab_size})")
+        from tokenizers import Tokenizer
+        print(f"  {DIM}·{RESET} Loading packaged tokenizer...")
+        tok = Tokenizer.from_file(str(tokenizer_path))
+        print(f"  {GREEN}✓{RESET} Tokenizer loaded  (vocab={tok.get_vocab_size()})")
         return tok
     except Exception:
         return None
@@ -107,7 +117,8 @@ def _try_load_tokenizer(package):
 
 def _encode(tokenizer, text: str, vocab_size: int) -> list[int]:
     if tokenizer is not None:
-        return tokenizer.encode(text)
+        encoded = tokenizer.encode(text)
+        return list(getattr(encoded, "ids", encoded))
     return _naive_tokenize(text, vocab_size)
 
 
@@ -117,8 +128,8 @@ def _decode(tokenizer, ids: list[int]) -> str:
     return "".join(chr(max(32, min(126, i % 95 + 32))) for i in ids)
 
 
-def _run_one(engine, tokenizer, prompt: str, args) -> tuple[str, float, float]:
-    """Run a single generation. Returns (output_text, ttft_s, total_s)."""
+def _run_one(engine, tokenizer, prompt: str, args) -> tuple[str, float, float, int]:
+    """Run one generation and return output, TTFT, elapsed time, and token count."""
     import numpy as np
 
     vocab_size = engine.weights.vocab_size
@@ -135,17 +146,21 @@ def _run_one(engine, tokenizer, prompt: str, args) -> tuple[str, float, float]:
     if tokenizer is not None and hasattr(tokenizer, "eos_token_id"):
         eos = tokenizer.eos_token_id
 
-    generated = engine.generate(
-        input_arr,
+    # Reuse the prefill KV cache.  Calling ``engine.generate(input_arr)`` here
+    # would prefill the prompt a second time and make the reported throughput
+    # depend on duplicate work rather than decode performance.
+    generated, _ = engine.generate_with_cache(
+        np.empty(0, dtype=np.int64),
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
         eos_token_id=eos,
+        cache=cache,
     )
     t_end = time.perf_counter()
 
     output = _decode(tokenizer, generated)
-    return output, t_ttft - t_start, t_end - t_start
+    return output, t_ttft - t_start, t_end - t_start, len(generated)
 
 
 def _print_generation(prompt: str, output: str, ttft: float, total: float, n_tokens: int) -> None:
@@ -164,18 +179,48 @@ def _benchmark_mode(engine, tokenizer, prompt: str, args) -> int:
     print(f"\n{BOLD}{CYAN}Benchmark mode — {args.iterations} iterations{RESET}")
     times: list[float] = []
     ttfts: list[float] = []
+    token_counts: list[int] = []
     for i in range(args.iterations):
-        _, ttft, total = _run_one(engine, tokenizer, prompt, args)
+        _, ttft, total, token_count = _run_one(engine, tokenizer, prompt, args)
         times.append(total)
         ttfts.append(ttft)
-        print(f"  iter {i+1:3d}/{args.iterations}  {total:.3f}s", end="\r")
+        token_counts.append(token_count)
+        print(f"  iter {i+1:3d}/{args.iterations}  {total:.3f}s  {token_count} tokens", end="\r")
     print()
 
-    tps_list = [args.max_tokens / t for t in times]
-    print(f"\n{BOLD}Results ({args.iterations} iterations, {args.max_tokens} tokens each):{RESET}")
-    print(f"  Throughput  mean={np.mean(tps_list):.1f}  min={np.min(tps_list):.1f}  max={np.max(tps_list):.1f}  tok/s")
-    print(f"  TTFT        mean={np.mean(ttfts)*1000:.1f}ms")
-    print(f"  Total       mean={np.mean(times)*1000:.1f}ms")
+    tps_list = [count / max(total, 1e-9) for count, total in zip(token_counts, times)]
+    steady_tps = tps_list[1:] if len(tps_list) > 1 else tps_list
+    steady_times = times[1:] if len(times) > 1 else times
+    steady_ttfts = ttfts[1:] if len(ttfts) > 1 else ttfts
+
+    def percentile(values: list[float], quantile: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = min(len(ordered) - 1, max(0, math.ceil(quantile * len(ordered)) - 1))
+        return ordered[index]
+
+    result = {
+        "prompt": prompt,
+        "iterations": args.iterations,
+        "requested_max_tokens": args.max_tokens,
+        "completion_tokens": token_counts,
+        "throughput_tok_s": tps_list,
+        "steady_throughput_tok_s": steady_tps,
+        "ttft_ms": [value * 1000.0 for value in ttfts],
+        "elapsed_ms": [value * 1000.0 for value in times],
+        "environment": {"platform": platform.platform(), "python": platform.python_version()},
+    }
+    print(f"\n{BOLD}Results ({args.iterations} iterations; measured completion tokens):{RESET}")
+    print(f"  Throughput  mean={np.mean(tps_list):.1f}  median={np.median(tps_list):.1f}  p95={percentile(tps_list, 0.95):.1f}  tok/s")
+    print(f"  Steady      mean={np.mean(steady_tps):.1f}  median={np.median(steady_tps):.1f}  tok/s (first iteration excluded)")
+    print(f"  TTFT        mean={np.mean(ttfts)*1000:.1f}ms  p95={percentile(steady_ttfts, 0.95)*1000:.1f}ms steady")
+    print(f"  Total       mean={np.mean(times)*1000:.1f}ms  p95={percentile(steady_times, 0.95)*1000:.1f}ms steady")
+    if args.benchmark_output:
+        output_path = Path(args.benchmark_output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print(f"  Saved       {output_path}")
     return 0
 
 
@@ -190,8 +235,8 @@ def _interactive_repl(engine, tokenizer, args) -> int:
         if not prompt:
             continue
         try:
-            output, ttft, total = _run_one(engine, tokenizer, prompt, args)
-            _print_generation(prompt, output, ttft, total, args.max_tokens)
+            output, ttft, total, token_count = _run_one(engine, tokenizer, prompt, args)
+            _print_generation(prompt, output, ttft, total, token_count)
         except Exception as exc:
             print(f"{RED}Error: {exc}{RESET}", file=sys.stderr)
     return 0
@@ -215,6 +260,8 @@ def main() -> int:
                         help="Run benchmark mode (requires --prompt)")
     parser.add_argument("--iterations", type=int, default=10,
                         help="Number of benchmark iterations (default: 10)")
+    parser.add_argument("--benchmark-output", type=Path,
+                        help="Write measured benchmark data as JSON")
 
     args = parser.parse_args()
     aeg_path = Path(args.aeg_path)
@@ -236,13 +283,13 @@ def main() -> int:
         prompts = Path(args.prompts_file).read_text().splitlines()
         prompts = [p.strip() for p in prompts if p.strip()]
         for p in prompts:
-            output, ttft, total = _run_one(engine, tokenizer, p, args)
-            _print_generation(p, output, ttft, total, args.max_tokens)
+            output, ttft, total, token_count = _run_one(engine, tokenizer, p, args)
+            _print_generation(p, output, ttft, total, token_count)
         return 0
 
     if args.prompt:
-        output, ttft, total = _run_one(engine, tokenizer, args.prompt, args)
-        _print_generation(args.prompt, output, ttft, total, args.max_tokens)
+        output, ttft, total, token_count = _run_one(engine, tokenizer, args.prompt, args)
+        _print_generation(args.prompt, output, ttft, total, token_count)
         return 0
 
     return _interactive_repl(engine, tokenizer, args)

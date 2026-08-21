@@ -27,6 +27,86 @@ class ShardingAxis:
     REPLICATED = "replicated"
 
 
+@dataclass(frozen=True)
+class DeviceCapacity:
+    """Measured capacity of one participant in a heterogeneous model mesh.
+
+    ``compute_units`` is a relative sustained-throughput estimate, not a
+    vendor peak.  ``memory_bytes`` is a hard placement constraint when it is
+    non-zero.  Keeping these values explicit prevents the common mistake of
+    treating a CPU and a GPU as equal workers merely because they are both
+    present.
+    """
+
+    device_id: str
+    kind: str
+    memory_bytes: int = 0
+    compute_units: float = 1.0
+    bandwidth_gbps: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not self.device_id:
+            raise ValueError("device_id must not be empty")
+        if self.compute_units <= 0 or self.bandwidth_gbps <= 0:
+            raise ValueError("device compute and bandwidth capacities must be positive")
+        if self.memory_bytes < 0:
+            raise ValueError("memory_bytes must be non-negative")
+
+
+def capacity_weighted_partition(length: int, capacities: list[float]) -> list[tuple[int, int]]:
+    """Partition ``length`` contiguously in proportion to device capacity.
+
+    For cumulative normalized capacity ``c_i`` the boundary is
+    ``b_i = floor(length * c_i / sum(c))``.  This is lossless, deterministic,
+    and minimizes the maximum fractional rounding error.  It is the placement
+    primitive used by the heterogeneous planner; unlike equal splitting it
+    gives a CPU a smaller shard when its measured throughput is lower.
+    """
+    if length < 0 or not capacities or any(value <= 0 for value in capacities):
+        raise ValueError("length must be non-negative and capacities must be positive")
+    # A tensor-parallel mesh may be wider than a particular tensor dimension
+    # (for example one KV head across eight ranks). Empty local shards are
+    # valid: concatenation reconstructs the global tensor and no weight is
+    # replicated merely to satisfy the mesh width.
+    if length < len(capacities):
+        return balanced_partition(length, len(capacities))
+    total = float(sum(capacities))
+    boundaries = [0]
+    cumulative = 0.0
+    for value in capacities[:-1]:
+        cumulative += float(value)
+        boundaries.append(int(length * cumulative / total))
+    boundaries.append(length)
+    ranges = list(zip(boundaries[:-1], boundaries[1:]))
+    if any(end <= start for start, end in ranges):
+        # Very skewed capacities can round a small shard to zero.  Allocate
+        # one item to each device and distribute the remainder proportionally.
+        ranges = balanced_partition(length, len(capacities))
+    return ranges
+
+
+def balanced_partition(length: int, parts: int) -> list[tuple[int, int]]:
+    """Return contiguous, lossless ranges with at most one element of skew.
+
+    The range for rank ``i`` is
+    ``[floor(i*length/parts), floor((i+1)*length/parts))``.  This is the
+    standard block partition used by model-parallel runtimes: every element is
+    assigned exactly once and ``max(range)-min(range) <= 1``.  In particular,
+    it avoids the common ``length // parts`` bug that silently drops remainder
+    rows when a hidden/intermediate dimension is not divisible by GPU count.
+
+    The invariant is the same equal-work objective used by tensor model
+    parallelism in Megatron-LM (Shoeybi et al., 2019), while allowing real
+    model dimensions that are not divisible by the device count.
+    """
+    if length < 0 or parts < 1:
+        raise ValueError("length must be non-negative and parts must be positive")
+    return [
+        ((index * length) // parts, ((index + 1) * length) // parts)
+        for index in range(parts)
+    ]
+
+
 @dataclass
 class TensorShard:
     """Description of a single shard of a tensor."""
@@ -85,11 +165,8 @@ class ShardingStrategy:
                 num_shards=1,
             )
         out_dim, in_dim = weight_shape
-        shard_out = (out_dim + self.tp_degree - 1) // self.tp_degree
         shards: list[TensorShard] = []
-        for i in range(self.tp_degree):
-            start = i * shard_out
-            end = min(start + shard_out, out_dim)
+        for i, (start, end) in enumerate(balanced_partition(out_dim, self.tp_degree)):
             shards.append(
                 TensorShard(
                     device_id=i,
@@ -109,11 +186,8 @@ class ShardingStrategy:
 
     def shard_attention_heads(self, tensor_name: str, num_heads: int, head_dim: int, batch_seq: tuple[int, int]) -> ShardingSpec:
         """Shard attention heads across the tensor parallel group."""
-        heads_per_shard = (num_heads + self.tp_degree - 1) // self.tp_degree
         shards: list[TensorShard] = []
-        for i in range(self.tp_degree):
-            start = i * heads_per_shard
-            end = min(start + heads_per_shard, num_heads)
+        for i, (start, end) in enumerate(balanced_partition(num_heads, self.tp_degree)):
             shards.append(
                 TensorShard(
                     device_id=i,
@@ -133,11 +207,8 @@ class ShardingStrategy:
 
     def shard_kv_cache(self, tensor_name: str, num_layers: int, num_kv_heads: int, head_dim: int, seq_len: int) -> ShardingSpec:
         """Shard KV cache heads across the tensor parallel group."""
-        heads_per_shard = (num_kv_heads + self.tp_degree - 1) // self.tp_degree
         shards: list[TensorShard] = []
-        for i in range(self.tp_degree):
-            start = i * heads_per_shard
-            end = min(start + heads_per_shard, num_kv_heads)
+        for i, (start, end) in enumerate(balanced_partition(num_kv_heads, self.tp_degree)):
             shards.append(
                 TensorShard(
                     device_id=i,

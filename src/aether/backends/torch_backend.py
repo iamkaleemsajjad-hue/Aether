@@ -14,45 +14,15 @@ import os
 import socket
 import time
 import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
+from aether.backends.compiled_handle import CompiledAEGHandle
 from aether.core.exceptions import BackendError
 from aether.core.hash_utils import compute_file_hash
-
-
-@dataclass
-class CompiledAEGHandle:
-    """Lightweight handle for locally compiled AEG artifacts.
-
-    This handle is used for a compiled artifact with a real executable engine
-    and tokenizer.  Session-scoped CPU KV caches are kept here rather than in
-    the global Runtime so independent models and tenants cannot accidentally
-    share state.
-    """
-
-    model_id: str
-    aeg_path: Path
-    manifest: dict[str, Any]
-    metadata: dict[str, Any] = field(default_factory=dict)
-    precision_map: dict[str, str] = field(default_factory=dict)
-    engine: Any | None = None
-    tokenizer: Any | None = None
-    lora_adapters: dict[str, dict[tuple[int, str], tuple[Any, Any, float]]] = field(default_factory=dict)
-    session_caches: dict[str, tuple[Any, Any]] = field(default_factory=dict)
-
-    def clear_session_cache(self, session_id: str) -> None:
-        """Release the incremental KV state owned by one agentic session."""
-        self.session_caches.pop(session_id, None)
-
-    @property
-    def architecture_family(self) -> str:
-        architecture = self.manifest.get("architecture", {})
-        return str(architecture.get("family", "unknown"))
 
 
 class TorchBackend(Backend):
@@ -76,6 +46,7 @@ class TorchBackend(Backend):
         self._models: dict[str, Any] = {}
         self._tokenizers: dict[str, Any] = {}
         self._device: str = "cpu"
+        self._devices: list[str] = ["cpu"]
         self._runtime_family: str = "cpu"
         self._allow_remote_code = False
         self._try_detect_device()
@@ -86,18 +57,71 @@ class TorchBackend(Backend):
             import torch
             if torch.cuda.is_available():
                 self._device = "cuda"
+                self._devices = [f"cuda:{index}" for index in range(torch.cuda.device_count())]
                 # ROCm is exposed as torch.cuda in many PyTorch builds.  The
                 # tensor device remains ``cuda`` but dispatch must distinguish
                 # the vendor runtime.
                 self._runtime_family = "rocm" if getattr(torch.version, "hip", None) else "cuda"
             elif torch.backends.mps.is_available():
                 self._device = "mps"
+                self._devices = ["mps"]
                 self._runtime_family = "metal"
             else:
                 self._device = "cpu"
+                self._devices = ["cpu"]
                 self._runtime_family = "cpu"
         except ImportError:
             self._device = "cpu"
+            self._devices = ["cpu"]
+            self._runtime_family = "cpu"
+
+    def _configure_devices(self, requested: list[str] | None) -> None:
+        """Apply an explicit single-copy execution mesh.
+
+        The default mesh contains every detected accelerator.  An explicit
+        mesh may also include ``cpu`` for heterogeneous model parallelism.
+        This method validates the mesh before any model tensor is materialized;
+        it never falls back to a replicated ``device_map='auto'`` load.
+        """
+        values = requested
+        if values is None:
+            raw = os.environ.get("AETHER_EXECUTION_DEVICES", "").strip()
+            values = [item.strip() for item in raw.split(",") if item.strip()] or None
+        if values is None:
+            return
+        normalized = ["cpu" if item == "cpu:0" else item for item in values]
+        if len(set(normalized)) != len(normalized):
+            raise BackendError("execution device mesh contains duplicate device IDs", backend_name=self.name)
+        for device in normalized:
+            if device == "cpu":
+                continue
+            if device.startswith("cuda:"):
+                try:
+                    index = int(device.split(":", 1)[1])
+                except ValueError as exc:
+                    raise BackendError(f"invalid CUDA device ID {device!r}", backend_name=self.name) from exc
+                import torch
+                if not torch.cuda.is_available() or index < 0 or index >= torch.cuda.device_count():
+                    raise BackendError(f"requested CUDA device {device!r} is unavailable", backend_name=self.name)
+                continue
+            if device == "mps":
+                import torch
+                if not torch.backends.mps.is_available():
+                    raise BackendError("requested MPS device is unavailable", backend_name=self.name)
+                continue
+            raise BackendError(f"unsupported execution device {device!r}", backend_name=self.name)
+        if not normalized:
+            raise BackendError("execution device mesh must not be empty", backend_name=self.name)
+        self._devices = normalized
+        self._device = next((item for item in normalized if item != "cpu"), normalized[0])
+        kinds = {"cpu" if item == "cpu" else item.split(":", 1)[0] for item in normalized}
+        if len(kinds) > 1:
+            self._runtime_family = "heterogeneous"
+        elif "cuda" in kinds:
+            self._runtime_family = "rocm" if getattr(torch.version, "hip", None) else "cuda"
+        elif "mps" in kinds:
+            self._runtime_family = "metal"
+        else:
             self._runtime_family = "cpu"
 
     def is_available(self) -> bool:
@@ -116,11 +140,17 @@ class TorchBackend(Backend):
         if target_id.startswith("cpu_"):
             return self._runtime_family == "cpu"
         if target_id.startswith("cuda_"):
-            return self._runtime_family == "cuda"
+            return self._runtime_family in {"cuda", "heterogeneous"} and any(
+                device.startswith("cuda:") for device in self._devices
+            )
         if target_id.startswith("rocm_"):
-            return self._runtime_family == "rocm"
+            return self._runtime_family in {"rocm", "heterogeneous"} and any(
+                device.startswith("cuda:") for device in self._devices
+            )
         if target_id.startswith("metal_"):
-            return self._runtime_family == "metal"
+            return self._runtime_family in {"metal", "heterogeneous"} and any(
+                device == "mps" for device in self._devices
+            )
         return target_id in self.info.supported_targets
 
     def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
@@ -136,6 +166,8 @@ class TorchBackend(Backend):
         """
         if model_id in self._models:
             return self._models[model_id]
+
+        self._configure_devices(kwargs.get("execution_devices"))
 
         compiled_handle = self._try_load_compiled_aeg(model_id, aeg_path)
         if compiled_handle is not None:
@@ -159,7 +191,7 @@ class TorchBackend(Backend):
         # particular, passing ``offline`` or ``download_timeout_s`` through to
         # Transformers can make otherwise valid local/HF loads fail or be
         # interpreted by custom config classes.
-        control_keys = {"offline", "download_timeout_s", "trust_remote_code"}
+        control_keys = {"offline", "download_timeout_s", "trust_remote_code", "execution_devices"}
         load_kwargs.update(
             {key: value for key, value in kwargs.items() if key not in control_keys}
         )
@@ -245,20 +277,24 @@ class TorchBackend(Backend):
                     )
 
                     engine_kind = engine.__class__.__name__
-                    if engine_kind == "EncoderExecutionEngine":
-                        engine = TorchEncoderAEGEngine(engine, self._device)
+                    if engine_kind == "CPUExecutionEngine" and len(self._devices) > 1:
+                        from aether.runtime.torch_tensor_parallel import TorchTensorParallelAEGEngine
+
+                        engine = TorchTensorParallelAEGEngine(engine, self._devices)
+                    elif engine_kind == "EncoderExecutionEngine":
+                        engine = TorchEncoderAEGEngine(engine, self._device, self._devices)
                     elif engine_kind == "Seq2SeqExecutionEngine":
-                        engine = TorchSeq2SeqAEGEngine(engine, self._device)
+                        engine = TorchSeq2SeqAEGEngine(engine, self._device, self._devices)
                     elif engine_kind == "HybridExecutionEngine":
-                        engine = TorchHybridAEGEngine(engine, self._device)
+                        engine = TorchHybridAEGEngine(engine, self._device, self._devices)
                     elif engine_kind == "MLAExecutionEngine":
-                        engine = TorchMLAAEGEngine(engine, self._device)
+                        engine = TorchMLAAEGEngine(engine, self._device, self._devices)
                     elif engine_kind == "MambaExecutionEngine":
-                        engine = TorchMambaAEGEngine(engine, self._device)
+                        engine = TorchMambaAEGEngine(engine, self._device, self._devices)
                     elif engine_kind == "Mamba2ExecutionEngine":
-                        engine = TorchMamba2AEGEngine(engine, self._device)
+                        engine = TorchMamba2AEGEngine(engine, self._device, self._devices)
                     elif engine_kind == "RWKVExecutionEngine":
-                        engine = TorchRWKVAEGEngine(engine, self._device)
+                        engine = TorchRWKVAEGEngine(engine, self._device, self._devices)
                     else:
                         engine = TorchAEGEngine(engine, self._device)
                 tokenizer_root = root / "tokenizer"

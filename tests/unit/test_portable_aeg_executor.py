@@ -56,6 +56,34 @@ def test_torch_portable_executor_matches_reference_cpu() -> None:
     assert actual_ids == expected_ids
 
 
+def test_torch_portable_executor_applies_grammar_token_mask() -> None:
+    pytest.importorskip("torch")
+    from aether.runtime.torch_engine import TorchAEGEngine
+
+    class Session:
+        def __init__(self) -> None:
+            self.advanced: list[int] = []
+
+        def get_token_mask(self) -> bytearray:
+            mask = bytearray(3)
+            mask[7 // 8] |= 1 << (7 % 8)
+            return mask
+
+        def advance(self, token_id: int) -> int:
+            self.advanced.append(token_id)
+            return 0 if token_id == 7 else -1
+
+    session = Session()
+    tokens = TorchAEGEngine(_tiny_engine(), "cpu").generate(
+        np.asarray([1], dtype=np.int64),
+        max_tokens=3,
+        temperature=0.0,
+        grammar_session=session,
+    )
+    assert tokens == [7, 7, 7]
+    assert session.advanced == tokens
+
+
 def test_torch_portable_executor_rejects_unsupported_optimized_cache_plans() -> None:
     pytest.importorskip("torch")
     from aether.runtime.torch_engine import TorchAEGEngine

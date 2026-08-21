@@ -26,14 +26,25 @@ class BackendRegistry:
 
     def _discover_backends(self) -> None:
         """Discover backends from built-in list and entry points."""
+        # PRD §3: Aether is PyTorch-independent at runtime. The priority order
+        # ensures that the native CPU engine is always tried first (no external
+        # dependencies), followed by optional accelerator runtimes, with the
+        # PyTorch backend reserved as a last-resort fallback.
         builtin_backends = [
+            # 1. Always available — pure numpy + compiled C++ (no PyTorch needed)
             "aether.backends.native_cpu_backend:NativeCPUBackend",
-            "aether.backends.torch_backend:TorchBackend",
+            # 2. ONNX Runtime — fast CPU/GPU inference without PyTorch
             "aether.backends.onnx_backend:ONNXBackend",
-            "aether.backends.vllm_backend:vLLMBackend",
+            # 3. llama.cpp — optimised native CPU inference with GGUF models
             "aether.backends.llamacpp_backend:LlamaCppBackend",
-            "aether.backends.trtllm_backend:TensorRTLLMBackend",
+            # 4. Apple MLX — Apple Silicon (Metal) without PyTorch
             "aether.backends.mlx_backend:MLXBackend",
+            # 5. vLLM — high-throughput GPU serving
+            "aether.backends.vllm_backend:vLLMBackend",
+            # 6. TensorRT-LLM — NVIDIA optimised GPU serving
+            "aether.backends.trtllm_backend:TensorRTLLMBackend",
+            # 7. PyTorch — LAST RESORT; requires torch + transformers installed
+            "aether.backends.torch_backend:TorchBackend",
         ]
 
         for backend_ref in builtin_backends:

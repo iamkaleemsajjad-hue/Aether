@@ -20,9 +20,38 @@ from aether.core.constants import (
 from aether.core.exceptions import ParallelismError
 from aether.core.types import ModelArchitecture, ShardingPlan
 from aether.parallelism.mesh import DeviceMesh
+from aether.parallelism.sharding import DeviceCapacity, capacity_weighted_partition
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class HeterogeneousShardingPlan:
+    """One model-wide placement plan for mixed CPU/GPU/NPU execution."""
+
+    phase: str
+    devices: tuple[DeviceCapacity, ...]
+    weight_ranges: dict[str, tuple[int, int]]
+    weight_fractions: dict[str, float]
+    model_copies: int
+    estimated_weight_bytes: int
+    estimated_all_reduce_bytes: int
+    bottleneck_time_units: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "format": "aether_heterogeneous_sharding_v1",
+            "phase": self.phase,
+            "model_copies": self.model_copies,
+            "devices": [device.__dict__ for device in self.devices],
+            "weight_ranges": {key: list(value) for key, value in self.weight_ranges.items()},
+            "weight_fractions": self.weight_fractions,
+            "estimated_weight_bytes": self.estimated_weight_bytes,
+            "estimated_all_reduce_bytes": self.estimated_all_reduce_bytes,
+            "bottleneck_time_units": self.bottleneck_time_units,
+            "invariant": "each weight element has exactly one device owner",
+        }
 
 
 @dataclass
@@ -64,11 +93,9 @@ class ParallelismPlanner:
         self.architecture = architecture
 
     def generate_plans(self, max_gpus: int = 8) -> dict[int, ShardingPlan]:
-        """Generate sharding plans for 1, 2, 4, ..., max_gpus."""
+        """Generate plans for every available GPU count up to ``max_gpus``."""
         plans: dict[int, ShardingPlan] = {}
         for num_gpus in range(1, max_gpus + 1):
-            if num_gpus & (num_gpus - 1) != 0 and num_gpus != 1:
-                continue
             try:
                 plans[num_gpus] = self.plan_for_gpus(num_gpus)
             except ParallelismError as exc:
@@ -81,7 +108,12 @@ class ParallelismPlanner:
             msg = "num_gpus must be >= 1"
             raise ParallelismError(msg)
 
-        config = self._search_config(num_gpus, phase)
+        # For inference, the portable default is a single model-wide tensor
+        # partition.  It guarantees that each physical GPU owns one shard of
+        # every splittable projection rather than receiving a full replica.
+        # Pipeline/context parallelism remains available through explicit plans,
+        # but is not silently selected for a normal multi-GPU request.
+        config = ParallelismConfig(tensor_parallel_degree=num_gpus)
         memory_per_gpu = self._estimate_memory_per_gpu(config, phase)
         return ShardingPlan(
             num_gpus=num_gpus,
@@ -91,6 +123,67 @@ class ParallelismPlanner:
             expert_parallel_degree=config.expert_parallel_degree,
             context_parallel_degree=config.context_parallel_degree,
             memory_per_gpu_gb=memory_per_gpu,
+        )
+
+    def plan_for_devices(
+        self,
+        devices: list[DeviceCapacity],
+        phase: str = "decode",
+        precision_bits: float = 16.0,
+    ) -> HeterogeneousShardingPlan:
+        """Build a capacity-weighted, single-copy plan for any device mix.
+
+        ``compute_units`` determines the work share; ``memory_bytes`` is a
+        hard placement constraint when known.  The resulting ranges describe
+        model weights, while activations are transient collective buffers and
+        are not counted as extra model replicas.
+        """
+        if not devices:
+            raise ParallelismError("at least one execution device is required")
+        if precision_bits <= 0:
+            raise ParallelismError("precision_bits must be positive")
+        total_bytes = max(
+            1,
+            int(self.architecture.params_billion * 1_000_000_000 * precision_bits / 8.0),
+        )
+        ranges = capacity_weighted_partition(
+            total_bytes, [device.compute_units for device in devices]
+        )
+        weight_ranges = {
+            device.device_id: value for device, value in zip(devices, ranges)
+        }
+        fractions = {
+            device.device_id: (end - start) / total_bytes
+            for device, (start, end) in zip(devices, ranges)
+        }
+        for device, (start, end) in zip(devices, ranges):
+            assigned = end - start
+            if device.memory_bytes and assigned > int(device.memory_bytes * 0.90):
+                raise ParallelismError(
+                    f"device {device.device_id!r} cannot hold its model shard: "
+                    f"{assigned} > 90% of {device.memory_bytes} bytes"
+                )
+        activation_bytes = int(
+            self.architecture.hidden_size * max(1, self.architecture.layers) * precision_bits / 8.0
+        )
+        participants = len(devices)
+        all_reduce_bytes = int(activation_bytes * 2.0 * (participants - 1) / participants)
+        work_time = max(
+            fractions[device.device_id] / device.compute_units for device in devices
+        )
+        communication_time = max(
+            all_reduce_bytes / (device.bandwidth_gbps * 1_000_000_000)
+            for device in devices
+        )
+        return HeterogeneousShardingPlan(
+            phase=phase,
+            devices=tuple(devices),
+            weight_ranges=weight_ranges,
+            weight_fractions=fractions,
+            model_copies=1,
+            estimated_weight_bytes=total_bytes,
+            estimated_all_reduce_bytes=all_reduce_bytes,
+            bottleneck_time_units=work_time + communication_time,
         )
 
     def _search_config(self, num_gpus: int, phase: str) -> ParallelismConfig:

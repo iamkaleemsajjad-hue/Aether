@@ -86,6 +86,15 @@ class RuntimeConfig:
     backend_name: str | None = None
     """Force a specific backend. None = auto-select."""
 
+    execution_devices: list[str] | None = None
+    """Explicit model-parallel device mesh, e.g. ``['cuda:0', 'cuda:1']``.
+
+    When omitted, an accelerator backend uses every compatible accelerator it
+    detects.  Supplying ``cpu`` alongside accelerator IDs enables the
+    heterogeneous path; the runtime shards one model across that mesh rather
+    than creating one full model replica per device.
+    """
+
     model_cache_dir: str | None = None
     """Custom model cache directory."""
 
@@ -212,6 +221,11 @@ class RuntimeConfig:
             raise RuntimeConfigError("multi_agent_kv_mode must be relay, kvcomm, droidspeak, or swarm")
         if self.mcp_timeout_ms <= 0:
             raise RuntimeConfigError("mcp_timeout_ms must be positive")
+        if self.execution_devices is not None:
+            if not self.execution_devices or len(set(self.execution_devices)) != len(self.execution_devices):
+                raise RuntimeConfigError("execution_devices must be a non-empty list of unique IDs")
+            if any(not isinstance(device, str) or not device.strip() for device in self.execution_devices):
+                raise RuntimeConfigError("execution_devices must contain non-empty strings")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -231,6 +245,7 @@ class RuntimeConfig:
             "default_max_tokens": self.default_max_tokens,
             "default_top_p": self.default_top_p,
             "backend_name": self.backend_name,
+            "execution_devices": list(self.execution_devices) if self.execution_devices is not None else None,
             "model_cache_dir": self.model_cache_dir,
             "model_download_timeout_s": self.model_download_timeout_s,
             "hf_offline": self.hf_offline,
@@ -285,6 +300,10 @@ class RuntimeConfig:
             default_max_tokens=data.get("default_max_tokens", DEFAULT_MAX_TOKENS),
             default_top_p=data.get("default_top_p", DEFAULT_TOP_P),
             backend_name=data.get("backend_name"),
+            execution_devices=(
+                list(data["execution_devices"])
+                if data.get("execution_devices") is not None else None
+            ),
             model_cache_dir=data.get("model_cache_dir"),
             model_download_timeout_s=data.get("model_download_timeout_s", 30.0),
             hf_offline=data.get("hf_offline", False),
@@ -342,6 +361,12 @@ class RuntimeConfig:
             config.server_port = int(os.environ["AETHER_SERVER_PORT"])
         if "AETHER_BACKEND" in os.environ:
             config.backend_name = os.environ["AETHER_BACKEND"]
+        if "AETHER_EXECUTION_DEVICES" in os.environ:
+            config.execution_devices = [
+                item.strip()
+                for item in os.environ["AETHER_EXECUTION_DEVICES"].split(",")
+                if item.strip()
+            ]
         if "AETHER_MODEL_DOWNLOAD_TIMEOUT_S" in os.environ:
             config.model_download_timeout_s = float(os.environ["AETHER_MODEL_DOWNLOAD_TIMEOUT_S"])
         if "AETHER_HF_OFFLINE" in os.environ:

@@ -109,12 +109,13 @@ class TorchAEGEngine:
         converted["num_activated_experts"] = int(getattr(layer, "num_activated_experts", 1) or 1)
         return converted
 
-    def _ensure_rope(self, required: int) -> None:
-        if self._cos is not None and int(self._cos.shape[0]) >= required:
+    def _ensure_rope(self, required: int, device: Any | None = None) -> None:
+        device = device or self.device
+        if self._cos is not None and int(self._cos.shape[0]) >= required and self._cos.device == device:
             return
         half = self.head_dim // 2
-        positions = self.torch.arange(required, device=self.device, dtype=self.torch.float32)[:, None]
-        exponent = self.torch.arange(half, device=self.device, dtype=self.torch.float32) * (2.0 / self.head_dim)
+        positions = self.torch.arange(required, device=device, dtype=self.torch.float32)[:, None]
+        exponent = self.torch.arange(half, device=device, dtype=self.torch.float32) * (2.0 / self.head_dim)
         inv_freq = self.weights.rope_theta ** (-exponent)
         angles = positions * inv_freq[None, :]
         self._cos = self.torch.cos(angles)
@@ -282,8 +283,6 @@ class TorchAEGEngine:
                       top_k: int = 0, top_p: float = 1.0, eos_token_id: int | None = None,
                       cache: TorchKVCache | None = None, cache_callback: Any | None = None,
                       grammar_session: Any | None = None, **_: Any) -> Iterator[int]:
-        if grammar_session is not None:
-            raise ValueError("grammar-constrained decoding is not implemented by the portable PyTorch executor")
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         ids = np.asarray(prompt_ids, dtype=np.int64).reshape(-1)
@@ -296,16 +295,34 @@ class TorchAEGEngine:
             raise ValueError("generation requires prompt ids or a populated cache")
         generated: list[int] = []
         for _ in range(int(max_tokens)):
+            if grammar_session is not None:
+                mask = grammar_session.get_token_mask()
+                if len(mask) * 8 < int(next_logits.numel()):
+                    raise ValueError("Grammar FSM vocabulary is smaller than model vocabulary")
+                allowed = self.torch.tensor(
+                    [
+                        (mask[index // 8] & (1 << (index % 8))) != 0
+                        for index in range(int(next_logits.numel()))
+                    ],
+                    dtype=self.torch.bool,
+                    device=next_logits.device,
+                )
+                if not bool(self.torch.any(allowed).item()):
+                    raise ValueError("Grammar FSM has no valid next token")
+                next_logits = next_logits.masked_fill(~allowed, -torch_inf(self.torch, next_logits.dtype))
             token = self._sample(next_logits, temperature, top_k, top_p)
+            if grammar_session is not None and grammar_session.advance(token) < 0:
+                raise ValueError("The portable PyTorch executor produced a token rejected by the grammar FSM")
             generated.append(token)
             yield token
+            if grammar_session is not None and getattr(grammar_session, "is_accepting", lambda: False)():
+                break
             if eos_token_id is not None and token == int(eos_token_id):
                 break
             _, cache = self.forward(np.asarray([token], dtype=np.int64), cache)
             next_logits = cache.last_logits
         if cache_callback is not None and cache is not None:
             cache_callback(cache)
-
     def generate(self, prompt_ids: np.ndarray, max_tokens: int = 16, **kwargs: Any) -> list[int]:
         return list(self.generate_iter(prompt_ids, max_tokens=max_tokens, **kwargs))
 
@@ -356,13 +373,14 @@ class TorchHybridAEGEngine:
     model-family name is consulted at runtime.
     """
 
-    def __init__(self, hybrid_engine: Any, device: str) -> None:
+    def __init__(self, hybrid_engine: Any, device: str, devices: list[str] | None = None) -> None:
         try:
             import torch
         except ImportError as exc:  # pragma: no cover - guarded by backend
             raise RuntimeError("PyTorch is required for portable hybrid execution") from exc
         self.torch = torch
         self.device = torch.device(device)
+        self.devices = [torch.device(value) for value in (devices or [device])]
         self.source_engine = hybrid_engine
         self.weights = hybrid_engine.weights
         self.layer_types = [str(value).lower() for value in hybrid_engine.layer_types]
@@ -370,6 +388,7 @@ class TorchHybridAEGEngine:
         self.num_kv_heads = int(hybrid_engine.num_kv_heads)
         self.head_dim = int(hybrid_engine._transformer.head_dim)
         self.num_layers = len(self.layer_types)
+        self.layer_devices = [self.devices[index % len(self.devices)] for index in range(self.num_layers)]
         self.state_size = int(hybrid_engine._mamba.state_size)
         self.inner_size = int(hybrid_engine._mamba.inner_size)
         self.dt_rank = int(hybrid_engine._mamba.dt_rank)
@@ -382,58 +401,60 @@ class TorchHybridAEGEngine:
         self.final_norm_bias = self._optional_tensor(self.weights.final_norm_bias)
         self.position_embedding = self._optional_tensor(self.weights.position_embedding)
         self.layers: list[dict[str, Any | None]] = []
-        for layer in self.weights.layers:
+        for index, layer in enumerate(self.weights.layers):
+            layer_device = self.layer_devices[index]
             transformer = layer.transformer
             mamba = layer.mamba
             if transformer is None or mamba is None:
                 raise ValueError("hybrid artifact contains an incomplete layer representation")
             self.layers.append({
-                "attention_norm": self._tensor(transformer.attention_norm),
-                "attention_norm_bias": self._optional_tensor(transformer.attention_norm_bias),
-                "q_proj": self._tensor(transformer.q_proj),
-                "k_proj": self._tensor(transformer.k_proj),
-                "v_proj": self._tensor(transformer.v_proj),
-                "o_proj": self._tensor(transformer.o_proj),
-                "q_proj_bias": self._optional_tensor(transformer.q_proj_bias),
-                "k_proj_bias": self._optional_tensor(transformer.k_proj_bias),
-                "v_proj_bias": self._optional_tensor(transformer.v_proj_bias),
-                "o_proj_bias": self._optional_tensor(transformer.o_proj_bias),
-                "ffn_norm": self._tensor(transformer.ffn_norm),
-                "ffn_norm_bias": self._optional_tensor(transformer.ffn_norm_bias),
-                "gate_proj": self._optional_tensor(transformer.gate_proj),
-                "up_proj": self._optional_tensor(transformer.up_proj),
-                "down_proj": self._optional_tensor(transformer.down_proj),
-                "gate_proj_bias": self._optional_tensor(transformer.gate_proj_bias),
-                "up_proj_bias": self._optional_tensor(transformer.up_proj_bias),
-                "down_proj_bias": self._optional_tensor(transformer.down_proj_bias),
-                "q_norm": self._optional_tensor(transformer.q_norm),
-                "k_norm": self._optional_tensor(transformer.k_norm),
-                "ssm_norm": self._tensor(mamba.norm),
-                "ssm_in_proj": self._tensor(mamba.in_proj),
-                "ssm_conv1d": self._tensor(mamba.conv1d),
-                "ssm_x_proj": self._tensor(mamba.x_proj),
-                "ssm_dt_proj": self._tensor(mamba.dt_proj),
-                "ssm_a_log": self._tensor(mamba.a_log),
-                "ssm_d": self._tensor(mamba.d),
-                "ssm_out_proj": self._tensor(mamba.out_proj),
-                "ssm_conv_bias": self._optional_tensor(mamba.conv_bias),
-                "ssm_dt_bias": self._optional_tensor(mamba.dt_bias),
+                "attention_norm": self._tensor(transformer.attention_norm, layer_device),
+                "attention_norm_bias": self._optional_tensor(transformer.attention_norm_bias, layer_device),
+                "q_proj": self._tensor(transformer.q_proj, layer_device),
+                "k_proj": self._tensor(transformer.k_proj, layer_device),
+                "v_proj": self._tensor(transformer.v_proj, layer_device),
+                "o_proj": self._tensor(transformer.o_proj, layer_device),
+                "q_proj_bias": self._optional_tensor(transformer.q_proj_bias, layer_device),
+                "k_proj_bias": self._optional_tensor(transformer.k_proj_bias, layer_device),
+                "v_proj_bias": self._optional_tensor(transformer.v_proj_bias, layer_device),
+                "o_proj_bias": self._optional_tensor(transformer.o_proj_bias, layer_device),
+                "ffn_norm": self._tensor(transformer.ffn_norm, layer_device),
+                "ffn_norm_bias": self._optional_tensor(transformer.ffn_norm_bias, layer_device),
+                "gate_proj": self._optional_tensor(transformer.gate_proj, layer_device),
+                "up_proj": self._optional_tensor(transformer.up_proj, layer_device),
+                "down_proj": self._optional_tensor(transformer.down_proj, layer_device),
+                "gate_proj_bias": self._optional_tensor(transformer.gate_proj_bias, layer_device),
+                "up_proj_bias": self._optional_tensor(transformer.up_proj_bias, layer_device),
+                "down_proj_bias": self._optional_tensor(transformer.down_proj_bias, layer_device),
+                "q_norm": self._optional_tensor(transformer.q_norm, layer_device),
+                "k_norm": self._optional_tensor(transformer.k_norm, layer_device),
+                "ssm_norm": self._tensor(mamba.norm, layer_device),
+                "ssm_in_proj": self._tensor(mamba.in_proj, layer_device),
+                "ssm_conv1d": self._tensor(mamba.conv1d, layer_device),
+                "ssm_x_proj": self._tensor(mamba.x_proj, layer_device),
+                "ssm_dt_proj": self._tensor(mamba.dt_proj, layer_device),
+                "ssm_a_log": self._tensor(mamba.a_log, layer_device),
+                "ssm_d": self._tensor(mamba.d, layer_device),
+                "ssm_out_proj": self._tensor(mamba.out_proj, layer_device),
+                "ssm_conv_bias": self._optional_tensor(mamba.conv_bias, layer_device),
+                "ssm_dt_bias": self._optional_tensor(mamba.dt_bias, layer_device),
             })
         self._cos: Any | None = None
         self._sin: Any | None = None
 
-    def _tensor(self, value: Any) -> Any:
-        return self.torch.as_tensor(np.asarray(value, dtype=np.float32), device=self.device)
+    def _tensor(self, value: Any, device: Any | None = None) -> Any:
+        return self.torch.as_tensor(np.asarray(value, dtype=np.float32), device=device or self.device)
 
-    def _optional_tensor(self, value: Any | None) -> Any | None:
-        return None if value is None else self._tensor(value)
+    def _optional_tensor(self, value: Any | None, device: Any | None = None) -> Any | None:
+        return None if value is None else self._tensor(value, device)
 
-    def _ensure_rope(self, required: int) -> None:
-        if self._cos is not None and int(self._cos.shape[0]) >= required:
+    def _ensure_rope(self, required: int, device: Any | None = None) -> None:
+        device = device or self.device
+        if self._cos is not None and int(self._cos.shape[0]) >= required and self._cos.device == device:
             return
         half = self.head_dim // 2
-        positions = self.torch.arange(required, device=self.device, dtype=self.torch.float32)[:, None]
-        exponent = self.torch.arange(half, device=self.device, dtype=self.torch.float32) * (2.0 / self.head_dim)
+        positions = self.torch.arange(required, device=device, dtype=self.torch.float32)[:, None]
+        exponent = self.torch.arange(half, device=device, dtype=self.torch.float32) * (2.0 / self.head_dim)
         inv_freq = float(self.weights.rope_theta) ** (-exponent)
         angles = positions * inv_freq[None, :]
         self._cos, self._sin = self.torch.cos(angles), self.torch.sin(angles)
@@ -501,9 +522,9 @@ class TorchHybridAEGEngine:
         if layer["k_norm"] is not None:
             key = self._norm(key, layer["k_norm"])
         uses_rope = str(self.weights.position_type or "RoPE").lower() in {"rope", "rotary", "rotary_embedding"}
-        positions = torch.tensor([past], device=self.device, dtype=torch.long)
+        positions = torch.tensor([past], device=hidden.device, dtype=torch.long)
         if uses_rope:
-            self._ensure_rope(past + 1)
+            self._ensure_rope(past + 1, hidden.device)
             query, key = self._rope(query, positions), self._rope(key, positions)
         if cache.keys[index] is None:
             keys, values = key, value
@@ -548,8 +569,8 @@ class TorchHybridAEGEngine:
         return TorchHybridCache(
             keys=[None] * self.num_layers,
             values=[None] * self.num_layers,
-            states=[torch.zeros((1, self.inner_size, self.state_size), device=self.device) for _ in range(self.num_layers)],
-            conv_history=[torch.zeros((1, self.inner_size, max(self.conv_kernel - 1, 0)), device=self.device) for _ in range(self.num_layers)],
+            states=[torch.zeros((1, self.inner_size, self.state_size), device=device) for device in self.layer_devices],
+            conv_history=[torch.zeros((1, self.inner_size, max(self.conv_kernel - 1, 0)), device=device) for device in self.layer_devices],
         )
 
     def forward(self, token_ids: np.ndarray | Any, cache: TorchHybridCache | None = None) -> tuple[np.ndarray, TorchHybridCache]:
@@ -570,8 +591,9 @@ class TorchHybridAEGEngine:
                 if self.position_embedding is not None:
                     hidden = hidden + self.position_embedding[past:past + 1]
                 for index, kind in enumerate(self.layer_types):
+                    hidden = hidden.to(self.layer_devices[index])
                     hidden = self._ssm_step(hidden, index, cache) if kind == "ssm" else self._attention_step(hidden, index, cache, past)
-                hidden = self._norm(hidden, self.final_norm, self.final_norm_bias)
+                hidden = self._norm(hidden.to(self.device), self.final_norm, self.final_norm_bias)
                 logits = self._linear(hidden, self.lm_head)
                 outputs.append(logits[0])
                 cache.length += 1
@@ -597,7 +619,8 @@ class TorchHybridAEGEngine:
 
     def generate_iter(self, prompt_ids: np.ndarray, max_tokens: int = 16, temperature: float = 0.0,
                       top_k: int = 0, top_p: float = 1.0, eos_token_id: int | None = None,
-                      cache: TorchHybridCache | None = None, cache_callback: Any | None = None, **_: Any) -> Iterator[int]:
+                      cache: TorchHybridCache | None = None, cache_callback: Any | None = None,
+                      grammar_session: Any | None = None, **_: Any) -> Iterator[int]:
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         prompt = np.asarray(prompt_ids, dtype=np.int64).reshape(-1)
@@ -609,8 +632,25 @@ class TorchHybridAEGEngine:
         else:
             raise ValueError("generation requires prompt ids or a populated cache")
         for _ in range(int(max_tokens)):
+            if grammar_session is not None:
+                mask = grammar_session.get_token_mask()
+                if len(mask) * 8 < int(next_logits.numel()):
+                    raise ValueError("Grammar FSM vocabulary is smaller than model vocabulary")
+                allowed = self.torch.tensor(
+                    [
+                        (mask[index // 8] & (1 << (index % 8))) != 0
+                        for index in range(int(next_logits.numel()))
+                    ], dtype=self.torch.bool, device=next_logits.device,
+                )
+                if not bool(self.torch.any(allowed).item()):
+                    raise ValueError("Grammar FSM has no valid next token")
+                next_logits = next_logits.masked_fill(~allowed, -self.torch.finfo(next_logits.dtype).max)
             token = self._sample(next_logits, temperature, top_k, top_p)
+            if grammar_session is not None and grammar_session.advance(token) < 0:
+                raise ValueError("the portable hybrid executor produced a token rejected by the grammar FSM")
             yield token
+            if grammar_session is not None and getattr(grammar_session, "is_accepting", lambda: False)():
+                break
             if eos_token_id is not None and token == int(eos_token_id):
                 break
             _, cache = self.forward(np.asarray([token], dtype=np.int64), cache)

@@ -5,23 +5,24 @@ be hidden behind the optional PyTorch backend: a user who installs the base
 package and receives a compiled AEG must be able to load that artifact without
 importing PyTorch or Transformers.
 
-This module reuses the compiled-AEG request handling in ``TorchBackend`` (the
-module does not import torch at import time), while providing its own model
-loader and tokenizer adapter. The forward pass is always performed by
+This module owns its compiled-AEG request handling and never imports the
+optional PyTorch backend. The forward pass is always performed by
 ``CPUExecutionEngine``.
 """
 
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from aether.backends.base import BackendInfo
-from aether.backends.torch_backend import CompiledAEGHandle, TorchBackend
+from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
+from aether.backends.compiled_handle import CompiledAEGHandle
 from aether.core.exceptions import BackendError
+from aether.core.hash_utils import compute_file_hash
 from aether.runtime.aeg_loader import load_engine_from_path, package_is_runnable
 
 
@@ -148,14 +149,10 @@ class PackagedTokenizer:
             )
 
 
-class NativeCPUBackend(TorchBackend):
+class NativeCPUBackend(Backend):
     """Aether-native CPU backend for self-contained AEG execution."""
 
     def __init__(self) -> None:
-        # Bypass TorchBackend.__init__: optional torch device discovery must not
-        # determine whether the framework-free backend is available.
-        from aether.backends.base import Backend
-
         Backend.__init__(
             self,
             BackendInfo(
@@ -238,3 +235,372 @@ class NativeCPUBackend(TorchBackend):
         self._models[model_id] = handle
         self._tokenizers[model_id] = tokenizer
         return handle
+
+    def get_capabilities(self) -> list[str]:
+        """Return capabilities of the framework-free packaged-AEG path."""
+        return self.info.capabilities
+
+    def _request_text(self, request: GenerationRequest, tokenizer: Any | None = None) -> str:
+        """Render a request using only the packaged tokenizer contract."""
+        if request.messages is not None:
+            if (
+                tokenizer is not None
+                and hasattr(tokenizer, "apply_chat_template")
+                and getattr(tokenizer, "chat_template", None) is not None
+            ):
+                return str(
+                    tokenizer.apply_chat_template(
+                        request.messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                )
+            return "\n".join(
+                f"{message.get('role', 'user')}: {message.get('content', '')}"
+                for message in request.messages
+            )
+        if request.prompt is None:
+            raise ValueError("Either prompt or messages must be provided")
+        return request.prompt
+
+    @staticmethod
+    def _stop_text(tokenizer: Any, token_ids: list[int], stops: list[str] | None) -> tuple[str, int, bool]:
+        text = tokenizer.decode(token_ids, skip_special_tokens=True)
+        if not stops:
+            return text, len(token_ids), False
+        cutoff = min((text.find(stop) for stop in stops if stop and stop in text), default=-1)
+        if cutoff < 0:
+            return text, len(token_ids), False
+        count = len(token_ids)
+        for index in range(1, len(token_ids) + 1):
+            prefix = tokenizer.decode(token_ids[:index], skip_special_tokens=True)
+            if any(stop and stop in prefix for stop in stops):
+                count = index
+                break
+        return text[:cutoff], count, True
+
+    def release_session_cache(self, model_id: str, session_id: str) -> None:
+        """Release request-local KV state without importing PyTorch."""
+        model = self._models.get(model_id)
+        if isinstance(model, CompiledAEGHandle):
+            model.clear_session_cache(session_id)
+
+    def _engine_for_lora(
+        self, handle: CompiledAEGHandle, engine: Any, adapter_id: Any,
+    ) -> tuple[Any, dict[str, Any] | None]:
+        """Select a verified compiled LoRA adapter without a model framework."""
+        if adapter_id is None:
+            return engine, None
+        if not isinstance(adapter_id, str) or not adapter_id:
+            raise BackendError("adapter_id must be a non-empty string", backend_name=self.name)
+        if adapter_id not in handle.lora_adapters:
+            raise BackendError(
+                f"compiled LoRA adapter {adapter_id!r} cannot be applied: adapter is absent",
+                backend_name=self.name,
+            )
+        try:
+            selected = engine.with_lora_adapter(handle.lora_adapters, adapter_id)
+        except Exception as exc:  # noqa: BLE001 - normalize artifact mismatch
+            raise BackendError(
+                f"compiled LoRA adapter {adapter_id!r} cannot be applied: {exc}",
+                backend_name=self.name,
+            ) from exc
+        return selected, {"adapter_id": adapter_id, "targets": len(handle.lora_adapters[adapter_id])}
+
+    def _engine_for_task_weights(
+        self, handle: CompiledAEGHandle, task_weights: Any,
+    ) -> tuple[Any, dict[str, Any] | None]:
+        """Load authenticated task-vector payloads into a request-local engine."""
+        if not task_weights:
+            return handle.engine, None
+        if not isinstance(task_weights, dict):
+            raise BackendError("task_weights must be a mapping", backend_name=self.name)
+        metadata = handle.metadata.get("task_vectors", {})
+        vectors = metadata.get("vectors", []) if isinstance(metadata, dict) else []
+        if not isinstance(vectors, list) or not vectors:
+            raise BackendError("the AEG does not contain executable task-vector payloads", backend_name=self.name)
+        artifacts = handle.manifest.get("artifacts", {})
+        available = {str(item.get("name")) for item in vectors if isinstance(item, dict)}
+        unknown = sorted(set(task_weights) - available)
+        if unknown:
+            raise BackendError(f"task_weights reference unknown vectors {unknown}", backend_name=self.name)
+        deltas: dict[str, np.ndarray] = {}
+        applied: list[str] = []
+        tensor_count = 0
+        for vector in vectors:
+            if not isinstance(vector, dict):
+                raise BackendError("malformed task-vector descriptor", backend_name=self.name)
+            name = str(vector.get("name", ""))
+            coefficient = task_weights.get(name, 0.0)
+            if not isinstance(coefficient, (int, float)) or coefficient < 0:
+                raise BackendError(f"invalid task weight for {name!r}", backend_name=self.name)
+            if coefficient == 0:
+                continue
+            relative = vector.get("path")
+            if not isinstance(relative, str) or Path(relative).is_absolute() or ".." in Path(relative).parts:
+                raise BackendError(f"unsafe task-vector path for {name!r}", backend_name=self.name)
+            path = (handle.aeg_path / relative).resolve()
+            if artifacts.get(relative) is None or not path.is_file() or compute_file_hash(path) != artifacts[relative]:
+                raise BackendError(f"task-vector payload failed AEG integrity validation: {relative}", backend_name=self.name)
+            try:
+                archive = np.load(path, allow_pickle=False)
+            except Exception as exc:  # noqa: BLE001
+                raise BackendError(f"unable to read task-vector payload {relative}", backend_name=self.name) from exc
+            with archive:
+                for descriptor in vector.get("tensors", []):
+                    tensor_name = descriptor.get("name")
+                    key = descriptor.get("key")
+                    shape = tuple(int(value) for value in descriptor.get("shape", []))
+                    if not isinstance(tensor_name, str) or not isinstance(key, str) or not shape or key not in archive:
+                        raise BackendError(f"malformed task-vector tensor descriptor in {name!r}", backend_name=self.name)
+                    array = np.asarray(archive[key], dtype=np.float32)
+                    if int(np.prod(shape)) != array.size:
+                        raise BackendError(f"task-vector tensor shape mismatch for {tensor_name!r}", backend_name=self.name)
+                    contribution = np.ascontiguousarray(array.reshape(shape), dtype=np.float32) * np.float32(coefficient)
+                    deltas[tensor_name] = deltas.get(tensor_name, 0.0) + contribution
+                    tensor_count += 1
+            applied.append(name)
+        if not applied:
+            raise BackendError("task_weights selected no non-zero task-vector payload", backend_name=self.name)
+        try:
+            return handle.engine.with_task_deltas(deltas), {"vectors": applied, "tensor_count": tensor_count}
+        except Exception as exc:  # noqa: BLE001
+            raise BackendError(f"task-vector deltas do not match the compiled model: {exc}", backend_name=self.name) from exc
+
+    def _begin_ttt(
+        self, handle: CompiledAEGHandle, prompt_ids: np.ndarray, request: GenerationRequest, engine: Any,
+    ) -> tuple[Any, str, list[dict[str, Any]], float] | None:
+        """Adapt persisted R5 slots using the portable engine's embeddings."""
+        ttt_engine = request.extra.get("ttt_engine")
+        if ttt_engine is None or not hasattr(engine.weights, "embedding"):
+            return None
+        request_id = str(request.extra.get("ttt_request_id") or uuid.uuid4().hex)
+        ttt_engine.begin_request(request_id)
+        try:
+            hidden = engine.weights.embedding[np.asarray(prompt_ids, dtype=np.int64)].astype(np.float32).tolist()
+            loss = float(ttt_engine.adapt(request_id, hidden))
+            slots = []
+            for layer_index in range(engine.weights.num_layers):
+                slot = ttt_engine.get_fast_weights(request_id, layer_index)
+                if slot is None:
+                    raise BackendError(f"R5 TTT slot {layer_index} was not available after adaptation", backend_name=self.name)
+                slots.append(slot)
+            return ttt_engine, request_id, slots, loss
+        except Exception:
+            ttt_engine.end_request(request_id)
+            raise
+
+    @staticmethod
+    def _end_ttt(state: tuple[Any, str, list[dict[str, Any]], float] | None) -> None:
+        if state is not None:
+            state[0].end_request(state[1])
+
+    def generate(self, request: GenerationRequest) -> GenerationResult:
+        """Generate from an executable AEG without importing a model framework."""
+        if request.model_id not in self._models:
+            self.load_model(request.model_id, aeg_path=request.extra.get("aeg_path"))
+        handle = self._models[request.model_id]
+        if handle.engine is None or handle.tokenizer is None:
+            raise BackendError("loaded AEG has no native tokenizer-backed engine", backend_name=self.name)
+        import time
+
+        text = self._request_text(request, handle.tokenizer)
+        encoded = handle.tokenizer(text, return_tensors="np")
+        prompt_ids = np.asarray(encoded["input_ids"][0], dtype=np.int64)
+        engine = handle.engine
+        engine, task_metrics = self._engine_for_task_weights(handle, request.extra.get("task_weights"))
+        adapter_id = request.extra.get("adapter_id", request.extra.get("adapter_name"))
+        engine, adapter_metrics = self._engine_for_lora(handle, engine, adapter_id)
+        ttt_state = self._begin_ttt(handle, prompt_ids, request, engine)
+        ttt_slots = ttt_state[2] if ttt_state is not None else None
+
+        session_id = request.extra.get("aether_kv_session_id")
+        cached = handle.session_caches.get(session_id) if isinstance(session_id, str) else None
+        cache = None
+        suffix = prompt_ids
+        reused_tokens = 0
+        multi_agent_reused_tokens = 0
+        coordinator = request.extra.get("multi_agent_kv_coordinator")
+        prefix_text = request.extra.get("multi_agent_prefix")
+        prefix_hash = request.extra.get("multi_agent_prefix_hash")
+        if (
+            ttt_state is None and coordinator is not None and isinstance(prefix_text, str)
+            and prefix_text and isinstance(prefix_hash, str) and prefix_hash
+        ):
+            if coordinator.hash_prefix(prefix_text) != prefix_hash:
+                raise BackendError("R2 multi-agent prefix hash does not match its text", backend_name=self.name)
+            prefix_ids = np.asarray(handle.tokenizer(prefix_text, return_tensors="np")["input_ids"][0], dtype=np.int64)
+            if prompt_ids.size < prefix_ids.size or not np.array_equal(prompt_ids[:prefix_ids.size], prefix_ids):
+                raise BackendError("R2 multi-agent prefix is not an exact token prefix of the request", backend_name=self.name)
+            shared_cache, shared_length = coordinator.get_shared_kv(prefix_hash)
+            if shared_cache is None:
+                _, shared_cache = engine.generate_with_cache(prefix_ids, max_tokens=0, cache=None)
+                coordinator.update_shared_kv(prefix_hash, shared_cache, seq_len=int(prefix_ids.size))
+                shared_length = int(prefix_ids.size)
+            else:
+                multi_agent_reused_tokens = int(shared_length)
+            if int(shared_length) != int(prefix_ids.size):
+                raise BackendError("R2 shared KV length does not match the tokenized prefix", backend_name=self.name)
+            cache = shared_cache.clone()
+            suffix = prompt_ids[prefix_ids.size:]
+        if cached is not None and cache is None:
+            cached_ids, cached_cache = cached
+            cached_ids = np.asarray(cached_ids, dtype=np.int64)
+            if prompt_ids.size >= cached_ids.size and np.array_equal(
+                prompt_ids[: cached_ids.size], cached_ids
+            ):
+                cache = cached_cache
+                suffix = prompt_ids[cached_ids.size :]
+                reused_tokens = int(cached_ids.size)
+            else:
+                handle.clear_session_cache(session_id)
+
+        start = time.perf_counter()
+        try:
+            if hasattr(engine, "generate_with_cache"):
+                generated, updated_cache = engine.generate_with_cache(
+                    suffix,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    top_k=request.top_k,
+                    top_p=request.top_p,
+                    eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+                    grammar_session=request.extra.get("grammar_session"),
+                    cache=cache,
+                    ttt_slots=ttt_slots,
+                    adapter_id=str(adapter_id) if adapter_id is not None else None,
+                    peagle_engine=request.extra.get("peagle_engine"),
+                )
+            else:
+                generated = engine.generate(
+                    prompt_ids,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    top_k=request.top_k,
+                    top_p=request.top_p,
+                    eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+                    ttt_slots=ttt_slots,
+                    peagle_engine=request.extra.get("peagle_engine"),
+                )
+                updated_cache = None
+        except TypeError:
+            # Specialised engines can expose a narrower generation signature.
+            # Retry only after removing optional orchestration hooks; never
+            # fabricate output or silently switch to another backend.
+            if not any(value is not None for value in (
+                request.extra.get("ttt_slots"), request.extra.get("peagle_engine"),
+            )):
+                raise
+            generated, updated_cache = engine.generate_with_cache(
+                suffix,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_k=request.top_k,
+                top_p=request.top_p,
+                eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+                grammar_session=request.extra.get("grammar_session"),
+                cache=cache,
+            )
+        finally:
+            self._end_ttt(ttt_state)
+        if isinstance(session_id, str):
+            full_ids = np.concatenate([prompt_ids, np.asarray(generated, dtype=np.int64)])
+            handle.session_caches[session_id] = (full_ids, updated_cache)
+        elapsed = time.perf_counter() - start
+        generated_text = handle.tokenizer.decode(generated, skip_special_tokens=True)
+        completion_tokens = len(generated)
+        if request.stop:
+            generated_text, completion_tokens, stopped = self._stop_text(
+                handle.tokenizer, generated, request.stop
+            )
+        else:
+            stopped = False
+        return GenerationResult(
+            text=generated_text,
+            prompt_tokens=int(prompt_ids.size),
+            completion_tokens=completion_tokens,
+            finish_reason="stop" if stopped or completion_tokens < request.max_tokens else "length",
+            backend_name=self.name,
+            metrics={
+                "ttft_ms": elapsed * 1000.0,
+                "throughput_tps": len(generated) / max(elapsed, 1e-9),
+                "device": self._device,
+                "framework_free": True,
+                "kv_reuse": reused_tokens > 0,
+                "kv_reused_tokens": reused_tokens,
+                "multi_agent_kv_reuse": multi_agent_reused_tokens > 0,
+                "multi_agent_kv_reused_tokens": multi_agent_reused_tokens,
+                **({"ttt_adaptation_loss": ttt_state[3]} if ttt_state is not None else {}),
+                **({"task_reweighting": task_metrics} if task_metrics is not None else {}),
+                **({"lora_adapter": adapter_metrics} if adapter_metrics is not None else {}),
+                **(
+                    {"speculative": stats}
+                    if callable(getattr(engine, "speculative_stats", None))
+                    and (stats := engine.speculative_stats()).get("draft_tokens", 0) > 0
+                    else {}
+                ),
+            },
+        )
+
+    def generate_stream(self, request: GenerationRequest) -> Any:
+        """Stream generated chunks from the compiled AEG path."""
+        if request.model_id not in self._models:
+            self.load_model(request.model_id, aeg_path=request.extra.get("aeg_path"))
+        handle = self._models[request.model_id]
+        if handle.engine is None or handle.tokenizer is None:
+            raise BackendError("loaded AEG has no native tokenizer-backed engine", backend_name=self.name)
+        text = self._request_text(request, handle.tokenizer)
+        encoded = handle.tokenizer(text, return_tensors="np")
+        prompt_ids = np.asarray(encoded["input_ids"][0], dtype=np.int64)
+        engine = handle.engine
+        adapter_id = request.extra.get("adapter_id", request.extra.get("adapter_name"))
+        if adapter_id is not None and hasattr(engine, "with_lora_adapter"):
+            engine = engine.with_lora_adapter(handle.lora_adapters, str(adapter_id))
+        session_id = request.extra.get("aether_kv_session_id")
+        cached = handle.session_caches.get(session_id) if isinstance(session_id, str) else None
+        cache = None
+        suffix = prompt_ids
+        if cached is not None:
+            cached_ids, cached_cache = cached
+            cached_ids = np.asarray(cached_ids, dtype=np.int64)
+            if prompt_ids.size >= cached_ids.size and np.array_equal(
+                prompt_ids[: cached_ids.size], cached_ids
+            ):
+                cache = cached_cache
+                suffix = prompt_ids[cached_ids.size :]
+            else:
+                handle.clear_session_cache(session_id)
+
+        token_ids: list[int] = []
+        previous = ""
+        updated_cache: list[Any] = [None]
+
+        def remember(value: Any) -> None:
+            updated_cache[0] = value
+
+        iterator = engine.generate_iter(
+            suffix,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_k=request.top_k,
+            top_p=request.top_p,
+            eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+            grammar_session=request.extra.get("grammar_session"),
+            cache=cache,
+            cache_callback=remember,
+            adapter_id=str(adapter_id) if adapter_id is not None else None,
+        )
+        for token_id in iterator:
+            token_ids.append(int(token_id))
+            decoded = handle.tokenizer.decode(
+                token_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            delta = decoded[len(previous):] if decoded.startswith(previous) else decoded
+            previous = decoded
+            if delta:
+                yield delta
+        if isinstance(session_id, str) and updated_cache[0] is not None:
+            full_ids = np.concatenate([prompt_ids, np.asarray(token_ids, dtype=np.int64)])
+            handle.session_caches[session_id] = (full_ids, updated_cache[0])

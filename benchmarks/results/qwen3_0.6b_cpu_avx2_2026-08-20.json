@@ -1,0 +1,37 @@
+{
+  "model": "Qwen 0.6B",
+  "source_checkpoint": "qwen 0.6B/model.safetensors",
+  "artifact": "scratch/qwen_benchmark.aeg",
+  "target": "cpu_avx2",
+  "precision": "BF16 source weights represented as float32 for the NumPy CPU path",
+  "measurement": {
+    "warmup_requests": 0,
+    "iterations": 3,
+    "prompt": "Benchmark",
+    "prompt_tokens": 9,
+    "requested_completion_tokens": 8,
+    "measured_completion_tokens": [8, 8, 8],
+    "cache_reuse": "prefill once, decode from returned KV cache",
+    "kernel_backend": "native C++ kernels plus NumPy BLAS GEMM",
+    "benchmark_runner": "scripts/run_inference.py --benchmark (measured completion count)"
+  },
+  "runs": [
+    {"iteration": 1, "latency_seconds": 6.220868, "tokens_per_second": 1.28599},
+    {"iteration": 2, "latency_seconds": 3.406737, "tokens_per_second": 2.34829},
+    {"iteration": 3, "latency_seconds": 3.382433, "tokens_per_second": 2.36516}
+  ],
+  "summary": {
+    "mean_tokens_per_second": 1.9998,
+    "median_tokens_per_second": 2.3483,
+    "steady_state_mean_tokens_per_second": 2.3567,
+    "mean_ttft_ms": 1075.4,
+    "steady_state_p95_ttft_ms": 381.0,
+    "note": "Measured after geometric KV-cache growth and reserved decode capacity were enabled. Completion count is measured per run. The first iteration includes one-time native-kernel/cache effects; steady-state is iterations 2-3. This is a CPU-only measurement, not a GPU claim."
+  },
+  "changes_measured": [
+    "decode benchmark reuses the prefill KV cache instead of prefilling twice",
+    "KV cache grows geometrically and reserves the requested decode window, avoiding per-token full-history concatenation",
+    "GQA decode avoids materializing repeated K/V tensors",
+    "CPU CLI uses a packaged tokenizer and does not fetch or import a model framework"
+  ]
+}

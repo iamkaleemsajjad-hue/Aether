@@ -1408,7 +1408,7 @@ def load_aeg_package(path: Path | str) -> AEGPackage:
 
 
 def create_default_sharding_plans(architecture: ModelArchitecture) -> dict[int, ShardingPlan]:
-    """Create default sharding plans for 1, 2, 4, and 8 GPUs based on architecture.
+    """Create lossless model-wide tensor plans for one through eight GPUs.
 
     Args:
         architecture: Model architecture metadata.
@@ -1418,38 +1418,19 @@ def create_default_sharding_plans(architecture: ModelArchitecture) -> dict[int, 
     """
     plans: dict[int, ShardingPlan] = {}
     params_gb = architecture.params_billion * 2.0  # Approximate GB at BF16
-    for num_gpus in (1, 2, 4, 8):
-        if num_gpus == 1:
-            plan = ShardingPlan(
-                num_gpus=1,
-                phase="prefill",
-                tensor_parallel_degree=1,
-                pipeline_stages=1,
-                memory_per_gpu_gb=params_gb,
-            )
-        elif num_gpus == 2:
-            plan = ShardingPlan(
-                num_gpus=2,
-                phase="prefill",
-                tensor_parallel_degree=2,
-                pipeline_stages=1,
-                memory_per_gpu_gb=params_gb / 2,
-            )
-        elif num_gpus == 4:
-            plan = ShardingPlan(
-                num_gpus=4,
-                phase="prefill",
-                tensor_parallel_degree=4,
-                pipeline_stages=1,
-                memory_per_gpu_gb=params_gb / 4,
-            )
-        else:
-            plan = ShardingPlan(
-                num_gpus=8,
-                phase="prefill",
-                tensor_parallel_degree=4,
-                pipeline_stages=2,
-                memory_per_gpu_gb=params_gb / 8,
-            )
-        plans[num_gpus] = plan
+    for num_gpus in range(1, 9):
+        # A compiled artifact records a model-wide tensor partition for every
+        # visible-device count.  ``balanced_partition`` handles dimensions
+        # that are not divisible by the count at execution time; no rank is a
+        # full model replica. Pipeline/context layouts remain explicit opt-in
+        # strategies rather than a hidden fallback.
+        plans[num_gpus] = ShardingPlan(
+            num_gpus=num_gpus,
+            phase="prefill",
+            tensor_parallel_degree=num_gpus,
+            pipeline_stages=1,
+            expert_parallel_degree=1,
+            context_parallel_degree=1,
+            memory_per_gpu_gb=params_gb / num_gpus,
+        )
     return plans

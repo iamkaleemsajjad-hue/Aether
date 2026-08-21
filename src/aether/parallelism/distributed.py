@@ -40,6 +40,7 @@ from typing import Any, Callable
 import numpy as np
 
 from aether.utils.logging import get_logger
+from aether.parallelism.sharding import balanced_partition
 
 logger = get_logger(__name__)
 
@@ -314,9 +315,7 @@ class SocketCollective:
         if self.world_size == 1 or not self._connected:
             return tensor.copy()
 
-        shard_size = tensor.shape[axis] // self.world_size
-        start = self.rank * shard_size
-        end = start + shard_size
+        start, end = balanced_partition(tensor.shape[axis], self.world_size)[self.rank]
         slices = [slice(None)] * tensor.ndim
         slices[axis] = slice(start, end)
         return tensor[tuple(slices)].copy()
@@ -406,17 +405,13 @@ class TensorParallelLinear:
         if mode == "column":
             # Split output dimension: each rank handles out_dim/world_size outputs
             out_features = weight.shape[0]
-            shard_size = out_features // world_size
-            start = rank * shard_size
-            end = start + shard_size
+            start, end = balanced_partition(out_features, world_size)[rank]
             self.weight_shard = weight[start:end, :]
             self.bias_shard = bias[start:end] if bias is not None else None
         else:  # row parallel
             # Split input dimension: each rank handles in_dim/world_size inputs
             in_features = weight.shape[1]
-            shard_size = in_features // world_size
-            start = rank * shard_size
-            end = start + shard_size
+            start, end = balanced_partition(in_features, world_size)[rank]
             self.weight_shard = weight[:, start:end]
             self.bias_shard = bias if rank == 0 else None  # Only rank 0 adds bias
 
@@ -433,9 +428,8 @@ class TensorParallelLinear:
             # Each rank has a shard of the input — compute partial matmul
             if x.shape[-1] > self.weight_shard.shape[1]:
                 # Slice input to our shard
-                shard_size = self.weight_shard.shape[1]
-                start = self.rank * shard_size
-                x_shard = x[..., start:start + shard_size]
+                start, end = balanced_partition(x.shape[-1], self.world_size)[self.rank]
+                x_shard = x[..., start:end]
             else:
                 x_shard = x
             out = x_shard @ self.weight_shard.T

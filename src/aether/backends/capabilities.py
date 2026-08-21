@@ -278,6 +278,27 @@ class HardwareCapabilities:
         import os
         arch = platform.machine()
         proc = platform.processor() or arch
+        uname = platform.uname()
+        identifier = " ".join(
+            value for value in (
+                proc,
+                uname.processor,
+                os.environ.get("PROCESSOR_IDENTIFIER", ""),
+            ) if value
+        )
+        normalized_identifier = identifier.upper()
+        if "INTEL" in normalized_identifier:
+            cpu_vendor = "Intel"
+        elif "AMD" in normalized_identifier or "RYZEN" in normalized_identifier:
+            cpu_vendor = "AMD"
+        elif "APPLE" in normalized_identifier:
+            cpu_vendor = "Apple"
+        elif "QUALCOMM" in normalized_identifier or "SNAPDRAGON" in normalized_identifier:
+            cpu_vendor = "Qualcomm"
+        elif arch.lower() in {"arm64", "aarch64"}:
+            cpu_vendor = "ARM"
+        else:
+            cpu_vendor = "unknown"
         cpu_count = os.cpu_count() or 1
         # Detect the actual instruction set on every supported host.  The old
         # implementation only inspected Linux /proc/cpuinfo, which made
@@ -292,6 +313,15 @@ class HardwareCapabilities:
                 bool(features.get(name))
                 for name in ("AVX512F", "AVX512BW", "AVX512VL")
             )
+        except (ImportError, AttributeError):
+            pass
+        features: dict[str, bool] = {}
+        try:
+            from numpy.core import _multiarray_umath
+            features = {
+                str(name).lower(): bool(value)
+                for name, value in getattr(_multiarray_umath, "__cpu_features__", {}).items()
+            }
         except (ImportError, AttributeError):
             pass
         if not has_avx512 and platform.system() == "Linux":
@@ -323,7 +353,14 @@ class HardwareCapabilities:
             compile_tested=True,
             execution_tested=True,  # CPU inference proven
             production_validated=False,  # not yet multi-model validated
-            extra={"cpu_count": cpu_count, "has_avx512": has_avx512},
+            extra={
+                "cpu_count": cpu_count,
+                "cpu_vendor": cpu_vendor,
+                "cpu_model": proc,
+                "machine": arch,
+                "has_avx512": has_avx512,
+                "cpu_features": features,
+            },
         )
 
 
