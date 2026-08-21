@@ -74,3 +74,51 @@ def test_gpt2_legacy_dimensions_are_normalized() -> None:
     assert detected.context_length == 1024
     assert detected.intermediate_size == 3072
 
+
+@pytest.mark.parametrize(
+    ("name", "family", "is_encoder", "is_encoder_decoder", "ssm_variant"),
+    [
+        ("InternVL", "vision_family", False, False, None),
+        ("BERT", "bert_family", True, False, None),
+        ("FLAN-T5", "encoder_decoder_family", False, True, None),
+        ("Mamba", "hybrid_ssm_family", False, False, "selective_scan"),
+        ("RWKV", "hybrid_ssm_family", False, False, "selective_scan"),
+        ("DeepSeek", "deepseek_family", False, False, None),
+    ],
+)
+def test_name_only_family_fallback_preserves_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    family: str,
+    is_encoder: bool,
+    is_encoder_decoder: bool,
+    ssm_variant: str | None,
+) -> None:
+    """Name fallback must not erase the graph contract before config load."""
+    monkeypatch.setenv("AETHER_HF_OFFLINE", "1")
+    detected = ArchitectureDetector().detect(name)
+    assert detected.family == family
+    assert detected.is_encoder is is_encoder
+    assert detected.is_encoder_decoder is is_encoder_decoder
+    assert detected.ssm_variant == ssm_variant
+
+
+def test_unknown_encoder_decoder_config_uses_declared_base_contract() -> None:
+    detected = ArchitectureDetector()._from_config(
+        {
+            "model_type": "custom_seq2seq",
+            "architectures": ["CustomForConditionalGeneration"],
+            "is_encoder_decoder": True,
+            "num_encoder_layers": 2,
+            "num_decoder_layers": 3,
+            "d_model": 32,
+            "num_heads": 4,
+            "d_ff": 64,
+            "vocab_size": 128,
+        }
+    )
+    assert detected.family == "encoder_decoder_family"
+    assert detected.is_encoder_decoder is True
+    assert detected.encoder_layers == 2
+    assert detected.decoder_layers == 3
+

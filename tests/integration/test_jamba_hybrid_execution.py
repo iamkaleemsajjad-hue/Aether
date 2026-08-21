@@ -120,6 +120,9 @@ def test_jamba_hybrid_compiles_reloads_and_reuses_cache(tmp_path: Path) -> None:
     portable = TorchHybridAEGEngine(engine, "cpu")
     portable_logits, _ = portable.forward(np.asarray([1, 2, 3], dtype=np.int64))
     np.testing.assert_allclose(full_logits, portable_logits, rtol=2e-5, atol=2e-5)
+    mesh = TorchHybridAEGEngine(engine, "cpu", devices=["cpu:0", "cpu:1"])
+    mesh_logits, _ = mesh.forward(np.asarray([1, 2, 3], dtype=np.int64))
+    np.testing.assert_allclose(full_logits, mesh_logits, rtol=2e-5, atol=2e-5)
 
     result = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
         str(artifact), prompt="hello", max_tokens=2, temperature=0.0

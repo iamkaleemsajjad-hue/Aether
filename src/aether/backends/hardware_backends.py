@@ -86,21 +86,33 @@ class CUDABackend(Backend):
         super().__init__(info)
         self._device = "cpu"  # Actual device — upgraded to CUDA if available
         self._arch_name = arch_name
+        self._cuda_devices: list[Any] = []
         self._cuda_available = self._detect_cuda()
 
     def _detect_cuda(self) -> bool:
+        """Detect NVIDIA devices without importing an ML framework."""
         try:
-            import torch
-            # PyTorch exposes HIP through the ``torch.cuda`` namespace for
-            # compatibility.  That must not make an AMD runtime look like an
-            # NVIDIA CUDA device to backend dispatch.
-            if getattr(torch.version, "hip", None):
-                return False
-            if torch.cuda.is_available():
-                self._device = "cuda"
+            from aether.backends.hardware_detector import detect_cuda_devices
+            detected = [cap for cap in detect_cuda_devices() if cap.available]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("framework-free CUDA detection failed: %s", exc)
+            detected = []
+        self._cuda_devices = detected
+        requested = self.target_id.replace("cuda_", "")
+        import re
+        requested_match = re.match(r"sm(\d+)", requested)
+        requested_sm = int(requested_match.group(1)) if requested_match else 0
+        for index, cap in enumerate(detected):
+            actual_match = re.match(r"sm(\d+)", str(cap.architecture))
+            actual_sm = int(actual_match.group(1)) if actual_match else 0
+            if requested in {"sm100_tee", "sm100_gb300"}:
+                compatible = str(cap.target_id).replace("cuda_", "") == requested
+            else:
+                compatible = actual_sm >= requested_sm if requested_sm else True
+            if compatible:
+                device_index = int(cap.extra.get("device_index", index))
+                self._device = f"cuda:{device_index}"
                 return True
-        except ImportError:
-            pass
         return False
 
     def is_available(self) -> bool:
@@ -159,18 +171,23 @@ class CUDABackend(Backend):
         }
 
         if self._cuda_available:
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    device_props = torch.cuda.get_device_properties(0)
-                    caps.update({
-                        "gpu_name": device_props.name,
-                        "total_memory_mb": device_props.total_memory // (1024 * 1024),
-                        "multi_processor_count": device_props.multi_processor_count,
-                        "cuda_version": torch.version.cuda,
-                    })
-            except Exception:  # noqa: BLE001
-                pass
+            device_index = int(self._device.rsplit(":", 1)[-1])
+            device = next(
+                (
+                    cap for cap in self._cuda_devices
+                    if int(cap.extra.get("device_index", -1)) == device_index
+                ),
+                self._cuda_devices[0],
+            )
+            caps.update({
+                "gpu_name": device.device,
+                "total_memory_mb": device.memory_bytes // (1024 * 1024),
+                "compute_capability": device.extra.get("compute_capability"),
+                "cuda_driver": device.driver_version,
+                "detection_method": device.runtime_version,
+                "device_count": len(self._cuda_devices),
+                "framework_free_detection": True,
+            })
         return caps
 
     def unload(self) -> None:
@@ -204,25 +221,37 @@ class ROCmBackend(Backend):
             info.capabilities.extend(["mxfp6", "fp8"])
         super().__init__(info)
         self._device = "cpu"
+        self._rocm_devices: list[Any] = []
         self._rocm_available = self._detect_rocm()
 
     def _detect_rocm(self) -> bool:
+        """Detect AMD devices using ROCm system interfaces, not PyTorch."""
         try:
-            import torch
-            if getattr(torch.version, "hip", None):
-                self._device = "cuda"  # PyTorch's HIP build uses cuda tensors
-                return bool(torch.cuda.is_available())
-            if hasattr(torch, "hip") and torch.hip.is_available():
-                self._device = "hip"
+            from aether.backends.hardware_detector import detect_rocm_devices
+            detected = [cap for cap in detect_rocm_devices() if cap.available]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("framework-free ROCm detection failed: %s", exc)
+            detected = []
+        self._rocm_devices = detected
+        if detected:
+            index = int(detected[0].extra.get("device_index", 0))
+            # Explicit Torch HIP execution, when installed, addresses HIP
+            # tensors through ``cuda:<index>``. Detection remains framework-free.
+            self._device = f"cuda:{index}"
+            return True
+
+        # Compatibility for applications that have already initialized a
+        # PyTorch HIP runtime.  We never import PyTorch here: consulting an
+        # existing module is optional and cannot turn the core package into a
+        # framework dependency.  The canonical detector above remains the
+        # source of truth for normal discovery.
+        import sys
+        torch = sys.modules.get("torch")
+        if torch is not None and getattr(getattr(torch, "version", None), "hip", None):
+            cuda = getattr(torch, "cuda", None)
+            if cuda is not None and bool(cuda.is_available()):
+                self._device = "cuda:0"
                 return True
-            if torch.cuda.is_available():
-                # ROCm appears as CUDA in PyTorch
-                gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
-                if "AMD" in gpu_name or "Radeon" in gpu_name or "Instinct" in gpu_name:
-                    self._device = "cuda"  # Actually ROCm
-                    return True
-        except ImportError:
-            pass
         return False
 
     def is_available(self) -> bool:
@@ -260,6 +289,8 @@ class ROCmBackend(Backend):
             raise BackendError(f"No model loaded for ROCm target {self.target_id}")
 
     def get_capabilities(self) -> list[str]:
+        # Keep the backend API stable; detailed per-device evidence is exposed
+        # by ``hardware_detector.detect_all_capabilities()``.
         return self.info.capabilities
 
     def emit_hip_source(self, op_name: str, config: dict[str, Any]) -> str:
@@ -313,16 +344,21 @@ class MetalBackend(Backend):
             info.capabilities.extend(["metal4_tensor_ops", "fp16_native"])
         super().__init__(info)
         self._device = "cpu"
+        self._metal_device: Any | None = None
         self._mps_available = self._detect_mps()
 
     def _detect_mps(self) -> bool:
+        """Detect Apple Silicon/Metal without importing PyTorch."""
         try:
-            import torch
-            if torch.backends.mps.is_available():
-                self._device = "mps"
-                return True
-        except (ImportError, AttributeError):
-            pass
+            from aether.backends.hardware_detector import detect_metal
+            detected = detect_metal()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("framework-free Metal detection failed: %s", exc)
+            return False
+        if detected.available:
+            self._metal_device = detected
+            self._device = "mps"
+            return True
         return False
 
     def is_available(self) -> bool:
@@ -360,6 +396,8 @@ class MetalBackend(Backend):
             raise BackendError(f"No model loaded for Metal target {self.target_id}")
 
     def get_capabilities(self) -> list[str]:
+        # Keep the backend API stable; detailed device evidence is exposed by
+        # ``hardware_detector.detect_all_capabilities()``.
         return self.info.capabilities
 
     def emit_msl_source(self, op_name: str, config: dict[str, Any]) -> str:
@@ -707,19 +745,25 @@ class OpenVINOBackend(Backend):
     """
 
     def __init__(self, target_id: str = "openvino_npu") -> None:
+        if target_id not in {"openvino_npu", "openvino_gpu"}:
+            raise ValueError(f"unsupported OpenVINO target {target_id!r}")
         self.target_id = target_id
+        self._device_name = "NPU" if target_id == "openvino_npu" else "GPU"
         super().__init__(BackendInfo(
             name="openvino",
             version="runtime",
             supported_targets=[target_id],
-            capabilities=["generate", "onnx_runtime", "intel_npu"],
+            capabilities=[
+                "generate", "onnx_runtime",
+                "intel_npu" if target_id == "openvino_npu" else "intel_gpu",
+            ],
         ))
         self._core = None
         self._available = False
         try:
             import openvino
             self._core = openvino.Core()
-            self._available = "NPU" in list(self._core.available_devices)
+            self._available = self._device_name in list(self._core.available_devices)
         except Exception:
             self._available = False
 
@@ -728,7 +772,10 @@ class OpenVINOBackend(Backend):
 
     def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
         if not self._available or self._core is None:
-            raise BackendError("OpenVINO NPU runtime is unavailable", backend_name=self.name)
+            raise BackendError(
+                f"OpenVINO {self._device_name} runtime is unavailable",
+                backend_name=self.name,
+            )
         path = Path(model_path)
         onnx = path if path.suffix.lower() == ".onnx" else path / "kernels" / "openvino" / "model.onnx"
         if not onnx.is_file():
@@ -736,7 +783,7 @@ class OpenVINOBackend(Backend):
                 "OpenVINO execution requires an emitted ONNX/OpenVINO target artifact; "
                 f"none was found at {onnx}", backend_name=self.name,
             )
-        self._compiled_model = self._core.compile_model(str(onnx), "NPU")
+        self._compiled_model = self._core.compile_model(str(onnx), self._device_name)
         return True
 
     def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
@@ -805,6 +852,7 @@ _BACKEND_REGISTRY: dict[str, type] = {
     "qualcomm_qnn": QualcommBackend,
     # OpenVINO / Intel NPU
     "openvino_npu": OpenVINOBackend,
+    "openvino_gpu": OpenVINOBackend,
 }
 
 

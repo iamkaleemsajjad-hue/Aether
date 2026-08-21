@@ -9,8 +9,11 @@ and is standard for the HuggingFace ecosystem.
 from __future__ import annotations
 
 import json
+import struct
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from safetensors import safe_open
 
@@ -86,7 +89,7 @@ class SafeTensorsLoader:
         msg = f"No SafeTensors files found at {self.model_path}"
         raise IngestionError(msg)
 
-    def load(self) -> dict[str, Any]:
+    def _load_with_optional_torch(self) -> dict[str, Any]:
         """Load all tensors and metadata from discovered SafeTensors files.
 
         Torch-free by default: the numpy framework covers every dtype the
@@ -121,6 +124,86 @@ class SafeTensorsLoader:
         self._metadata = metadata
         logger.info("Loaded SafeTensors", path=str(self.model_path), tensors=len(tensors))
         return tensors
+
+    def load(self) -> dict[str, Any]:
+        """Load tensors without requiring PyTorch, including BF16 files."""
+        tensors: dict[str, Any] = {}
+        metadata: dict[str, Any] = {}
+        try:
+            for st_file in self.discover_files():
+                with safe_open(st_file, framework="numpy", device="cpu") as handle:
+                    metadata.update(handle.metadata() or {})
+                    for key in handle.keys():
+                        tensors[key] = handle.get_tensor(key)
+        except Exception as numpy_exc:  # noqa: BLE001 - use framework-free decoder
+            try:
+                for st_file in self.discover_files():
+                    raw_tensors, raw_metadata = self._load_raw_safetensors(st_file)
+                    tensors.update(raw_tensors)
+                    metadata.update(raw_metadata)
+            except Exception as raw_exc:  # noqa: BLE001 - preserve source error
+                raise IngestionError(
+                    f"Unable to load SafeTensors without a framework: {raw_exc}"
+                ) from numpy_exc
+        self._tensors = tensors
+        self._metadata = metadata
+        logger.info("Loaded SafeTensors", path=str(self.model_path), tensors=len(tensors))
+        return tensors
+
+    @staticmethod
+    def _load_raw_safetensors(path: Path) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+        """Decode SafeTensors with only the stdlib and NumPy.
+
+        BF16 payloads are expanded by moving their 16 bits into the high half
+        of an IEEE FP32 word. This keeps local SafeTensors compilation
+        independent of PyTorch on NumPy versions without native BF16 support.
+        """
+        blob = path.read_bytes()
+        if len(blob) < 8:
+            raise ValueError(f"SafeTensors file is truncated: {path}")
+        header_length = struct.unpack_from("<Q", blob, 0)[0]
+        header_start = 8
+        data_start = header_start + header_length
+        if data_start > len(blob):
+            raise ValueError(f"SafeTensors header exceeds file size: {path}")
+        header = json.loads(blob[header_start:data_start].decode("utf-8"))
+        if not isinstance(header, dict):
+            raise ValueError("SafeTensors header must be an object")
+        metadata = header.pop("__metadata__", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        dtype_map: dict[str, np.dtype[Any]] = {
+            "BOOL": np.dtype(np.bool_), "U8": np.dtype("<u1"), "I8": np.dtype("<i1"),
+            "U16": np.dtype("<u2"), "I16": np.dtype("<i2"), "U32": np.dtype("<u4"),
+            "I32": np.dtype("<i4"), "U64": np.dtype("<u8"), "I64": np.dtype("<i8"),
+            "F16": np.dtype("<f2"), "F32": np.dtype("<f4"), "F64": np.dtype("<f8"),
+        }
+        tensors: dict[str, np.ndarray] = {}
+        for name, spec in header.items():
+            if not isinstance(spec, dict):
+                raise ValueError(f"invalid tensor header for {name!r}")
+            dtype_name = str(spec.get("dtype", ""))
+            shape = tuple(int(value) for value in spec.get("shape", []))
+            offsets = spec.get("data_offsets")
+            if not isinstance(offsets, list) or len(offsets) != 2:
+                raise ValueError(f"invalid data offsets for {name!r}")
+            start, end = int(offsets[0]), int(offsets[1])
+            if start < 0 or end < start or data_start + end > len(blob):
+                raise ValueError(f"tensor {name!r} has invalid data bounds")
+            payload = memoryview(blob)[data_start + start:data_start + end]
+            if dtype_name == "BF16":
+                values = np.frombuffer(payload, dtype="<u2").astype("<u4") << 16
+                tensor = values.view("<f4")
+            else:
+                dtype = dtype_map.get(dtype_name)
+                if dtype is None:
+                    raise ValueError(f"unsupported SafeTensors dtype {dtype_name!r}")
+                tensor = np.frombuffer(payload, dtype=dtype)
+            expected = int(np.prod(shape, dtype=np.int64)) if shape else 1
+            if tensor.size != expected:
+                raise ValueError(f"tensor {name!r} element count does not match its shape")
+            tensors[name] = np.array(tensor.reshape(shape), copy=True)
+        return tensors, metadata
 
     def load_config(self) -> dict[str, Any]:
         """Load the model config.json if present."""

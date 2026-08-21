@@ -34,6 +34,12 @@ import sys
 import time
 from pathlib import Path
 
+if sys.platform == "win32":
+    # The CLI uses checkmarks and arrows in its progress output.  Make the
+    # documented Windows workflow fail-safe on legacy cp1252 consoles.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 
 def _add_src_to_path() -> None:
     root = Path(__file__).resolve().parent.parent
@@ -90,15 +96,21 @@ def run_dry_run(model: str, targets: list[str]) -> int:
     try:
         plan = compiler.plan(model)
         _info(f"Model             : {model}")
-        _info(f"Architecture      : {plan.architecture.family} {plan.architecture.params_billion:.1f}B")
+        _info(
+            f"Architecture      : {plan.architecture.family} "
+            f"{plan.architecture.params_billion:.1f}B"
+        )
         _info(f"Layers            : {plan.architecture.layers}")
         _info(f"Hidden size       : {plan.architecture.hidden_size}")
         _info(f"Attention heads   : {plan.architecture.num_attention_heads}")
         _info(f"Est. compile time : {plan.estimated_compile_time_s:.1f}s")
         _info(f"Est. memory (BF16): {plan.estimated_memory_gb:.2f} GB")
-        _info(f"Default precision : {config.default_precision}")
+        _info(f"Precision mode    : {config.precision_assignment_mode}")
         _info(f"Targets           : {', '.join(targets) if targets else 'auto'}")
-        _info(f"Optimizer passes  : {', '.join(plan.optimizer_passes)}")
+        _info(
+            "Optimizer passes  : "
+            f"configured for optimization level {config.optimization_level}"
+        )
     except Exception as exc:
         _error(f"Plan failed: {exc}")
         return 1
@@ -119,9 +131,13 @@ def run_compile(
     from aether.compiler.compiler import Compiler
     from aether.compiler.config import CompilerConfig
 
+    # CompilerConfig intentionally does not expose a fictitious global
+    # ``default_precision`` knob.  Uniform Q4_K_M is the supported explicit
+    # low-bit mode; all other values use the calibrated/source-precision path.
+    precision_mode = "uniform" if precision.upper() == "Q4_K_M" else "sensitivity"
     config = CompilerConfig(
-        default_precision=precision,
         optimization_level=opt_level,
+        precision_assignment_mode=precision_mode,
         targets=targets or ["cpu_avx512"],
         overwrite=overwrite,
     )
@@ -173,7 +189,6 @@ def run_compile(
     if profile:
         _header("Profile")
         try:
-            from aether.compiler.report import CompilationReport
             report_path = package.root / "compile_report.json"
             if report_path.exists():
                 import json

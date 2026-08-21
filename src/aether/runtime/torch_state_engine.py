@@ -13,14 +13,35 @@ from typing import Any, Iterator
 import numpy as np
 
 
+def _apply_torch_grammar_mask(logits: Any, grammar_session: Any, torch: Any) -> Any:
+    """Mask a Torch logits vector using the authenticated byte-mask FSM."""
+    mask = grammar_session.get_token_mask()
+    vocab_size = int(logits.numel())
+    if len(mask) * 8 < vocab_size:
+        raise ValueError("Grammar FSM vocabulary is smaller than model vocabulary")
+    allowed = torch.tensor(
+        [
+            (mask[index // 8] & (1 << (index % 8))) != 0
+            for index in range(vocab_size)
+        ],
+        dtype=torch.bool,
+        device=logits.device,
+    )
+    if not bool(torch.any(allowed).item()):
+        raise ValueError("Grammar FSM has no valid next token")
+    return logits.masked_fill(~allowed, -torch.finfo(logits.dtype).max)
+
+
 class _TorchStateBase:
-    def __init__(self, source_engine: Any, device: str) -> None:
+    def __init__(self, source_engine: Any, device: str, devices: list[str] | None = None) -> None:
         try:
             import torch
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("PyTorch is required for portable state execution") from exc
         self.torch = torch
         self.device = torch.device(device)
+        self.devices = [torch.device(value) for value in (devices or [device])]
+        self.layer_devices = [self.devices[index % len(self.devices)] for index in range(len(source_engine.weights.layers))]
         self.source_engine = source_engine
         self.weights = source_engine.weights
         self.embedding = self._tensor(self.weights.embedding)
@@ -28,8 +49,8 @@ class _TorchStateBase:
         self.lm_head = self._tensor(self.weights.lm_head)
         self.num_layers = len(self.weights.layers)
 
-    def _tensor(self, value: Any) -> Any:
-        return self.torch.as_tensor(np.asarray(value, dtype=np.float32), device=self.device)
+    def _tensor(self, value: Any, device: Any | None = None) -> Any:
+        return self.torch.as_tensor(np.asarray(value, dtype=np.float32), device=device or self.device)
 
     @staticmethod
     def _ids(torch: Any, values: Any, device: Any, vocab: int) -> Any:
@@ -73,7 +94,7 @@ class _TorchStateBase:
 
     def _generate_iter(self, prompt_ids: np.ndarray, max_tokens: int, temperature: float,
                        top_k: int, top_p: float, eos_token_id: int | None, cache: Any,
-                       cache_callback: Any | None) -> Iterator[int]:
+                       cache_callback: Any | None, grammar_session: Any | None = None) -> Iterator[int]:
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         prompt = np.asarray(prompt_ids, dtype=np.int64).reshape(-1)
@@ -85,8 +106,14 @@ class _TorchStateBase:
         else:
             raise ValueError("generation requires prompt ids or a populated cache")
         for _ in range(int(max_tokens)):
+            if grammar_session is not None:
+                next_logits = _apply_torch_grammar_mask(next_logits, grammar_session, self.torch)
             token = self._sample(next_logits, temperature, top_k, top_p)
+            if grammar_session is not None and grammar_session.advance(token) < 0:
+                raise ValueError("the portable state executor produced a token rejected by the grammar FSM")
             yield token
+            if grammar_session is not None and getattr(grammar_session, "is_accepting", lambda: False)():
+                break
             if eos_token_id is not None and token == int(eos_token_id):
                 break
             _, cache = self.forward(np.asarray([token], dtype=np.int64), cache)
@@ -98,8 +125,8 @@ class _TorchStateBase:
 class TorchMamba2AEGEngine(_TorchStateBase):
     """Portable PyTorch implementation of the Mamba-2 SSD recurrence."""
 
-    def __init__(self, source_engine: Any, device: str) -> None:
-        super().__init__(source_engine, device)
+    def __init__(self, source_engine: Any, device: str, devices: list[str] | None = None) -> None:
+        super().__init__(source_engine, device, devices)
         self.state_size = int(source_engine.state_size)
         self.inner_size = int(source_engine.inner_size)
         self.num_heads = int(source_engine.num_heads)
@@ -107,22 +134,23 @@ class TorchMamba2AEGEngine(_TorchStateBase):
         self.head_dim = int(source_engine.head_dim)
         self.conv_kernel = int(source_engine.conv_kernel)
         self.layers: list[dict[str, Any | None]] = []
-        for layer in self.weights.layers:
+        for index, layer in enumerate(self.weights.layers):
+            layer_device = self.layer_devices[index]
             self.layers.append({
-                "norm": self._tensor(layer.norm), "in_proj": self._tensor(layer.in_proj),
-                "conv1d": self._tensor(layer.conv1d), "a_log": self._tensor(layer.a_log),
-                "d": self._tensor(layer.d), "dt": self._tensor(layer.dt),
-                "out_proj": self._tensor(layer.out_proj),
-                "in_bias": None if layer.in_proj_bias is None else self._tensor(layer.in_proj_bias),
-                "conv_bias": None if layer.conv_bias is None else self._tensor(layer.conv_bias),
+                "norm": self._tensor(layer.norm, layer_device), "in_proj": self._tensor(layer.in_proj, layer_device),
+                "conv1d": self._tensor(layer.conv1d, layer_device), "a_log": self._tensor(layer.a_log, layer_device),
+                "d": self._tensor(layer.d, layer_device), "dt": self._tensor(layer.dt, layer_device),
+                "out_proj": self._tensor(layer.out_proj, layer_device),
+                "in_bias": None if layer.in_proj_bias is None else self._tensor(layer.in_proj_bias, layer_device),
+                "conv_bias": None if layer.conv_bias is None else self._tensor(layer.conv_bias, layer_device),
             })
 
     def _new_cache(self) -> Any:
         torch = self.torch
         channels = self.inner_size + 2 * self.num_groups * self.state_size
         return type("TorchMamba2Cache", (), {
-            "states": [torch.zeros((1, self.num_heads, self.head_dim, self.state_size), device=self.device) for _ in self.layers],
-            "conv_history": [torch.zeros((1, channels, max(self.conv_kernel - 1, 0)), device=self.device) for _ in self.layers],
+            "states": [torch.zeros((1, self.num_heads, self.head_dim, self.state_size), device=device) for device in self.layer_devices],
+            "conv_history": [torch.zeros((1, channels, max(self.conv_kernel - 1, 0)), device=device) for device in self.layer_devices],
             "length": 0, "last_logits": None,
         })()
 
@@ -168,8 +196,8 @@ class TorchMamba2AEGEngine(_TorchStateBase):
             for token in ids:
                 hidden = self.embedding.index_select(0, token.reshape(1))
                 for index in range(self.num_layers):
-                    hidden = self._step(hidden, index, cache)
-                hidden = self._norm(hidden, self.final_norm)
+                    hidden = self._step(hidden.to(self.layer_devices[index]), index, cache)
+                hidden = self._norm(hidden.to(self.device), self.final_norm)
                 logits = self._linear(hidden, self.lm_head)
                 outputs.append(logits[0])
                 cache.length += 1
@@ -178,8 +206,9 @@ class TorchMamba2AEGEngine(_TorchStateBase):
 
     def generate_iter(self, prompt_ids: np.ndarray, max_tokens: int = 16, temperature: float = 0.0,
                       top_k: int = 0, top_p: float = 1.0, eos_token_id: int | None = None,
-                      cache: Any | None = None, cache_callback: Any | None = None, **_: Any) -> Iterator[int]:
-        yield from self._generate_iter(prompt_ids, max_tokens, temperature, top_k, top_p, eos_token_id, cache, cache_callback)
+                      cache: Any | None = None, cache_callback: Any | None = None,
+                      grammar_session: Any | None = None, **_: Any) -> Iterator[int]:
+        yield from self._generate_iter(prompt_ids, max_tokens, temperature, top_k, top_p, eos_token_id, cache, cache_callback, grammar_session)
 
     def generate(self, prompt_ids: np.ndarray, max_tokens: int = 16, **kwargs: Any) -> list[int]:
         return list(self.generate_iter(prompt_ids, max_tokens=max_tokens, **kwargs))
@@ -188,28 +217,29 @@ class TorchMamba2AEGEngine(_TorchStateBase):
 class TorchMambaAEGEngine(_TorchStateBase):
     """Portable PyTorch implementation of Mamba-1 selective scan."""
 
-    def __init__(self, source_engine: Any, device: str) -> None:
-        super().__init__(source_engine, device)
+    def __init__(self, source_engine: Any, device: str, devices: list[str] | None = None) -> None:
+        super().__init__(source_engine, device, devices)
         self.state_size = int(source_engine.state_size)
         self.inner_size = int(source_engine.inner_size)
         self.dt_rank = int(source_engine.dt_rank)
         self.conv_kernel = int(source_engine.conv_kernel)
         self.layers: list[dict[str, Any | None]] = []
-        for layer in self.weights.layers:
+        for index, layer in enumerate(self.weights.layers):
+            layer_device = self.layer_devices[index]
             self.layers.append({
-                "norm": self._tensor(layer.norm), "in_proj": self._tensor(layer.in_proj),
-                "conv1d": self._tensor(layer.conv1d), "x_proj": self._tensor(layer.x_proj),
-                "dt_proj": self._tensor(layer.dt_proj), "a_log": self._tensor(layer.a_log),
-                "d": self._tensor(layer.d), "out_proj": self._tensor(layer.out_proj),
-                "conv_bias": None if layer.conv_bias is None else self._tensor(layer.conv_bias),
-                "dt_bias": None if layer.dt_bias is None else self._tensor(layer.dt_bias),
+                "norm": self._tensor(layer.norm, layer_device), "in_proj": self._tensor(layer.in_proj, layer_device),
+                "conv1d": self._tensor(layer.conv1d, layer_device), "x_proj": self._tensor(layer.x_proj, layer_device),
+                "dt_proj": self._tensor(layer.dt_proj, layer_device), "a_log": self._tensor(layer.a_log, layer_device),
+                "d": self._tensor(layer.d, layer_device), "out_proj": self._tensor(layer.out_proj, layer_device),
+                "conv_bias": None if layer.conv_bias is None else self._tensor(layer.conv_bias, layer_device),
+                "dt_bias": None if layer.dt_bias is None else self._tensor(layer.dt_bias, layer_device),
             })
 
     def _new_cache(self) -> Any:
         torch = self.torch
         return type("TorchMambaCache", (), {
-            "states": [torch.zeros((1, self.state_size, self.inner_size), device=self.device) for _ in self.layers],
-            "conv_history": [torch.zeros((1, self.inner_size, max(self.conv_kernel - 1, 0)), device=self.device) for _ in self.layers],
+            "states": [torch.zeros((1, self.state_size, self.inner_size), device=device) for device in self.layer_devices],
+            "conv_history": [torch.zeros((1, self.inner_size, max(self.conv_kernel - 1, 0)), device=device) for device in self.layer_devices],
             "length": 0, "last_logits": None,
         })()
 
@@ -252,8 +282,8 @@ class TorchMambaAEGEngine(_TorchStateBase):
             for token in ids:
                 hidden = self.embedding.index_select(0, token.reshape(1))
                 for index in range(self.num_layers):
-                    hidden = self._step(hidden, index, cache)
-                hidden = self._norm(hidden, self.final_norm)
+                    hidden = self._step(hidden.to(self.layer_devices[index]), index, cache)
+                hidden = self._norm(hidden.to(self.device), self.final_norm)
                 logits = self._linear(hidden, self.lm_head)
                 outputs.append(logits[0])
                 cache.length += 1
@@ -262,8 +292,9 @@ class TorchMambaAEGEngine(_TorchStateBase):
 
     def generate_iter(self, prompt_ids: np.ndarray, max_tokens: int = 16, temperature: float = 0.0,
                       top_k: int = 0, top_p: float = 1.0, eos_token_id: int | None = None,
-                      cache: Any | None = None, cache_callback: Any | None = None, **_: Any) -> Iterator[int]:
-        yield from self._generate_iter(prompt_ids, max_tokens, temperature, top_k, top_p, eos_token_id, cache, cache_callback)
+                      cache: Any | None = None, cache_callback: Any | None = None,
+                      grammar_session: Any | None = None, **_: Any) -> Iterator[int]:
+        yield from self._generate_iter(prompt_ids, max_tokens, temperature, top_k, top_p, eos_token_id, cache, cache_callback, grammar_session)
 
     def generate(self, prompt_ids: np.ndarray, max_tokens: int = 16, **kwargs: Any) -> list[int]:
         return list(self.generate_iter(prompt_ids, max_tokens=max_tokens, **kwargs))
@@ -278,35 +309,38 @@ class TorchMLAAEGEngine:
     added later without changing the AEG representation.
     """
 
-    def __init__(self, source_engine: Any, device: str) -> None:
+    def __init__(self, source_engine: Any, device: str, devices: list[str] | None = None) -> None:
         try:
             import torch
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("PyTorch is required for portable MLA execution") from exc
         self.torch = torch
         self.device = torch.device(device)
+        self.devices = [torch.device(value) for value in (devices or [device])]
         self.source_engine = source_engine
         self.weights = source_engine.weights
         self.config = source_engine.config
+        self.layer_devices = [self.devices[index % len(self.devices)] for index in range(len(self.weights.layers))]
         self.embedding = self._tensor(self.weights.embedding)
         self.final_norm = self._tensor(self.weights.final_norm)
         self.lm_head = self._tensor(self.weights.lm_head)
         self.layers: list[dict[str, Any | None]] = []
-        for layer in self.weights.layers:
-            converted = {name: self._tensor(value) for name, value in layer.mla.items()}
+        for index, layer in enumerate(self.weights.layers):
+            layer_device = self.layer_devices[index]
+            converted = {name: self._tensor(value, layer_device) for name, value in layer.mla.items()}
             converted.update({
-                "attention_norm": self._tensor(layer.attention_norm),
-                "ffn_norm": self._tensor(layer.ffn_norm),
-                "o_proj": self._tensor(layer.o_proj),
-                "ffn_in": self._tensor(layer.ffn_in),
-                "ffn_out": self._tensor(layer.ffn_out),
-                "ffn_up": None if layer.ffn_up is None else self._tensor(layer.ffn_up),
-                "router": None if layer.router is None else self._tensor(layer.router),
+                "attention_norm": self._tensor(layer.attention_norm, layer_device),
+                "ffn_norm": self._tensor(layer.ffn_norm, layer_device),
+                "o_proj": self._tensor(layer.o_proj, layer_device),
+                "ffn_in": self._tensor(layer.ffn_in, layer_device),
+                "ffn_out": self._tensor(layer.ffn_out, layer_device),
+                "ffn_up": None if layer.ffn_up is None else self._tensor(layer.ffn_up, layer_device),
+                "router": None if layer.router is None else self._tensor(layer.router, layer_device),
                 "experts": [
                     {
-                        "gate_proj": self._tensor(expert.gate_proj),
-                        "up_proj": self._tensor(expert.up_proj),
-                        "down_proj": self._tensor(expert.down_proj),
+                        "gate_proj": self._tensor(expert.gate_proj, layer_device),
+                        "up_proj": self._tensor(expert.up_proj, layer_device),
+                        "down_proj": self._tensor(expert.down_proj, layer_device),
                     }
                     for expert in layer.experts
                 ],
@@ -314,8 +348,8 @@ class TorchMLAAEGEngine:
             })
             self.layers.append(converted)
 
-    def _tensor(self, value: Any) -> Any:
-        return self.torch.as_tensor(np.asarray(value, dtype=np.float32), device=self.device)
+    def _tensor(self, value: Any, device: Any | None = None) -> Any:
+        return self.torch.as_tensor(np.asarray(value, dtype=np.float32), device=device or self.device)
 
     def _norm(self, value: Any, weight: Any) -> Any:
         if str(self.weights.norm_type).lower() == "layernorm":
@@ -370,8 +404,9 @@ class TorchMLAAEGEngine:
         torch = self.torch
         d = int(value.shape[-1])
         half = d // 2
-        positions = torch.arange(offset, offset + int(value.shape[-2]), device=self.device, dtype=torch.float32)[:, None]
-        freqs = 1.0 / (float(self.config.rope_theta) ** (torch.arange(half, device=self.device, dtype=torch.float32) / half))
+        device = value.device
+        positions = torch.arange(offset, offset + int(value.shape[-2]), device=device, dtype=torch.float32)[:, None]
+        freqs = 1.0 / (float(self.config.rope_theta) ** (torch.arange(half, device=device, dtype=torch.float32) / half))
         angles = positions * freqs[None, :]
         cos, sin = torch.cos(angles), torch.sin(angles)
         first, second = value[..., :half], value[..., half:]
@@ -409,7 +444,7 @@ class TorchMLAAEGEngine:
         k = torch.cat((k_nope, k_rope), dim=-1).transpose(1, 2)
         v = v.transpose(1, 2)
         scores = torch.matmul(q, k.transpose(-1, -2)) / np.sqrt(nope + rope)
-        mask = torch.triu(torch.full((seq, seq), -torch.inf, device=self.device), diagonal=1)
+        mask = torch.triu(torch.full((seq, seq), -torch.inf, device=value.device), diagonal=1)
         scores = scores + mask.reshape(1, 1, seq, seq)
         attention = torch.softmax(scores, dim=-1)
         out = torch.matmul(attention, v).transpose(1, 2).reshape(batch, seq, heads * vdim)
@@ -429,9 +464,9 @@ class TorchMLAAEGEngine:
         all_ids = np.asarray(cache.token_ids + ids.detach().cpu().tolist(), dtype=np.int64)
         hidden = self.embedding.index_select(0, torch.as_tensor(all_ids, device=self.device)).unsqueeze(0)
         with torch.no_grad():
-            for layer in self.layers:
-                hidden = self._layer(hidden, layer, int(all_ids.size))
-            hidden = self._norm(hidden, self.final_norm)
+            for index, layer in enumerate(self.layers):
+                hidden = self._layer(hidden.to(self.layer_devices[index]), layer, int(all_ids.size))
+            hidden = self._norm(hidden.to(self.device), self.final_norm)
             logits = self._linear(hidden, self.lm_head)[0]
         cache.token_ids = all_ids.tolist()
         cache.length = len(cache.token_ids)
@@ -450,7 +485,8 @@ class TorchMLAAEGEngine:
 
     def generate_iter(self, prompt_ids: np.ndarray, max_tokens: int = 16, temperature: float = 0.0,
                       top_k: int = 0, top_p: float = 1.0, eos_token_id: int | None = None,
-                      cache: Any | None = None, cache_callback: Any | None = None, **_: Any) -> Iterator[int]:
+                      cache: Any | None = None, cache_callback: Any | None = None,
+                      grammar_session: Any | None = None, **_: Any) -> Iterator[int]:
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         prompt = np.asarray(prompt_ids, dtype=np.int64).reshape(-1)
@@ -462,8 +498,14 @@ class TorchMLAAEGEngine:
         else:
             raise ValueError("generation requires prompt ids or a populated cache")
         for _ in range(int(max_tokens)):
+            if grammar_session is not None:
+                next_logits = _apply_torch_grammar_mask(next_logits, grammar_session, self.torch)
             token = self._sample(next_logits, temperature, top_k, top_p)
+            if grammar_session is not None and grammar_session.advance(token) < 0:
+                raise ValueError("the portable MLA executor produced a token rejected by the grammar FSM")
             yield token
+            if grammar_session is not None and getattr(grammar_session, "is_accepting", lambda: False)():
+                break
             if eos_token_id is not None and token == int(eos_token_id):
                 break
             _, cache = self.forward(np.asarray([token], dtype=np.int64), cache)
@@ -478,11 +520,12 @@ class TorchMLAAEGEngine:
 class TorchRWKVAEGEngine(_TorchStateBase):
     """Portable PyTorch implementation of the stable RWKV WKV recurrence."""
 
-    def __init__(self, source_engine: Any, device: str) -> None:
-        super().__init__(source_engine, device)
+    def __init__(self, source_engine: Any, device: str, devices: list[str] | None = None) -> None:
+        super().__init__(source_engine, device, devices)
         self.layers: list[dict[str, Any]] = []
-        for layer in self.weights.layers:
-            self.layers.append({name: self._tensor(getattr(layer, name)) for name in (
+        for index, layer in enumerate(self.weights.layers):
+            layer_device = self.layer_devices[index]
+            self.layers.append({name: self._tensor(getattr(layer, name), layer_device) for name in (
                 "norm", "ffn_norm", "time_decay", "time_first", "time_mix_k", "time_mix_v",
                 "time_mix_r", "ffn_time_mix_k", "ffn_time_mix_r", "key", "value",
                 "receptance", "output", "ffn_key", "ffn_value", "ffn_receptance",
@@ -492,10 +535,10 @@ class TorchRWKVAEGEngine(_TorchStateBase):
         torch = self.torch
         hidden = int(self.embedding.shape[1])
         return type("TorchRWKVCache", (), {
-            "aa": [torch.zeros((1, hidden), device=self.device) for _ in self.layers],
-            "bb": [torch.zeros((1, hidden), device=self.device) for _ in self.layers],
-            "pp": [torch.full((1, hidden), -torch.inf, device=self.device) for _ in self.layers],
-            "previous": [torch.zeros((1, hidden), device=self.device) for _ in self.layers],
+            "aa": [torch.zeros((1, hidden), device=device) for device in self.layer_devices],
+            "bb": [torch.zeros((1, hidden), device=device) for device in self.layer_devices],
+            "pp": [torch.full((1, hidden), -torch.inf, device=device) for device in self.layer_devices],
+            "previous": [torch.zeros((1, hidden), device=device) for device in self.layer_devices],
             "length": 0, "last_logits": None,
         })()
 
@@ -547,8 +590,8 @@ class TorchRWKVAEGEngine(_TorchStateBase):
             for token in ids:
                 hidden = self.embedding.index_select(0, token.reshape(1))
                 for index in range(self.num_layers):
-                    hidden = self._step(hidden, index, cache)
-                hidden = self._rwkv_norm(hidden, self.final_norm)
+                    hidden = self._step(hidden.to(self.layer_devices[index]), index, cache)
+                hidden = self._rwkv_norm(hidden.to(self.device), self.final_norm)
                 logits = self._linear(hidden, self.lm_head)
                 outputs.append(logits[0])
                 cache.length += 1
@@ -557,8 +600,9 @@ class TorchRWKVAEGEngine(_TorchStateBase):
 
     def generate_iter(self, prompt_ids: np.ndarray, max_tokens: int = 16, temperature: float = 0.0,
                       top_k: int = 0, top_p: float = 1.0, eos_token_id: int | None = None,
-                      cache: Any | None = None, cache_callback: Any | None = None, **_: Any) -> Iterator[int]:
-        yield from self._generate_iter(prompt_ids, max_tokens, temperature, top_k, top_p, eos_token_id, cache, cache_callback)
+                      cache: Any | None = None, cache_callback: Any | None = None,
+                      grammar_session: Any | None = None, **_: Any) -> Iterator[int]:
+        yield from self._generate_iter(prompt_ids, max_tokens, temperature, top_k, top_p, eos_token_id, cache, cache_callback, grammar_session)
 
     def generate(self, prompt_ids: np.ndarray, max_tokens: int = 16, **kwargs: Any) -> list[int]:
         return list(self.generate_iter(prompt_ids, max_tokens=max_tokens, **kwargs))

@@ -606,11 +606,28 @@ class IngestionPipeline:
                     ),
                 )
                 source_name, value = value_candidates[0]
+            packed_source = source_name.lower()
+            packed_shape = np.asarray(value).shape
+            expected_intermediate = int(
+                getattr(getattr(graph, "architecture", None), "intermediate_size", 0) or 0
+            )
             packed_gate_up = (
                 key[1] == "gate_proj"
-                and "gate_up_proj" in source_name.lower()
                 and np.asarray(value).ndim == 2
-                and np.asarray(value).shape[0] % 2 == 0
+                and packed_shape[0] % 2 == 0
+                and (
+                    "gate_up_proj" in packed_source
+                    or (
+                        # OLMo/OLMoE use ``ff_proj`` for the fused gate+up
+                        # projection.  Match the configured intermediate
+                        # width so a classic single ``ff_proj`` is not
+                        # accidentally halved merely because its row count
+                        # happens to be even.
+                        "ff_proj" in packed_source
+                        and expected_intermediate > 0
+                        and packed_shape[0] == 2 * expected_intermediate
+                    )
+                )
             )
             if packed_gate_up:
                 packed = np.asarray(value)
@@ -755,6 +772,14 @@ class IngestionPipeline:
         "attn_q": "qkv",
         "attn_k": "qkv",
         "attn_v": "qkv",
+        # OLMo / OLMoE checkpoints use a fused attention projection and a
+        # short FFN vocabulary rather than the Llama-style names.
+        "att_proj": "qkv",
+        "attn_proj": "qkv",
+        "attn_out": "out_proj",
+        "ff_proj": "gate_proj",
+        "ff_out": "ffn",
+        "ff_norm": "ffn_norm",
         # GPT-2 / DialoGPT layernorm spellings.
         "ln_1": "rmsnorm",
         "ln_2": "ffn_norm",
@@ -857,6 +882,7 @@ class IngestionPipeline:
         "dense_4h_to_h": "ffn",
         "wqkv": "qkv",
         "wo": "out_proj",
+        "qkv_proj": "qkv",
         "norm_1": "rmsnorm",
         "norm_2": "ffn_norm",
         "ln_attn": "rmsnorm",

@@ -386,6 +386,7 @@ class HardwareTarget(enum.Enum):
     ROCM_RDNA3 = "rocm_rdna3"
     ROCM_CDNA3 = "rocm_cdna3"
     OPENVINO_NPU = "openvino_npu"
+    OPENVINO_GPU = "openvino_gpu"
     QUALCOMM_QNN = "qualcomm_qnn"
     CPU_AVX512 = "cpu_avx512"
     CPU_AVX2 = "cpu_avx2"
@@ -443,6 +444,7 @@ class HardwareTarget(enum.Enum):
             HardwareTarget.AMD_MI350X: "AMD",
             HardwareTarget.ROCM_CDNA5_MI455X: "AMD",
             HardwareTarget.OPENVINO_NPU: "Intel",
+            HardwareTarget.OPENVINO_GPU: "Intel",
             HardwareTarget.QUALCOMM_QNN: "Qualcomm",
             HardwareTarget.QUALCOMM_CLOUD_AI100: "Qualcomm",
             HardwareTarget.CPU_AVX512: "CPU",
@@ -479,6 +481,7 @@ class HardwareTarget(enum.Enum):
             HardwareTarget.AMD_MI350X: "AMD MI350X (CDNA4)",
             HardwareTarget.ROCM_CDNA5_MI455X: "AMD MI455X (CDNA5, 432 GB HBM4)",
             HardwareTarget.OPENVINO_NPU: "Intel Arc NPU (OpenVINO)",
+            HardwareTarget.OPENVINO_GPU: "Intel GPU (OpenVINO)",
             HardwareTarget.QUALCOMM_QNN: "Qualcomm Snapdragon NPU (QNN)",
             HardwareTarget.QUALCOMM_CLOUD_AI100: "Qualcomm Cloud AI 100 Ultra",
             HardwareTarget.CPU_AVX512: "x86_64 (AVX-512)",
@@ -515,6 +518,7 @@ class HardwareTarget(enum.Enum):
             HardwareTarget.AMD_MI350X: ["vllm", "pytorch"],
             HardwareTarget.ROCM_CDNA5_MI455X: ["vllm", "pytorch"],
             HardwareTarget.OPENVINO_NPU: ["onnxruntime", "pytorch"],
+            HardwareTarget.OPENVINO_GPU: ["onnxruntime", "pytorch"],
             HardwareTarget.QUALCOMM_QNN: ["onnxruntime", "pytorch"],
             HardwareTarget.QUALCOMM_CLOUD_AI100: ["onnxruntime", "pytorch"],
             HardwareTarget.CPU_AVX512: ["llama.cpp", "onnxruntime", "aether_cpu"],
@@ -659,6 +663,19 @@ class HardwareTarget(enum.Enum):
                 pass
 
         # ── 4. Apple Metal via platform APIs ─────────────────────────────────
+        # OpenVINO is the framework-independent probe for Intel integrated
+        # and discrete GPUs. Require the plugin to enumerate the device;
+        # package presence alone is not evidence of usable hardware.
+        try:
+            import openvino  # type: ignore[import]  # noqa: PLC0415
+            devices = list(openvino.Core().available_devices)
+            if "GPU" in devices:
+                return HardwareTarget.OPENVINO_GPU
+            if "NPU" in devices:
+                return HardwareTarget.OPENVINO_NPU
+        except Exception:  # noqa: BLE001
+            pass
+
         if sys.platform == "darwin":
             try:
                 import subprocess  # noqa: PLC0415

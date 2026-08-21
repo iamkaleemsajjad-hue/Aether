@@ -117,6 +117,10 @@ def test_encoder_compile_reload_and_embedding(tmp_path: Path) -> None:
         np.asarray([[1, 2, 3]], dtype=np.int64)
     )
     np.testing.assert_allclose(portable_embedding, cpu_embedding, rtol=2e-5, atol=2e-5)
+    mesh_embedding = TorchEncoderAEGEngine(engine, "cpu", devices=["cpu:0", "cpu:1"]).pooled(
+        np.asarray([[1, 2, 3]], dtype=np.int64)
+    )
+    np.testing.assert_allclose(mesh_embedding, cpu_embedding, rtol=2e-5, atol=2e-5)
 
     result = CliRunner().invoke(
         cli,

@@ -640,3 +640,35 @@ def test_unavailable_profile_only_is_not_reported_as_implemented():
     for target in ("qualcomm_qnn", "riscv_sifive_x160", "fpga_xilinx_vu9p"):
         assert by_target[target].available is False
         assert by_target[target].implemented is False
+
+
+def test_openvino_gpu_probe_uses_device_registry(monkeypatch):
+    """Intel GPU detection requires an actual OpenVINO GPU device entry."""
+    import sys
+    import types
+
+    class FakeCore:
+        available_devices = ["CPU", "GPU"]
+
+        def get_property(self, device, name):
+            assert device == "GPU"
+            return {
+                "FULL_DEVICE_NAME": "Intel Arc Test GPU",
+                "DEVICE_ARCHITECTURE": "xe_hpg",
+                "DRIVER_VERSION": "test-driver",
+            }[name]
+
+    fake_openvino = types.ModuleType("openvino")
+    fake_openvino.Core = FakeCore
+    fake_openvino.__version__ = "test"
+    monkeypatch.setitem(sys.modules, "openvino", fake_openvino)
+
+    from aether.backends.hardware_detector import detect_openvino_gpu
+
+    result = detect_openvino_gpu()
+    assert result.available is True
+    assert result.vendor == "Intel"
+    assert result.target_id == "openvino_gpu"
+    assert result.device == "Intel Arc Test GPU"
+    assert result.architecture == "xe_hpg"
+    assert result.execution_tested is False

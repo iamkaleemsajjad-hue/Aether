@@ -599,6 +599,7 @@ class Runtime:
                 offline=self.config.hf_offline,
                 download_timeout_s=self.config.model_download_timeout_s,
                 trust_remote_code=self.config.allow_remote_code,
+                execution_devices=self.config.execution_devices,
             )
             self._loaded_backends[model_id] = backend
             # Optional v4/v5 layers are initialized at the same reachability

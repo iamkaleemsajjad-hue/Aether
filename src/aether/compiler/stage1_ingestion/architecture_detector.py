@@ -149,6 +149,28 @@ class ArchitectureDetector:
                 "or a supported Hugging Face model identifier."
             )
         # Build a best-guess architecture only for a recognized family.
+        return self._family_default_architecture(model, family)
+
+    @staticmethod
+    def _family_default_architecture(model: str, family: str) -> ModelArchitecture:
+        """Build a conservative family contract for name-only references.
+
+        A name-only reference cannot provide real tensor geometry, so the
+        dimensions below are deliberately provisional.  The compiler replaces
+        them with ``config.json``/GGUF metadata whenever it can materialize a
+        checkpoint.  The important invariant here is that family semantics
+        (encoder, encoder-decoder, SSM, MLA, MoE, and multimodal) are not
+        silently erased by the fallback path.
+        """
+        is_encoder = family in {
+            "bert_family", "roberta_family", "deberta_family",
+            "electra_family", "albert_family",
+        }
+        is_encoder_decoder = family == "encoder_decoder_family"
+        is_multimodal = family == "vision_family"
+        is_ssm = family == "hybrid_ssm_family"
+        is_mla = family == "deepseek_family"
+        is_moe = family == "moe_family" or is_mla
         return ModelArchitecture(
             family=family,
             params_billion=0.0,
@@ -159,6 +181,25 @@ class ArchitectureDetector:
             context_length=4096,
             vocab_size=32000,
             intermediate_size=11008,
+            is_encoder=is_encoder,
+            is_encoder_decoder=is_encoder_decoder,
+            is_multimodal=is_multimodal,
+            is_moe=is_moe,
+            num_experts=8 if is_moe else 0,
+            num_activated_experts=2 if is_moe else 0,
+            attention_type=(
+                "MLA" if is_mla
+                else "MHA" if family in {
+                    "gpt_family", "phi_family", "bert_family", "roberta_family",
+                    "deberta_family", "electra_family", "albert_family",
+                }
+                else "MQA" if family in {"gemma_family", "falcon_family"}
+                else "GQA"
+            ),
+            ssm_variant="selective_scan" if is_ssm else None,
+            ffn_type="GELU" if is_encoder else "SwiGLU",
+            norm_type="LayerNorm" if is_encoder else "RMSNorm",
+            position_type="none" if is_encoder else "RoPE",
         )
 
     def _from_gguf(self, path: Path) -> ModelArchitecture:
@@ -268,6 +309,10 @@ class ArchitectureDetector:
         if not arch_type:
             raise ArchitectureDetectionError("Local config.json does not declare an architecture")
         family = self._detect_family_from_arch_type(arch_type)
+        if family is None and bool(config.get("is_encoder_decoder") is True):
+            # Hugging Face's base config contract is authoritative even when
+            # a custom repository uses a class name unknown to this registry.
+            family = "encoder_decoder_family"
         if family is None and self._is_generic_decoder_config(config, str(arch_type)):
             # Aether is an open compiler, not a closed allow-list of current
             # Hub class names. A new family may still expose the standard
@@ -438,9 +483,17 @@ class ArchitectureDetector:
                 moe_layer_indices = list(range(first_dense, int(num_hidden_layers)))
         else:
             moe_layer_indices = None
-        is_encoder = family in ("bert_family", "roberta_family", "deberta_family", "electra_family", "albert_family")
-        is_encoder_decoder = family == "encoder_decoder_family"
+        is_encoder = (
+            family in ("bert_family", "roberta_family", "deberta_family", "electra_family", "albert_family")
+        ) or bool(config.get("is_encoder") is True)
+        is_encoder_decoder = bool(
+            family == "encoder_decoder_family"
+            or config.get("is_encoder_decoder") is True
+        )
         is_multimodal = bool(
+            family == "vision_family"
+            or family == "whisper_family"
+            or
             config.get("vision_config") is not None
             or config.get("visual_config") is not None
             or any(marker in architecture_name for marker in ("vision", "vl", "visual", "audio"))

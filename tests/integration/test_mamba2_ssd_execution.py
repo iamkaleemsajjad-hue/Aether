@@ -96,3 +96,6 @@ def test_mamba2_ssd_compiles_serializes_and_generates(tmp_path: Path) -> None:
     portable = TorchMamba2AEGEngine(cpu_engine, "cpu")
     portable_logits, _ = portable.forward(np.asarray([1, 2, 3], dtype=np.int64))
     np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
+    mesh = TorchMamba2AEGEngine(cpu_engine, "cpu", devices=["cpu:0", "cpu:1"])
+    mesh_logits, _ = mesh.forward(np.asarray([1, 2, 3], dtype=np.int64))
+    np.testing.assert_allclose(cpu_logits, mesh_logits, rtol=2e-5, atol=2e-5)

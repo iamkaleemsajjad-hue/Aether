@@ -71,8 +71,9 @@ def detect_all_capabilities() -> list[HardwareCapabilities]:
     # 4. Metal (Apple Silicon)
     caps.append(detect_metal())
 
-    # 5. OpenVINO / Intel NPU
+    # 5. OpenVINO / Intel NPU and GPU
     caps.append(detect_openvino())
+    caps.append(detect_openvino_gpu())
 
     # 6. Vendor-specific targets (always unavailable on this host)
     caps.extend(_unavailable_vendor_targets())
@@ -168,37 +169,75 @@ def detect_cuda_devices() -> list[HardwareCapabilities]:
         _lib = ctypes.CDLL("nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1")
         if _lib.cuInit(0) == 0:  # CUDA_SUCCESS
             count = ctypes.c_int(0)
+            _lib.cuDeviceGetCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
+            _lib.cuDeviceGetCount.restype = ctypes.c_int
             _lib.cuDeviceGetCount(ctypes.byref(count))
             if count.value > 0:
-                major = ctypes.c_int(0)
-                minor = ctypes.c_int(0)
-                _lib.cuDeviceGetAttribute(ctypes.byref(major), 75, 0)
-                _lib.cuDeviceGetAttribute(ctypes.byref(minor), 76, 0)
-                target_id = _cuda_target_id(major.value, minor.value)
-                return [HardwareCapabilities(
-                    vendor="NVIDIA",
-                    device=f"NVIDIA GPU (via cuDriver, {count.value} device(s))",
-                    architecture=f"sm{major.value}{minor.value}",
-                    target_id=target_id,
-                    driver_version="unknown (ctypes)",
-                    runtime_version="cuda_driver",
-                    memory_bytes=0,
-                    supports_fp32=True,
-                    supports_fp16=True,
-                    supports_bf16=major.value >= 8,
-                    supports_fp8=major.value >= 9,
-                    supports_fp4=(major.value >= 10),
-                    supports_int8=True,
-                    supports_int4=True,
-                    supports_cuda_graph=True,
-                    warp_or_wavefront_size=32,
-                    implemented=True,
-                    available=True,
-                    compile_tested=False,
-                    execution_tested=False,
-                    production_validated=False,
-                    extra={"device_count": count.value, "detection_method": "ctypes_cuda_driver"},
-                )]
+                # The driver API fallback must preserve physical-device
+                # identity. Returning one aggregate capability for N GPUs
+                # made a two-GPU host look like a single device and prevented
+                # a correct model-parallel plan.
+                _lib.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+                _lib.cuDeviceGet.restype = ctypes.c_int
+                _lib.cuDeviceGetAttribute.argtypes = [
+                    ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int
+                ]
+                _lib.cuDeviceGetAttribute.restype = ctypes.c_int
+                _lib.cuDeviceGetName.argtypes = [
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_int
+                ]
+                _lib.cuDeviceGetName.restype = ctypes.c_int
+                _lib.cuDeviceTotalMem_v2.argtypes = [
+                    ctypes.POINTER(ctypes.c_size_t), ctypes.c_int
+                ]
+                _lib.cuDeviceTotalMem_v2.restype = ctypes.c_int
+                devices: list[HardwareCapabilities] = []
+                for index in range(count.value):
+                    device = ctypes.c_int(0)
+                    if _lib.cuDeviceGet(ctypes.byref(device), index) != 0:
+                        continue
+                    major = ctypes.c_int(0)
+                    minor = ctypes.c_int(0)
+                    _lib.cuDeviceGetAttribute(ctypes.byref(major), 75, device.value)
+                    _lib.cuDeviceGetAttribute(ctypes.byref(minor), 76, device.value)
+                    name_buffer = ctypes.create_string_buffer(256)
+                    name = f"NVIDIA GPU {index}"
+                    if _lib.cuDeviceGetName(name_buffer, len(name_buffer), device.value) == 0:
+                        name = name_buffer.value.decode(errors="replace") or name
+                    memory = ctypes.c_size_t(0)
+                    _lib.cuDeviceTotalMem_v2(ctypes.byref(memory), device.value)
+                    target_id = _cuda_target_id(major.value, minor.value)
+                    devices.append(HardwareCapabilities(
+                        vendor="NVIDIA",
+                        device=name,
+                        architecture=f"sm{major.value}{minor.value}",
+                        target_id=target_id,
+                        driver_version="unknown (ctypes)",
+                        runtime_version="cuda_driver",
+                        memory_bytes=int(memory.value),
+                        supports_fp32=True,
+                        supports_fp16=True,
+                        supports_bf16=major.value >= 8,
+                        supports_fp8=major.value >= 9,
+                        supports_fp4=(major.value >= 10),
+                        supports_int8=True,
+                        supports_int4=True,
+                        supports_cuda_graph=True,
+                        warp_or_wavefront_size=32,
+                        implemented=True,
+                        available=True,
+                        compile_tested=False,
+                        execution_tested=False,
+                        production_validated=False,
+                        extra={
+                            "device_index": index,
+                            "device_count": count.value,
+                            "compute_capability": f"{major.value}.{minor.value}",
+                            "detection_method": "ctypes_cuda_driver",
+                        },
+                    ))
+                if devices:
+                    return devices
     except Exception:  # noqa: BLE001
         pass
 
@@ -256,24 +295,9 @@ def detect_rocm_devices() -> list[HardwareCapabilities]:
     except Exception:  # noqa: BLE001
         pass
 
-    # PyTorch HIP fallback. ROCm is exposed as ``torch.hip`` by some builds
-    # and as an AMD-backed ``torch.cuda`` by others. Normalize either form to
-    # canonical Aether target IDs.
-    try:
-        import torch  # noqa: PLC0415
-        hip_available = bool(hasattr(torch, "hip") and torch.hip.is_available())
-        cuda_reports_amd = False
-        if not hip_available and hasattr(torch, "cuda") and torch.cuda.is_available():
-            cuda_reports_amd = any(
-                marker in str(torch.cuda.get_device_name(index)).upper()
-                for index in range(torch.cuda.device_count())
-                for marker in ("AMD", "RADEON", "INSTINCT", "MI100", "MI200", "MI300", "MI350")
-            )
-        if hip_available or cuda_reports_amd:
-            detected = _detect_rocm_via_hip(torch)
-            if detected:
-                return detected
-    except Exception:  # noqa: BLE001
+    # PyTorch HIP fallback is intentionally disabled. Hardware detection must
+    # not import a framework; use amdsmi, rocm-smi, or /dev/kfd instead.
+    if False:  # pragma: no cover - retained only as legacy compatibility code
         pass
 
     # ── 2. rocm-smi subprocess ────────────────────────────────────────────────
@@ -453,6 +477,79 @@ def detect_openvino() -> HardwareCapabilities:
         )
 
 
+def detect_openvino_gpu() -> HardwareCapabilities:
+    """Detect Intel GPU execution through OpenVINO's real device registry.
+
+    OpenVINO exposes Intel integrated and discrete GPUs as ``GPU``.  Merely
+    finding the Python package is insufficient: this function requires the
+    device to be present in ``Core.available_devices`` and records queried
+    device properties as evidence.  It intentionally reports one capability
+    object for the OpenVINO GPU device class; per-card enumeration is owned by
+    the vendor runtime and is not fabricated here.
+    """
+    try:
+        import openvino  # type: ignore[import]
+        core = openvino.Core()
+        devices = list(core.available_devices)
+        if "GPU" not in devices:
+            return HardwareCapabilities.unavailable(
+                vendor="Intel",
+                device="Intel GPU",
+                architecture="openvino_gpu",
+                target_id="openvino_gpu",
+                reason=(
+                    "OpenVINO is installed, but its device list contains no GPU; "
+                    f"available devices: {devices}"
+                ),
+                implemented=True,
+            )
+
+        def property_or_unknown(name: str) -> str:
+            try:
+                value = core.get_property("GPU", name)
+                return str(value)
+            except Exception:  # noqa: BLE001 - optional property varies by plugin
+                return "unknown"
+
+        return HardwareCapabilities(
+            vendor="Intel",
+            device=property_or_unknown("FULL_DEVICE_NAME"),
+            architecture=property_or_unknown("DEVICE_ARCHITECTURE"),
+            target_id="openvino_gpu",
+            driver_version=property_or_unknown("DRIVER_VERSION"),
+            runtime_version=getattr(openvino, "__version__", "unknown"),
+            supports_fp32=True,
+            supports_fp16=True,
+            supports_bf16=True,
+            supports_int8=True,
+            supports_int4=True,
+            implemented=True,
+            available=True,
+            compile_tested=False,
+            execution_tested=False,
+            production_validated=False,
+            extra={"available_devices": devices, "detection_method": "openvino_core"},
+        )
+    except ImportError:
+        return HardwareCapabilities.unavailable(
+            vendor="Intel",
+            device="Intel GPU",
+            architecture="openvino_gpu",
+            target_id="openvino_gpu",
+            reason="OpenVINO package not installed",
+            implemented=False,
+        )
+    except Exception as exc:
+        return HardwareCapabilities.unavailable(
+            vendor="Intel",
+            device="Intel GPU",
+            architecture="openvino_gpu",
+            target_id="openvino_gpu",
+            reason=f"OpenVINO GPU enumeration failed: {exc}",
+            implemented=True,
+        )
+
+
 def get_memory_info(device_type: str = "cpu", device_index: int = 0) -> MemoryInfo:
     """Get current memory information for a device.
 
@@ -546,13 +643,6 @@ def validate_backend_environment(target_id: str) -> ValidationResult:
 
     if target_id.startswith("cpu"):
         try:
-            import torch
-            checks_passed.append(f"PyTorch {torch.__version__} available")
-            details["torch_version"] = torch.__version__
-        except ImportError:
-            checks_failed.append("PyTorch not installed")
-
-        try:
             import numpy as np
             checks_passed.append(f"NumPy {np.__version__} available")
         except ImportError:
@@ -580,21 +670,13 @@ def validate_backend_environment(target_id: str) -> ValidationResult:
         )
 
     if target_id.startswith("cuda"):
-        try:
-            import torch
-            # HIP builds intentionally expose ``torch.cuda`` for API
-            # compatibility.  Check the vendor runtime before reporting CUDA.
-            if getattr(torch.version, "hip", None):
-                checks_failed.append("PyTorch is a ROCm/HIP build, not NVIDIA CUDA")
-            elif torch.cuda.is_available():
-                checks_passed.append(f"CUDA available: {torch.cuda.get_device_name(0)}")
-                checks_passed.append(f"CUDA version: {torch.version.cuda}")
-                details["cuda_version"] = torch.version.cuda
-                details["device_count"] = torch.cuda.device_count()
-            else:
-                checks_failed.append("CUDA runtime not available")
-        except ImportError:
-            checks_failed.append("PyTorch not installed")
+        detected = [cap for cap in detect_cuda_devices() if cap.available]
+        if detected:
+            checks_passed.append(f"CUDA detected without PyTorch ({len(detected)} device(s))")
+            details["device_count"] = len(detected)
+            details["devices"] = [cap.to_dict() for cap in detected]
+        else:
+            checks_failed.append("CUDA runtime not available")
 
         return ValidationResult(
             backend_name=target_id,
@@ -606,22 +688,13 @@ def validate_backend_environment(target_id: str) -> ValidationResult:
         )
 
     if target_id.startswith("rocm"):
-        try:
-            import torch
-            has_rocm = (
-                (hasattr(torch, "hip") and torch.hip.is_available()) or
-                (torch.cuda.is_available() and any(
-                    kw in torch.cuda.get_device_name(i)
-                    for i in range(torch.cuda.device_count())
-                    for kw in ("AMD", "Radeon", "Instinct")
-                ))
-            )
-            if has_rocm:
-                checks_passed.append("ROCm runtime detected")
-            else:
-                checks_failed.append("ROCm runtime not available")
-        except Exception as exc:  # noqa: BLE001
-            checks_failed.append(f"ROCm detection failed: {exc}")
+        detected = [cap for cap in detect_rocm_devices() if cap.available]
+        if detected:
+            checks_passed.append(f"ROCm detected without PyTorch ({len(detected)} device(s))")
+            details["device_count"] = len(detected)
+            details["devices"] = [cap.to_dict() for cap in detected]
+        else:
+            checks_failed.append("ROCm runtime not available")
 
         return ValidationResult(
             backend_name=target_id,
@@ -632,15 +705,33 @@ def validate_backend_environment(target_id: str) -> ValidationResult:
             details=details,
         )
 
+    if target_id.startswith("openvino"):
+        detected = (
+            detect_openvino()
+            if target_id == "openvino_npu"
+            else detect_openvino_gpu()
+        )
+        if detected.available:
+            checks_passed.append(f"OpenVINO device detected: {detected.device}")
+            details["device"] = detected.to_dict()
+        else:
+            checks_failed.append(detected.unavailable_reason or "OpenVINO device unavailable")
+        return ValidationResult(
+            backend_name=target_id,
+            available=bool(detected.available),
+            checks_passed=checks_passed,
+            checks_failed=checks_failed,
+            warnings=warnings,
+            details=details,
+        )
+
     if target_id.startswith("metal"):
-        try:
-            import torch
-            if torch.backends.mps.is_available():
-                checks_passed.append("Apple MPS/Metal available")
-            else:
-                checks_failed.append("Apple MPS/Metal not available")
-        except Exception as exc:  # noqa: BLE001
-            checks_failed.append(f"Metal detection failed: {exc}")
+        detected = detect_metal()
+        if detected.available:
+            checks_passed.append("Apple Metal detected without PyTorch")
+            details["device"] = detected.to_dict()
+        else:
+            checks_failed.append("Apple MPS/Metal not available")
 
         return ValidationResult(
             backend_name=target_id,

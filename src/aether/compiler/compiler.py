@@ -1226,7 +1226,10 @@ class Compiler:
             portable_decoder or portable_mla or portable_hybrid or portable_state
             or portable_encoder or portable_seq2seq
         ):
-            kernels.portable_backends = ["pytorch"]
+            # ``aether_cpu`` is the framework-free execution contract for the
+            # canonical AEG graph.  PyTorch remains an optional accelerator
+            # materializer, never a dependency of the artifact or base wheel.
+            kernels.portable_backends = ["aether_cpu", "pytorch"]
             for profile in target_profiles:
                 if _has_portable_torch_contract(profile.target_id):
                     kernels.variant_status[profile.target_id] = "portable"

@@ -102,6 +102,51 @@ def _write_tiny_llama(
     tokenizer.save(str(path / "tokenizer.json"))
     transformers.PreTrainedTokenizerFast(
         tokenizer_file=str(path / "tokenizer.json"), unk_token="<unk>"
+        ).save_pretrained(str(path))
+
+
+def _write_tiny_olmo(path: Path) -> None:
+    """Write the fused-projection vocabulary used by OLMo/OLMoE checkpoints."""
+    safetensors = pytest.importorskip("safetensors.numpy")
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+
+    vocab_size, hidden, intermediate = 32, 16, 32
+    (path / "config.json").write_text(json.dumps({
+        "architectures": ["OlmoForCausalLM"],
+        "model_type": "olmo",
+        "num_hidden_layers": 1,
+        "hidden_size": hidden,
+        "intermediate_size": intermediate,
+        "hidden_act": "silu",
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "vocab_size": vocab_size,
+        "layer_norm_epsilon": 1e-5,
+        "rope_theta": 10000.0,
+        "torch_dtype": "float32",
+    }), encoding="utf-8")
+    rng = np.random.default_rng(71)
+    tensors = {
+        "model.transformer.wte.weight": rng.normal(size=(vocab_size, hidden)).astype("float32"),
+        "model.transformer.ln_f.weight": np.ones(hidden, dtype="float32"),
+        "lm_head.weight": rng.normal(size=(vocab_size, hidden)).astype("float32"),
+        "model.transformer.blocks.0.attn_norm.weight": np.ones(hidden, dtype="float32"),
+        "model.transformer.blocks.0.att_proj.weight": rng.normal(size=(3 * hidden, hidden)).astype("float32"),
+        "model.transformer.blocks.0.attn_out.weight": rng.normal(size=(hidden, hidden)).astype("float32"),
+        "model.transformer.blocks.0.ff_norm.weight": np.ones(hidden, dtype="float32"),
+        # OLMo's gated FFN stores gate and up rows in one ``ff_proj`` tensor.
+        "model.transformer.blocks.0.ff_proj.weight": rng.normal(size=(2 * intermediate, hidden)).astype("float32"),
+        "model.transformer.blocks.0.ff_out.weight": rng.normal(size=(hidden, intermediate)).astype("float32"),
+    }
+    safetensors.save_file(tensors, str(path / "model.safetensors"))
+    vocab = {"<unk>": 0, "hello": 1, "world": 2}
+    vocab.update({f"tok{i}": i + 3 for i in range(vocab_size - 3)})
+    tokenizer = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocab=vocab, unk_token="<unk>"))
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    tokenizer.save(str(path / "tokenizer.json"))
+    transformers.PreTrainedTokenizerFast(
+        tokenizer_file=str(path / "tokenizer.json"), unk_token="<unk>"
     ).save_pretrained(str(path))
 
 
@@ -658,6 +703,10 @@ def test_t5_encoder_decoder_compiles_and_generates(tmp_path: Path) -> None:
     cpu_logits, _ = load_engine_from_path(artifact).forward(np.asarray([3, 4], dtype=np.int64))
     portable_logits, _ = TorchSeq2SeqAEGEngine(engine, "cpu").forward(np.asarray([3, 4], dtype=np.int64))
     np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
+    mesh_logits, _ = TorchSeq2SeqAEGEngine(engine, "cpu", devices=["cpu:0", "cpu:1"]).forward(
+        np.asarray([3, 4], dtype=np.int64)
+    )
+    np.testing.assert_allclose(cpu_logits, mesh_logits, rtol=2e-5, atol=2e-5)
 
 
 @pytest.mark.integration
@@ -737,6 +786,10 @@ def test_deepseek_style_mla_compiles_and_runs_without_standard_qkv(tmp_path: Pat
     cpu_logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2, 3], dtype=np.int64))
     portable_logits, _ = TorchMLAAEGEngine(engine, "cpu").forward(np.asarray([1, 2, 3], dtype=np.int64))
     np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
+    mesh_logits, _ = TorchMLAAEGEngine(engine, "cpu", devices=["cpu:0", "cpu:1"]).forward(
+        np.asarray([1, 2, 3], dtype=np.int64)
+    )
+    np.testing.assert_allclose(cpu_logits, mesh_logits, rtol=2e-5, atol=2e-5)
 
 
 @pytest.mark.integration
@@ -770,6 +823,10 @@ def test_deepseek_style_mla_moe_compiles_and_runs_with_routed_ffn(tmp_path: Path
 
     portable_logits, _ = TorchMLAAEGEngine(engine, "cpu").forward(np.asarray([1, 2, 3], dtype=np.int64))
     np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
+    mesh_logits, _ = TorchMLAAEGEngine(engine, "cpu", devices=["cpu:0", "cpu:1"]).forward(
+        np.asarray([1, 2, 3], dtype=np.int64)
+    )
+    np.testing.assert_allclose(cpu_logits, mesh_logits, rtol=2e-5, atol=2e-5)
 
 
 @pytest.mark.integration
@@ -805,6 +862,10 @@ def test_mamba_selective_scan_compiles_and_runs_with_recurrent_state(tmp_path: P
     cpu_logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2, 3], dtype=np.int64))
     portable_logits, _ = TorchMambaAEGEngine(engine, "cpu").forward(np.asarray([1, 2, 3], dtype=np.int64))
     np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
+    mesh_logits, _ = TorchMambaAEGEngine(engine, "cpu", devices=["cpu:0", "cpu:1"]).forward(
+        np.asarray([1, 2, 3], dtype=np.int64)
+    )
+    np.testing.assert_allclose(cpu_logits, mesh_logits, rtol=2e-5, atol=2e-5)
 
 
 @pytest.mark.integration
@@ -828,6 +889,26 @@ def test_generic_registry_decoder_family_compiles_and_runs(tmp_path: Path) -> No
     assert package.manifest.architecture.family == "generic_decoder_family"
     logits, _ = load_engine_from_path(artifact).forward(np.asarray([1], dtype=np.int64))
     assert logits.shape == (1, 32)
+
+
+@pytest.mark.integration
+def test_olmo_fused_checkpoint_compiles_and_runs(tmp_path: Path) -> None:
+    """OLMo's real short/fused tensor vocabulary must remain executable."""
+    source = tmp_path / "tiny-olmo-fused"
+    source.mkdir()
+    _write_tiny_olmo(source)
+    artifact = tmp_path / "tiny-olmo-fused.aeg"
+    Compiler(CompilerConfig(
+        targets=["cpu_avx2"],
+        overwrite=True,
+        calibration_tokens=8,
+        cache_dir=str(tmp_path / "compiler-cache"),
+    )).compile(str(source), output_path=artifact)
+    package = load_aeg_package(artifact)
+    assert package.manifest.architecture.family == "generic_decoder_family"
+    assert package.metadata["unbound_weight_names"] == []
+    logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2], dtype=np.int64))
+    assert logits.shape == (2, 32)
 
 
 @pytest.mark.integration
