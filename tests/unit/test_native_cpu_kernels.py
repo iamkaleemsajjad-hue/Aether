@@ -107,9 +107,12 @@ class TestCompilation:
           aether_flash_attn (FlashAttention-2 online softmax),
           aether_rope,
           aether_dequantize_symmetric, aether_dequantize_affine,
-          aether_qgemv_affine, aether_argmax.
+          aether_qgemv_affine, aether_argmax,
+          aether_int4_gemv (INT4 packed GEMV, 2x bandwidth vs INT8),
+          aether_geglu (GeGLU for Gemma-family FFN),
+          aether_rmsnorm_swiglu_linear (fused RMSNorm+SwiGLU+Linear).
         """
-        assert len(native.available_kernels()) == 13
+        assert len(native.available_kernels()) == 16
 
     @requires_compiler
     def test_repeated_calls_reuse_the_cached_library(self, native: NativeCPUKernels) -> None:
