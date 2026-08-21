@@ -1,65 +1,161 @@
-name: Release
+name: Publish to PyPI
 
+# Triggers:
+#   1. When you push a version tag:  git tag v1.0.1 && git push origin v1.0.1
+#   2. Manually from GitHub Actions tab (workflow_dispatch)
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "v*.*.*"        # v1.0.0, v1.2.3, v2.0.0-beta.1, etc.
   workflow_dispatch:
+    inputs:
+      target:
+        description: "Publish target"
+        required: true
+        default: "pypi"
+        type: choice
+        options:
+          - pypi
+          - testpypi
 
 jobs:
-  build-and-publish:
-    name: Build and publish to PyPI
+  # ── Step 1: Build the distribution packages ────────────────────────────────
+  build:
+    name: Build distribution
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/aether-runtime
-    permissions:
-      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # full history needed for version detection
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install build dependencies
+      - name: Install build tools
         run: |
           python -m pip install --upgrade pip
           pip install build twine
 
-      - name: Build package
+      - name: Build wheel and sdist
         run: python -m build
 
-      - name: Check package metadata
-        run: twine check dist/*
+      - name: Verify package metadata
+        run: twine check --strict dist/*
+
+      - name: Show built artifacts
+        run: ls -lh dist/
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-packages
+          path: dist/
+          retention-days: 7
+
+  # ── Step 2: Publish to TestPyPI first (for tag pushes) ────────────────────
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # Only run on tag pushes, not manual dispatch targeting pypi directly
+    if: github.event_name == 'push' || github.event.inputs.target == 'testpypi'
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/aether-runtime
+    permissions:
+      id-token: write           # Required for OIDC Trusted Publisher
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-packages
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true   # Don't fail if this version already exists
+
+  # ── Step 3: Publish to real PyPI ──────────────────────────────────────────
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build, publish-testpypi]
+    runs-on: ubuntu-latest
+    # On tag push: run after TestPyPI succeeds
+    # On manual dispatch targeting pypi: run directly
+    if: |
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'pypi')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/aether-runtime
+    permissions:
+      id-token: write           # Required for OIDC Trusted Publisher
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-packages
+          path: dist/
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
 
-  create-github-release:
-    name: Create GitHub release
-    needs: build-and-publish
+  # ── Step 4: Create GitHub Release with release notes ─────────────────────
+  github-release:
+    name: Create GitHub Release
+    needs: publish-pypi
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Generate release notes
-        id: release_notes
-        run: |
-          version=${GITHUB_REF#refs/tags/}
-          echo "VERSION=$version" >> $GITHUB_ENV
-          sed -n "/^## \[$version\]/,/^## \[/p" CHANGELOG.md | sed '$d' > release-notes.md
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-packages
+          path: dist/
 
-      - name: Create release
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          # Try to extract section from CHANGELOG.md if it exists
+          if [ -f CHANGELOG.md ]; then
+            awk "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" \
+              CHANGELOG.md > release-notes.md
+          fi
+          # Fallback: generate release notes from git log since last tag
+          if [ ! -s release-notes.md ]; then
+            git log $(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")..HEAD \
+              --pretty=format:"- %s (%h)" --no-merges > release-notes.md || true
+          fi
+          # Final fallback
+          if [ ! -s release-notes.md ]; then
+            echo "Release ${{ env.TAG }}" > release-notes.md
+          fi
+          cat release-notes.md
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
+          name: Aether Runtime ${{ env.TAG }}
           body_path: release-notes.md
+          files: dist/*
           draft: false
-          prerelease: ${{ contains(env.VERSION, 'alpha') || contains(env.VERSION, 'beta') || contains(env.VERSION, 'rc') }}
+          prerelease: ${{ contains(env.TAG, 'alpha') || contains(env.TAG, 'beta') || contains(env.TAG, 'rc') }}
