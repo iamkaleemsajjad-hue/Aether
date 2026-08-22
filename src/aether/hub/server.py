@@ -597,7 +597,7 @@ def create_hub_app(hub: AetherHubServer | None = None) -> Any:
     app = FastAPI(
         title="Aether Hub",
         description="Aether Model Registry — content-addressed AEG artifact storage",
-        version="1.0.0",
+        version="1.2.0",
     )
 
     def _auth(authorization: str | None = Header(default=None)) -> HubUser:

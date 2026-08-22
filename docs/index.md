@@ -77,8 +77,8 @@ print(client.chat.completions.create(model="Qwen/Qwen3-0.6B", messages=[{"role":
 
 ## Community
 
-- GitHub: [github.com/aether-dev/aether-runtime](https://github.com/aether-dev/aether-runtime)
-- Docs: [docs.aether.dev](https://docs.aether.dev)
+- GitHub: [github.com/iamkaleemsajjad-hue/Aether](https://github.com/iamkaleemsajjad-hue/Aether)
+- Docs: [project documentation](https://github.com/iamkaleemsajjad-hue/Aether/tree/main/docs)
 
 ## License
 

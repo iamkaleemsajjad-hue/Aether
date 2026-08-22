@@ -17,7 +17,7 @@ class MLXBackend(Backend):
     def __init__(self) -> None:
         info = BackendInfo(
             name="mlx",
-            version="1.0.0",
+            version="1.2.0",
             supported_targets=["metal_m1", "metal_m3"],
             capabilities=["generate", "chat", "embed", "unified_memory"],
         )

@@ -18,7 +18,7 @@ class vLLMBackend(Backend):
     def __init__(self) -> None:
         info = BackendInfo(
             name="vllm",
-            version="1.0.0",
+            version="1.2.0",
             supported_targets=["cuda_sm80", "cuda_sm89", "cuda_sm90", "cuda_sm100", "rocm_cdna3"],
             capabilities=["generate", "chat", "embed", "rerank", "paged_attention", "speculative"],
         )

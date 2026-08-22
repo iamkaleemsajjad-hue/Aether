@@ -28,7 +28,7 @@ Thank you for your interest in contributing to Aether Runtime! This document cov
 
 We are committed to providing a friendly, safe, and welcoming environment for all contributors. Please be respectful, constructive, and inclusive in all interactions. Harassment, discrimination, and abusive behavior are not tolerated.
 
-If you experience or witness unacceptable behavior, please report it to the maintainers at `conduct@aether.dev`.
+If you experience or witness unacceptable behavior, please report it to the maintainer at `iamkaleemsajjad@gmail.com`.
 
 ---
 
@@ -57,7 +57,7 @@ If you experience or witness unacceptable behavior, please report it to the main
 ### Clone the repository
 
 ```bash
-git clone https://github.com/aether-dev/aether-runtime.git
+git clone https://github.com/iamkaleemsajjad-hue/Aether.git
 cd aether-runtime
 ```
 
@@ -359,7 +359,7 @@ We use GitHub Issues for bug reports, feature requests, and design discussions.
 
 ## Security
 
-If you discover a security vulnerability, please report it privately to `security@aether.dev` rather than opening a public issue. We will respond promptly and coordinate disclosure.
+If you discover a security vulnerability, please report it privately to `iamkaleemsajjad@gmail.com` rather than opening a public issue. We will respond promptly and coordinate disclosure.
 
 ---
 
@@ -395,10 +395,10 @@ Look for issues labeled `good first issue` and `help wanted` on GitHub.
 
 ## Community
 
-- GitHub Discussions: [github.com/aether-dev/aether-runtime/discussions](https://github.com/aether-dev/aether-runtime/discussions)
+- GitHub Discussions: [github.com/iamkaleemsajjad-hue/Aether/discussions](https://github.com/iamkaleemsajjad-hue/Aether/discussions)
 - Discord: [discord.gg/aether-runtime](https://discord.gg/aether-runtime)
 - Twitter/X: [@aether_runtime](https://twitter.com/aether_runtime)
-- Newsletter: [aether.dev/newsletter](https://aether.dev/newsletter)
+- Project updates: [GitHub repository](https://github.com/iamkaleemsajjad-hue/Aether)
 
 ---
 

@@ -127,8 +127,8 @@ python -m twine check --strict dist\*
 
 Expected output from `twine check`:
 ```
-Checking dist/aether_runtime-1.0.0-py3-none-any.whl: PASSED
-Checking dist/aether_runtime-1.0.0.tar.gz: PASSED
+Checking dist/aether_runtime-1.2.0-py3-none-any.whl: PASSED
+Checking dist/aether_runtime-1.2.0.tar.gz: PASSED
 ```
 
 If you see `PASSED` — you're ready to publish.
@@ -142,13 +142,13 @@ Open [`pyproject.toml`](pyproject.toml) and bump the version:
 ```toml
 [project]
 name = "aether-runtime"
-version = "1.0.1"   # ← change this
+version = "1.2.0"   # current release
 ```
 
 > Follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`
-> - `PATCH` (1.0.0 → 1.0.1): Bug fixes
-> - `MINOR` (1.0.0 → 1.1.0): New features, backwards compatible
-> - `MAJOR` (1.0.0 → 2.0.0): Breaking changes
+> - `PATCH` (1.2.0 → 1.2.1): Bug fixes
+> - `MINOR` (1.2.0 → 1.3.0): New features, backwards compatible
+> - `MAJOR` (1.2.0 → 2.0.0): Breaking changes
 
 ---
 
@@ -156,7 +156,7 @@ version = "1.0.1"   # ← change this
 
 ```powershell
 git add pyproject.toml
-git commit -m "chore: bump version to 1.0.1"
+git commit -m "release: prepare v1.2.0"
 git push origin main
 ```
 
@@ -168,10 +168,10 @@ git push origin main
 
 ```powershell
 # Create a tag matching the version in pyproject.toml
-git tag v1.0.1
+git tag v1.2.0
 
 # Push the tag to GitHub — this starts the publish workflow
-git push origin v1.0.1
+git push origin v1.2.0
 ```
 
 ---
@@ -250,7 +250,7 @@ You can't re-upload the same version number. Bump the version in `pyproject.toml
 
 Make sure you push the **tag**, not just the commit:
 ```bash
-git push origin v1.0.1    # ← pushes the tag — triggers workflow
+git push origin v1.2.0    # ← pushes the tag — triggers workflow
 git push origin main      # ← pushes the commit — does NOT trigger workflow
 ```
 
@@ -293,6 +293,6 @@ https://pypi.org/project/aether-runtime/
 - [ ] Enable GitHub Pages: repo Settings → Pages → Source = "GitHub Actions"
 - [ ] Bump version in `pyproject.toml`
 - [ ] Commit + push
-- [ ] Create + push tag: `git tag v1.0.1 && git push origin v1.0.1`
+- [ ] Create + push tag: `git tag v1.2.0 && git push origin v1.2.0`
 - [ ] Watch workflow at: https://github.com/iamkaleemsajjad-hue/Aether/actions
 - [ ] Verify: `pip install aether-runtime` works from any machine

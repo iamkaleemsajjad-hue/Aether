@@ -22,7 +22,7 @@ class ONNXBackend(Backend):
     def __init__(self) -> None:
         info = BackendInfo(
             name="onnx",
-            version="1.0.0",
+            version="1.2.0",
             supported_targets=["cpu_avx512", "cpu_neon", "openvino_npu", "openvino_gpu"],
             capabilities=["generate", "chat", "stream", "embed", "cross_platform"],
         )

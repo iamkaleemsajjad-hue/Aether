@@ -91,7 +91,7 @@ class VSCodePluginManifest:
             "version": self.VERSION,
             "publisher": "aether-dev",
             "license": "Apache-2.0",
-            "repository": {"type": "git", "url": "https://github.com/aether-dev/aether-runtime"},
+            "repository": {"type": "git", "url": "https://github.com/iamkaleemsajjad-hue/Aether"},
             "engines": {"vscode": "^1.90.0"},
             "categories": ["Machine Learning", "Other"],
             "keywords": ["LLM", "inference", "compiler", "AEG", "Aether", "AI"],

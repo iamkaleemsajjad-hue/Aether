@@ -48,9 +48,7 @@ def resolve_checkpoint_shard(checkpoint_dir: str | Path, shard_name: object) -> 
 
     parts = tuple(part for part in posix_name.parts if part not in {"", "."})
     if not parts or ".." in parts:
-        raise ValueError(
-            f"shard path escapes checkpoint directory: {shard_name!r}"
-        )
+        raise ValueError(f"unsafe shard path {shard_name!r}: parent traversal")
 
     root = Path(checkpoint_dir).absolute()
     shard = root.joinpath(*parts)

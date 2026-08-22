@@ -17,7 +17,7 @@ This guide walks you through installing Aether, compiling your first model, and 
 ### One-click install (Linux/macOS)
 
 ```bash
-git clone https://github.com/aether-dev/aether-runtime
+git clone https://github.com/iamkaleemsajjad-hue/Aether
 cd aether-runtime
 ./scripts/install.sh        # auto-detects CUDA/ROCm/MPS
 # or with options:
@@ -27,7 +27,7 @@ cd aether-runtime
 ### One-click install (Windows)
 
 ```powershell
-git clone https://github.com/aether-dev/aether-runtime
+git clone https://github.com/iamkaleemsajjad-hue/Aether
 cd aether-runtime
 .\scripts\install.ps1        # auto-detects CUDA
 .\scripts\install.ps1 -Dev   # include dev/test dependencies
@@ -80,7 +80,7 @@ Expected output:
 ```
 [OK] Python 3.11.x
 [OK] PyTorch 2.5.x
-[OK] aether-runtime 1.0.0
+[OK] aether-runtime 1.2.0
 [OK] SafeTensors
 [OK] GGUF reader
 [OK] ONNX
