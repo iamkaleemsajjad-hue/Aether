@@ -142,6 +142,11 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
         return _load_seq2seq_engine_from_package(package, architecture)
     if bool(architecture.get("is_encoder", False)):
         return _load_encoder_engine_from_package(package, architecture)
+    # Every decoder family uses the same vocabulary contract even when its
+    # execution engine is specialized (MLA, Mamba, RWKV, or hybrid). Validate
+    # it before dispatch so a stale manifest cannot be hidden by a specialized
+    # loader.
+    _validate_decoder_vocabulary_contract(package, architecture)
     if str(architecture.get("attention_type", "") or "").upper() == "MLA":
         return _load_mla_engine_from_package(package, architecture)
     if architecture.get("ssm_variant") == "selective_scan":
@@ -672,11 +677,17 @@ def _load_seq2seq_engine_from_package(package: Any, architecture: dict[str, Any]
     ffn_type = str(architecture.get("ffn_type", "ReLU"))
 
     embedding = require("embedding")
+    _validate_embedding_shape(embedding, architecture, context="encoder-decoder")
     lm_head = optional("lm_head")
     if lm_head is None:
         if not bool(architecture.get("tie_word_embeddings", True)):
             raise AEGLoadError("untied encoder-decoder AEG is missing lm_head")
         lm_head = embedding
+    elif lm_head.ndim != 2 or lm_head.shape != embedding.shape:
+        raise AEGLoadError(
+            "encoder-decoder LM head invariant violated: expected shape "
+            f"{tuple(embedding.shape)}, tensor has {tuple(lm_head.shape)}"
+        )
 
     encoder_layers: list[Seq2SeqLayer] = []
     for i in range(enc_count):
@@ -991,6 +1002,65 @@ def _architecture_dict(package: Any) -> dict[str, Any]:
     if architecture is None:
         return {}
     return architecture.to_dict() if hasattr(architecture, "to_dict") else dict(architecture)
+
+
+def _validate_embedding_shape(
+    embedding: np.ndarray,
+    architecture: dict[str, Any],
+    *,
+    context: str = "",
+) -> None:
+    """Validate the physical token table against manifest dimensions."""
+    label = f"{context} " if context else ""
+    if embedding.ndim != 2:
+        raise AEGLoadError(
+            f"{label}embedding invariant violated: expected a 2-D table, "
+            f"tensor has shape {tuple(embedding.shape)}"
+        )
+    hidden_size = int(embedding.shape[1])
+    manifest_hidden = int(architecture.get("hidden_size", 0) or 0)
+    if manifest_hidden > 0 and manifest_hidden != hidden_size:
+        raise AEGLoadError(
+            f"{label}hidden size invariant violated: manifest declares "
+            f"{manifest_hidden} but the embedding tensor has hidden dimension "
+            f"{hidden_size}"
+        )
+    manifest_vocab = int(architecture.get("vocab_size", 0) or 0)
+    if manifest_vocab > 0 and manifest_vocab != int(embedding.shape[0]):
+        raise AEGLoadError(
+            f"{label}vocabulary invariant violated: manifest declares "
+            f"vocab_size={manifest_vocab} but the embedding tensor has "
+            f"{int(embedding.shape[0])} rows"
+        )
+
+
+def _validate_decoder_vocabulary_contract(
+    package: Any, architecture: dict[str, Any]
+) -> None:
+    """Validate vocabulary dimensions before any decoder-family dispatch."""
+    from aether.quantization.formats import dequantize_tensor
+
+    store = package.weight_store()
+    if "embedding" not in store.entries:
+        raise AEGLoadError("AEG package is missing required token embedding")
+    embedding = np.asarray(
+        dequantize_tensor(store.load_tensor("embedding")), dtype=np.float32
+    )
+    _validate_embedding_shape(embedding, architecture)
+    lm_head = None
+    if "lm_head" in store.entries:
+        lm_head = np.asarray(
+            dequantize_tensor(store.load_tensor("lm_head")), dtype=np.float32
+        )
+    if lm_head is not None and (
+        lm_head.ndim != 2
+        or lm_head.shape[0] != embedding.shape[0]
+        or lm_head.shape[1] != embedding.shape[1]
+    ):
+        raise AEGLoadError(
+            "LM head invariant violated: expected shape "
+            f"{tuple(embedding.shape)} but tensor has {tuple(lm_head.shape)}"
+        )
 
 
 def _dequantized_by_key(package: Any) -> dict[tuple[int | None, str | None], np.ndarray]:

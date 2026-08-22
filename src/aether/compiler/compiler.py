@@ -201,6 +201,46 @@ def _verify_weight_accounting(
     three logical tensors it stands for.
     """
     serialized = set(package.weights)
+
+    # Validate the physical vocabulary contract before the package is saved.
+    # A malformed artifact must fail during compilation rather than compiling
+    # successfully and surprising the user only at first inference.
+    embedding = package.weights.get("embedding")
+    if embedding is not None:
+        embedding_shape = tuple(getattr(embedding, "shape", ()))
+        if len(embedding_shape) != 2:
+            raise CompilationError(
+                "Token embedding must be a 2-D tensor; serialized shape is "
+                f"{embedding_shape}",
+                model_id=model_id,
+                stage="stage4_packaging",
+            )
+        manifest_hidden = int(getattr(architecture, "hidden_size", 0) or 0)
+        manifest_vocab = int(getattr(architecture, "vocab_size", 0) or 0)
+        if manifest_hidden > 0 and manifest_hidden != embedding_shape[1]:
+            raise CompilationError(
+                "Hidden size invariant violated before packaging: manifest "
+                f"declares {manifest_hidden} but the embedding tensor has "
+                f"hidden dimension {embedding_shape[1]}",
+                model_id=model_id,
+                stage="stage4_packaging",
+            )
+        if manifest_vocab > 0 and manifest_vocab != embedding_shape[0]:
+            raise CompilationError(
+                "Vocabulary invariant violated before packaging: manifest "
+                f"declares vocab_size={manifest_vocab} but the embedding tensor "
+                f"has {embedding_shape[0]} rows",
+                model_id=model_id,
+                stage="stage4_packaging",
+            )
+        lm_head = package.weights.get("lm_head")
+        if lm_head is not None and tuple(getattr(lm_head, "shape", ())) != embedding_shape:
+            raise CompilationError(
+                "LM head invariant violated before packaging: expected shape "
+                f"{embedding_shape} but tensor has {tuple(getattr(lm_head, 'shape', ()))}",
+                model_id=model_id,
+                stage="stage4_packaging",
+            )
     if bool(getattr(architecture, "is_encoder_decoder", False)):
         required = {"embedding", "encoder_final_norm", "final_norm"}
         # lm_head may be tied to the shared embedding in T5 checkpoints.
@@ -617,6 +657,15 @@ class Compiler:
         except Exception as exc:
             msg = f"Model ingestion failed for {model}: {exc}"
             raise CompilationError(msg, model_id=model_id, stage="stage1_ingestion") from exc
+
+        # Stage 1 may materialize a Hub snapshot and replace preliminary
+        # name-based metadata with the checkpoint's authoritative config.  The
+        # graph owns the post-materialization architecture contract; carry it
+        # forward so optimization, targeting, memory estimates, and the
+        # manifest cannot regress to stale pre-download values.
+        graph_architecture = getattr(graph, "architecture", None)
+        if isinstance(graph_architecture, ModelArchitecture):
+            architecture = graph_architecture
 
         # Pass 18 consumes an explicit trained drafter bundle.  Load it into
         # the in-memory graph before optimization; the pass validates and

@@ -14,6 +14,7 @@ from typing import Any
 
 import numpy as np
 
+from aether.compiler.stage1_ingestion.checkpoint_paths import resolve_checkpoint_shard
 from aether.core.exceptions import IngestionError, UnsupportedFormatError
 from aether.utils.logging import get_logger
 
@@ -205,17 +206,14 @@ untrusted model pickle as a fallback.
                 weight_map = index.get("weight_map")
                 if not isinstance(weight_map, dict) or not weight_map:
                     raise ValueError("checkpoint index has no weight_map")
-                shard_names = sorted({str(name) for name in weight_map.values()})
+                shard_names = sorted(weight_map.values(), key=repr)
                 shard_files = []
-                root = directory.resolve()
+                seen_files: set[Path] = set()
                 for shard_name in shard_names:
-                    relative = Path(shard_name)
-                    if relative.is_absolute() or ".." in relative.parts:
-                        raise ValueError(f"unsafe shard path {shard_name!r}")
-                    shard = (directory / relative).resolve()
-                    if not shard.is_relative_to(root):
-                        raise ValueError(f"shard path escapes checkpoint directory: {shard_name!r}")
-                    shard_files.append(shard)
+                    shard = resolve_checkpoint_shard(directory, shard_name)
+                    if shard not in seen_files:
+                        seen_files.add(shard)
+                        shard_files.append(shard)
             except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
                 raise IngestionError(f"invalid PyTorch checkpoint index {index_path}: {exc}") from exc
         else:

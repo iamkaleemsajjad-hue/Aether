@@ -221,6 +221,40 @@ class TestCompilerPlan:
         assert aeg.root.exists()
         assert (aeg.root / "manifest.json").exists()
 
+    def test_hub_snapshot_config_replaces_pre_download_name_geometry(
+        self, tmp_path, tiny_local_safetensors_model, monkeypatch
+    ) -> None:
+        """A downloaded checkpoint, not a name table, owns executable geometry."""
+        from aether.compiler.stage1_ingestion.ingestion import IngestionPipeline
+        from aether.runtime.aeg_loader import load_engine_from_path
+
+        # Simulate the Hub path without network access.  The Qwen name causes
+        # the initial detector to have a provisional (and intentionally stale)
+        # vocabulary, while the materialized checkpoint is a valid tiny model.
+        monkeypatch.setenv("AETHER_HF_OFFLINE", "1")
+        monkeypatch.setattr(
+            IngestionPipeline,
+            "_download_hf_snapshot",
+            lambda _self, _model: str(tiny_local_safetensors_model),
+        )
+        artifact = tmp_path / "hub-snapshot.aeg"
+        package = Compiler(
+            CompilerConfig(
+                targets=["cpu_avx512"],
+                overwrite=True,
+                skip_download=False,
+                calibration_tokens=8,
+                cache_dir=str(tmp_path / "cache"),
+            )
+        ).compile("Qwen/Qwen3-0.6B", output_path=artifact)
+
+        assert package.manifest is not None
+        assert package.manifest.architecture.vocab_size == 32
+        assert package.manifest.architecture.layers == 1
+        engine = load_engine_from_path(artifact)
+        logits, _ = engine.forward([1, 2])
+        assert logits.shape == (2, 32)
+
     def test_quality_report(self, minimal_aeg_package) -> None:
         compiler = Compiler()
         report = compiler.quality_report(minimal_aeg_package)
