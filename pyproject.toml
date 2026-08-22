@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aether-runtime"
-version = "1.0.1"
+version = "1.2.0"
 description = "Aether Runtime — the compiler for AI models. Compile any model into a portable Aether Execution Graph (AEG) and run it on any hardware."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [
-    { name = "Aether Contributors", email = "dev@aether.dev" }
+    { name = "Muhammad Kaleem Sajjad", email = "iamkaleemsajjad@gmail.com" }
 ]
 keywords = [
     "ai",
@@ -195,11 +195,11 @@ full = [
 ]
 
 [project.urls]
-Homepage = "https://aether.dev"
-Documentation = "https://docs.aether.dev"
-Repository = "https://github.com/aether-dev/aether-runtime"
-Issues = "https://github.com/aether-dev/aether-runtime/issues"
-Discussions = "https://github.com/aether-dev/aether-runtime/discussions"
+Homepage = "https://github.com/iamkaleemsajjad-hue/Aether"
+Documentation = "https://github.com/iamkaleemsajjad-hue/Aether/tree/main/docs"
+Repository = "https://github.com/iamkaleemsajjad-hue/Aether"
+Issues = "https://github.com/iamkaleemsajjad-hue/Aether/issues"
+Discussions = "https://github.com/iamkaleemsajjad-hue/Aether/discussions"
 
 [project.scripts]
 aether = "aether.cli:main"
@@ -286,7 +286,7 @@ include = [
 
 [tool.hatch.version]
 source = "vcs"
-fallback-version = "1.0.0"
+fallback-version = "1.2.0"
 
 [tool.ruff]
 target-version = "py310"

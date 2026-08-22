@@ -150,7 +150,7 @@ class HubClient:
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "aether-runtime/1.0.0",
+            "User-Agent": "aether-runtime/1.2.0",
         }
         if self.auth_token:
             headers["Authorization"] = f"Bearer {self.auth_token}"
@@ -224,7 +224,7 @@ class HubClient:
         try:
             req = urllib.request.Request(
                 f"{self.hub_url}/health",
-                headers={"User-Agent": "aether-runtime/1.0.0"},
+                headers={"User-Agent": "aether-runtime/1.2.0"},
                 method="GET",
             )
             # Health probing is only a capability check; it must not block

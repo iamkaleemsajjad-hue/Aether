@@ -5,6 +5,19 @@ All notable changes to Aether Runtime will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-22 -- Metadata and Checkpoint Ingestion Release
+
+### Changed
+
+- Corrected package author, contact email, homepage, documentation, repository,
+  issue, and discussion metadata.
+- Unified the runtime version to `1.2.0` across packaging, runtime telemetry,
+  backend metadata, documentation, and release configuration.
+- Added portable Hugging Face checkpoint shard resolution for SafeTensors and
+  PyTorch indexes, including nested relative shard paths and cache symlinks.
+- Added architecture, vocabulary, embedding, and LM-head integrity validation
+  before AEG packaging and at runtime.
+
 ## [0.6.0] - 2026-08-14 -- Production Hardening, Capability Model, Adversarial Tests
 
 ### Added -- Hardware Capability Model (PRD Section 12, 41)
@@ -447,5 +460,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OpenAI-compatible REST API.
 - Research-backed optimizer passes and runtime intelligence.
 
-[Unreleased]: https://github.com/aether-dev/aether-runtime/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/aether-dev/aether-runtime/releases/tag/v0.1.0
+[Unreleased]: https://github.com/iamkaleemsajjad-hue/Aether/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.0
+[0.1.0]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v0.1.0
