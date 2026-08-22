@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aether-runtime"
-version = "1.0.0"
+version = "1.0.1"
 description = "Aether Runtime — the compiler for AI models. Compile any model into a portable Aether Execution Graph (AEG) and run it on any hardware."
 readme = "README.md"
 license = { text = "Apache-2.0" }
