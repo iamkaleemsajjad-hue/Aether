@@ -17,6 +17,7 @@ import numpy as np
 
 from safetensors import safe_open
 
+from aether.compiler.stage1_ingestion.checkpoint_paths import resolve_checkpoint_shard
 from aether.core.exceptions import IngestionError
 from aether.utils.logging import get_logger
 
@@ -58,22 +59,21 @@ class SafeTensorsLoader:
                     weight_map = index.get("weight_map", {})
                     if not isinstance(weight_map, dict) or not weight_map:
                         raise ValueError("index.json has no weight_map")
-                    # Collect unique shard filenames in sorted order.
-                    shard_names = sorted(set(str(v) for v in weight_map.values()))
-                    root = self.model_path.resolve()
+                    # Index values are relative to the checkpoint directory,
+                    # not to the process working directory.  Resolve them via
+                    # the shared cross-platform helper so normal Hugging Face
+                    # names and cache-backed symlinks work on every machine.
+                    # Sort by representation so malformed mixed-type values
+                    # still reach the resolver and produce a useful
+                    # IngestionError instead of an uncaught TypeError.
+                    shard_names = sorted(weight_map.values(), key=repr)
                     shard_files: list[Path] = []
+                    seen_files: set[Path] = set()
                     for shard_name in shard_names:
-                        relative = Path(shard_name)
-                        if shard_name.startswith(("/", "\\")) or relative.is_absolute() or ".." in relative.parts:
-                            raise ValueError(f"unsafe shard path {shard_name!r}")
-                        shard = (self.model_path / relative).resolve()
-                        if not shard.is_relative_to(root):
-                            raise ValueError(
-                                f"shard path escapes checkpoint directory: {shard_name!r}"
-                            )
-                        if not shard.exists():
-                            raise ValueError(f"shard file not found: {shard}")
-                        shard_files.append(shard)
+                        shard = resolve_checkpoint_shard(self.model_path, shard_name)
+                        if shard not in seen_files:
+                            seen_files.add(shard)
+                            shard_files.append(shard)
                     if shard_files:
                         return shard_files
                 except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:

@@ -1429,19 +1429,30 @@ class IngestionPipeline:
 
     def _ingest_auto(self, model: str, architecture: ModelArchitecture) -> AEGGraph:
         """Auto-detect format and ingest. Also used for HuggingFace Hub models."""
-        graph = AEGGraph(name=f"{architecture.family}_auto", architecture=architecture)
         logger.info(f"Auto-ingesting model: {model}")
-        self._build_architecture_graph(graph, architecture)
         source = Path(model)
         downloaded = False
         if not source.exists():
             if self.config.skip_download:
+                graph = AEGGraph(name=f"{architecture.family}_auto", architecture=architecture)
+                self._build_architecture_graph(graph, architecture)
                 graph.set_metadata("weights_attached", 0)
                 graph.set_metadata("source_model_id", model)
                 logger.warning("Skipping model download for %s by compiler configuration", model)
                 return graph
             source = Path(self._download_hf_snapshot(model))
             downloaded = True
+
+        # A Hub identifier can be recognized from a name before its snapshot
+        # exists.  That preliminary recognition is only a routing hint: the
+        # materialized checkpoint's config is the authoritative architecture
+        # contract.  Refresh the existing object in place so every later
+        # compiler stage (graph, optimizer, targeting, manifest, and runtime)
+        # observes the same dimensions.  This is deliberately family-neutral;
+        # it fixes stale name tables without adding model-specific exceptions.
+        architecture = self._refresh_architecture_from_snapshot(source, architecture)
+        graph = AEGGraph(name=f"{architecture.family}_auto", architecture=architecture)
+        self._build_architecture_graph(graph, architecture)
         graph.set_metadata("source_model_path", str(source.resolve()))
         # A local directory may still hold SafeTensors shards even when format
         # detection fell through to "auto"; attach them when they are there.
@@ -1461,6 +1472,43 @@ class IngestionPipeline:
                 "A graph-only artifact is not a runnable compilation."
             )
         return graph
+
+    @staticmethod
+    def _refresh_architecture_from_snapshot(
+        source: Path, architecture: ModelArchitecture
+    ) -> ModelArchitecture:
+        """Use a materialized checkpoint's config as the architecture source.
+
+        Name-only model references may have been classified with a convenience
+        table before the Hub snapshot was downloaded.  Such tables cannot be
+        trusted for exact tensor geometry: model revisions, tokenizer sizes,
+        layer schedules, and attention constants can change independently of a
+        repository name.  If the snapshot has a config, parse it now and copy
+        the result into the caller's object so existing graph references remain
+        valid.  A config parsing error is surfaced instead of silently compiling
+        against stale or guessed metadata.
+        """
+        if not source.is_dir() or not (source / "config.json").is_file():
+            return architecture
+
+        try:
+            from aether.compiler.stage1_ingestion.architecture_detector import (
+                ArchitectureDetector,
+            )
+
+            refreshed = ArchitectureDetector().detect(str(source))
+        except Exception as exc:  # noqa: BLE001 - normalize at ingestion boundary
+            raise IngestionError(
+                f"Unable to read authoritative architecture from materialized "
+                f"checkpoint {source}: {exc}"
+            ) from exc
+
+        # ModelArchitecture is intentionally mutable.  Updating in place is
+        # important because the compiler received this same object before the
+        # download and later stages still hold that reference.
+        architecture.__dict__.clear()
+        architecture.__dict__.update(refreshed.__dict__)
+        return architecture
 
     def _download_hf_snapshot(self, model: str) -> str:
         """Materialize a real Hugging Face snapshot for compiler ingestion.

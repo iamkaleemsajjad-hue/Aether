@@ -1383,6 +1383,41 @@ class TestSafeTensorsMultiShard:
         with pytest.raises(IngestionError):
             SafeTensorsLoader(tmp_path).discover_files()
 
+    def test_safetensors_index_resolves_nested_relative_shards(self, tmp_path: Path) -> None:
+        """HF indexes may use nested relative shard names."""
+        from aether.compiler.stage1_ingestion.safetensors_loader import SafeTensorsLoader
+
+        save_file = pytest.importorskip("safetensors.numpy").save_file
+        shard_dir = tmp_path / "weights" / "nested"
+        shard_dir.mkdir(parents=True)
+        shard = shard_dir / "model-00001-of-00001.safetensors"
+        save_file({"weight": np.ones((2, 2), dtype=np.float32)}, str(shard))
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+            "metadata": {},
+            "weight_map": {"weight": "weights/nested/model-00001-of-00001.safetensors"},
+        }))
+
+        files = SafeTensorsLoader(tmp_path).discover_files()
+        assert files == [shard]
+
+    @pytest.mark.parametrize("shard_name", [
+        "C:/outside/model.safetensors",
+        "\\\\server\\share\\model.safetensors",
+        "/outside/model.safetensors",
+    ])
+    def test_safetensors_index_rejects_nonportable_absolute_shards(
+        self, tmp_path: Path, shard_name: str
+    ) -> None:
+        """An index cannot embed a machine-specific absolute weight path."""
+        from aether.compiler.stage1_ingestion.safetensors_loader import SafeTensorsLoader
+        from aether.core.exceptions import IngestionError
+
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+            "metadata": {}, "weight_map": {"weight": shard_name},
+        }))
+        with pytest.raises(IngestionError, match="unsafe shard path"):
+            SafeTensorsLoader(tmp_path).discover_files()
+
 
 # ===========================================================================
 # Gap 13 — PyTorch TorchScript ingestion
