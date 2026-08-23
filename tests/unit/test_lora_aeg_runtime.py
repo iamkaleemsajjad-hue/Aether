@@ -95,6 +95,29 @@ def test_compiled_lora_blob_is_loaded_and_changes_real_projection(tmp_path: Path
     assert len(generated) == 1
 
 
+def test_cpu_decode_does_not_copy_transposed_projection_weights(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Single-token projection must keep the zero-copy transpose view.
+
+    A decode step visits every projection in every layer.  Materialising a
+    contiguous transpose at each visit turns a normal model into repeated
+    model-sized memory copies and makes CPU generation appear hung.
+    """
+    import aether.runtime.cpu_engine as cpu_engine_module
+
+    engine = _engine()
+    original = cpu_engine_module.np.ascontiguousarray
+    calls: list[tuple[int, ...]] = []
+
+    def record(value, *args, **kwargs):
+        calls.append(tuple(np.asarray(value).shape))
+        return original(value, *args, **kwargs)
+
+    monkeypatch.setattr(cpu_engine_module.np, "ascontiguousarray", record)
+    engine._linear(np.ones((1, 4), dtype=np.float32), engine.weights.layers[0].q_proj)
+
+    assert calls == [(1, 4)]
+
+
 def test_compiled_lora_loader_rejects_legacy_or_tampered_blob(tmp_path: Path) -> None:
     _write_adapter_artifact(tmp_path)
     blob = tmp_path / "adapters" / "demo" / "lora_A.bin"

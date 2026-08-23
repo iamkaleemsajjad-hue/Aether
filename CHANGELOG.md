@@ -5,6 +5,19 @@ All notable changes to Aether Runtime will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] - 2026-08-23 -- Cross-Device Load and CPU Decode Stability Release
+
+### Fixed
+
+- Allowed tensor-parallel executors to load artifacts containing persisted
+  sparse-attention or KV-alias plans by using dense, correctness-preserving
+  attention/cache semantics when those accelerator optimizations are not
+  implemented.
+- Removed repeated large transposed-weight copies from single-token CPU
+  decoding, restoring responsive generation for compiled models.
+- Added regression coverage for persisted optimization plans and the CPU
+  decode weight-layout contract.
+
 ## [1.2.2] - 2026-08-23 -- Hardware Pipeline and Runtime Compatibility Release
 
 ### Fixed
@@ -470,6 +483,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OpenAI-compatible REST API.
 - Research-backed optimizer passes and runtime intelligence.
 
-[Unreleased]: https://github.com/iamkaleemsajjad-hue/Aether/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/iamkaleemsajjad-hue/Aether/compare/v1.2.3...HEAD
+[1.2.3]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.3
+[1.2.2]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.2
 [1.2.0]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.0
 [0.1.0]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v0.1.0

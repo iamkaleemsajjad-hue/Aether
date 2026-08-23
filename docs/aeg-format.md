@@ -51,7 +51,7 @@ This mirrors LLVM IR's stability guarantee and makes AEG a reliable distribution
 {
   "format_version": "AEG/1.0",
   "model_id": "Qwen/Qwen3-72B-Instruct",
-  "aether_version": "1.2.2",
+  "aether_version": "1.2.3",
   "compiled_at": "2026-07-27T00:00:00Z",
   "graph_hash": "sha256:abc123...",
   "architecture": {

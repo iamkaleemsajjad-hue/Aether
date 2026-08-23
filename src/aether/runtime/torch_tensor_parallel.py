@@ -131,8 +131,28 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         # concatenation collectives reconstruct Q/K/V before attention, so a
         # mesh wider than the KV-head count does not require replicating the
         # complete projection or silently dropping heads.
-        if cpu_engine.sparse_attention_plan or cpu_engine.semantic_kv_plan or cpu_engine.cross_layer_kv_plan:
-            raise ValueError("tensor-parallel execution does not yet implement persisted sparse/KV alias plans")
+        # These plans are optional memory/latency optimizations persisted by
+        # the compiler.  They must never make a portable artifact unloadable
+        # on an accelerator: the exact dense attention/cache semantics remain
+        # valid when an accelerator executor does not implement a particular
+        # optimization.  In that case we deliberately retain the complete
+        # cache for correctness and warn about the additional memory cost.
+        self.persisted_optimization_plans = {
+            name: value
+            for name, value in (
+                ("sparse_attention", cpu_engine.sparse_attention_plan),
+                ("semantic_kv", cpu_engine.semantic_kv_plan),
+                ("cross_layer_kv", cpu_engine.cross_layer_kv_plan),
+            )
+            if value is not None
+        }
+        if self.persisted_optimization_plans:
+            logger.warning(
+                "Tensor-parallel executor is using dense attention/full KV semantics; "
+                "persisted optimizations are not implemented on this accelerator path: %s. "
+                "Model remains runnable with higher memory use.",
+                sorted(self.persisted_optimization_plans),
+            )
 
         self.embedding, self._embedding_ranges = self._row_shards(embedding)
         self.final_norm = self._tensor_primary(source_weights.final_norm)

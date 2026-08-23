@@ -173,7 +173,7 @@ class AetherTracer:
                     },
                     "scopeSpans": [
                         {
-                            "scope": {"name": "aether.tracer", "version": "1.2.2"},
+                            "scope": {"name": "aether.tracer", "version": "1.2.3"},
                             "spans": [span.to_otlp_dict() for span in self._finished_spans],
                         }
                     ],

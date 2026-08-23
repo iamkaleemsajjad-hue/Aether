@@ -1093,10 +1093,10 @@ class NativeCPUKernels:
     def sgemm(self, a: np.ndarray, b: np.ndarray, force_native: bool = False) -> np.ndarray:
         """Single-precision matrix multiply ``a @ b``.
 
-        GEMM is delegated to numpy/BLAS for large M (prefill) since a tuned BLAS
-        outperforms a portable C++ triple loop.  For M=1 (autoregressive decode)
-        the call is routed to ``aether_sgemv`` which avoids tile-setup overhead
-        and achieves ~3x higher throughput on a single-token weight projection.
+        GEMM is delegated to NumPy/BLAS for prefill and single-token decode;
+        this avoids the portable C++ SGEMV path, which can be substantially
+        slower than the host BLAS for large language-model projections.  The
+        native implementation remains available through ``force_native``.
 
         Args:
             a: Left matrix, shape ``(M, K)``.
@@ -1114,9 +1114,14 @@ class NativeCPUKernels:
         if lhs.shape[1] != rhs.shape[0]:
             msg = f"shapes {lhs.shape} and {rhs.shape} are not aligned for matmul"
             raise ValueError(msg)
-        # For M=1 (decode) route to the faster SGEMV kernel (skip GEMM tile setup).
-        if lhs.shape[0] == 1 and self.ensure_compiled():
-            return self.sgemv(rhs.T, lhs[0]).reshape(1, -1)
+        # Single-token decode is a matrix-vector operation, but the bundled
+        # portable SGEMV kernel can be substantially slower than the host's
+        # BLAS for large language-model projections (especially the
+        # vocabulary head).  Use NumPy's BLAS-backed matmul here so CPU
+        # generation remains responsive across hosts; retain the native
+        # implementation as an explicit API through ``sgemv``.
+        if lhs.shape[0] == 1:
+            return (lhs @ rhs).astype(np.float32)
         if not force_native or not self.ensure_compiled():
             return (lhs @ rhs).astype(np.float32)
         lhs_c = np.ascontiguousarray(lhs)

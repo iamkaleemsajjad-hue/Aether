@@ -738,9 +738,13 @@ class CPUExecutionEngine:
         # (in_features, out_features). Infer the orientation from the actual
         # contraction dimension instead of identifying a model family.
         if matrix.shape[1] == input_features:
-            kernel = np.ascontiguousarray(matrix.T)
+            # ``matrix.T`` is a zero-copy view.  ``sgemm`` accepts strided
+            # NumPy operands and the native forced-GEMM path materializes its
+            # own contiguous operand only when it actually needs one.  Do not
+            # copy every large projection during single-token decode.
+            kernel = matrix.T
         elif matrix.shape[0] == input_features:
-            kernel = np.ascontiguousarray(matrix)
+            kernel = matrix
         else:
             raise ValueError(
                 "linear weight/input mismatch: input has "

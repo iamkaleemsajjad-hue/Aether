@@ -34,7 +34,7 @@ class TorchBackend(Backend):
     def __init__(self) -> None:
         info = BackendInfo(
             name="pytorch",
-            version="1.2.2",
+            version="1.2.3",
             supported_targets=[
                 "cuda_sm70", "cuda_sm80", "cuda_sm89", "cuda_sm90", "cuda_sm100",
                 "cpu_avx512", "cpu_neon", "rocm_rdna3", "rocm_cdna3", "metal_m1", "metal_m3",

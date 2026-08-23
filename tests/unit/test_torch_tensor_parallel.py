@@ -130,3 +130,16 @@ def test_capacity_partition_uses_physical_memory_ratio() -> None:
     """A 36/64 capacity mesh receives 36%/64% of a divisible tensor."""
     ranges = capacity_weighted_partition(100, [36.0, 64.0])
     assert ranges == [(0, 36), (36, 100)]
+
+
+def test_tensor_parallel_keeps_persisted_optimizations_advisory() -> None:
+    """Optional CPU cache plans must not make a GPU artifact unloadable."""
+    source = _toy_engine()
+    source.sparse_attention_plan = {"enabled": True}
+    source.semantic_kv_plan = {"format": "aether_kv_compression_v1"}
+    source.cross_layer_kv_plan = {"format": "aether_cross_layer_kv_v1"}
+
+    parallel = TorchTensorParallelAEGEngine(source, ["cpu:0", "cpu:1"])
+    assert sorted(parallel.persisted_optimization_plans) == [
+        "cross_layer_kv", "semantic_kv", "sparse_attention"
+    ]
