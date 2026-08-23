@@ -159,6 +159,8 @@ class ModelWeights:
     ffn_type: str = "SwiGLU"
     #: Whether attention and FFN branches share one pre-norm input.
     parallel_residual: bool = False
+    attention_layers: list[str] | None = None
+    attention_window: int | None = None
 
     @property
     def hidden_size(self) -> int:
@@ -548,6 +550,8 @@ class CPUExecutionEngine:
             ffn_type=self.weights.ffn_type,
             position_type=self.weights.position_type,
             parallel_residual=self.weights.parallel_residual,
+            attention_layers=self.weights.attention_layers,
+            attention_window=self.weights.attention_window,
         )
         return CPUExecutionEngine(
             weights,
@@ -872,6 +876,7 @@ class CPUExecutionEngine:
         causal_offset: int,
         key_positions: np.ndarray | None = None,
         query_positions: np.ndarray | None = None,
+        window_size: int | None = None,
     ) -> np.ndarray:
         """Scaled dot-product attention with causal masking and GQA broadcast.
 
@@ -927,6 +932,8 @@ class CPUExecutionEngine:
 
         # Causal mask uses original token positions, not compressed row indices.
         allowed = key_positions[None, :] <= query_positions[:, None]
+        if window_size is not None and window_size > 0:
+            allowed &= key_positions[None, :] >= (query_positions[:, None] - int(window_size) + 1)
         sparse_allowed = self._sparse_allowed_mask(
             seq_len=seq_len,
             total=total,
@@ -1089,6 +1096,17 @@ class CPUExecutionEngine:
             hidden = hidden + self.weights.position_embedding[past:end]
 
         for index, layer in enumerate(self.weights.layers):
+            attention_layers = getattr(self.weights, "attention_layers", None)
+            attention_kind = (
+                str(attention_layers[index]).lower()
+                if isinstance(attention_layers, list) and index < len(attention_layers)
+                else "global"
+            )
+            local_attention = attention_kind in {"local", "sliding_window", "window"}
+            attention_window = (
+                int(getattr(self.weights, "attention_window", 0) or 0)
+                if local_attention else None
+            )
             # ── Attention block ──
             # For decode (seq_len == 1) with no LoRA: use the fused
             # rmsnorm_linear kernel to eliminate the intermediate normed buffer.
@@ -1151,6 +1169,7 @@ class CPUExecutionEngine:
                 seq_len == 1
                 and self.sparse_attention_plan is None
                 and self.kernels.is_native
+                and not local_attention
                 and str(self.weights.position_type or "RoPE").lower() not in {"alibi", "alibi_bias"}
             ):
                 context = self.kernels.flash_attn(
@@ -1167,6 +1186,7 @@ class CPUExecutionEngine:
                     causal_offset=past,
                     key_positions=key_positions,
                     query_positions=np.arange(past, past + seq_len, dtype=np.int64),
+                    window_size=attention_window,
                 )
             compressed_keys, compressed_values, compressed_positions = self._compress_semantic_kv(
                 cache, index, keys, values, key_positions

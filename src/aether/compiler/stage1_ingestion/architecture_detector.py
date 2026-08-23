@@ -415,6 +415,40 @@ class ArchitectureDetector:
                 position_type = "absolute"
             else:
                 position_type = "RoPE"
+        raw_attention_layers = config.get("attention_layers")
+        attention_layers: list[str] | None = None
+        if isinstance(raw_attention_layers, list) and len(raw_attention_layers) == int(num_hidden_layers):
+            if all(not isinstance(value, (list, tuple, dict)) for value in raw_attention_layers):
+                attention_layers = [str(value) for value in raw_attention_layers]
+        # GPT-Neo stores the same contract as repeated groups, for example
+        # ``[[["global", "local"], 12]]``.  Expand it once at ingestion so
+        # every executor receives an unambiguous per-layer schedule.
+        if attention_layers is None:
+            expanded: list[str] = []
+            raw_attention_types = config.get("attention_types")
+            if isinstance(raw_attention_types, list):
+                try:
+                    for group in raw_attention_types:
+                        if not isinstance(group, (list, tuple)) or len(group) != 2:
+                            raise ValueError
+                        pattern, count = group
+                        if isinstance(pattern, str):
+                            pattern_values = [pattern]
+                        elif isinstance(pattern, (list, tuple)) and pattern:
+                            pattern_values = [str(value) for value in pattern]
+                        else:
+                            raise ValueError
+                        for layer_index in range(int(count)):
+                            expanded.append(pattern_values[layer_index % len(pattern_values)])
+                    if len(expanded) == int(num_hidden_layers):
+                        attention_layers = expanded
+                except (TypeError, ValueError):
+                    attention_layers = None
+        raw_attention_window = config.get("window_size", config.get("attention_window"))
+        try:
+            attention_window = int(raw_attention_window) if raw_attention_window is not None else None
+        except (TypeError, ValueError):
+            attention_window = None
         embedding_norm = bool(
             config.get("embedding_norm", False)
             or model_type == "bloom"
@@ -633,6 +667,8 @@ class ArchitectureDetector:
             ffn_type=ffn_type,
             norm_type=norm_type,
             position_type=position_type,
+            attention_layers=attention_layers,
+            attention_window=attention_window,
             embedding_norm=embedding_norm,
         )
 

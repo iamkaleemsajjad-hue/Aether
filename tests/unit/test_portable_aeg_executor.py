@@ -56,6 +56,24 @@ def test_torch_portable_executor_matches_reference_cpu() -> None:
     assert actual_ids == expected_ids
 
 
+def test_torch_portable_executor_preserves_qk_norm_and_local_attention() -> None:
+    """Qwen-style head norms and GPT-Neo-style windows share one contract."""
+    pytest.importorskip("torch")
+    from aether.runtime.torch_engine import TorchAEGEngine
+
+    reference = _tiny_engine()
+    for layer in reference.weights.layers:
+        layer.q_norm = np.ones(reference.head_dim, dtype=np.float32)
+        layer.k_norm = np.ones(reference.head_dim, dtype=np.float32)
+    reference.weights.attention_layers = ["global", "local"]
+    reference.weights.attention_window = 2
+    portable = TorchAEGEngine(reference, "cpu")
+    ids = np.asarray([1, 3, 5, 2], dtype=np.int64)
+    expected, _ = reference.forward(ids)
+    actual, _ = portable.forward(ids)
+    np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)
+
+
 def test_torch_portable_executor_applies_grammar_token_mask() -> None:
     pytest.importorskip("torch")
     from aether.runtime.torch_engine import TorchAEGEngine

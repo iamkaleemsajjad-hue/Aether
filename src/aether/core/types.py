@@ -1119,6 +1119,12 @@ class ModelArchitecture:
     position_type: str = "RoPE"
     """Position encoding used by the decoder (RoPE, ALiBi, or none)."""
 
+    attention_layers: list[str] | None = None
+    """Per-layer attention pattern, e.g. GPT-Neo's ``global``/``local`` mix."""
+
+    attention_window: int | None = None
+    """Local causal attention window in tokens when the source declares one."""
+
     embedding_norm: bool = False
     """Whether the token embedding output has a learned normalization."""
 
@@ -1224,6 +1230,8 @@ class ModelArchitecture:
             "ffn_type": self.ffn_type,
             "norm_type": self.norm_type,
             "position_type": self.position_type,
+            "attention_layers": self.attention_layers,
+            "attention_window": self.attention_window,
             "embedding_norm": self.embedding_norm,
             "qk_norm": self.qk_norm,
             "parallel_residual": self.parallel_residual,
@@ -1281,6 +1289,14 @@ class ModelArchitecture:
             ffn_type=data.get("ffn_type", "SwiGLU"),
             norm_type=data.get("norm_type", "RMSNorm"),
             position_type=data.get("position_type", "RoPE"),
+            attention_layers=(
+                [str(value) for value in data["attention_layers"]]
+                if isinstance(data.get("attention_layers"), list) else None
+            ),
+            attention_window=(
+                int(data["attention_window"])
+                if data.get("attention_window") is not None else None
+            ),
             embedding_norm=bool(data.get("embedding_norm", False)),
             qk_norm=bool(data.get("qk_norm", False)),
             parallel_residual=bool(data.get("parallel_residual", False)),

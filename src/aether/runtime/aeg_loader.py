@@ -242,6 +242,10 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
     # Models with tied embeddings ship no separate lm_head; reuse the embedding.
     lm_head = tensors.get((None, "lm_head"))
     if lm_head is None:
+        if not bool(architecture.get("tie_word_embeddings", True)):
+            raise AEGLoadError(
+                "untied decoder AEG is missing the required lm_head tensor"
+            )
         lm_head = embedding
         logger.debug("No lm_head tensor found; using tied embedding weights")
 
@@ -285,6 +289,14 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
         ffn_type=str(architecture.get("ffn_type", "SwiGLU") or "SwiGLU"),
         position_type=str(architecture.get("position_type", "RoPE") or "RoPE"),
         parallel_residual=bool(architecture.get("parallel_residual", False)),
+        attention_layers=(
+            [str(value) for value in architecture["attention_layers"]]
+            if isinstance(architecture.get("attention_layers"), list) else None
+        ),
+        attention_window=(
+            int(architecture["attention_window"])
+            if architecture.get("attention_window") is not None else None
+        ),
     )
     kernels = get_native_kernels()
     _load_packaged_native_kernels(package, kernels)

@@ -15,6 +15,7 @@ a claim that every accelerator-specific FlashAttention kernel is present.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any, Iterator
 
 import numpy as np
@@ -50,6 +51,22 @@ class TorchAEGEngine:
             raise RuntimeError("PyTorch is required for portable AEG execution") from exc
         self.torch = torch
         self.device = torch.device(device)
+        # The portable executor used to materialize every artifact as FP32.
+        # That is needlessly expensive on CUDA and also defeats the fused
+        # half-precision kernels used by PyTorch.  Keep an explicit override
+        # for validation/reproducibility, while selecting the safe fast path
+        # for the target device by default.
+        requested_dtype = str(os.environ.get("AETHER_TORCH_DTYPE", "auto")).lower()
+        if requested_dtype in {"fp16", "float16", "half"}:
+            self.compute_dtype = torch.float16
+        elif requested_dtype in {"bf16", "bfloat16"}:
+            self.compute_dtype = torch.bfloat16
+        elif requested_dtype in {"fp32", "float32"}:
+            self.compute_dtype = torch.float32
+        elif self.device.type == "cuda":
+            self.compute_dtype = torch.float16
+        else:
+            self.compute_dtype = torch.float32
         self.source_engine = cpu_engine
         self.weights = cpu_engine.weights
         self.num_heads = int(cpu_engine.num_heads)
@@ -65,6 +82,7 @@ class TorchAEGEngine:
             )
         self.embedding = self._tensor(self.weights.embedding)
         self.final_norm = self._tensor(self.weights.final_norm)
+        self.final_norm_bias = self._optional_tensor(getattr(self.weights, "final_norm_bias", None))
         self.lm_head = self._tensor(self.weights.lm_head)
         self.embedding_norm = (
             self._tensor(self.weights.embedding_norm)
@@ -83,7 +101,9 @@ class TorchAEGEngine:
         self._sin: Any | None = None
 
     def _tensor(self, value: Any) -> Any:
-        return self.torch.as_tensor(np.asarray(value, dtype=np.float32), device=self.device)
+        return self.torch.as_tensor(
+            np.asarray(value, dtype=np.float32), device=self.device, dtype=self.compute_dtype
+        )
 
     def _optional_tensor(self, value: Any | None) -> Any | None:
         return None if value is None else self._tensor(value)
@@ -124,11 +144,16 @@ class TorchAEGEngine:
     def _norm(self, x: Any, weight: Any, bias: Any | None = None) -> Any:
         eps = float(self.weights.norm_eps)
         if str(self.weights.norm_type).lower() == "layernorm":
-            mean = x.mean(dim=-1, keepdim=True)
-            var = (x - mean).pow(2).mean(dim=-1, keepdim=True)
-            result = (x - mean) / self.torch.sqrt(var + eps) * weight
-            return result if bias is None else result + bias
-        return x * self.torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps) * weight
+            return self.torch.nn.functional.layer_norm(
+                x, (int(x.shape[-1]),), weight, bias, eps
+            )
+        # Accumulate the RMS in FP32 even when activations use FP16.  This is
+        # the standard stable RMSNorm evaluation and avoids quality loss from
+        # a half-precision reduction over a large hidden dimension.
+        rms = self.torch.rsqrt(
+            x.float().pow(2).mean(dim=-1, keepdim=True) + eps
+        ).to(dtype=x.dtype)
+        return x * rms * weight
 
     def _linear(self, x: Any, weight: Any, bias: Any | None = None) -> Any:
         if weight.ndim != 2:
@@ -154,8 +179,8 @@ class TorchAEGEngine:
 
     def _rope(self, x: Any, positions: Any) -> Any:
         assert self._cos is not None and self._sin is not None
-        cos = self._cos.index_select(0, positions).unsqueeze(1)
-        sin = self._sin.index_select(0, positions).unsqueeze(1)
+        cos = self._cos.index_select(0, positions).unsqueeze(1).to(dtype=x.dtype)
+        sin = self._sin.index_select(0, positions).unsqueeze(1).to(dtype=x.dtype)
         # AEG's canonical RoPE layout is the half-split form used by the
         # reference CPU kernel: [x_0..x_h, x_h..x_2h], not an interleaved
         # even/odd layout.  Keeping this convention makes CPU and accelerator
@@ -202,23 +227,96 @@ class TorchAEGEngine:
             output.index_put_((rows,), value * routing[rows, slots].unsqueeze(-1), accumulate=True)
         return output
 
-    def _attention(self, q: Any, k: Any, v: Any, query_positions: Any, key_positions: Any) -> Any:
-        repeats = self.num_heads // self.num_kv_heads
-        k = k.repeat_interleave(repeats, dim=1)
-        v = v.repeat_interleave(repeats, dim=1)
-        scores = self.torch.einsum("qhd,khd->hqk", q, k) / np.sqrt(self.head_dim)
-        if str(self.weights.position_type or "RoPE").lower() in {"alibi", "alibi_bias"}:
-            distance = key_positions[None, :] - query_positions[:, None]
-            distance_tensor = self.torch.as_tensor(
-                distance, dtype=scores.dtype, device=self.device
-            )
-            scores = scores + self._alibi_slopes[:, None, None] * distance_tensor[None, :, :]
-        allowed = key_positions[None, :] <= query_positions[:, None]
-        scores = scores.masked_fill(~allowed.unsqueeze(0), -torch_inf(self.torch, scores.dtype))
-        probs = self.torch.softmax(scores, dim=-1)
-        return self.torch.einsum("hqk,khd->qhd", probs, v)
+    def _attention(
+        self,
+        q: Any,
+        k: Any,
+        v: Any,
+        query_positions: Any,
+        key_positions: Any,
+        window_size: int | None = None,
+    ) -> Any:
+        """Exact attention, dispatching to PyTorch's fused SDPA when possible.
 
-    def forward(self, token_ids: np.ndarray | Any, cache: TorchKVCache | None = None) -> tuple[np.ndarray, TorchKVCache]:
+        The boolean mask is intentionally expressed in source token
+        positions, not cache row indices.  That keeps the same semantics for
+        normal prefill, incremental decode, local GPT-Neo layers, and future
+        cache implementations that compact rows.
+        """
+        torch = self.torch
+        position_type = str(self.weights.position_type or "RoPE").lower()
+        is_alibi = position_type in {"alibi", "alibi_bias"}
+        is_prefill = int(query_positions.numel()) > 1 and int(key_positions.numel()) == int(query_positions.numel())
+        contiguous = bool(
+            query_positions.numel()
+            and key_positions.numel()
+            and int(query_positions[0].item()) == 0
+            and int(key_positions[0].item()) == 0
+        )
+        local = window_size is not None and int(window_size) > 0
+
+        # SDPA accepts [batch, heads, query, dim].  enable_gqa avoids
+        # materializing repeated KV heads on supported PyTorch versions.
+        q4 = q.transpose(0, 1).unsqueeze(0)
+        k4 = k.transpose(0, 1).unsqueeze(0)
+        v4 = v.transpose(0, 1).unsqueeze(0)
+        if not is_alibi:
+            attn_mask = None
+            is_causal = bool(is_prefill and contiguous and not local)
+            if not is_causal and not (
+                int(query_positions.numel()) == 1
+                and bool(torch.all(key_positions <= query_positions[-1]).item())
+                and not local
+            ):
+                allowed = key_positions[None, :] <= query_positions[:, None]
+                if local:
+                    allowed &= key_positions[None, :] >= (
+                        query_positions[:, None] - int(window_size) + 1
+                    )
+                attn_mask = allowed
+            try:
+                context = torch.nn.functional.scaled_dot_product_attention(
+                    q4, k4, v4, attn_mask=attn_mask, dropout_p=0.0,
+                    is_causal=is_causal, enable_gqa=True,
+                )
+                return context.squeeze(0).transpose(0, 1)
+            except (TypeError, RuntimeError):
+                # Older PyTorch builds do not expose enable_gqa or may lack a
+                # suitable fused backend.  The exact fallback remains valid.
+                pass
+
+        repeats = self.num_heads // self.num_kv_heads
+        k_full = k.repeat_interleave(repeats, dim=1)
+        v_full = v.repeat_interleave(repeats, dim=1)
+        scores = torch.einsum("qhd,khd->hqk", q, k_full) / np.sqrt(self.head_dim)
+        if is_alibi:
+            distance = key_positions[None, :] - query_positions[:, None]
+            scores = scores + self._alibi_slopes[:, None, None] * distance.to(dtype=scores.dtype)[None, :, :]
+        allowed = key_positions[None, :] <= query_positions[:, None]
+        if local:
+            allowed &= key_positions[None, :] >= query_positions[:, None] - int(window_size) + 1
+        scores = scores.masked_fill(~allowed.unsqueeze(0), -torch.finfo(scores.dtype).max)
+        probs = torch.softmax(scores, dim=-1)
+        return torch.einsum("hqk,khd->qhd", probs, v_full)
+
+    def _append_kv(self, old: Any | None, value: Any, past: int, total: int) -> Any:
+        """Append KV in amortized-linear storage instead of copying the prefix."""
+        torch = self.torch
+        if old is None or int(old.shape[0]) < total:
+            old_capacity = 0 if old is None else int(old.shape[0])
+            capacity = max(total, max(16, old_capacity * 2))
+            result = torch.empty(
+                (capacity, *tuple(value.shape[1:])), dtype=value.dtype, device=value.device
+            )
+            if old is not None and past:
+                result[:past].copy_(old[:past])
+        else:
+            result = old
+        result[past:total].copy_(value)
+        return result
+
+    def _forward_device(self, token_ids: np.ndarray | Any, cache: TorchKVCache | None = None) -> tuple[Any, TorchKVCache]:
+        """Forward pass that keeps logits on the accelerator for generation."""
         torch = self.torch
         ids = torch.as_tensor(np.asarray(token_ids, dtype=np.int64).reshape(-1), device=self.device)
         if ids.numel() == 0:
@@ -238,8 +336,19 @@ class TorchAEGEngine:
         if self.position_embedding is not None:
             hidden = hidden + self.position_embedding.index_select(0, positions)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for index, layer in enumerate(self.layers):
+                attention_layers = getattr(self.weights, "attention_layers", None)
+                attention_kind = (
+                    str(attention_layers[index]).lower()
+                    if isinstance(attention_layers, list) and index < len(attention_layers)
+                    else "global"
+                )
+                local_attention = attention_kind in {"local", "sliding_window", "window"}
+                attention_window = (
+                    int(getattr(self.weights, "attention_window", 0) or 0)
+                    if local_attention else None
+                )
                 normed = self._norm(hidden, layer["attention_norm"], layer["attention_norm_bias"])
                 q = self._linear(normed, layer["q_proj"], layer["q_proj_bias"]).reshape(seq_len, self.num_heads, self.head_dim)
                 if layer["q_norm"] is not None:
@@ -252,12 +361,13 @@ class TorchAEGEngine:
                 v = self._linear(normed, layer["v_proj"], layer["v_proj_bias"]).reshape(seq_len, self.num_kv_heads, self.head_dim)
                 if uses_rope:
                     k = self._rope(k, positions)
-                if cache.keys[index] is not None:
-                    k_all = torch.cat((cache.keys[index], k), dim=0)
-                    v_all = torch.cat((cache.values[index], v), dim=0)
-                else:
-                    k_all, v_all = k, v
-                context = self._attention(q, k_all, v_all, positions, torch.arange(past + seq_len, device=self.device))
+                total = past + seq_len
+                k_all = self._append_kv(cache.keys[index], k, past, total)
+                v_all = self._append_kv(cache.values[index], v, past, total)
+                context = self._attention(
+                    q, k_all[:total], v_all[:total], positions,
+                    torch.arange(total, device=self.device), attention_window,
+                )
                 cache.keys[index] = k_all
                 cache.values[index] = v_all
                 attention_out = self._linear(
@@ -272,10 +382,14 @@ class TorchAEGEngine:
                     gate = self._linear(normed, layer["gate_proj"], layer["gate_proj_bias"])
                     up = self._linear(normed, layer["up_proj"], layer["up_proj_bias"]) if layer["up_proj"] is not None else None
                     hidden = hidden + self._linear(self._activation(gate, up), layer["down_proj"], layer["down_proj_bias"])
-            hidden = self._norm(hidden, self.final_norm)
+            hidden = self._norm(hidden, self.final_norm, self.final_norm_bias)
             logits = self._linear(hidden, self.lm_head)
             cache.length = past + seq_len
             cache.last_logits = logits[-1].detach()
+        return logits, cache
+
+    def forward(self, token_ids: np.ndarray | Any, cache: TorchKVCache | None = None) -> tuple[np.ndarray, TorchKVCache]:
+        logits, cache = self._forward_device(token_ids, cache)
         return logits.detach().float().cpu().numpy(), cache
 
     def _sample(self, logits: Any, temperature: float, top_k: int, top_p: float) -> int:
@@ -306,8 +420,8 @@ class TorchAEGEngine:
             raise ValueError("max_tokens must be positive")
         ids = np.asarray(prompt_ids, dtype=np.int64).reshape(-1)
         if ids.size:
-            logits, cache = self.forward(ids, cache)
-            next_logits = self.torch.as_tensor(logits[-1], device=self.device)
+            _, cache = self._forward_device(ids, cache)
+            next_logits = cache.last_logits
         elif cache is not None and cache.last_logits is not None:
             next_logits = cache.last_logits
         else:
@@ -338,7 +452,7 @@ class TorchAEGEngine:
                 break
             if eos_token_id is not None and token == int(eos_token_id):
                 break
-            _, cache = self.forward(np.asarray([token], dtype=np.int64), cache)
+            _, cache = self._forward_device(np.asarray([token], dtype=np.int64), cache)
             next_logits = cache.last_logits
         if cache_callback is not None and cache is not None:
             cache_callback(cache)

@@ -359,6 +359,8 @@ def _verify_weight_accounting(
                 required.add(f"layer_{i}_{component}")
     else:
         required = {"embedding"}
+        if not bool(getattr(architecture, "tie_word_embeddings", True)):
+            required.add("lm_head")
         if bool(getattr(architecture, "embedding_norm", False)):
             required.add("embedding_norm")
         if str(getattr(architecture, "position_type", "RoPE") or "RoPE").lower() in {

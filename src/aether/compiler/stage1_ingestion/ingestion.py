@@ -800,6 +800,7 @@ class IngestionPipeline:
         "token_embd": "embedding",
         "wte": "embedding",
         "wpe": "position_embedding",
+        "position_embedding": "position_embedding",
         "input_layernorm": "rmsnorm",
         "ln1": "rmsnorm",
         "ln2": "ffn_norm",

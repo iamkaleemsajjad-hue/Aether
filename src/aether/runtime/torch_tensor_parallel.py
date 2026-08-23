@@ -22,6 +22,7 @@ implementation; vendor collectives can replace the explicit copies later.
 from __future__ import annotations
 
 import time
+import os
 from types import SimpleNamespace
 from typing import Any
 
@@ -64,6 +65,15 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         self.torch = torch
         self.devices = [torch.device(value) for value in devices]
         self.device = self.devices[0]
+        requested_dtype = str(os.environ.get("AETHER_TORCH_DTYPE", "auto")).lower()
+        if requested_dtype in {"fp16", "float16", "half"}:
+            self.compute_dtype = torch.float16
+        elif requested_dtype in {"bf16", "bfloat16"}:
+            self.compute_dtype = torch.bfloat16
+        elif requested_dtype in {"fp32", "float32"} or self.device.type != "cuda":
+            self.compute_dtype = torch.float32
+        else:
+            self.compute_dtype = torch.float16
         self._shard_weights = self._calibrate_mixed_mesh()
         total_capacity = float(sum(self._shard_weights or ()))
         self.shard_fractions = (
@@ -112,6 +122,9 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
             norm_type=source_weights.norm_type,
             ffn_type=source_weights.ffn_type,
             position_type=source_weights.position_type,
+            attention_layers=getattr(source_weights, "attention_layers", None),
+            attention_window=getattr(source_weights, "attention_window", None),
+            final_norm_bias=getattr(source_weights, "final_norm_bias", None),
         )
         self.num_heads = int(cpu_engine.num_heads)
         self.num_kv_heads = int(cpu_engine.num_kv_heads)
@@ -156,6 +169,7 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
 
         self.embedding, self._embedding_ranges = self._row_shards(embedding)
         self.final_norm = self._tensor_primary(source_weights.final_norm)
+        self.final_norm_bias = self._optional_primary(getattr(source_weights, "final_norm_bias", None))
         self.lm_head, self._lm_head_ranges = self._row_shards(
             source_weights.lm_head, self.embedding_hidden_size, "lm_head"
         )
@@ -174,13 +188,17 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         return alibi_slopes(self.num_heads)
 
     def _tensor_primary(self, value: Any) -> Any:
-        return self.torch.as_tensor(np.asarray(value, dtype=np.float32), device=self.device)
+        return self.torch.as_tensor(
+            np.asarray(value, dtype=np.float32), device=self.device, dtype=self.compute_dtype
+        )
 
     def _optional_primary(self, value: Any | None) -> Any | None:
         return None if value is None else self._tensor_primary(value)
 
     def _tensor_on(self, value: Any, device: Any) -> Any:
-        return self.torch.as_tensor(np.asarray(value, dtype=np.float32), device=device)
+        return self.torch.as_tensor(
+            np.asarray(value, dtype=np.float32), device=device, dtype=self.compute_dtype
+        )
 
     def _synchronize(self, device: Any) -> None:
         if device.type == "cuda":
@@ -461,8 +479,19 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         if self.position_embedding is not None:
             hidden = hidden + self._position_lookup(positions)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for index, layer in enumerate(self.layers):
+                attention_layers = getattr(self.weights, "attention_layers", None)
+                attention_kind = (
+                    str(attention_layers[index]).lower()
+                    if isinstance(attention_layers, list) and index < len(attention_layers)
+                    else "global"
+                )
+                local_attention = attention_kind in {"local", "sliding_window", "window"}
+                attention_window = (
+                    int(getattr(self.weights, "attention_window", 0) or 0)
+                    if local_attention else None
+                )
                 normed = self._norm(hidden, layer["attention_norm"], layer["attention_norm_bias"])
                 q = self._parallel_row_linear(normed, layer["q_proj"], layer["q_proj_bias"]).reshape(seq_len, self.num_heads, self.head_dim)
                 if layer["q_norm"] is not None:
@@ -475,12 +504,13 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
                 if uses_rope:
                     k = self._rope(k, positions)
                 v = self._parallel_row_linear(normed, layer["v_proj"], layer["v_proj_bias"]).reshape(seq_len, self.num_kv_heads, self.head_dim)
-                if cache.keys[index] is not None:
-                    k_all = torch.cat((cache.keys[index], k), dim=0)
-                    v_all = torch.cat((cache.values[index], v), dim=0)
-                else:
-                    k_all, v_all = k, v
-                context = self._attention(q, k_all, v_all, positions, torch.arange(past + seq_len, device=self.device))
+                total = past + seq_len
+                k_all = self._append_kv(cache.keys[index], k, past, total)
+                v_all = self._append_kv(cache.values[index], v, past, total)
+                context = self._attention(
+                    q, k_all[:total], v_all[:total], positions,
+                    torch.arange(total, device=self.device), attention_window,
+                )
                 cache.keys[index] = k_all
                 cache.values[index] = v_all
                 attention_out = self._parallel_column_linear(
@@ -494,8 +524,18 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
                     gate = self._parallel_row_linear(normed, layer["gate_proj"], layer["gate_proj_bias"])
                     up = None if layer["up_proj"] is None else self._parallel_row_linear(normed, layer["up_proj"], layer["up_proj_bias"])
                     hidden = hidden + self._parallel_column_linear(self._activation(gate, up), layer["down_proj"], layer["down_proj_bias"])
-            hidden = self._norm(hidden, self.final_norm)
+            hidden = self._norm(hidden, self.final_norm, self.final_norm_bias)
             logits = self._parallel_row_linear(hidden, self.lm_head, None)
             cache.length = past + seq_len
             cache.last_logits = logits[-1].detach()
         return logits.detach().float().cpu().numpy(), cache
+
+    def _forward_device(self, token_ids: np.ndarray | Any, cache: TorchKVCache | None = None) -> tuple[Any, TorchKVCache]:
+        """Compatibility bridge for the base generation loop.
+
+        Tensor parallelism still has a separate sharded forward implementation;
+        it retains device-resident ``cache.last_logits`` and only materializes
+        this returned tensor for callers that explicitly request ``forward``.
+        """
+        logits, cache = self.forward(token_ids, cache)
+        return self.torch.as_tensor(logits, device=self.device), cache
