@@ -727,9 +727,34 @@ class CPUExecutionEngine:
     ) -> np.ndarray:
         """Apply a base linear projection and the selected real LoRA delta."""
         x32 = np.ascontiguousarray(x, dtype=np.float32)
-        output = self.kernels.sgemm(x32, weight.T)
+        matrix = np.asarray(weight, dtype=np.float32)
+        if matrix.ndim != 2:
+            raise ValueError(
+                f"linear weight must be a rank-2 matrix, got shape {matrix.shape}"
+            )
+        input_features = int(x32.shape[-1])
+        # AEG stores the usual PyTorch layout (out_features, in_features),
+        # while some source checkpoints use Conv1D layout
+        # (in_features, out_features). Infer the orientation from the actual
+        # contraction dimension instead of identifying a model family.
+        if matrix.shape[1] == input_features:
+            kernel = np.ascontiguousarray(matrix.T)
+        elif matrix.shape[0] == input_features:
+            kernel = np.ascontiguousarray(matrix)
+        else:
+            raise ValueError(
+                "linear weight/input mismatch: input has "
+                f"{input_features} features but weight shape is {matrix.shape}"
+            )
+        output = self.kernels.sgemm(x32, kernel)
         if bias is not None:
-            output = output + np.asarray(bias, dtype=np.float32)
+            bias_array = np.asarray(bias, dtype=np.float32).reshape(-1)
+            if bias_array.size != output.shape[-1]:
+                raise ValueError(
+                    f"linear bias has {bias_array.size} elements but output has "
+                    f"{output.shape[-1]} features"
+                )
+            output = output + bias_array
         if self.active_lora_adapter is None or target is None:
             return output
         adapter = self.lora_adapters.get(self.active_lora_adapter)

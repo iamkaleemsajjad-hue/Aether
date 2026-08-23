@@ -157,7 +157,7 @@ class NativeCPUBackend(Backend):
             self,
             BackendInfo(
                 name="aether_cpu",
-                version="1.2.0",
+                version="1.2.2",
                 supported_targets=[
                     "cpu_avx2", "cpu_avx512", "cpu_neon",
                     "cpu_avx512_ternary", "cpu_neon_ternary",

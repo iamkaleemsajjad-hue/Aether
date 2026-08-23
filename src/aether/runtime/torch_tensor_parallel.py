@@ -29,6 +29,9 @@ import numpy as np
 
 from aether.parallelism.sharding import balanced_partition, capacity_weighted_partition
 from aether.runtime.torch_engine import TorchAEGEngine, TorchKVCache
+from aether.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def _boundaries(length: int, parts: int) -> list[tuple[int, int]]:
@@ -62,6 +65,17 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         self.devices = [torch.device(value) for value in devices]
         self.device = self.devices[0]
         self._shard_weights = self._calibrate_mixed_mesh()
+        total_capacity = float(sum(self._shard_weights or ()))
+        self.shard_fractions = (
+            [value / total_capacity for value in self._shard_weights]
+            if total_capacity > 0.0 else
+            [1.0 / len(self.devices)] * len(self.devices)
+        )
+        logger.info(
+            "Tensor-parallel shard fractions across %s: %s",
+            [str(device) for device in self.devices],
+            [round(value, 6) for value in self.shard_fractions],
+        )
 
         # ── Hardware topology + collective strategy ────────────────────────
         # Detect NVLink / PCIe / XGMI interconnects and log the recommended
@@ -77,8 +91,7 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
             # payload = 2 * hidden_size * 4 bytes (float32)
             _sample_payload = 2 * 4096 * 4
             _latency_ms = self._topology.allreduce_latency_ms(_sample_payload)
-            import logging as _logging
-            _logging.getLogger(__name__).info(
+            logger.info(
                 "TP collective strategy: %s | %s | "
                 "estimated allreduce latency per layer (H=4096): %.3f ms",
                 _strat.value,
@@ -123,7 +136,9 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
 
         self.embedding, self._embedding_ranges = self._row_shards(embedding)
         self.final_norm = self._tensor_primary(source_weights.final_norm)
-        self.lm_head, self._lm_head_ranges = self._row_shards(source_weights.lm_head)
+        self.lm_head, self._lm_head_ranges = self._row_shards(
+            source_weights.lm_head, self.embedding_hidden_size, "lm_head"
+        )
         self.embedding_norm = self._optional_primary(source_weights.embedding_norm)
         self.embedding_norm_bias = self._optional_primary(source_weights.embedding_norm_bias)
         self.position_embedding, self._position_ranges = self._optional_row_shards(position_embedding)
@@ -154,17 +169,31 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
             self.torch.mps.synchronize()
 
     def _calibrate_mixed_mesh(self) -> list[float] | None:
-        """Measure relative GEMM throughput only for heterogeneous meshes.
+        """Return physical-memory capacities or measure mixed-device throughput.
 
-        Equal GPU meshes intentionally use equal tensor partitions.  A CPU
-        plus accelerator mesh has no portable peak-throughput constant, so a
-        short measured GEMM is used as the capacity signal instead of
-        inventing cross-vendor FLOP conversion factors.  The calibration is
-        model-size independent and is run before any model shard is uploaded.
+        GPU model parallelism is capacity constrained: a 36 GiB card and a
+        64 GiB card cannot safely receive equal weight ranges.  Total device
+        memory therefore determines the default partition for homogeneous
+        accelerator meshes.  A mixed CPU/accelerator mesh has no meaningful
+        common memory-performance unit, so a small measured GEMM supplies a
+        conservative compute-capacity signal instead.  Both probes happen
+        before model shards are uploaded.
         """
+        torch = self.torch
+        if all(device.type == "cuda" for device in self.devices):
+            capacities: list[float] = []
+            try:
+                for device in self.devices:
+                    properties = torch.cuda.get_device_properties(device)
+                    total_memory = float(getattr(properties, "total_memory", 0))
+                    if total_memory <= 0.0:
+                        return None
+                    capacities.append(total_memory)
+                return capacities
+            except Exception:  # noqa: BLE001 - equal partition is safe fallback
+                return None
         if len({device.type for device in self.devices}) <= 1:
             return None
-        torch = self.torch
         rows = 256
         columns = 512
         weights: list[float] = []
@@ -195,13 +224,45 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
             return _boundaries(length, len(self.devices))
         return capacity_weighted_partition(length, self._shard_weights)
 
-    def _row_shards(self, value: Any) -> tuple[list[Any], list[tuple[int, int]]]:
+    def _canonical_projection(self, value: Any, input_features: int, name: str) -> np.ndarray:
+        """Return a projection in ``(out_features, in_features)`` layout.
+
+        AEG ingestion preserves enough source layout information for the
+        single-device engines to accept both PyTorch ``Linear`` matrices and
+        source-checkpoint ``Conv1D`` matrices. Tensor parallelism must normalize the
+        matrix before partitioning: row sharding always means output-feature
+        sharding and column sharding always means input-feature sharding.
+        This is shape-driven, so it is independent of a model-family name.
+        """
         array = np.asarray(value)
+        if array.ndim != 2:
+            raise ValueError(f"{name} weight must be rank-2, got shape {array.shape}")
+        if int(array.shape[1]) == int(input_features):
+            return np.ascontiguousarray(array)
+        if int(array.shape[0]) == int(input_features):
+            return np.ascontiguousarray(array.T)
+        raise ValueError(
+            f"{name} weight/input mismatch: input has {input_features} features "
+            f"but weight shape is {array.shape}"
+        )
+
+    def _row_shards(
+        self, value: Any, input_features: int | None = None, name: str = "projection"
+    ) -> tuple[list[Any], list[tuple[int, int]]]:
+        array = (
+            self._canonical_projection(value, input_features, name)
+            if input_features is not None else np.asarray(value)
+        )
         ranges = self._partition_ranges(int(array.shape[0]))
         return [self._tensor_on(array[start:end], device) for device, (start, end) in zip(self.devices, ranges)], ranges
 
-    def _column_shards(self, value: Any) -> tuple[list[Any], list[tuple[int, int]]]:
-        array = np.asarray(value)
+    def _column_shards(
+        self, value: Any, input_features: int | None = None, name: str = "projection"
+    ) -> tuple[list[Any], list[tuple[int, int]]]:
+        array = (
+            self._canonical_projection(value, input_features, name)
+            if input_features is not None else np.asarray(value)
+        )
         ranges = self._partition_ranges(int(array.shape[1]))
         return [self._tensor_on(array[:, start:end], device) for device, (start, end) in zip(self.devices, ranges)], ranges
 
@@ -222,33 +283,74 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         result: dict[str, Any] = {
             name: self._optional_primary(getattr(layer, name, None)) for name in primary_names
         }
-        result["q_proj"], result["q_ranges"] = self._row_shards(layer.q_proj)
-        result["k_proj"], result["k_ranges"] = self._row_shards(layer.k_proj)
-        result["v_proj"], result["v_ranges"] = self._row_shards(layer.v_proj)
-        result["o_proj"], result["o_ranges"] = self._column_shards(layer.o_proj)
+        result["q_proj"], result["q_ranges"] = self._row_shards(
+            layer.q_proj, self.embedding_hidden_size, "q_proj"
+        )
+        result["k_proj"], result["k_ranges"] = self._row_shards(
+            layer.k_proj, self.embedding_hidden_size, "k_proj"
+        )
+        result["v_proj"], result["v_ranges"] = self._row_shards(
+            layer.v_proj, self.embedding_hidden_size, "v_proj"
+        )
+        result["o_proj"], result["o_ranges"] = self._column_shards(
+            layer.o_proj, self.num_heads * self.head_dim, "o_proj"
+        )
         result["q_proj_bias"] = self._row_bias_shards(getattr(layer, "q_proj_bias", None))
         result["k_proj_bias"] = self._row_bias_shards(getattr(layer, "k_proj_bias", None))
         result["v_proj_bias"] = self._row_bias_shards(getattr(layer, "v_proj_bias", None))
+        gate_features = None
         if layer.gate_proj is None:
             result["gate_proj"], result["gate_ranges"] = None, None
         else:
-            result["gate_proj"], result["gate_ranges"] = self._row_shards(layer.gate_proj)
-        result["up_proj"] = None if layer.up_proj is None else self._row_shards(layer.up_proj)[0]
-        result["up_ranges"] = None if layer.up_proj is None else self._partition_ranges(np.asarray(layer.up_proj).shape[0])
+            gate_matrix = self._canonical_projection(
+                layer.gate_proj, self.embedding_hidden_size, "gate_proj"
+            )
+            gate_features = int(gate_matrix.shape[0])
+            result["gate_proj"], result["gate_ranges"] = self._row_shards(
+                gate_matrix, self.embedding_hidden_size, "gate_proj"
+            )
+        result["up_proj"] = (
+            None if layer.up_proj is None else
+            self._row_shards(layer.up_proj, self.embedding_hidden_size, "up_proj")[0]
+        )
+        result["up_ranges"] = (
+            None if layer.up_proj is None else
+            self._partition_ranges(int(self._canonical_projection(
+                layer.up_proj, self.embedding_hidden_size, "up_proj"
+            ).shape[0]))
+        )
         if layer.down_proj is None:
             result["down_proj"], result["down_ranges"] = None, None
         else:
-            result["down_proj"], result["down_ranges"] = self._column_shards(layer.down_proj)
+            if gate_features is None:
+                raise ValueError("down_proj requires a gate/up projection to define its input width")
+            result["down_proj"], result["down_ranges"] = self._column_shards(
+                layer.down_proj, gate_features,
+                "down_proj",
+            )
         result["gate_proj_bias"] = self._row_bias_shards(getattr(layer, "gate_proj_bias", None))
         result["up_proj_bias"] = self._row_bias_shards(getattr(layer, "up_proj_bias", None))
 
         router = getattr(layer, "router", None)
-        result["router"], result["router_ranges"] = (self._row_shards(router) if router is not None else (None, None))
+        result["router"], result["router_ranges"] = (
+            self._row_shards(router, self.embedding_hidden_size, "router")
+            if router is not None else (None, None)
+        )
         result["experts"] = []
         for expert in (getattr(layer, "experts", None) or []):
-            gate, gate_ranges = self._row_shards(expert.gate_proj)
-            up = None if expert.up_proj is None else self._row_shards(expert.up_proj)[0]
-            down, _ = self._column_shards(expert.down_proj)
+            gate_matrix = self._canonical_projection(
+                expert.gate_proj, self.embedding_hidden_size, "expert.gate_proj"
+            )
+            gate, gate_ranges = self._row_shards(
+                gate_matrix, self.embedding_hidden_size, "expert.gate_proj"
+            )
+            up = (
+                None if expert.up_proj is None else
+                self._row_shards(expert.up_proj, self.embedding_hidden_size, "expert.up_proj")[0]
+            )
+            down, _ = self._column_shards(
+                expert.down_proj, int(gate_matrix.shape[0]), "expert.down_proj"
+            )
             result["experts"].append({
                 "gate_proj": gate, "up_proj": up, "down_proj": down,
                 "gate_proj_bias": self._row_bias_shards(getattr(expert, "gate_proj_bias", None)),

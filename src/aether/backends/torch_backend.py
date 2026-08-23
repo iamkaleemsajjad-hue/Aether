@@ -23,6 +23,9 @@ from aether.backends.base import Backend, BackendInfo, GenerationRequest, Genera
 from aether.backends.compiled_handle import CompiledAEGHandle
 from aether.core.exceptions import BackendError
 from aether.core.hash_utils import compute_file_hash
+from aether.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class TorchBackend(Backend):
@@ -31,7 +34,7 @@ class TorchBackend(Backend):
     def __init__(self) -> None:
         info = BackendInfo(
             name="pytorch",
-            version="1.2.0",
+            version="1.2.2",
             supported_targets=[
                 "cuda_sm70", "cuda_sm80", "cuda_sm89", "cuda_sm90", "cuda_sm100",
                 "cpu_avx512", "cpu_neon", "rocm_rdna3", "rocm_cdna3", "metal_m1", "metal_m3",
@@ -125,10 +128,16 @@ class TorchBackend(Backend):
             self._runtime_family = "cpu"
 
     def is_available(self) -> bool:
-        """Return True if PyTorch and transformers are installed."""
+        """Return True when the optional PyTorch runtime is installed.
+
+        Transformers is only needed for loading an uncompiled Hugging Face
+        model.  A self-contained AEG carries its tokenizer and can execute
+        with the documented ``[pytorch]`` extra (Torch plus the base
+        ``tokenizers`` dependency), so Transformers must not gate accelerator
+        backend discovery.
+        """
         try:
             import torch  # noqa: F401
-            import transformers  # noqa: F401
             return True
         except ImportError:
             return False
@@ -281,8 +290,9 @@ class TorchBackend(Backend):
                     # For standard dense decoders (CPUExecutionEngine is what
                     # load_engine_from_path returns for decoder-only AEGs), use
                     # TorchTensorParallelAEGEngine when ≥2 devices are available.
-                    # This gives equal-weight sharding across all GPUs with no
-                    # manual configuration required (PRD §multi-gpu-equal-sharing).
+                    # This gives capacity-weighted sharding across all devices
+                    # with no manual configuration required.  Equal-sized
+                    # devices naturally reduce to equal partitions.
                     # Specialised architectures (MLA, SSM, encoder, seq2seq) have
                     # their own cross-device wrappers and are dispatched below.
                     _TP_ELIGIBLE_ENGINES = {"CPUExecutionEngine"}
@@ -312,13 +322,13 @@ class TorchBackend(Backend):
                         engine = TorchAEGEngine(engine, self._device)
                 tokenizer_root = root / "tokenizer"
                 if tokenizer_root.exists():
-                    from transformers import AutoTokenizer
+                    # The tokenizer is part of the authenticated AEG.  Do
+                    # not route this path through Transformers: compiled AEG
+                    # execution is intentionally supported with only the
+                    # optional PyTorch extra, without the HF frontend.
+                    from aether.backends.native_cpu_backend import PackagedTokenizer
 
-                    tokenizer = AutoTokenizer.from_pretrained(
-                        tokenizer_root,
-                        local_files_only=True,
-                        trust_remote_code=False,
-                    )
+                    tokenizer = PackagedTokenizer(tokenizer_root / "tokenizer.json")
         except Exception as exc:
             raise BackendError(
                 f"AEG artifact {root} failed integrity/load validation before execution: {exc}",

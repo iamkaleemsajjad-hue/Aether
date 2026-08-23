@@ -20,7 +20,7 @@ class TensorRTLLMBackend(Backend):
     def __init__(self) -> None:
         info = BackendInfo(
             name="trtllm",
-            version="1.2.0",
+            version="1.2.2",
             supported_targets=["cuda_sm80", "cuda_sm89", "cuda_sm90", "cuda_sm100"],
             capabilities=["generate", "chat", "fp8", "compiled_engine"],
         )

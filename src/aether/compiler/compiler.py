@@ -186,6 +186,68 @@ def _verify_layer_invariants(
         )
 
 
+def _reconcile_physical_vocabulary(
+    graph: Any,
+    architecture: ModelArchitecture,
+    package: Any,
+    model_id: str,
+) -> None:
+    """Make the manifest vocabulary match the authenticated checkpoint rows.
+
+    Some Hugging Face configurations report a tokenizer/padded vocabulary
+    larger than the physical model embedding (Qwen3 is one example).  The
+    executable contract is the number of rows actually present in both the
+    embedding and LM head; retaining the larger config value creates an AEG
+    that can never execute.  This is a format-level reconciliation, not a
+    model-family exception.  Corrupted artifacts are still rejected later by
+    the strict loader invariant because this adjustment happens only during
+    compilation from the source checkpoint.
+    """
+    embedding = package.weights.get("embedding")
+    if embedding is None:
+        return
+    shape = tuple(getattr(embedding, "shape", ()))
+    if len(shape) != 2 or int(shape[0]) <= 0:
+        raise CompilationError(
+            f"Token embedding for {model_id} has invalid serialized shape {shape}",
+            model_id=model_id,
+            stage="stage4_packaging",
+        )
+    rows, hidden = int(shape[0]), int(shape[1])
+    if int(architecture.hidden_size) > 0 and int(architecture.hidden_size) != hidden:
+        return
+    declared = int(architecture.vocab_size or 0)
+    if declared == rows:
+        return
+    lm_head = package.weights.get("lm_head")
+    lm_shape = tuple(getattr(lm_head, "shape", ())) if lm_head is not None else shape
+    if lm_head is not None and lm_shape != shape:
+        raise CompilationError(
+            "LM head and token embedding have different physical vocabulary "
+            f"shapes: embedding={shape}, lm_head={lm_shape}",
+            model_id=model_id,
+            stage="stage4_packaging",
+        )
+    logger.warning(
+        "Checkpoint physical vocabulary (%d rows) differs from declared vocabulary "
+        "(%d); using the physical rows for the runnable AEG",
+        rows,
+        declared,
+    )
+    architecture.vocab_size = rows
+    for node_id in ("embedding", "lm_head"):
+        try:
+            node = graph.get_node(node_id)
+        except (AttributeError, KeyError):
+            node = None
+        if node is not None:
+            attributes = getattr(node, "attributes", {})
+            if isinstance(attributes, dict):
+                attributes["vocab_size"] = rows
+    package.metadata["source_declared_vocab_size"] = declared
+    package.metadata["physical_vocab_size"] = rows
+
+
 def _verify_weight_accounting(
     graph: Any,
     architecture: ModelArchitecture,
@@ -1199,6 +1261,8 @@ class Compiler:
             ) from exc
 
         # ── Hard layer/architecture invariants ─────────────────────────────
+        _reconcile_physical_vocabulary(graph, architecture, package, model_id)
+
         # The source architecture is the single source of truth. The compiled
         # artifact must describe exactly the same model or the pipeline has
         # silently corrupted it (the historical 4-layer -> 1-layer bug).

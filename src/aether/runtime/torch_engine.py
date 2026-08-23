@@ -131,7 +131,26 @@ class TorchAEGEngine:
         return x * self.torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps) * weight
 
     def _linear(self, x: Any, weight: Any, bias: Any | None = None) -> Any:
-        return self.torch.nn.functional.linear(x, weight, bias)
+        if weight.ndim != 2:
+            raise ValueError(f"linear weight must be rank-2, got shape {tuple(weight.shape)}")
+        input_features = int(x.shape[-1])
+        if int(weight.shape[1]) == input_features:
+            canonical = weight
+        elif int(weight.shape[0]) == input_features:
+            # Some source checkpoints store Conv1D weights as
+            # (in_features, out_features), unlike nn.Linear.
+            canonical = weight.transpose(0, 1)
+        else:
+            raise ValueError(
+                "linear weight/input mismatch: input has "
+                f"{input_features} features but weight shape is {tuple(weight.shape)}"
+            )
+        if bias is not None and int(bias.numel()) != int(canonical.shape[0]):
+            raise ValueError(
+                f"linear bias has {int(bias.numel())} elements but output has "
+                f"{int(canonical.shape[0])} features"
+            )
+        return self.torch.nn.functional.linear(x, canonical, bias)
 
     def _rope(self, x: Any, positions: Any) -> Any:
         assert self._cos is not None and self._sin is not None

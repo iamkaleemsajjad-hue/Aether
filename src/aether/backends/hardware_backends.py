@@ -524,7 +524,7 @@ class RISCVNPUBackend(Backend):
         self.target_id = target_id
         info = BackendInfo(
             name=f"riscv_{target_id}",
-            version="1.2.0",
+            version="1.2.2",
             supported_targets=[target_id],
             capabilities=["generate", "edge_inference", "sub_10w", "onnx_runtime"],
         )
@@ -632,7 +632,7 @@ class FPGABackend(Backend):
         self.target_id = target_id
         info = BackendInfo(
             name=f"fpga_{target_id}",
-            version="1.2.0",
+            version="1.2.2",
             supported_targets=[target_id],
             capabilities=["generate", "low_power", "decode_only"],
         )

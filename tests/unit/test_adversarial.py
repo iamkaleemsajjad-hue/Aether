@@ -406,6 +406,29 @@ class TestBackendSelection:
         assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr[-2000:]}"
         assert "FAILED_AS_EXPECTED" in proc.stdout
 
+    def test_pytorch_backend_does_not_require_transformers(self) -> None:
+        """Compiled AEG GPU dispatch only needs the optional Torch runtime."""
+        code = (
+            "import sys\n"
+            "class _Block:\n"
+            "    def find_module(self, name, path=None):\n"
+            "        if name == 'transformers' or name.startswith('transformers.'):\n"
+            "            return self\n"
+            "    def load_module(self, name):\n"
+            "        raise ImportError('transformers is blocked')\n"
+            "sys.meta_path.insert(0, _Block())\n"
+            "from aether.backends.torch_backend import TorchBackend\n"
+            "backend = TorchBackend()\n"
+            "assert backend.is_available()\n"
+            "print('OK')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=120,
+            cwd=str(Path(__file__).resolve().parents[2]),
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr[-2000:]}"
+        assert "OK" in proc.stdout
+
     def test_cpu_fallback_is_aether_native(self) -> None:
         """recommend_backend never falls back to pytorch, and the CPU target's
         terminal candidate is the Aether-native engine."""
