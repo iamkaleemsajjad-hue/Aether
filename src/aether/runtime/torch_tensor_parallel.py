@@ -459,12 +459,26 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
             output.index_add_(0, rows, value * routing[rows, slots].unsqueeze(-1))
         return output
 
-    def forward(self, token_ids: np.ndarray | Any, cache: TorchKVCache | None = None) -> tuple[np.ndarray, TorchKVCache]:
+    def _forward_device(
+        self,
+        token_ids: np.ndarray | Any,
+        cache: TorchKVCache | None = None,
+        *,
+        validate_ids: bool = False,
+    ) -> tuple[Any, TorchKVCache]:
         torch = self.torch
-        ids = torch.as_tensor(np.asarray(token_ids, dtype=np.int64).reshape(-1), device=self.device)
+        if isinstance(token_ids, torch.Tensor):
+            ids = token_ids.reshape(-1)
+            if ids.device != self.device or ids.dtype != torch.long:
+                ids = ids.to(device=self.device, dtype=torch.long)
+        else:
+            ids = torch.as_tensor(
+                np.asarray(token_ids, dtype=np.int64).reshape(-1),
+                device=self.device,
+            )
         if ids.numel() == 0:
             raise ValueError("forward() requires at least one token")
-        if int(ids.min()) < 0 or int(ids.max()) >= self.embedding_vocab_size:
+        if validate_ids and (int(ids.min()) < 0 or int(ids.max()) >= self.embedding_vocab_size):
             raise ValueError("token id is outside the compiled vocabulary")
         cache = cache or TorchKVCache([None] * self.num_layers, [None] * self.num_layers)
         past = int(cache.length)
@@ -528,14 +542,9 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
             logits = self._parallel_row_linear(hidden, self.lm_head, None)
             cache.length = past + seq_len
             cache.last_logits = logits[-1].detach()
+        return logits, cache
+
+    def forward(self, token_ids: np.ndarray | Any, cache: TorchKVCache | None = None) -> tuple[np.ndarray, TorchKVCache]:
+        """Run a public forward pass and materialize logits as NumPy."""
+        logits, cache = self._forward_device(token_ids, cache, validate_ids=True)
         return logits.detach().float().cpu().numpy(), cache
-
-    def _forward_device(self, token_ids: np.ndarray | Any, cache: TorchKVCache | None = None) -> tuple[Any, TorchKVCache]:
-        """Compatibility bridge for the base generation loop.
-
-        Tensor parallelism still has a separate sharded forward implementation;
-        it retains device-resident ``cache.last_logits`` and only materializes
-        this returned tensor for callers that explicitly request ``forward``.
-        """
-        logits, cache = self.forward(token_ids, cache)
-        return self.torch.as_tensor(logits, device=self.device), cache

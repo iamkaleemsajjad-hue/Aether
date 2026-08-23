@@ -7,7 +7,7 @@ Compiler pipeline with rich progress output, dry-run support, profiling,
 and detailed result reporting.
 
 Usage examples:
-    # Compile with defaults (Q4_K_M, auto targets)
+    # Compile with defaults (source precision, auto targets)
     python scripts/compile_model.py Qwen/Qwen3-0.6B
 
     # Preview compilation plan without running it
@@ -213,8 +213,13 @@ def main() -> int:
     parser.add_argument("--output", "-o", help="Output .aeg directory path")
     parser.add_argument("--targets", nargs="+", default=[], metavar="TARGET",
                         help="Hardware targets (e.g. cuda_sm90 cpu_avx512)")
-    parser.add_argument("--precision", default="Q4_K_M",
-                        help="Default quantization precision (default: Q4_K_M)")
+    parser.add_argument(
+        "--precision", default="BF16",
+        help=(
+            "Weight precision policy (default: BF16/source precision; "
+            "use Q4_K_M explicitly for lossy low-bit quantization)"
+        ),
+    )
     parser.add_argument("--opt-level", type=int, default=3, choices=[0, 1, 2, 3],
                         help="Optimizer pass level 0-3 (default: 3)")
     parser.add_argument("--dry-run", action="store_true",

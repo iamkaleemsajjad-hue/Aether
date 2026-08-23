@@ -56,6 +56,21 @@ def test_torch_portable_executor_matches_reference_cpu() -> None:
     assert actual_ids == expected_ids
 
 
+def test_torch_portable_executor_accepts_device_tokens_without_changing_results() -> None:
+    """The decode fast path must preserve logits for tensor-resident tokens."""
+    torch = pytest.importorskip("torch")
+    from aether.runtime.torch_engine import TorchAEGEngine
+
+    engine = TorchAEGEngine(_tiny_engine(), "cpu")
+    ids = np.asarray([1, 3, 5, 2], dtype=np.int64)
+    numpy_logits, _ = engine.forward(ids)
+    tensor_logits, _ = engine.forward(torch.as_tensor(ids, dtype=torch.long))
+    np.testing.assert_array_equal(tensor_logits, numpy_logits)
+
+    with pytest.raises(ValueError, match="outside the compiled vocabulary"):
+        engine.forward(torch.tensor([engine.weights.vocab_size], dtype=torch.long))
+
+
 def test_torch_portable_executor_preserves_qk_norm_and_local_attention() -> None:
     """Qwen-style head norms and GPT-Neo-style windows share one contract."""
     pytest.importorskip("torch")

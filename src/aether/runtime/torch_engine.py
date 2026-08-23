@@ -315,13 +315,33 @@ class TorchAEGEngine:
         result[past:total].copy_(value)
         return result
 
-    def _forward_device(self, token_ids: np.ndarray | Any, cache: TorchKVCache | None = None) -> tuple[Any, TorchKVCache]:
+    def _forward_device(
+        self,
+        token_ids: np.ndarray | Any,
+        cache: TorchKVCache | None = None,
+        *,
+        validate_ids: bool = False,
+    ) -> tuple[Any, TorchKVCache]:
         """Forward pass that keeps logits on the accelerator for generation."""
         torch = self.torch
-        ids = torch.as_tensor(np.asarray(token_ids, dtype=np.int64).reshape(-1), device=self.device)
+        # Keep decode tokens on the execution device.  The old path converted
+        # every one-token decode step through NumPy, which forced a host-to-
+        # device copy and made CUDA's scalar validation below synchronize the
+        # stream.  Public ``forward`` and the initial prompt still opt into
+        # validation; internally generated tokens are already produced by the
+        # model and do not need a second round trip through the host.
+        if isinstance(token_ids, torch.Tensor):
+            ids = token_ids.reshape(-1)
+            if ids.device != self.device or ids.dtype != torch.long:
+                ids = ids.to(device=self.device, dtype=torch.long)
+        else:
+            ids = torch.as_tensor(
+                np.asarray(token_ids, dtype=np.int64).reshape(-1),
+                device=self.device,
+            )
         if ids.numel() == 0:
             raise ValueError("forward() requires at least one token")
-        if int(ids.min()) < 0 or int(ids.max()) >= self.embedding.shape[0]:
+        if validate_ids and (int(ids.min()) < 0 or int(ids.max()) >= self.embedding.shape[0]):
             raise ValueError("token id is outside the compiled vocabulary")
         cache = cache or TorchKVCache([None] * self.num_layers, [None] * self.num_layers)
         past = int(cache.length)
@@ -389,7 +409,7 @@ class TorchAEGEngine:
         return logits, cache
 
     def forward(self, token_ids: np.ndarray | Any, cache: TorchKVCache | None = None) -> tuple[np.ndarray, TorchKVCache]:
-        logits, cache = self._forward_device(token_ids, cache)
+        logits, cache = self._forward_device(token_ids, cache, validate_ids=True)
         return logits.detach().float().cpu().numpy(), cache
 
     def _sample(self, logits: Any, temperature: float, top_k: int, top_p: float) -> int:
@@ -420,7 +440,7 @@ class TorchAEGEngine:
             raise ValueError("max_tokens must be positive")
         ids = np.asarray(prompt_ids, dtype=np.int64).reshape(-1)
         if ids.size:
-            _, cache = self._forward_device(ids, cache)
+            _, cache = self._forward_device(ids, cache, validate_ids=True)
             next_logits = cache.last_logits
         elif cache is not None and cache.last_logits is not None:
             next_logits = cache.last_logits
@@ -452,7 +472,13 @@ class TorchAEGEngine:
                 break
             if eos_token_id is not None and token == int(eos_token_id):
                 break
-            _, cache = self._forward_device(np.asarray([token], dtype=np.int64), cache)
+            # ``token`` is sampled on-device.  Reusing a device tensor avoids
+            # a synchronization plus a NumPy/device copy on every decode
+            # iteration, which is material for small-batch generation.
+            _, cache = self._forward_device(
+                self.torch.tensor([token], dtype=self.torch.long, device=self.device),
+                cache,
+            )
             next_logits = cache.last_logits
         if cache_callback is not None and cache is not None:
             cache_callback(cache)
