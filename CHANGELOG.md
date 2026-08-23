@@ -5,6 +5,19 @@ All notable changes to Aether Runtime will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4] - 2026-08-23 -- Portable Decoder Correctness and Throughput Release
+
+### Fixed
+
+- Preserved LayerNorm, absolute-position, parallel-residual, GPT-Neo local-attention,
+  and grouped-query attention semantics in the portable PyTorch executor.
+- Removed repeated CUDA host synchronizations from incremental decoding and enabled
+  faster SDPA dispatch for ordinary multi-head attention.
+- Packed compatible QKV and gated-FFN projections to reduce accelerator launch overhead.
+- Added correctness-preserving dense fallback execution for persisted sparse/KV plans
+  that do not have a verified portable PyTorch kernel.
+- Centralized runtime/backend version reporting on `AETHER_VERSION`.
+
 ## [1.2.3] - 2026-08-23 -- Cross-Device Load and CPU Decode Stability Release
 
 ### Fixed
@@ -483,7 +496,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OpenAI-compatible REST API.
 - Research-backed optimizer passes and runtime intelligence.
 
-[Unreleased]: https://github.com/iamkaleemsajjad-hue/Aether/compare/v1.2.3...HEAD
+[Unreleased]: https://github.com/iamkaleemsajjad-hue/Aether/compare/v1.2.4...HEAD
+[1.2.4]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.4
 [1.2.3]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.3
 [1.2.2]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.2
 [1.2.0]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.0

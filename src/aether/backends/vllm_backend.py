@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
+from aether.core.constants import AETHER_VERSION
 
 
 class vLLMBackend(Backend):
@@ -18,7 +19,7 @@ class vLLMBackend(Backend):
     def __init__(self) -> None:
         info = BackendInfo(
             name="vllm",
-            version="1.2.3",
+            version=AETHER_VERSION,
             supported_targets=["cuda_sm80", "cuda_sm89", "cuda_sm90", "cuda_sm100", "rocm_cdna3"],
             capabilities=["generate", "chat", "embed", "rerank", "paged_attention", "speculative"],
         )

@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
+from aether.core.constants import AETHER_VERSION
 from aether.core.exceptions import BackendError
 
 
@@ -22,7 +23,7 @@ class ONNXBackend(Backend):
     def __init__(self) -> None:
         info = BackendInfo(
             name="onnx",
-            version="1.2.3",
+            version=AETHER_VERSION,
             supported_targets=["cpu_avx512", "cpu_neon", "openvino_npu", "openvino_gpu"],
             capabilities=["generate", "chat", "stream", "embed", "cross_platform"],
         )

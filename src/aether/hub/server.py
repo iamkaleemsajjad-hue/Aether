@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from aether.core.constants import AETHER_VERSION
+
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -597,7 +599,7 @@ def create_hub_app(hub: AetherHubServer | None = None) -> Any:
     app = FastAPI(
         title="Aether Hub",
         description="Aether Model Registry — content-addressed AEG artifact storage",
-        version="1.2.3",
+        version=AETHER_VERSION,
     )
 
     def _auth(authorization: str | None = Header(default=None)) -> HubUser:

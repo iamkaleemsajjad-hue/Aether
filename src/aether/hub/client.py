@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from aether.core.constants import DEFAULT_HUB_URL, HUB_RETRY_ATTEMPTS, HUB_RETRY_BACKOFF_S
+from aether.core.constants import AETHER_VERSION, DEFAULT_HUB_URL, HUB_RETRY_ATTEMPTS, HUB_RETRY_BACKOFF_S
 from aether.core.exceptions import AuthenticationError, HubError
 from aether.utils.file_io import safe_model_id_path
 from aether.utils.logging import get_logger
@@ -150,7 +150,7 @@ class HubClient:
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "aether-runtime/1.2.3",
+            "User-Agent": f"aether-runtime/{AETHER_VERSION}",
         }
         if self.auth_token:
             headers["Authorization"] = f"Bearer {self.auth_token}"
@@ -224,7 +224,7 @@ class HubClient:
         try:
             req = urllib.request.Request(
                 f"{self.hub_url}/health",
-                headers={"User-Agent": "aether-runtime/1.2.3"},
+                headers={"User-Agent": f"aether-runtime/{AETHER_VERSION}"},
                 method="GET",
             )
             # Health probing is only a capability check; it must not block

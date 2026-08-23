@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
+from aether.core.constants import AETHER_VERSION
 
 
 class MLXBackend(Backend):
@@ -17,7 +18,7 @@ class MLXBackend(Backend):
     def __init__(self) -> None:
         info = BackendInfo(
             name="mlx",
-            version="1.2.3",
+            version=AETHER_VERSION,
             supported_targets=["metal_m1", "metal_m3"],
             capabilities=["generate", "chat", "embed", "unified_memory"],
         )

@@ -1117,6 +1117,14 @@ class CPUExecutionEngine:
                 and self.active_lora_adapter is None
                 and ttt_slots is None
                 and self.kernels.is_native
+                # ``rmsnorm_linear`` implements x / RMS(x) * weight.  It is
+                # not algebraically equivalent to LayerNorm, which also
+                # subtracts the feature mean and may add a bias.  Using the
+                # fused RMS kernel for GPT-2/GPT-Neo/Falcon/BLOOM/OPT-style
+                # models silently changes every decode step after prefill and
+                # can turn an otherwise valid model into repetition garbage.
+                and str(self.weights.norm_type).lower() != "layernorm"
+                and layer.attention_norm_bias is None
             ):
                 q = self.kernels.rmsnorm_linear(
                     hidden, layer.attention_norm, layer.q_proj, self.weights.norm_eps,

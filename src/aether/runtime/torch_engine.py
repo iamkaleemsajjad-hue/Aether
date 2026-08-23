@@ -76,10 +76,17 @@ class TorchAEGEngine:
         self._alibi_slopes = self._tensor(alibi_slopes(self.num_heads))
         if self.num_heads % self.num_kv_heads:
             raise ValueError("query heads must be divisible by KV heads")
-        if cpu_engine.sparse_attention_plan or cpu_engine.semantic_kv_plan or cpu_engine.cross_layer_kv_plan:
-            raise ValueError(
-                "portable PyTorch AEG execution does not yet implement persisted sparse/KV alias plans"
-            )
+        # The AEG metadata may contain approximate sparse/KV plans selected by
+        # the CPU target.  Those plans are not portable PyTorch kernels: using
+        # them here would silently change the model's attention graph.  Keep
+        # the exact dense implementation as the safe accelerator fallback.
+        # This is intentionally a fallback, not an error: a compiled artifact
+        # must remain runnable on a different supported target.
+        self._ignored_optimized_plans = {
+            "sparse_attention": bool(cpu_engine.sparse_attention_plan),
+            "semantic_kv": bool(cpu_engine.semantic_kv_plan),
+            "cross_layer_kv": bool(cpu_engine.cross_layer_kv_plan),
+        }
         self.embedding = self._tensor(self.weights.embedding)
         self.final_norm = self._tensor(self.weights.final_norm)
         self.final_norm_bias = self._optional_tensor(getattr(self.weights, "final_norm_bias", None))
@@ -127,6 +134,52 @@ class TorchAEGEngine:
             for expert in (getattr(layer, "experts", None) or [])
         ]
         converted["num_activated_experts"] = int(getattr(layer, "num_activated_experts", 1) or 1)
+
+        # Pack projections that share the same input into one device GEMM.
+        # The concatenation is algebraically lossless and removes two launch
+        # boundaries from the decode hot path.  Keep the logical AEG layout in
+        # the source engine; only the device resident representation is packed.
+        q, k, v = converted["q_proj"], converted["k_proj"], converted["v_proj"]
+        if q is not None and k is not None and v is not None:
+            hidden = int(self.weights.hidden_size)
+
+            def canonical(value: Any) -> Any:
+                if int(value.shape[1]) == hidden:
+                    return value
+                if int(value.shape[0]) == hidden:
+                    return value.transpose(0, 1)
+                raise ValueError(
+                    "attention projection does not contract the model hidden size: "
+                    f"{tuple(value.shape)} vs {hidden}"
+                )
+
+            q, k, v = canonical(q), canonical(k), canonical(v)
+            biases = (
+                converted["q_proj_bias"],
+                converted["k_proj_bias"],
+                converted["v_proj_bias"],
+            )
+            if all(bias is None for bias in biases) or all(bias is not None for bias in biases):
+                converted["qkv_weight"] = self.torch.cat((q, k, v), dim=0)
+                converted["qkv_bias"] = None if biases[0] is None else self.torch.cat(biases, dim=0)
+                converted["q_width"] = int(q.shape[0])
+                converted["k_width"] = int(k.shape[0])
+                converted["v_width"] = int(v.shape[0])
+                converted["q_proj"] = converted["k_proj"] = converted["v_proj"] = None
+                converted["q_proj_bias"] = converted["k_proj_bias"] = converted["v_proj_bias"] = None
+
+        gate, up = converted["gate_proj"], converted["up_proj"]
+        if gate is not None and up is not None and int(gate.shape[1]) == int(up.shape[1]):
+            gate_bias, up_bias = converted["gate_proj_bias"], converted["up_proj_bias"]
+            if (gate_bias is None) == (up_bias is None):
+                converted["gate_up_weight"] = self.torch.cat((gate, up), dim=0)
+                converted["gate_up_bias"] = (
+                    None if gate_bias is None else self.torch.cat((gate_bias, up_bias), dim=0)
+                )
+                converted["gate_width"] = int(gate.shape[0])
+                converted["up_width"] = int(up.shape[0])
+                converted["gate_proj"] = converted["up_proj"] = None
+                converted["gate_proj_bias"] = converted["up_proj_bias"] = None
         return converted
 
     def _ensure_rope(self, required: int, device: Any | None = None) -> None:
@@ -246,13 +299,16 @@ class TorchAEGEngine:
         torch = self.torch
         position_type = str(self.weights.position_type or "RoPE").lower()
         is_alibi = position_type in {"alibi", "alibi_bias"}
-        is_prefill = int(query_positions.numel()) > 1 and int(key_positions.numel()) == int(query_positions.numel())
-        contiguous = bool(
-            query_positions.numel()
-            and key_positions.numel()
-            and int(query_positions[0].item()) == 0
-            and int(key_positions[0].item()) == 0
-        )
+        query_length = int(q.shape[0])
+        key_length = int(k.shape[0])
+        is_prefill = query_length > 1 and key_length == query_length
+        # TorchAEGEngine owns a monotonic, zero-based cache.  The caller passes
+        # ``arange(total)`` as key positions, so this invariant is known from
+        # tensor shapes and does not require reading a CUDA scalar.  The old
+        # implementation called .item() on position tensors for every layer
+        # and every generated token, synchronizing the host with the GPU and
+        # destroying decode throughput.
+        contiguous = True
         local = window_size is not None and int(window_size) > 0
 
         # SDPA accepts [batch, heads, query, dim].  enable_gqa avoids
@@ -263,11 +319,7 @@ class TorchAEGEngine:
         if not is_alibi:
             attn_mask = None
             is_causal = bool(is_prefill and contiguous and not local)
-            if not is_causal and not (
-                int(query_positions.numel()) == 1
-                and bool(torch.all(key_positions <= query_positions[-1]).item())
-                and not local
-            ):
+            if not is_causal and not (query_length == 1 and not local):
                 allowed = key_positions[None, :] <= query_positions[:, None]
                 if local:
                     allowed &= key_positions[None, :] >= (
@@ -275,9 +327,19 @@ class TorchAEGEngine:
                     )
                 attn_mask = allowed
             try:
+                # Passing enable_gqa=True for ordinary MHA can prevent the
+                # backend from selecting its fastest FlashAttention path on
+                # some PyTorch/CUDA combinations.  Only request GQA when the
+                # K/V head geometry actually requires it.
+                sdpa_kwargs = {
+                    "attn_mask": attn_mask,
+                    "dropout_p": 0.0,
+                    "is_causal": is_causal,
+                }
+                if self.num_kv_heads != self.num_heads:
+                    sdpa_kwargs["enable_gqa"] = True
                 context = torch.nn.functional.scaled_dot_product_attention(
-                    q4, k4, v4, attn_mask=attn_mask, dropout_p=0.0,
-                    is_causal=is_causal, enable_gqa=True,
+                    q4, k4, v4, **sdpa_kwargs,
                 )
                 return context.squeeze(0).transpose(0, 1)
             except (TypeError, RuntimeError):
@@ -286,8 +348,11 @@ class TorchAEGEngine:
                 pass
 
         repeats = self.num_heads // self.num_kv_heads
-        k_full = k.repeat_interleave(repeats, dim=1)
-        v_full = v.repeat_interleave(repeats, dim=1)
+        if repeats == 1:
+            k_full, v_full = k, v
+        else:
+            k_full = k.repeat_interleave(repeats, dim=1)
+            v_full = v.repeat_interleave(repeats, dim=1)
         scores = torch.einsum("qhd,khd->hqk", q, k_full) / np.sqrt(self.head_dim)
         if is_alibi:
             distance = key_positions[None, :] - query_positions[:, None]
@@ -370,15 +435,26 @@ class TorchAEGEngine:
                     if local_attention else None
                 )
                 normed = self._norm(hidden, layer["attention_norm"], layer["attention_norm_bias"])
-                q = self._linear(normed, layer["q_proj"], layer["q_proj_bias"]).reshape(seq_len, self.num_heads, self.head_dim)
+                if layer.get("qkv_weight") is not None:
+                    qkv = self._linear(normed, layer["qkv_weight"], layer["qkv_bias"])
+                    q_width = int(layer["q_width"])
+                    k_width = int(layer["k_width"])
+                    q = qkv[..., :q_width]
+                    k = qkv[..., q_width:q_width + k_width]
+                    v = qkv[..., q_width + k_width:]
+                else:
+                    q = self._linear(normed, layer["q_proj"], layer["q_proj_bias"])
+                    k = self._linear(normed, layer["k_proj"], layer["k_proj_bias"])
+                    v = self._linear(normed, layer["v_proj"], layer["v_proj_bias"])
+                q = q.reshape(seq_len, self.num_heads, self.head_dim)
                 if layer["q_norm"] is not None:
                     q = self._norm(q, layer["q_norm"])
                 if uses_rope:
                     q = self._rope(q, positions)
-                k = self._linear(normed, layer["k_proj"], layer["k_proj_bias"]).reshape(seq_len, self.num_kv_heads, self.head_dim)
+                k = k.reshape(seq_len, self.num_kv_heads, self.head_dim)
                 if layer["k_norm"] is not None:
                     k = self._norm(k, layer["k_norm"])
-                v = self._linear(normed, layer["v_proj"], layer["v_proj_bias"]).reshape(seq_len, self.num_kv_heads, self.head_dim)
+                v = v.reshape(seq_len, self.num_kv_heads, self.head_dim)
                 if uses_rope:
                     k = self._rope(k, positions)
                 total = past + seq_len
@@ -394,14 +470,34 @@ class TorchAEGEngine:
                     context.reshape(seq_len, self.num_heads * self.head_dim),
                     layer["o_proj"], layer["o_proj_bias"],
                 )
-                hidden = hidden + attention_out
-                normed = self._norm(hidden, layer["ffn_norm"], layer["ffn_norm_bias"])
-                if layer["experts"]:
-                    hidden = hidden + self._moe_ffn(normed, layer)
+                if bool(getattr(self.weights, "parallel_residual", False)):
+                    # GPT-J and other parallel-residual blocks evaluate both
+                    # branches from the same normalized input:
+                    #   y = x + Attn(LN(x)) + FFN(LN(x)).
+                    # Treating them as sequential changes every later logit.
+                    ffn_input = normed
                 else:
-                    gate = self._linear(normed, layer["gate_proj"], layer["gate_proj_bias"])
-                    up = self._linear(normed, layer["up_proj"], layer["up_proj_bias"]) if layer["up_proj"] is not None else None
-                    hidden = hidden + self._linear(self._activation(gate, up), layer["down_proj"], layer["down_proj_bias"])
+                    hidden = hidden + attention_out
+                    ffn_input = self._norm(
+                        hidden, layer["ffn_norm"], layer["ffn_norm_bias"]
+                    )
+                if layer["experts"]:
+                    ffn_out = self._moe_ffn(ffn_input, layer)
+                else:
+                    if layer.get("gate_up_weight") is not None:
+                        gate_up = self._linear(ffn_input, layer["gate_up_weight"], layer["gate_up_bias"])
+                        gate_width = int(layer["gate_width"])
+                        gate = gate_up[..., :gate_width]
+                        up = gate_up[..., gate_width:]
+                    else:
+                        gate = self._linear(ffn_input, layer["gate_proj"], layer["gate_proj_bias"])
+                        up = self._linear(ffn_input, layer["up_proj"], layer["up_proj_bias"]) if layer["up_proj"] is not None else None
+                    ffn_out = self._linear(self._activation(gate, up), layer["down_proj"], layer["down_proj_bias"])
+                hidden = (
+                    hidden + attention_out + ffn_out
+                    if bool(getattr(self.weights, "parallel_residual", False))
+                    else hidden + ffn_out
+                )
             hidden = self._norm(hidden, self.final_norm, self.final_norm_bias)
             logits = self._linear(hidden, self.lm_head)
             cache.length = past + seq_len

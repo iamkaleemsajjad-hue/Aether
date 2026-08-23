@@ -21,6 +21,7 @@ import numpy as np
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
 from aether.backends.compiled_handle import CompiledAEGHandle
+from aether.core.constants import AETHER_VERSION
 from aether.core.exceptions import BackendError
 from aether.core.hash_utils import compute_file_hash
 from aether.runtime.aeg_loader import load_engine_from_path, package_is_runnable
@@ -157,7 +158,7 @@ class NativeCPUBackend(Backend):
             self,
             BackendInfo(
                 name="aether_cpu",
-                version="1.2.3",
+                version=AETHER_VERSION,
                 supported_targets=[
                     "cpu_avx2", "cpu_avx512", "cpu_neon",
                     "cpu_avx512_ternary", "cpu_neon_ternary",

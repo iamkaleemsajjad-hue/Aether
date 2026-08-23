@@ -89,6 +89,41 @@ def test_torch_portable_executor_preserves_qk_norm_and_local_attention() -> None
     np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)
 
 
+def test_torch_portable_executor_preserves_layernorm_and_absolute_positions() -> None:
+    """GPT-2/GPT-Neo-style LayerNorm blocks must match the reference path."""
+    pytest.importorskip("torch")
+    from aether.runtime.torch_engine import TorchAEGEngine
+
+    reference = _tiny_engine()
+    reference.weights.norm_type = "LayerNorm"
+    reference.weights.position_type = "absolute"
+    reference.weights.position_embedding = np.arange(32 * 8, dtype=np.float32).reshape(32, 8) / 1000.0
+    reference.weights.final_norm_bias = np.linspace(-0.1, 0.1, 8, dtype=np.float32)
+    for layer in reference.weights.layers:
+        layer.attention_norm_bias = np.linspace(-0.2, 0.2, 8, dtype=np.float32)
+        layer.ffn_norm_bias = np.linspace(0.15, -0.15, 8, dtype=np.float32)
+
+    portable = TorchAEGEngine(reference, "cpu")
+    ids = np.asarray([1, 3, 5, 2], dtype=np.int64)
+    expected, _ = reference.forward(ids)
+    actual, _ = portable.forward(ids)
+    np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)
+
+
+def test_torch_portable_executor_preserves_parallel_residual() -> None:
+    """Parallel-residual models must use one shared pre-norm input per block."""
+    pytest.importorskip("torch")
+    from aether.runtime.torch_engine import TorchAEGEngine
+
+    reference = _tiny_engine()
+    reference.weights.parallel_residual = True
+    portable = TorchAEGEngine(reference, "cpu")
+    ids = np.asarray([1, 3, 5, 2], dtype=np.int64)
+    expected, _ = reference.forward(ids)
+    actual, _ = portable.forward(ids)
+    np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)
+
+
 def test_torch_portable_executor_applies_grammar_token_mask() -> None:
     pytest.importorskip("torch")
     from aether.runtime.torch_engine import TorchAEGEngine
@@ -117,11 +152,11 @@ def test_torch_portable_executor_applies_grammar_token_mask() -> None:
     assert session.advanced == tokens
 
 
-def test_torch_portable_executor_rejects_unsupported_optimized_cache_plans() -> None:
+def test_torch_portable_executor_falls_back_to_exact_dense_attention_for_unverified_plans() -> None:
     pytest.importorskip("torch")
     from aether.runtime.torch_engine import TorchAEGEngine
 
     reference = _tiny_engine()
     reference.semantic_kv_plan = {"format": "aether_kv_compression_v1"}
-    with pytest.raises(ValueError, match="persisted sparse/KV alias plans"):
-        TorchAEGEngine(reference, "cpu")
+    portable = TorchAEGEngine(reference, "cpu")
+    assert portable._ignored_optimized_plans["semantic_kv"] is True

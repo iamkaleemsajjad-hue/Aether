@@ -21,6 +21,7 @@ import numpy as np
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
 from aether.backends.compiled_handle import CompiledAEGHandle
+from aether.core.constants import AETHER_VERSION
 from aether.core.exceptions import BackendError
 from aether.core.hash_utils import compute_file_hash
 from aether.utils.logging import get_logger
@@ -34,7 +35,7 @@ class TorchBackend(Backend):
     def __init__(self) -> None:
         info = BackendInfo(
             name="pytorch",
-            version="1.2.3",
+            version=AETHER_VERSION,
             supported_targets=[
                 "cuda_sm70", "cuda_sm80", "cuda_sm89", "cuda_sm90", "cuda_sm100",
                 "cpu_avx512", "cpu_neon", "rocm_rdna3", "rocm_cdna3", "metal_m1", "metal_m3",

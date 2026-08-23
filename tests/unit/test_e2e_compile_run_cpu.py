@@ -104,6 +104,28 @@ def _make_model_weights() -> ModelWeights:
     )
 
 
+def test_layernorm_decode_never_uses_rmsnorm_fusion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LayerNorm decoder steps must retain mean subtraction and bias."""
+    from aether.kernels.native_cpu import NativeCPUKernels
+
+    kernels = NativeCPUKernels()
+    if not kernels.ensure_compiled():
+        pytest.skip("native CPU kernels are unavailable")
+    weights = _make_model_weights()
+    weights.norm_type = "LayerNorm"
+    for layer in weights.layers:
+        layer.attention_norm_bias = np.linspace(-0.2, 0.2, HIDDEN, dtype=np.float32)
+        layer.ffn_norm_bias = np.linspace(0.1, -0.1, HIDDEN, dtype=np.float32)
+
+    def unexpected_rms_fusion(*_args: object, **_kwargs: object) -> np.ndarray:
+        raise AssertionError("RMSNorm fusion was used for a LayerNorm model")
+
+    monkeypatch.setattr(kernels, "rmsnorm_linear", unexpected_rms_fusion)
+    engine = CPUExecutionEngine(weights, num_heads=HEADS, num_kv_heads=KV_HEADS, kernels=kernels)
+    _, cache = engine.forward(np.asarray([1, 2, 3], dtype=np.int64))
+    engine.forward(np.asarray([4], dtype=np.int64), cache)
+
+
 def _build_aeg_graph(arch: ModelArchitecture, weights: ModelWeights) -> AEGGraph:
     """Build an AEGGraph and attach real weight arrays to every node."""
     from aether.compiler.stage1_ingestion.ingestion import IngestionPipeline

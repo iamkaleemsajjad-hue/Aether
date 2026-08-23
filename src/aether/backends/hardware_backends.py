@@ -29,6 +29,7 @@ from typing import Any, Iterator
 import numpy as np
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
+from aether.core.constants import AETHER_VERSION
 from aether.core.exceptions import BackendError
 from aether.utils.logging import get_logger
 
@@ -524,7 +525,7 @@ class RISCVNPUBackend(Backend):
         self.target_id = target_id
         info = BackendInfo(
             name=f"riscv_{target_id}",
-            version="1.2.3",
+            version=AETHER_VERSION,
             supported_targets=[target_id],
             capabilities=["generate", "edge_inference", "sub_10w", "onnx_runtime"],
         )
@@ -632,7 +633,7 @@ class FPGABackend(Backend):
         self.target_id = target_id
         info = BackendInfo(
             name=f"fpga_{target_id}",
-            version="1.2.3",
+            version=AETHER_VERSION,
             supported_targets=[target_id],
             capabilities=["generate", "low_power", "decode_only"],
         )

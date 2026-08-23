@@ -411,7 +411,13 @@ class ArchitectureDetector:
         if not position_type:
             if bool(config.get("alibi", False)):
                 position_type = "ALiBi"
-            elif any(marker in model_type or marker in architecture_name for marker in ("gpt2", "gpt_neo", "opt", "bloom")):
+            # Match complete model types here.  ``gpt_neo`` is a prefix of
+            # ``gpt_neox``; a substring test silently turns GPT-NeoX's RoPE
+            # contract into GPT-Neo's learned absolute positions and then
+            # requires a position table that the checkpoint does not contain.
+            elif model_type in {"gpt2", "gpt_neo", "opt", "bloom"} or architecture_name in {
+                "gpt2", "gpt2lmheadmodel", "gptneoforcausallm", "optforcausallm", "bloomforcausallm"
+            }:
                 position_type = "absolute"
             else:
                 position_type = "RoPE"
