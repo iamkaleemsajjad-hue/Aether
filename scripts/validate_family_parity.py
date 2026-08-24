@@ -196,6 +196,30 @@ def build_tiny(family: str, out: Path) -> None:
             num_key_value_heads=2, intermediate_size=128,
             max_position_embeddings=128, **common,
         )
+    elif family == "mamba":
+        cfg = tf.MambaConfig(
+            hidden_size=64, num_hidden_layers=4, state_size=8,
+            conv_kernel=4, expand=2, **common,
+        )
+    elif family == "mamba2":
+        cfg = tf.Mamba2Config(
+            hidden_size=64, num_hidden_layers=4, state_size=8,
+            conv_kernel=4, expand=2, n_groups=1, head_dim=16, num_heads=8,
+            **common,
+        )
+    elif family == "rwkv":
+        cfg = tf.RwkvConfig(
+            hidden_size=64, num_hidden_layers=4, context_length=128, **common,
+        )
+    elif family == "jamba":
+        cfg = tf.JambaConfig(
+            hidden_size=64, num_hidden_layers=4, num_attention_heads=4,
+            num_key_value_heads=2, intermediate_size=128,
+            mamba_d_state=8, mamba_d_conv=4, expert_layer_period=2,
+            attn_layer_period=2, attn_layer_offset=1,
+            num_experts=2, num_experts_per_tok=1,
+            max_position_embeddings=128, **common,
+        )
     else:
         raise SystemExit(f"unknown family {family}")
 
@@ -284,6 +308,17 @@ def run_family(family: str) -> bool:
         ok = compare("cpu-prefill", ref, np.asarray(cpu_logits, np.float32))
 
         from aether.runtime.torch_engine import TorchAEGEngine
+
+        # The accelerator wrappers are architecture-specific.  Only a dense
+        # decoder (CPUExecutionEngine) belongs in TorchAEGEngine or the sharded
+        # engine; wrapping a state-space or latent-attention engine in the dense
+        # executor would report a harness error rather than a real defect.
+        if engine.__class__.__name__ != "CPUExecutionEngine":
+            print(
+                f"    NOTE {family} uses the {engine.__class__.__name__}; only the "
+                "reference CPU engine is compared here."
+            )
+            return ok
 
         tengine = TorchAEGEngine(engine, "cpu")
         t_logits, _ = tengine.forward(ids)

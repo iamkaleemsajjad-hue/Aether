@@ -1,118 +1,172 @@
 # Aether Runtime — Supported Model Matrix
 
-Aether detects model architecture from `config.json`, GGUF headers, SafeTensors metadata,
-or structural graph analysis — **not** from the model name. Any model whose architecture
-is recognized by the detector can be compiled to an AEG artifact and executed anywhere.
+Aether detects model architecture from `config.json`, GGUF headers, SafeTensors
+metadata, or structural graph analysis — **not** from the model name. Any model
+whose architecture is recognized by the detector can be compiled to a
+self-contained `.aeg` artifact and executed on any supported target.
+
+## How this matrix is verified
+
+Every family marked **✅ Parity-verified** is checked by
+[`scripts/validate_family_parity.py`](../scripts/validate_family_parity.py),
+which for each family:
+
+1. builds a small model of that architecture with 🤗 Transformers,
+2. compiles it through the full Aether pipeline to an `.aeg`,
+3. runs the artifact on the NumPy CPU engine, the PyTorch engine, and the
+   tensor-parallel engine — for both prefill and incremental decode, and
+4. compares every logit against the Transformers reference.
+
+The gate is the maximum logit deviation relative to the reference logit spread,
+with the reference weights rounded to BF16 first (the compiler's default
+residency) so the test measures the forward pass rather than quantization. A
+correct implementation lands near **1e-6**; a wrong attention scale, rotary
+convention, or permuted head is orders of magnitude larger. Reproduce with:
+
+```bash
+python scripts/validate_family_parity.py llama qwen3 gemma2 gpt_neo   # etc.
+```
 
 ## Legend
 
 | Symbol | Meaning |
 |--------|---------|
-| ✅ | Detection + ingestion + AEG compile + runtime execution — validated by test suite |
-| 🟡 | Detection + ingestion + AEG compile — runtime execution not yet checkpoint-validated |
-| 🔍 | Detection only — full ingestion/execution requires real checkpoint fixture |
-| ❌ | Not yet supported |
+| ✅ | **Parity-verified**: compiled output matches the 🤗 Transformers reference to ~1e-6 on prefill and decode, on the CPU, PyTorch, and tensor-parallel engines. |
+| 🟡 | **Runs, not parity-gated**: compiles and executes through the shared decoder path, but has no automatic per-logit comparison against a reference implementation yet. |
+| 🔬 | **Specialized engine, known-incorrect**: ingests and runs, but its dedicated engine does **not** currently match the reference. Do not rely on it. |
+| ❌ | **Not yet supported**: fails to compile or has no execution path. |
 
 ---
 
-## Primary Model Families
+## Decoder families — parity-verified ✅
 
-| Family | Representative Models | Detect | Compile | Run | Architecture |
-|--------|-----------------------|:------:|:-------:|:---:|-------------|
-| **Llama 3.x** | Llama-3.1-8B, 3.2-1B, 3.3-70B | ✅ | ✅ | 🟡 | GQA + SwiGLU + RMSNorm + RoPE |
-| **Qwen 3** | Qwen3-0.6B, 1.5B, 8B, 32B, 72B | ✅ | ✅ | 🟡 | GQA + QKNorm + SwiGLU + YaRN RoPE |
-| **Qwen 2.5 / 2** | Qwen2.5-7B, Qwen2-72B, Qwen2-VL | ✅ | ✅ | 🟡 | GQA + SwiGLU |
-| **Mistral 7B** | Mistral-7B-v0.1, v0.2, v0.3 | ✅ | ✅ | 🟡 | GQA + SwiGLU + RMSNorm |
-| **Mixtral** | Mixtral-8x7B, Mixtral-8x22B | ✅ | ✅ | 🟡 | GQA + SwiGLU + MoE (8 experts, top-2) |
-| **Gemma 2** | Gemma-2-2B, 9B, 27B | ✅ | ✅ | 🟡 | MQA + GeGLU + RMSNorm |
-| **Gemma 3** | Gemma-3-4B, 12B, 27B | ✅ | 🟡 | 🟡 | MQA + GeGLU + RMSNorm |
-| **DeepSeek V3** | DeepSeek-V3 (685B MoE) | ✅ | 🟡 | 🔍 | MLA + MoE (256 experts, top-8) |
-| **DeepSeek R1** | DeepSeek-R1-671B | ✅ | 🟡 | 🔍 | MLA + MoE (256 experts, top-8) |
-| **Phi-3 / Phi-4** | Phi-3 (3.8B), Phi-4 (14B) | ✅ | ✅ | 🟡 | GQA + GELU + LayerNorm |
-| **Falcon** | Falcon-7B, Falcon-40B, Falcon-180B | ✅ | 🟡 | 🔍 | MQA + GELU + LayerNorm |
-| **BERT** | BERT-base, BERT-large (uncased/cased) | ✅ | ✅ | ✅ | Bidirectional + GELU |
-| **RoBERTa** | RoBERTa-base, RoBERTa-large | ✅ | ✅ | 🟡 | Bidirectional + GELU |
-| **DeBERTa** | DeBERTa-v3-base, large, xlarge | ✅ | ✅ | 🟡 | Disentangled attention |
-| **ELECTRA** | ELECTRA-base, large | ✅ | 🟡 | 🔍 | Bidirectional + GELU |
-| **ALBERT** | ALBERT-base-v2, large, xlarge | ✅ | 🟡 | 🔍 | Shared layers + GELU |
-| **GPT-2** | GPT-2 (117M, 345M, 762M, 1.5B) | ✅ | ✅ | 🟡 | MHA + GELU + absolute position |
-| **GPT-NeoX** | GPT-NeoX-20B, Pythia (70M–12B) | ✅ | 🟡 | 🔍 | MHA + GELU + RoPE |
-| **Mamba / Mamba-2** | Mamba-3-7B, Mamba-2 | ✅ | 🟡 | 🔍 | Selective scan SSM |
-| **RWKV-7** | RWKV-7 (1.5B, 3B, 7B) | ✅ | 🟡 | 🔍 | Linear attention + state space |
-| **Jamba** | Jamba-1.5-mini, Jamba-1.5-large | ✅ | 🟡 | 🔍 | Hybrid SSM + Attention + MoE |
-| **T5 / mT5 / FLAN-T5** | T5-base through T5-11B | ✅ | 🟡 | 🔍 | Encoder-decoder + relative attention |
-| **BART** | BART-base, BART-large | ✅ | 🟡 | 🔍 | Encoder-decoder |
-| **Whisper** | Whisper tiny/base/small/medium/large-v3 | ✅ | 🟡 | 🔍 | Conv + cross-attention |
+These share the standard decoder graph and are verified against Transformers on
+every execution path. Each row's *distinguishing numerics* are the constants
+Aether derives from the checkpoint and applies at runtime; getting any of them
+wrong changes every logit, which is why they are individually pinned by
+[`tests/unit/test_execution_numerics.py`](../tests/unit/test_execution_numerics.py).
 
----
+| Family | Representative models | Distinguishing numerics Aether handles |
+|--------|-----------------------|----------------------------------------|
+| **Llama 3.x** | Llama-3.1-8B, 3.2-1B/3B, 3.3-70B | GQA · SwiGLU · RMSNorm · RoPE (the baseline block) |
+| **Qwen 2 / 2.5** | Qwen2-7B/72B, Qwen2.5 | GQA · SwiGLU; sliding-window honored only when the schedule enables it |
+| **Qwen 3** | Qwen3-0.6B/1.5B/8B/32B/72B | per-head Q/K-norm |
+| **Qwen 3 MoE** | Qwen3-MoE | routed experts **without** top-k renormalization (`norm_topk_prob: false`) |
+| **Mistral** | Mistral-7B v0.1–v0.3 | GQA · SwiGLU |
+| **Mixtral** | Mixtral-8x7B, 8x22B | top-2 of 8 experts **with** top-k renormalization |
+| **Gemma 2** | Gemma-2-2B/9B/27B | ×√H embedding scale · `(1+w)` norms · sandwich norm · `query_pre_attn_scalar` scale · attention & final logit soft-caps · GeGLU |
+| **Gemma 3** | Gemma-3-1B/4B/12B/27B (text) | all of Gemma-2 plus a separate rotary base for sliding-window layers |
+| **GPT-2** | GPT-2 117M–1.5B, DialoGPT | MHA · Conv1D weight layout · GELU-tanh · learned absolute positions · LayerNorm |
+| **GPT-Neo** | GPT-Neo 125M/1.3B/2.7B | **unscaled attention** (no 1/√d) · local/global layer schedule |
+| **GPT-NeoX** | GPT-NeoX-20B, Pythia 70M–12B | 25% partial rotary · per-head-interleaved fused QKV · parallel residual · exact-erf GELU |
+| **GPT-J** | GPT-J-6B | interleaved (rotate-every-two) rotary · partial rotary · parallel residual |
+| **Phi-3** | Phi-3-mini/small/medium | fused QKV · SwiGLU |
+| **Falcon** | Falcon-7B/40B (new decoder arch) | per-KV-group interleaved fused QKV · parallel residual · single/dual block norms |
+| **BLOOM** | BLOOM 560M–176B | **ALiBi** positions · per-head-interleaved fused QKV · embedding LayerNorm |
+| **MPT** | MPT-7B/30B | ALiBi · `d_model`/`n_heads`/`n_layers` config spellings · low-precision LayerNorm |
+| **StarCoder2** | StarCoder2-3B/7B/15B | GQA · GELU-tanh · sliding-window schedule |
+| **Cohere / Command-R** | Command-R, Command-R+ | interleaved rotary · `logit_scale` · parallel residual · one block norm |
+| **OLMo 2** | OLMo-2-7B/13B | **post-norm** block · full-projection Q/K-norm |
+| **OLMoE** | OLMoE-1B-7B | pre-norm · full-projection Q/K-norm · experts without top-k renormalization |
+| **StableLM** | StableLM-2, StableLM-3B | 25% partial rotary |
+| **Granite** | Granite-3.x dense | embedding / residual / attention / logit multipliers |
+| **EXAONE 4** | EXAONE-4 | post-norm · per-head Q/K-norm · **NoPE global layers** (rotary only on sliding-window layers) |
+| **SmolLM 3** | SmolLM3-3B | interleaved NoPE layers among RoPE layers |
+| **GLM-4** | GLM-4-9B, GLM-4 (text) | interleaved rotary · 50% partial rotary · GLM-spelled sandwich norm |
+| **Nemotron** | Nemotron dense | `LayerNorm1P` (`(1+w)` LayerNorm) · squared-ReLU FFN · 50% partial rotary |
 
-## GGUF Format
-
-Any GGUF file whose `general.architecture` field maps to a known family is directly supported.
-Architecture is read from the GGUF header — the filename is ignored.
-
-| Quantization | Support |
-|-------------|---------|
-| Q4_0, Q4_1 | ✅ Detected + dequantized |
-| Q4_K_M, Q4_K_S | ✅ Detected + dequantized |
-| Q8_0 | ✅ Detected + dequantized |
-| Q5_K_M | ✅ Detected + dequantized |
-| F16, F32 | ✅ Detected + loaded |
-
----
-
-## Vision-Language Models
-
-| Family | Models | Support |
-|--------|--------|---------|
-| LLaVA | LLaVA-1.5, LLaVA-NeXT | 🟡 Detection + planning |
-| InternVL | InternVL-2, InternVL-2.5 | 🟡 Detection + planning |
-| PaliGemma | PaliGemma-3B, 10B | 🟡 Detection + planning |
-| Qwen2-VL / Qwen3-VL | Qwen2-VL-7B, Qwen2.5-VL-7B | 🟡 Detection + planning |
-| Pixtral | Pixtral-12B, Pixtral-Large | 🟡 Detection + planning |
+**These families cover a large share of the open-weight ecosystem by shared
+graph.** A checkpoint that is architecturally a member of one of the rows above —
+for example Yi, InternLM, TinyLlama, Zephyr, Dolphin, Nous-Hermes, OpenChat,
+Tulu, SOLAR, MiniCPM, and the many Llama/Qwen/Mistral fine-tunes — executes
+through the same verified path, because detection keys on structure, not name.
+They are covered transitively; only the base architectures above are directly
+parity-gated.
 
 ---
 
-## Generic Decoder Family (100+ aliases)
+## Encoder & encoder-decoder — runs, not parity-gated 🟡
 
-The following models are detected through the capability-driven `generic_decoder_family` path.
-Architecture dimensions come from the model's `config.json`; the runtime contract
-is the standard decoder (RMSNorm/LayerNorm, GQA/MQA/MHA, RoPE/ALiBi, gated FFN).
+These have dedicated engines with round-trip tests (compile → load → execute,
+with the portable and CPU engines cross-checked), but no automatic per-logit
+comparison against Transformers. They execute; they are not yet certified
+bit-for-bit.
 
-OLMo / OLMoE · Granite / Granite-Code / Granite-3 / Granite-4 · Command R / Command A / Command R+ ·
-Yi / Yi-Coder · InternLM-2 / InternLM-3 · MiniCPM / MiniCPM-3 · SmolLM / SmolLM-2 ·
-StarCoder / StarCoder2 · Code Llama / CodeGemma / CodeQwen / DeepSeek-Coder / Codestral ·
-CodeGeeX · WizardCoder / WizardLM · BLOOM / BLOOMZ · MPT · GPT-J / GPT-OSS ·
-RedPajama · OpenELM · StableLM · Pythia · OPT · XGen · Vicuna ·
-GLM-4 / GLM-5 / ChatGLM · Kimi / Kimi-K2 · Hunyuan · MiniMax ·
-EXAONE · HyperCLOVA X · Solar · JAIS · SeaLLM · Aya / Aya Expanse ·
-Nous Hermes · OpenChat · Zephyr · Dolphin · Tulu · TinyLlama ·
-MobileLLM / MobileLLM-2 / MobileLLM-3 · BitNet b1.58 · Liquid LFM ·
-RecurrentGemma · Nemotron / Nvidia-Nemotron · Megatron ·
-Arctic / Snowflake Arctic · Grok · Apertus · Sarvam · StepFun / Step-1 ·
-DBRX · Zamba / Zamba-2 · Hymba · Falcon-H1 · Bamba
+| Family | Representative models | Engine |
+|--------|-----------------------|--------|
+| **BERT** | BERT-base/large (uncased/cased) | bidirectional encoder |
+| **RoBERTa** | RoBERTa-base/large | bidirectional encoder |
+| **DeBERTa** | DeBERTa-v3-base/large | bidirectional encoder |
+| **ELECTRA** | ELECTRA-base/large | bidirectional encoder |
+| **ALBERT** | ALBERT-v2 | shared-layer encoder |
+| **T5 / mT5 / FLAN-T5** | T5-small → T5-11B | encoder-decoder + relative attention |
 
 ---
 
-## Execution Paths
+## State-space & hybrid — specialized engine, currently incorrect 🔬
 
-| Execution Path | Framework | Supported Hardware |
-|---------------|-----------|-------------------|
-| `aether_cpu` | Pure NumPy + native C++ kernels (no PyTorch) | Any CPU with AVX2/AVX-512/NEON |
-| `vllm` | vLLM | NVIDIA CUDA, AMD ROCm |
-| `mlx` | Apple MLX | Apple Silicon (M1–M5) |
-| `onnxruntime` | ONNX Runtime | CPU, OpenVINO, QNN, RISC-V |
-| `tensorrt-llm` | TensorRT-LLM | NVIDIA CUDA (sm80+) |
-| `llama.cpp` | llama.cpp shared library | CPU, Metal, CUDA |
-| `bitnet.cpp` | bitnet.cpp | CPU (AVX2/NEON ternary), FPGA |
+These ingest and run through their own engines, but **do not currently match the
+reference implementation** when checked with `validate_family_parity.py`, so they
+must not be relied on for correct output yet. This is a deliberate downgrade from
+earlier documentation, which asserted support without a parity check:
+
+| Family | Status detail |
+|--------|---------------|
+| **Mamba** | Runs; selective-scan output diverges from the reference (cosine ≈ 0.97). Not correct. |
+| **Mamba-2 / SSD** | Runs; output badly diverges (cosine ≈ 0.21). Not correct. |
+| **RWKV-7** | Does not currently bind its time-mix/channel-mix weights during compile. |
+| **Jamba** | Hybrid attention+SSM+MoE; the reference path requires CUDA Mamba kernels, so it is unverified on CPU. |
 
 ---
 
-## Notes
+## Not yet supported ❌
 
-- Detection means the architecture is recognized and `ModelArchitecture` is populated correctly.
-- Compilation means the 5-stage compiler pipeline produces a valid `.aeg/` artifact.
-- Runtime execution means the AEG can be loaded and decoded via at least one execution path.
-- A `config.json` in a local checkpoint directory is always authoritative over the name-based lookup.
-- Families marked 🔍 fail with a clear error message — they never silently produce synthetic weights.
-- For multi-GPU deployment, the AEG artifact contains pre-computed sharding plans weighted by VRAM for 1–8 GPUs (Pass 6: Parallelism Discovery).
+| Family | Reason |
+|--------|--------|
+| **DeepSeek V3 / R1 (MLA)** | Multi-head latent attention fuses `k_rope` into `kv_a_proj`, adds shared experts alongside routed ones, and uses sigmoid group-limited routing. The MLA engine does not yet reconstruct this contract; compile fails on the fused projection. |
+| **MiniMax** | Lightning attention (alternating linear/softmax layers) is a distinct architecture class without an engine. |
+| **Whisper / vision-language** | Audio and multimodal encoders are detected but have no verified execution contract. |
+
+---
+
+## Compile-once, run-everywhere
+
+The portability promise holds and is verified:
+
+* An `.aeg` compiled for **any** target (`cuda_sm70`, `metal_m1`, `cpu_avx512`, …)
+  executes on **any** host with a supported backend. Artifacts built for the
+  three targets above produce **identical** logits when run on the same machine.
+* The `.aeg` is **fully self-contained**: it embeds the quantized weights, the
+  complete tokenizer, the computation graph, and integrity hashes. After
+  compilation the original checkpoint can be **deleted**, and
+  `aether run model.aeg --prompt "…"` still loads and generates correctly with
+  no network access and no reference to the source model.
+
+Verify both properties yourself:
+
+```bash
+aether compile ./some-model -t cpu_avx512 -o model.aeg
+rm -rf ./some-model                 # delete the original entirely
+aether run model.aeg --prompt "The capital of France is" --temperature 0
+# → "Paris. …"  (runs from the artifact alone)
+```
+
+---
+
+## GGUF format
+
+Any GGUF file whose `general.architecture` maps to a parity-verified decoder
+family above is supported; the architecture is read from the header, not the
+filename. Q4_0/Q4_1, Q4_K_M/Q4_K_S, Q5_K_M, Q6_K, Q8_0, and F16/F32 tensors are
+dequantized on load.
+
+---
+
+## A note on multi-GPU
+
+Tensor-parallel sharding is a **memory-capacity** mechanism, not a throughput
+boost for small models. Splitting a model that already fits on one accelerator
+adds a cross-device copy to every layer and makes decode *slower*. Aether
+therefore auto-shards only when the model does not fit on the smallest device;
+otherwise it runs single-device. Force sharding for benchmarking with
+`AETHER_FORCE_TENSOR_PARALLEL=1`.

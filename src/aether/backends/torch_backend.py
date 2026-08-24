@@ -79,6 +79,103 @@ class TorchBackend(Backend):
             self._devices = ["cpu"]
             self._runtime_family = "cpu"
 
+    def _should_shard(self, engine: Any) -> bool:
+        """Decide whether a dense decoder should be tensor-parallel sharded.
+
+        Tensor parallelism is a memory-capacity tool, not a throughput tool for
+        small models: every layer copies activations between devices, and for a
+        model that already fits on one GPU those copies serialize the decode
+        pipeline and make it *slower* than single-device execution.  A 350M
+        model split across two GPUs is the pathological case — it runs at about
+        half the single-device rate.
+
+        So sharding is selected only when at least one of these holds:
+
+        * there are ``≥2`` accelerators AND the model's resident size does not
+          comfortably fit in the smallest device's free memory (the genuine
+          capacity case), or
+        * the operator explicitly requested it via
+          ``AETHER_FORCE_TENSOR_PARALLEL=1`` (benchmarking / correctness runs).
+
+        Otherwise a single device is used.  A heterogeneous mesh that includes
+        CPU is never auto-sharded: mixing a CPU shard into a GPU decode is far
+        slower than either alone and must be opted into explicitly.
+        """
+        accelerators = [device for device in self._devices if device != "cpu"]
+        if len(accelerators) < 2:
+            return False
+        force = os.environ.get("AETHER_FORCE_TENSOR_PARALLEL", "").strip().lower()
+        if force in {"1", "true", "yes"}:
+            return True
+        if len(accelerators) != len(self._devices):
+            # Heterogeneous CPU+GPU mesh: never automatic.
+            return False
+        try:
+            required = self._estimated_weight_bytes(engine)
+            headroom = self._smallest_free_accelerator_bytes(accelerators)
+        except Exception:  # noqa: BLE001 — capacity probing must never block a load
+            # If the probe fails, prefer the safe fast path: a single device
+            # runs any model that the host could load in the first place.
+            return False
+        if required <= 0 or headroom <= 0:
+            return False
+        # Require the whole model plus a working margin for activations and the
+        # KV cache (2x) to fit before choosing single-device execution.
+        fits_on_one = required * 2.0 <= headroom
+        if not fits_on_one:
+            logger.info(
+                "Model needs ~%.1f GiB but the smallest device has ~%.1f GiB free; "
+                "activating tensor-parallel execution.",
+                required / 1024**3,
+                headroom / 1024**3,
+            )
+        return not fits_on_one
+
+    @staticmethod
+    def _estimated_weight_bytes(engine: Any) -> int:
+        """Estimate the resident size of a compiled engine's weights.
+
+        Uses the embedding and per-layer projection shapes already materialized
+        by the loader, at two bytes per element (the FP16/BF16 accelerator
+        residency), so it needs no second pass over the weight blob.
+        """
+        import numpy as np
+
+        weights = engine.weights
+        total = int(np.asarray(weights.embedding).size)
+        if getattr(weights, "lm_head", None) is not None:
+            total += int(np.asarray(weights.lm_head).size)
+        for layer in weights.layers:
+            for name in (
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ):
+                tensor = getattr(layer, name, None)
+                if tensor is not None:
+                    total += int(np.asarray(tensor).size)
+            for expert in getattr(layer, "experts", None) or []:
+                for name in ("gate_proj", "up_proj", "down_proj"):
+                    tensor = getattr(expert, name, None)
+                    if tensor is not None:
+                        total += int(np.asarray(tensor).size)
+        return total * 2  # bytes per element at FP16/BF16 residency
+
+    def _smallest_free_accelerator_bytes(self, accelerators: list[str]) -> int:
+        """Return the free memory of the most constrained accelerator, in bytes."""
+        import torch
+
+        free_values: list[int] = []
+        for device in accelerators:
+            if device.startswith("cuda:"):
+                index = int(device.split(":", 1)[1])
+                free, _total = torch.cuda.mem_get_info(index)
+                free_values.append(int(free))
+            elif device == "mps":
+                # MPS shares host memory and exposes no per-device free query;
+                # treat it as ample so a unified-memory Mac never auto-shards.
+                free_values.append(1 << 62)
+        return min(free_values) if free_values else 0
+
     def _configure_devices(self, requested: list[str] | None) -> None:
         """Apply an explicit single-copy execution mesh.
 
@@ -289,15 +386,14 @@ class TorchBackend(Backend):
                     engine_kind = engine.__class__.__name__
                     # ── Multi-GPU tensor-parallel dispatch ─────────────────────
                     # For standard dense decoders (CPUExecutionEngine is what
-                    # load_engine_from_path returns for decoder-only AEGs), use
-                    # TorchTensorParallelAEGEngine when ≥2 devices are available.
-                    # This gives capacity-weighted sharding across all devices
-                    # with no manual configuration required.  Equal-sized
-                    # devices naturally reduce to equal partitions.
+                    # load_engine_from_path returns for decoder-only AEGs),
+                    # capacity-weighted sharding across every device is
+                    # available.  It is only selected when the model cannot be
+                    # served from one device: see ``_should_shard``.
                     # Specialised architectures (MLA, SSM, encoder, seq2seq) have
                     # their own cross-device wrappers and are dispatched below.
                     _TP_ELIGIBLE_ENGINES = {"CPUExecutionEngine"}
-                    if engine_kind in _TP_ELIGIBLE_ENGINES and len(self._devices) > 1:
+                    if engine_kind in _TP_ELIGIBLE_ENGINES and self._should_shard(engine):
                         from aether.runtime.torch_tensor_parallel import TorchTensorParallelAEGEngine
                         logger.info(
                             "Activating tensor-parallel execution across %d GPUs: %s",
