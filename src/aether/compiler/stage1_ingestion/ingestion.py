@@ -1004,6 +1004,10 @@ class IngestionPipeline:
         import re
 
         lowered_placement = str(placement or "pre").lower()
+        # ``sandwich_glm`` marks the GLM-4 spelling of the same four-norm block.
+        glm_style = lowered_placement == "sandwich_glm"
+        if glm_style:
+            lowered_placement = "sandwich"
         if lowered_placement in {"post", "sandwich"}:
             layer_scope = re.search(
                 r"(?:^|_)(?:layers?|blocks?|blk|h)[._](\d+)(?:[._]|$)",
@@ -1020,13 +1024,25 @@ class IngestionPipeline:
                     if re.search(r"(?:^|_)post_feedforward_layernorm(?:_|$)", scoped):
                         return index, "ffn_norm"
                 else:
-                    # Gemma-2/3, EXAONE-4: four norms per block.
-                    if re.search(r"(?:^|_)post_attention_layernorm(?:_|$)", scoped):
+                    # Four norms per block, but the ecosystem spells them two
+                    # different ways.  Gemma-2/3 and EXAONE-4 pair
+                    # ``pre_feedforward``/``post_feedforward`` and use
+                    # ``post_attention_layernorm`` for the attention *output*.
+                    # GLM-4 keeps the Llama meaning of
+                    # ``post_attention_layernorm`` (the pre-FFN norm) and adds
+                    # ``post_self_attn``/``post_mlp`` for the two output norms.
+                    # Resolve the unambiguous spellings first, then let the
+                    # shared name follow whichever convention is present.
+                    if re.search(r"(?:^|_)post_self_attn_layernorm(?:_|$)", scoped):
                         return index, "post_attention_norm"
+                    if re.search(r"(?:^|_)post_mlp_layernorm(?:_|$)", scoped):
+                        return index, "post_ffn_norm"
                     if re.search(r"(?:^|_)pre_feedforward_layernorm(?:_|$)", scoped):
                         return index, "ffn_norm"
                     if re.search(r"(?:^|_)post_feedforward_layernorm(?:_|$)", scoped):
                         return index, "post_ffn_norm"
+                    if re.search(r"(?:^|_)post_attention_layernorm(?:_|$)", scoped):
+                        return index, "ffn_norm" if glm_style else "post_attention_norm"
                     if re.search(r"(?:^|_)post_attention_norm(?:_|$)", scoped):
                         return index, "post_attention_norm"
                     if re.search(r"(?:^|_)post_ffn_norm(?:_|$)", scoped):
@@ -2458,7 +2474,9 @@ class IngestionPipeline:
             # learned norms per layer, applied to each sublayer's output before
             # the residual add.  They must exist as parameter-bearing nodes or
             # the source tensors would be dropped during binding.
-            if str(getattr(architecture, "norm_placement", "pre") or "pre").lower() == "sandwich":
+            if str(
+                getattr(architecture, "norm_placement", "pre") or "pre"
+            ).lower().startswith("sandwich"):
                 for component, source_id in (
                     ("post_attention_norm", out_proj_node.id),
                     ("post_ffn_norm", ffn_norm_node.id),

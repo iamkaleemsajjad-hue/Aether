@@ -174,12 +174,12 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
             )
 
         self.embedding, self._embedding_ranges = self._row_shards(embedding)
-        self.final_norm = self._tensor_primary(source_weights.final_norm)
+        self.final_norm = self._norm_primary(source_weights.final_norm)
         self.final_norm_bias = self._optional_primary(getattr(source_weights, "final_norm_bias", None))
         self.lm_head, self._lm_head_ranges = self._row_shards(
             source_weights.lm_head, self.embedding_hidden_size, "lm_head"
         )
-        self.embedding_norm = self._optional_primary(source_weights.embedding_norm)
+        self.embedding_norm = self._optional_norm_primary(source_weights.embedding_norm)
         self.embedding_norm_bias = self._optional_primary(source_weights.embedding_norm_bias)
         self.position_embedding, self._position_ranges = self._optional_row_shards(position_embedding)
         self.layers = [self._convert_sharded_layer(layer) for layer in source_weights.layers]
@@ -203,6 +203,25 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
 
     def _optional_primary(self, value: Any | None) -> Any | None:
         return None if value is None else self._tensor_primary(value)
+
+    def _norm_primary(self, value: Any) -> Any:
+        """Materialize a normalization *scale* in its effective form.
+
+        Gemma stores normalization weights as offsets from unity, so the scale
+        actually applied is ``1 + w``.  Materializing the raw weight instead
+        collapses the residual stream — and because it only affects this
+        executor, it would appear exclusively on a multi-device host.  Biases
+        are additive and must not receive the offset.
+        """
+        array = np.asarray(value, dtype=np.float32)
+        if self.norm_offset_one:
+            array = array + np.float32(1.0)
+        return self.torch.as_tensor(
+            array, device=self.device, dtype=self.compute_dtype
+        )
+
+    def _optional_norm_primary(self, value: Any | None) -> Any | None:
+        return None if value is None else self._norm_primary(value)
 
     def _tensor_on(self, value: Any, device: Any) -> Any:
         return self.torch.as_tensor(
@@ -330,15 +349,21 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         # device; only the projections are sharded.  The sandwich/post-norm
         # slots must be carried too, or a Gemma-2/3, OLMo-2 or EXAONE-4 model
         # would silently execute as a plain pre-norm block on a multi-GPU mesh.
+        norm_scale_names = (
+            "attention_norm", "q_norm", "k_norm", "ffn_norm",
+            "post_attention_norm", "post_ffn_norm",
+        )
         primary_names = (
-            "attention_norm", "attention_norm_bias", "q_norm", "k_norm",
-            "ffn_norm", "ffn_norm_bias", "o_proj_bias", "down_proj_bias",
-            "post_attention_norm", "post_attention_norm_bias",
-            "post_ffn_norm", "post_ffn_norm_bias",
+            "attention_norm_bias", "ffn_norm_bias", "o_proj_bias", "down_proj_bias",
+            "post_attention_norm_bias", "post_ffn_norm_bias",
         )
         result: dict[str, Any] = {
-            name: self._optional_primary(getattr(layer, name, None)) for name in primary_names
+            name: self._optional_norm_primary(getattr(layer, name, None))
+            for name in norm_scale_names
         }
+        result.update(
+            {name: self._optional_primary(getattr(layer, name, None)) for name in primary_names}
+        )
         result["q_proj"], result["q_ranges"] = self._row_shards(
             layer.q_proj, self.embedding_hidden_size, "q_proj"
         )
@@ -462,8 +487,13 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
             raise ValueError("portable MoE layer is missing its router or experts")
         router_logits = self._parallel_row_linear(hidden, layer["router"], None)
         top_k = min(layer["num_activated_experts"], len(layer["experts"]))
-        selected_logits, selected = self.torch.topk(router_logits, top_k, dim=-1)
-        routing = self.torch.softmax(selected_logits, dim=-1)
+        # Probabilities come from a softmax over the complete expert set; only
+        # architectures declaring ``norm_topk_prob`` renormalize the selected k.
+        probabilities = self.torch.softmax(router_logits.float(), dim=-1)
+        routing, selected = self.torch.topk(probabilities, top_k, dim=-1)
+        if self.moe_renormalize_topk:
+            routing = routing / routing.sum(dim=-1, keepdim=True)
+        routing = routing.to(dtype=hidden.dtype)
         output = self.torch.zeros_like(hidden)
         for expert_index, expert in enumerate(layer["experts"]):
             rows, slots = self.torch.where(selected == expert_index)
@@ -483,7 +513,15 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         cache: TorchKVCache | None = None,
         *,
         validate_ids: bool = False,
+        reserve: int = 0,
     ) -> tuple[Any, TorchKVCache]:
+        """Run one sharded step.
+
+        The signature must stay compatible with
+        :meth:`TorchAEGEngine._forward_device`: the inherited generation loop
+        calls it directly, so a missing keyword here is a runtime failure that
+        only appears on a multi-device host.
+        """
         torch = self.torch
         if isinstance(token_ids, torch.Tensor):
             ids = token_ids.reshape(-1)
@@ -559,8 +597,8 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
                     k = self._rope(k, *rope_factors)
                 v = self._parallel_row_linear(normed, layer["v_proj"], layer["v_proj_bias"]).reshape(seq_len, self.num_kv_heads, self.head_dim)
                 total = past + seq_len
-                k_all = self._append_kv(cache.keys[index], k, past, total)
-                v_all = self._append_kv(cache.values[index], v, past, total)
+                k_all = self._append_kv(cache.keys[index], k, past, total, reserve)
+                v_all = self._append_kv(cache.values[index], v, past, total, reserve)
                 context = self._attention(
                     q, k_all[:total], v_all[:total], positions,
                     self._key_positions(total), attention_window, attention_scale,

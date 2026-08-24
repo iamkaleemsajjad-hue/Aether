@@ -69,6 +69,7 @@ EXECUTION_NUMERICS_FIELDS: tuple[str, ...] = (
     "qk_norm_scope",
     "no_rope_layers",
     "gelu_approximate",
+    "moe_renormalize_topk",
 )
 
 
@@ -221,6 +222,7 @@ class TorchAEGEngine:
             str(getattr(weights, "qk_norm_scope", "head") or "head").lower() == "full"
         )
         self.gelu_approximate = bool(getattr(weights, "gelu_approximate", True))
+        self.moe_renormalize_topk = bool(getattr(weights, "moe_renormalize_topk", True))
         # PyTorch 2.4+ exposes a fused RMSNorm that accumulates in FP32.  It
         # replaces a seven-op reduction per normalization — with four norms per
         # layer that is the single largest source of launch overhead in decode.
@@ -529,7 +531,13 @@ class TorchAEGEngine:
         return self.torch.tanh(value / limit) * limit
 
     def _moe_ffn(self, hidden: Any, layer: dict[str, Any]) -> Any:
-        """Execute top-k routed SwiGLU experts on the selected device."""
+        """Execute top-k routed SwiGLU experts on the selected device.
+
+        The router probabilities come from a softmax over **all** experts; only
+        architectures that declare ``norm_topk_prob`` renormalize the selected
+        k.  See :meth:`CPUExecutionEngine._moe_ffn` for why the two forms are
+        not interchangeable.
+        """
         torch = self.torch
         router = layer["router"]
         experts = layer["experts"]
@@ -539,8 +547,11 @@ class TorchAEGEngine:
         top_k = min(int(layer["num_activated_experts"]), len(experts))
         if top_k <= 0:
             raise ValueError("portable MoE top-k must be positive")
-        selected_logits, selected = torch.topk(router_logits, top_k, dim=-1)
-        routing = torch.softmax(selected_logits, dim=-1)
+        probabilities = torch.softmax(router_logits.float(), dim=-1)
+        routing, selected = torch.topk(probabilities, top_k, dim=-1)
+        if self.moe_renormalize_topk:
+            routing = routing / routing.sum(dim=-1, keepdim=True)
+        routing = routing.to(dtype=hidden.dtype)
         output = torch.zeros_like(hidden)
         for expert_index, expert in enumerate(experts):
             rows, slots = torch.where(selected == expert_index)

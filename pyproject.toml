@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aether-runtime"
-version = "1.2.4.alpha"
+version = "1.2.4.beta"
 description = "Aether Runtime — the compiler for AI models. Compile any model into a portable Aether Execution Graph (AEG) and run it on any hardware."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -286,7 +286,7 @@ include = [
 
 [tool.hatch.version]
 source = "vcs"
-fallback-version = "1.2.4.alpha"
+fallback-version = "1.2.4.beta"
 
 [tool.ruff]
 target-version = "py310"

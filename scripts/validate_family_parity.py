@@ -144,6 +144,52 @@ def build_tiny(family: str, out: Path) -> None:
             max_position_embeddings=128, sliding_window=8,
             layer_types=["sliding_attention", "full_attention"] * 2, **common,
         )
+    elif family == "deepseek_v3":
+        # Multi-head latent attention: compressed Q/KV projections plus a
+        # decoupled RoPE key.  Routed to the MLA executor, not the dense one.
+        cfg = tf.DeepseekV3Config(
+            hidden_size=64, num_hidden_layers=4, num_attention_heads=4,
+            num_key_value_heads=4, intermediate_size=128,
+            kv_lora_rank=16, q_lora_rank=32,
+            qk_nope_head_dim=16, qk_rope_head_dim=16, v_head_dim=16,
+            n_routed_experts=4, num_experts_per_tok=2, n_shared_experts=1,
+            n_group=2, topk_group=1,
+            first_k_dense_replace=1, moe_intermediate_size=64,
+            max_position_embeddings=128, **common,
+        )
+    elif family == "qwen3_moe":
+        cfg = tf.Qwen3MoeConfig(
+            hidden_size=64, num_hidden_layers=4, num_attention_heads=4,
+            num_key_value_heads=2, intermediate_size=128, head_dim=16,
+            num_experts=4, num_experts_per_tok=2, moe_intermediate_size=64,
+            max_position_embeddings=128, **common,
+        )
+    elif family == "olmoe":
+        cfg = tf.OlmoeConfig(
+            hidden_size=64, num_hidden_layers=4, num_attention_heads=4,
+            num_key_value_heads=2, intermediate_size=128,
+            num_experts=4, num_experts_per_tok=2,
+            max_position_embeddings=128, **common,
+        )
+    elif family == "glm4":
+        cfg = tf.Glm4Config(
+            hidden_size=64, num_hidden_layers=4, num_attention_heads=4,
+            num_key_value_heads=2, intermediate_size=128, head_dim=16,
+            max_position_embeddings=128, **common,
+        )
+    elif family == "nemotron":
+        cfg = tf.NemotronConfig(
+            hidden_size=64, num_hidden_layers=4, num_attention_heads=4,
+            num_key_value_heads=2, intermediate_size=128,
+            max_position_embeddings=128, **common,
+        )
+    elif family == "minimax":
+        cfg = tf.MiniMaxConfig(
+            hidden_size=64, num_hidden_layers=4, num_attention_heads=4,
+            num_key_value_heads=2, intermediate_size=128,
+            num_local_experts=4, num_experts_per_tok=2,
+            max_position_embeddings=128, **common,
+        )
     elif family == "smollm3":
         cfg = tf.SmolLM3Config(
             hidden_size=64, num_hidden_layers=4, num_attention_heads=4,
@@ -255,6 +301,33 @@ def run_family(family: str) -> bool:
             row, cache = engine.forward(np.asarray([tid], np.int64), cache)
             step_rows.append(np.asarray(row, np.float32)[-1])
         ok &= compare("cpu-decode", ref, np.stack(step_rows))
+
+        # The tensor-parallel executor is what a multi-GPU host selects, and it
+        # reimplements the block, so it needs the same proof.  A two-device CPU
+        # mesh exercises the identical sharding and collective code paths.
+        from aether.runtime.torch_tensor_parallel import TorchTensorParallelAEGEngine
+
+        sharded = TorchTensorParallelAEGEngine(engine, ["cpu:0", "cpu:1"])
+        s_logits, _ = sharded.forward(ids)
+        ok &= compare("sharded-prefill", ref, np.asarray(s_logits, np.float32))
+
+        step_rows, cache = [], None
+        for tid in ids:
+            row, cache = sharded.forward(np.asarray([tid], np.int64), cache)
+            step_rows.append(np.asarray(row, np.float32)[-1])
+        ok &= compare("sharded-decode", ref, np.stack(step_rows))
+
+        # Exercise the generation loop too: it calls into the sharded overrides
+        # with the base class's full keyword contract.
+        greedy_single = tengine.generate(ids[:4], max_tokens=4, temperature=0.0)
+        greedy_sharded = sharded.generate(ids[:4], max_tokens=4, temperature=0.0)
+        if greedy_single == greedy_sharded:
+            print("    PASS sharded-generate: matches single-device tokens")
+        else:
+            ok = False
+            print(
+                f"    FAIL sharded-generate: {greedy_sharded} != {greedy_single}"
+            )
         return ok
     except Exception as exc:  # noqa: BLE001
         import traceback

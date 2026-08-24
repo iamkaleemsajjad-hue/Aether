@@ -213,7 +213,11 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
                     architecture.get("num_activated_experts", 0) or 0
                 ),
                 parallel_residual=bool(architecture.get("parallel_residual", False)),
-                norm_placement=str(architecture.get("norm_placement", "pre") or "pre"),
+                norm_placement=(
+                    "sandwich"
+                    if str(architecture.get("norm_placement", "pre")).lower() == "sandwich_glm"
+                    else str(architecture.get("norm_placement", "pre") or "pre")
+                ),
                 qk_norm_scope=str(architecture.get("qk_norm_scope", "head") or "head"),
                 num_kv_heads_for_norm=num_kv_heads,
                 is_moe_layer=(
@@ -1037,6 +1041,10 @@ def _execution_numerics(architecture: dict[str, Any]) -> dict[str, Any]:
             return None
 
     placement = str(architecture.get("norm_placement", "pre") or "pre").lower()
+    if placement == "sandwich_glm":
+        # A spelling variant of the sandwich block; ingestion has already bound
+        # each norm to its slot, so execution is identical.
+        placement = "sandwich"
     if placement not in {"pre", "post", "sandwich"}:
         raise AEGLoadError(f"unsupported norm placement {placement!r} in AEG manifest")
     scope = str(architecture.get("qk_norm_scope", "head") or "head").lower()
@@ -1061,6 +1069,7 @@ def _execution_numerics(architecture: dict[str, Any]) -> dict[str, Any]:
         "qk_norm_scope": scope,
         "no_rope_layers": index_list("no_rope_layers"),
         "gelu_approximate": bool(architecture.get("gelu_approximate", True)),
+        "moe_renormalize_topk": bool(architecture.get("moe_renormalize_topk", True)),
     }
 
 
@@ -1229,7 +1238,7 @@ def _build_layer(
     k_norm_size = (
         (num_kv_heads_for_norm or num_kv_heads) * head_dim if full_scope else head_dim
     )
-    sandwich = str(norm_placement).lower() == "sandwich"
+    sandwich = str(norm_placement).lower().startswith("sandwich")
 
     k_proj = tensors.get((index, "k_proj"))
     v_proj = tensors.get((index, "v_proj"))
@@ -1296,11 +1305,11 @@ def _build_layer(
             experts=experts,
             num_activated_experts=int(num_activated_experts or 1),
             q_norm=(
-                _norm_vector(tensors.get((index, "q_norm")), head_dim)
+                _norm_vector(tensors.get((index, "q_norm")), q_norm_size)
                 if tensors.get((index, "q_norm")) is not None else None
             ),
             k_norm=(
-                _norm_vector(tensors.get((index, "k_norm")), head_dim)
+                _norm_vector(tensors.get((index, "k_norm")), k_norm_size)
                 if tensors.get((index, "k_norm")) is not None else None
             ),
         )

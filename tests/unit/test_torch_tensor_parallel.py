@@ -143,3 +143,62 @@ def test_tensor_parallel_keeps_persisted_optimizations_advisory() -> None:
     assert sorted(parallel.persisted_optimization_plans) == [
         "cross_layer_kv", "semantic_kv", "sparse_attention"
     ]
+
+
+def test_tensor_parallel_generate_matches_single_device() -> None:
+    """The inherited generation loop must run on the sharded engine.
+
+    ``forward()`` alone does not exercise ``generate_iter``, which calls
+    ``_forward_device`` with its full keyword contract.  A sharded override that
+    drifts from the base signature fails only here, and only on a host with two
+    or more devices — exactly the case a single-GPU or CPU run never reaches.
+    """
+    source = _toy_engine()
+    single = TorchAEGEngine(source, "cpu")
+    parallel = TorchTensorParallelAEGEngine(source, ["cpu:0", "cpu:1"])
+
+    prompt = np.asarray([1, 3, 4], dtype=np.int64)
+    expected = single.generate(prompt, max_tokens=6, temperature=0.0)
+    actual = parallel.generate(prompt, max_tokens=6, temperature=0.0)
+    assert actual == expected
+
+    # generate_with_cache returns the cache the session layer stores and reuses.
+    resumed, cache = parallel.generate_with_cache(prompt, max_tokens=3, temperature=0.0)
+    assert len(resumed) == 3
+    assert cache.length == len(prompt) + 3
+
+
+def test_tensor_parallel_streaming_matches_single_device() -> None:
+    """Streaming decode must agree token-for-token with the single-device engine."""
+    source = _toy_engine()
+    single = TorchAEGEngine(source, "cpu")
+    parallel = TorchTensorParallelAEGEngine(source, ["cpu:0", "cpu:1"])
+
+    prompt = np.asarray([2, 5], dtype=np.int64)
+    expected = list(single.generate_iter(prompt, max_tokens=5, temperature=0.0))
+    actual = list(parallel.generate_iter(prompt, max_tokens=5, temperature=0.0))
+    assert actual == expected
+
+
+def test_sharded_overrides_keep_the_base_signature() -> None:
+    """A sharded override must accept exactly what the base loop passes.
+
+    The generation loop lives on the base class and calls these methods
+    directly, so a drifted signature raises only when a multi-device mesh is
+    actually present.  Comparing signatures catches it on any host.
+    """
+    import inspect
+
+    drifted: list[str] = []
+    for name, override in vars(TorchTensorParallelAEGEngine).items():
+        if name.startswith("__") or not callable(override):
+            continue
+        inherited = getattr(TorchAEGEngine, name, None)
+        if inherited is None:
+            continue
+        if inspect.signature(inherited) != inspect.signature(override):
+            drifted.append(
+                f"{name}: base{inspect.signature(inherited)} "
+                f"vs sharded{inspect.signature(override)}"
+            )
+    assert not drifted, "sharded overrides drifted from the base contract: " + "; ".join(drifted)

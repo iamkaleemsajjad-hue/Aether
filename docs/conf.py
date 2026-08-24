@@ -10,8 +10,8 @@ sys.path.insert(0, os.path.abspath("../src"))
 project = "Aether Runtime"
 copyright = "2026, Muhammad Kaleem Sajjad"
 author = "Muhammad Kaleem Sajjad"
-version = "1.2.4.alpha"
-release = "1.2.4.alpha"
+version = "1.2.4.beta"
+release = "1.2.4.beta"
 
 extensions = [
     "myst_parser",

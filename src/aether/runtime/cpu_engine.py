@@ -229,6 +229,8 @@ class ModelWeights:
     no_rope_layers: list[int] | None = None
     #: Whether a GELU activation uses the tanh approximation.
     gelu_approximate: bool = True
+    #: Whether routed-MoE top-k weights are renormalized to sum to one.
+    moe_renormalize_topk: bool = True
 
     @property
     def hidden_size(self) -> int:
@@ -1038,11 +1040,18 @@ class CPUExecutionEngine:
     def _moe_ffn(self, hidden: np.ndarray, layer: LayerWeights) -> np.ndarray:
         """Execute top-k routed SwiGLU experts for a token batch.
 
-        The router computes logits ``x W_router^T`` and selects the declared
-        top-k experts per token.  Softmax is applied over the selected logits,
-        then each selected expert contributes its weighted FFN output.  This
-        is the reference dispatch equation used by sparse MoE transformers;
-        it intentionally favors transparent correctness over fused kernels.
+        The router computes logits ``x W_router^T``, converts them to
+        probabilities with a softmax over **all** experts, and selects the
+        declared top-k.  Whether those k weights are then renormalized to sum to
+        one is a published property of the architecture:
+
+        * Mixtral and DeepSeek renormalize (``norm_topk_prob: true``), which is
+          algebraically identical to a softmax over the selected subset;
+        * Qwen3-MoE and OLMoE do not, so their expert outputs are scaled by the
+          full-vocabulary probabilities and the block contributes less than one
+          expert's worth of signal.
+
+        Treating the two as interchangeable rescales every MoE layer's output.
         """
         if layer.router is None or not layer.experts:
             raise ValueError("MoE layer is missing its router or expert bank")
@@ -1051,16 +1060,19 @@ class CPUExecutionEngine:
         top_k = min(int(layer.num_activated_experts), len(layer.experts))
         if top_k <= 0:
             raise ValueError("MoE top-k must be positive")
+        # Softmax over the complete expert set, in float32 for stability.
+        shifted = router_logits - np.max(router_logits, axis=-1, keepdims=True)
+        probabilities = np.exp(shifted)
+        probabilities /= np.maximum(probabilities.sum(axis=-1, keepdims=True), 1e-12)
         # argpartition avoids a full expert sort while retaining exact top-k
         # membership. Sorting the selected columns gives deterministic ties.
         selected = np.argpartition(router_logits, -top_k, axis=-1)[:, -top_k:]
-        selected_logits = np.take_along_axis(router_logits, selected, axis=-1)
-        order = np.argsort(-selected_logits, axis=-1, kind="stable")
+        routing = np.take_along_axis(probabilities, selected, axis=-1)
+        order = np.argsort(-routing, axis=-1, kind="stable")
         selected = np.take_along_axis(selected, order, axis=-1)
-        selected_logits = np.take_along_axis(selected_logits, order, axis=-1)
-        selected_logits -= np.max(selected_logits, axis=-1, keepdims=True)
-        routing = np.exp(selected_logits)
-        routing /= np.maximum(routing.sum(axis=-1, keepdims=True), 1e-12)
+        routing = np.take_along_axis(routing, order, axis=-1)
+        if self.weights.moe_renormalize_topk:
+            routing = routing / np.maximum(routing.sum(axis=-1, keepdims=True), 1e-12)
 
         output = np.zeros_like(source, dtype=np.float32)
         for expert_index, expert in enumerate(layer.experts):
@@ -1384,6 +1396,9 @@ class CPUExecutionEngine:
                 and layer.attention_norm_bias is None
                 and not self.weights.norm_offset_one
                 and layer.q_proj_bias is None
+                # A full-projection Q norm must be applied before the head
+                # split, which this fused kernel has already performed.
+                and not (self._qk_norm_is_full and layer.q_norm is not None)
             ):
                 q = self.kernels.rmsnorm_linear(
                     hidden, layer.attention_norm, layer.q_proj, self.weights.norm_eps,
@@ -1395,7 +1410,10 @@ class CPUExecutionEngine:
                     normed = self._apply_ttt_slot(
                         normed, ttt_slots[index] if index < len(ttt_slots) else None
                     )
-                q = self._linear(normed, layer.q_proj, (index, "q_proj"), layer.q_proj_bias).reshape(seq_len, self.num_heads, self.head_dim)
+                q = self._linear(normed, layer.q_proj, (index, "q_proj"), layer.q_proj_bias)
+                if layer.q_norm is not None and self._qk_norm_is_full:
+                    q = self._norm(q, layer.q_norm)
+                q = q.reshape(seq_len, self.num_heads, self.head_dim)
             if layer.q_norm is not None and not self._qk_norm_is_full:
                 q = self._head_norm(q, layer.q_norm)
             if layer_uses_rope:

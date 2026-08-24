@@ -1262,6 +1262,14 @@ class ModelArchitecture:
     SmolLM3 interleaves NoPE layers among RoPE layers.
     """
 
+    moe_renormalize_topk: bool = True
+    """Whether routed-MoE top-k weights are renormalized to sum to one.
+
+    Mixtral and DeepSeek renormalize; Qwen3-MoE and OLMoE publish
+    ``norm_topk_prob: false`` and scale expert outputs by the full-softmax
+    probabilities instead.  The choice rescales every MoE layer's output.
+    """
+
     gelu_approximate: bool = True
     """Whether a GELU activation uses the tanh approximation.
 
@@ -1372,6 +1380,7 @@ class ModelArchitecture:
             "fused_qkv_layout": self.fused_qkv_layout,
             "no_rope_layers": self.no_rope_layers,
             "gelu_approximate": self.gelu_approximate,
+            "moe_renormalize_topk": self.moe_renormalize_topk,
         }
 
     @staticmethod
@@ -1461,6 +1470,7 @@ class ModelArchitecture:
                 if data.get("no_rope_layers") is not None else None
             ),
             gelu_approximate=bool(data.get("gelu_approximate", True)),
+            moe_renormalize_topk=bool(data.get("moe_renormalize_topk", True)),
         )
 
     def __repr__(self) -> str:

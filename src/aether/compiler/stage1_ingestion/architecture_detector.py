@@ -213,7 +213,9 @@ class ArchitectureDetector:
         def has(marker: str) -> bool:
             return any(marker in name for name in lowered)
 
-        if placement == "sandwich" and not has("pre_feedforward_layernorm"):
+        if placement == "sandwich" and not (
+            has("pre_feedforward_layernorm") or has("post_mlp_layernorm")
+        ):
             logger.warning(
                 "%s declares sandwich normalization but has no "
                 "pre_feedforward_layernorm tensors; compiling it as a pre-norm "
@@ -454,7 +456,10 @@ class ArchitectureDetector:
                 "layer_norm_eps",
                 config.get(
                     "layer_norm_epsilon",
-                    config.get("norm_epsilon", config.get("layernorm_epsilon", 1e-5)),
+                    config.get(
+                        "norm_epsilon",
+                        config.get("layernorm_epsilon", config.get("norm_eps", 1e-5)),
+                    ),
                 ),
             ),
         )
@@ -497,6 +502,11 @@ class ArchitectureDetector:
         ).lower()
         if "geglu" in hidden_act or "geglu" in architecture_name or model_type.startswith("gemma"):
             ffn_type = "GeGLU"
+        elif any(marker in hidden_act for marker in ("relu2", "squared_relu", "relu_squared")):
+            # Squared ReLU (Nemotron, Primer) has one intermediate projection
+            # and no gate; reading it as SwiGLU demands an up projection the
+            # checkpoint does not contain.
+            ffn_type = "ReLU2"
         elif any(marker in hidden_act for marker in ("gated-gelu", "gated_gelu", "gatedgelu")) or model_type in {"t5", "mt5"} and config.get("is_gated_act", False):
             ffn_type = "GatedGELU"
         elif model_type in {"t5", "mt5", "byt5", "ul2"} and "relu" in hidden_act and "gated" not in hidden_act:
@@ -529,6 +539,11 @@ class ArchitectureDetector:
                 config.get(key) is not None
                 for key in ("layer_norm_eps", "layer_norm_epsilon", "norm_epsilon", "layernorm_epsilon")
             ):
+                norm_type = "LayerNorm"
+            elif model_type == "nemotron" or "nemotron" in architecture_name:
+                # Nemotron's published LayerNorm1P is a LayerNorm whose scale is
+                # (1 + weight); its config spells the epsilon plainly as
+                # ``norm_eps``, matching neither family's usual key.
                 norm_type = "LayerNorm"
             else:
                 norm_type = "LayerNorm" if any(
@@ -631,11 +646,11 @@ class ArchitectureDetector:
             # These families always normalize Q and K; the contract is
             # structural rather than switchable, so their configs declare no
             # flag for it.
-            or model_type in {"olmo2", "olmo_2", "exaone4"}
+            or model_type in {"olmo2", "olmo_2", "exaone4", "olmoe"}
             or model_type.startswith("gemma3")
             or any(
                 marker in architecture_name
-                for marker in ("olmo2", "exaone4", "gemma3")
+                for marker in ("olmo2", "exaone4", "gemma3", "olmoe")
             )
         )
         # Falcon's legacy multi-query attention shares a single K/V head across
@@ -977,11 +992,20 @@ class ArchitectureDetector:
         norm_offset_one = bool(
             model_type.startswith("gemma")
             or "gemma" in architecture_name
+            # Nemotron's LayerNorm1P applies (1 + weight) exactly as Gemma's
+            # RMSNorm does, so one offset flag covers both.
+            or model_type == "nemotron"
+            or "nemotron" in architecture_name
             or config.get("norm_offset_one", False)
         )
         declared_placement = str(config.get("norm_placement", "") or "").strip().lower()
         if declared_placement in {"pre", "post", "sandwich"}:
             norm_placement = declared_placement
+        elif model_type.startswith("glm4") or "glm4" in architecture_name:
+            # Same four-norm block as Gemma-2, different tensor spelling; the
+            # variant is recorded so ingestion binds the right norm to the
+            # right slot.
+            norm_placement = "sandwich_glm"
         elif (
             model_type.startswith("gemma2")
             or model_type.startswith("gemma3")
@@ -1005,7 +1029,9 @@ class ArchitectureDetector:
         # OLMo-2 normalizes the whole Q/K projection rather than each head.
         # EXAONE-4 shares the placement but keeps per-head Q/K norms.
         qk_norm_scope = "full" if (
-            model_type in {"olmo2", "olmo_2"} or "olmo2" in architecture_name
+            model_type in {"olmo2", "olmo_2", "olmoe"}
+            or "olmo2" in architecture_name
+            or "olmoe" in architecture_name
         ) else "head"
 
         # ── Rotary geometry ───────────────────────────────────────────────
@@ -1026,14 +1052,16 @@ class ArchitectureDetector:
                 rope_partial_dim = None
 
         # GPT-J pairs adjacent channels; GPT-NeoX/Llama pair the two halves.
-        # Cohere/Command-R also publishes the interleaved form (its reference
-        # implementation builds the table with repeat_interleave rather than
-        # concatenation).
+        # Cohere/Command-R and GLM/GLM-4 also publish the interleaved form
+        # (their reference implementations build the table with
+        # repeat_interleave rather than concatenation).
         rope_interleaved = bool(
             config.get("rope_interleaved", False)
-            or model_type in {"gptj", "gpt-j", "gpt_j", "cohere", "cohere2"}
+            or model_type in {"gptj", "gpt-j", "gpt_j", "cohere", "cohere2", "glm", "glm4"}
             or "gptj" in architecture_name.replace("_", "").replace("-", "")
             or "cohere" in architecture_name
+            or "glm4" in architecture_name
+            or architecture_name.startswith("glm")
         )
         rope_local_theta = numeric("rope_local_base_freq", "rope_theta_local")
 
@@ -1094,6 +1122,12 @@ class ArchitectureDetector:
             # ``gelu_pytorch_tanh`` / ``gelu_fast`` spelling is the tanh
             # approximation.  BLOOM's built-in activation is also the tanh form
             # even though its config names no activation at all.
+            # Mixtral and DeepSeek renormalize the selected top-k routing
+            # weights; Qwen3-MoE and OLMoE publish ``norm_topk_prob: false``
+            # and keep the full-softmax probabilities.
+            "moe_renormalize_topk": bool(
+                config.get("norm_topk_prob", config.get("normalize_expert_weights", True))
+            ),
             "gelu_approximate": bool(
                 any(
                     marker in hidden_activation

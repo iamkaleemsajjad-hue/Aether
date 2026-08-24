@@ -313,3 +313,88 @@ def test_unscaled_attention_changes_the_distribution() -> None:
     default_logits, _ = engine.forward(ids)
     unscaled_logits, _ = unscaled.forward(ids)
     assert not np.allclose(default_logits, unscaled_logits, rtol=1e-4, atol=1e-4)
+
+
+class TestRoutedExpertNormalization:
+    """Top-k routing weights are renormalized only when declared."""
+
+    def test_mixtral_renormalizes(self) -> None:
+        architecture = _detect(
+            architecture="MixtralForCausalLM", model_type="mixtral",
+            num_local_experts=8, num_experts_per_tok=2, rms_norm_eps=1e-5,
+        )
+        assert architecture.moe_renormalize_topk is True
+
+    def test_qwen3_moe_and_olmoe_do_not(self) -> None:
+        # Both publish norm_topk_prob: false, so expert outputs keep the
+        # full-softmax probabilities and the block contributes less than one
+        # expert's worth of signal.
+        for name, model_type in (
+            ("Qwen3MoeForCausalLM", "qwen3_moe"),
+            ("OlmoeForCausalLM", "olmoe"),
+        ):
+            architecture = _detect(
+                architecture=name, model_type=model_type,
+                num_experts=8, num_experts_per_tok=2,
+                norm_topk_prob=False, rms_norm_eps=1e-5,
+            )
+            assert architecture.moe_renormalize_topk is False, name
+
+
+class TestOffsetNormalizationFamilies:
+    """Some families store normalization weights as offsets from unity."""
+
+    def test_nemotron_is_layernorm_with_a_unit_offset(self) -> None:
+        # NemotronLayerNorm1P: a LayerNorm whose scale is (1 + weight).  Its
+        # config spells the epsilon plainly as ``norm_eps``.
+        architecture = _detect(
+            architecture="NemotronForCausalLM", model_type="nemotron",
+            hidden_act="relu2", partial_rotary_factor=0.5, norm_eps=1e-5,
+        )
+        assert architecture.norm_type == "LayerNorm"
+        assert architecture.norm_offset_one is True
+        assert architecture.norm_eps == pytest.approx(1e-5)
+        # Squared ReLU has a single intermediate projection and no gate.
+        assert architecture.ffn_type == "ReLU2"
+        assert architecture.rope_partial_dim == 8
+
+
+class TestSandwichSpellingVariants:
+    """The four-norm block is spelled two different ways in the ecosystem."""
+
+    def test_glm4_uses_its_own_spelling(self) -> None:
+        # GLM-4 keeps the Llama meaning of post_attention_layernorm (pre-FFN)
+        # and adds post_self_attn / post_mlp as the two output norms.
+        architecture = _detect(
+            architecture="Glm4ForCausalLM", model_type="glm4",
+            head_dim=16, partial_rotary_factor=0.5, rms_norm_eps=1e-6,
+        )
+        assert architecture.norm_placement == "sandwich_glm"
+        assert architecture.rope_interleaved is True
+        assert architecture.rope_partial_dim == 8
+
+    def test_glm_variant_binds_norms_to_the_right_slots(self) -> None:
+        from aether.compiler.stage1_ingestion.ingestion import IngestionPipeline
+
+        normalize = IngestionPipeline._normalise_weight_name
+        # GLM spelling.
+        assert normalize("model.layers.0.post_self_attn_layernorm.weight", "sandwich_glm") == (
+            0, "post_attention_norm"
+        )
+        assert normalize("model.layers.0.post_attention_layernorm.weight", "sandwich_glm") == (
+            0, "ffn_norm"
+        )
+        assert normalize("model.layers.0.post_mlp_layernorm.weight", "sandwich_glm") == (
+            0, "post_ffn_norm"
+        )
+        # Gemma spelling: the same shared name means the attention output norm.
+        assert normalize("model.layers.0.post_attention_layernorm.weight", "sandwich") == (
+            0, "post_attention_norm"
+        )
+        assert normalize("model.layers.0.pre_feedforward_layernorm.weight", "sandwich") == (
+            0, "ffn_norm"
+        )
+        # Pre-norm blocks keep the historical Llama meaning.
+        assert normalize("model.layers.0.post_attention_layernorm.weight", "pre") == (
+            0, "ffn_norm"
+        )
