@@ -18,6 +18,10 @@ automatically — no special installation step required beyond `pip install -e "
 | [`convert_weights.py`](#convert_weightspy) | Convert between weight formats |
 | [`benchmark_kernels.py`](#benchmark_kernelspy) | Micro-benchmark native CPU kernels |
 | [`profile_memory.py`](#profile_memorypy) | Memory profiling for compilation and inference |
+| [`validate_family_parity.py`](#validate_family_paritypy) | Verify compiled output matches HuggingFace, per model family |
+| [`profile_decode.py`](#profile_decodepy) | Attribute decode time on the current device |
+| [`benchmark_dispatch.py`](#benchmark_dispatchpy) | Compare per-token kernel launches against HuggingFace |
+| [`benchmark_decode.py`](#benchmark_decodepy) | Measure decode throughput of a compiled artifact |
 | [`ci_smoke_test.py`](#ci_smoke_testpy) | Standalone CI smoke test (no pytest needed) |
 
 ---
@@ -215,4 +219,64 @@ Designed to complete in under 60 seconds on any development machine.
   with:
     name: test-results
     path: ci_results.xml
+```
+
+
+---
+
+### `validate_family_parity.py`
+
+Numerical parity harness.  For each named family it builds a small random model
+with Transformers, compiles it through Aether, and compares logits against the
+HuggingFace reference across every executor: the NumPy CPU engine, the PyTorch
+engine, and the tensor-parallel engine, for both prefill and incremental decode.
+
+```bash
+python scripts/validate_family_parity.py gpt_neo qwen3 gemma2 olmo2
+```
+
+Weights are rounded to BF16 before the reference runs, matching the compiler's
+default storage precision, so the comparison measures the forward pass rather
+than quantization.  The gate is max logit deviation relative to the reference
+logit spread; a correct implementation lands near 1e-6, while a wrong attention
+scale, rotary layout, or permuted head is orders of magnitude larger.
+
+Cosine similarity is deliberately *not* the gate: over a large vocabulary it
+stays above 0.99 even when attention is structurally wrong.
+
+### `profile_decode.py`
+
+Attributes decode time on whatever device is given.
+
+```bash
+python scripts/profile_decode.py model.aeg cuda 100
+```
+
+Reports wall clock and per-token latency, summed GPU kernel time, the gap
+between them (host-side stall), the ops with the largest self CPU and self GPU
+time, and a count of host/device synchronizations.  Use it to distinguish the
+three reasons a small model decodes slowly: too many launches, a stalled host,
+or a slow kernel choice.  It also prints which SDPA backends are enabled, since
+FlashAttention requires compute capability 8.0 and older GPUs silently take a
+different path.
+
+### `benchmark_dispatch.py`
+
+Counts ATen dispatches per decoded token for Aether and for HuggingFace on the
+same architecture, separating real kernels from metadata-only view ops.
+
+```bash
+python scripts/benchmark_dispatch.py gpt_neo
+```
+
+Deterministic and machine-independent, so it answers "does Aether launch more
+work per token than Transformers?" without needing the target accelerator.
+
+### `benchmark_decode.py`
+
+Straight throughput measurement of a compiled artifact.
+
+```bash
+python scripts/benchmark_decode.py model.aeg cuda 100
+AETHER_BENCH_PROFILE=1 python scripts/benchmark_decode.py model.aeg cpu 32
 ```

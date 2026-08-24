@@ -872,10 +872,19 @@ class TorchAEGEngine:
         return logits.detach().float().cpu().numpy(), cache
 
     def _sample(self, logits: Any, temperature: float, top_k: int, top_p: float) -> int:
+        return int(self._sample_device(logits, temperature, top_k, top_p).item())
+
+    def _sample_device(self, logits: Any, temperature: float, top_k: int, top_p: float) -> Any:
+        """Select the next token, leaving the result on the execution device.
+
+        Returning a device tensor is what allows the caller to queue the next
+        forward pass before reading this token back to the host.  Reading it
+        immediately would drain the whole queue first.
+        """
         torch = self.torch
         values = logits.float()
         if temperature <= 0:
-            return int(torch.argmax(values).item())
+            return torch.argmax(values)
         values = values / float(temperature)
         if top_k > 0:
             top_k = min(int(top_k), int(values.numel()))
@@ -883,13 +892,28 @@ class TorchAEGEngine:
             values = values.masked_fill(values < threshold, -torch_inf(torch, values.dtype))
         probs = torch.softmax(values, dim=-1)
         if 0.0 < top_p < 1.0:
-            sorted_probs, sorted_ids = torch.sort(probs, descending=True)
-            cumulative = torch.cumsum(sorted_probs, dim=-1)
-            remove = cumulative - sorted_probs > float(top_p)
-            sorted_probs = sorted_probs.masked_fill(remove, 0.0)
-            sorted_probs = sorted_probs / sorted_probs.sum()
-            return int(sorted_ids[torch.multinomial(sorted_probs, 1)].item())
-        return int(torch.multinomial(probs, 1).item())
+            return self._sample_top_p(probs, float(top_p))
+        return torch.multinomial(probs, 1).reshape(())
+
+    def _sample_top_p(self, probs: Any, top_p: float) -> Any:
+        """Nucleus sampling, entirely on the execution device.
+
+        The nucleus is the shortest prefix of the descending-probability order
+        whose cumulative mass reaches ``p``.  Finding it needs the full ordering:
+        a cheaper top-k pre-truncation would only be exact if its mass already
+        reached ``p``, and testing that requires reading a value back to the
+        host.  One extra sort kernel is much cheaper than the pipeline drain a
+        host read would cause on every token, so this keeps the sort.
+        """
+        torch = self.torch
+        ordered, order = torch.sort(probs, descending=True)
+        # ``cumulative - ordered`` is the mass strictly before each entry, so
+        # this keeps the first entry whose predecessors have not yet reached p,
+        # always retaining at least the most probable token.
+        cumulative = ordered.cumsum(dim=-1)
+        selected = ordered * (cumulative - ordered <= top_p).to(dtype=ordered.dtype)
+        selected = selected / selected.sum()
+        return order[torch.multinomial(selected, 1)].reshape(())
 
     def generate_iter(self, prompt_ids: np.ndarray, max_tokens: int = 16, temperature: float = 0.0,
                       top_k: int = 0, top_p: float = 1.0, eos_token_id: int | None = None,
@@ -908,42 +932,114 @@ class TorchAEGEngine:
             next_logits = cache.last_logits
         else:
             raise ValueError("generation requires prompt ids or a populated cache")
-        generated: list[int] = []
+        if grammar_session is None:
+            yield from self._generate_pipelined(
+                cache, next_logits, max_tokens, temperature, top_k, top_p, eos_token_id
+            )
+        else:
+            yield from self._generate_constrained(
+                cache, next_logits, max_tokens, temperature, top_k, top_p,
+                eos_token_id, grammar_session,
+            )
+        if cache_callback is not None and cache is not None:
+            cache_callback(cache)
+
+    def _generate_pipelined(
+        self,
+        cache: TorchKVCache,
+        next_logits: Any,
+        max_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        eos_token_id: int | None,
+    ) -> Iterator[int]:
+        """Decode with the host running one step ahead of the device.
+
+        Autoregressive decode has to move each sampled token back to the host,
+        both to yield it and to test it against the stop token.  Doing that
+        immediately after sampling serializes the pipeline: the host blocks
+        until every kernel queued for this step has retired, so the several
+        hundred launches that make up the *next* step cannot be issued while the
+        device is still busy with this one.  For a small model — where a step is
+        a few hundred microseconds of arithmetic but a comparable amount of
+        launch work — that alternation roughly doubles the time per token.
+
+        So the next step's forward pass and sampling are queued *first*, and only
+        then is the current token read back.  The synchronization still happens
+        once per token, but by that point the device already has a full step of
+        work in flight, and the host's launch cost overlaps device execution
+        instead of following it.
+
+        The lookahead step is speculative: when generation stops early its KV
+        rows are discarded by rewinding the cache length, so the returned cache
+        describes exactly the tokens that were yielded.
+        """
+        token_device = self._sample_device(next_logits, temperature, top_k, top_p)
+        stop = None if eos_token_id is None else int(eos_token_id)
         for _ in range(int(max_tokens)):
-            if grammar_session is not None:
-                mask = grammar_session.get_token_mask()
-                if len(mask) * 8 < int(next_logits.numel()):
-                    raise ValueError("Grammar FSM vocabulary is smaller than model vocabulary")
-                allowed = self.torch.tensor(
-                    [
-                        (mask[index // 8] & (1 << (index % 8))) != 0
-                        for index in range(int(next_logits.numel()))
-                    ],
-                    dtype=self.torch.bool,
-                    device=next_logits.device,
-                )
-                if not bool(self.torch.any(allowed).item()):
-                    raise ValueError("Grammar FSM has no valid next token")
-                next_logits = next_logits.masked_fill(~allowed, -torch_inf(self.torch, next_logits.dtype))
-            token = self._sample(next_logits, temperature, top_k, top_p)
-            if grammar_session is not None and grammar_session.advance(token) < 0:
-                raise ValueError("The portable PyTorch executor produced a token rejected by the grammar FSM")
-            generated.append(token)
+            checkpoint = int(cache.length)
+            _, cache = self._forward_device(token_device.reshape(1), cache)
+            following = self._sample_device(cache.last_logits, temperature, top_k, top_p)
+            # The queue now holds a complete step; syncing here costs only the
+            # residual device time rather than the whole step.
+            token = int(token_device.item())
             yield token
-            if grammar_session is not None and getattr(grammar_session, "is_accepting", lambda: False)():
+            if stop is not None and token == stop:
+                cache.length = checkpoint
+                break
+            token_device = following
+
+    def _generate_constrained(
+        self,
+        cache: TorchKVCache,
+        next_logits: Any,
+        max_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        eos_token_id: int | None,
+        grammar_session: Any,
+    ) -> Iterator[int]:
+        """Decode under a grammar FSM, which cannot run ahead.
+
+        The FSM has to observe each accepted token on the host before it can
+        compute the mask for the next step, so this path keeps the strict
+        sample-then-advance ordering and forgoes the lookahead above.
+        """
+        torch = self.torch
+        for _ in range(int(max_tokens)):
+            mask = grammar_session.get_token_mask()
+            if len(mask) * 8 < int(next_logits.numel()):
+                raise ValueError("Grammar FSM vocabulary is smaller than model vocabulary")
+            allowed = torch.tensor(
+                [
+                    (mask[index // 8] & (1 << (index % 8))) != 0
+                    for index in range(int(next_logits.numel()))
+                ],
+                dtype=torch.bool,
+                device=next_logits.device,
+            )
+            if not bool(torch.any(allowed).item()):
+                raise ValueError("Grammar FSM has no valid next token")
+            next_logits = next_logits.masked_fill(
+                ~allowed, -torch_inf(torch, next_logits.dtype)
+            )
+            token = self._sample(next_logits, temperature, top_k, top_p)
+            if grammar_session.advance(token) < 0:
+                raise ValueError(
+                    "The portable PyTorch executor produced a token rejected by the grammar FSM"
+                )
+            yield token
+            if getattr(grammar_session, "is_accepting", lambda: False)():
                 break
             if eos_token_id is not None and token == int(eos_token_id):
                 break
-            # ``token`` is sampled on-device.  Reusing a device tensor avoids
-            # a synchronization plus a NumPy/device copy on every decode
-            # iteration, which is material for small-batch generation.
             _, cache = self._forward_device(
-                self.torch.tensor([token], dtype=self.torch.long, device=self.device),
-                cache,
+                torch.tensor([token], dtype=torch.long, device=self.device), cache
             )
             next_logits = cache.last_logits
-        if cache_callback is not None and cache is not None:
-            cache_callback(cache)
+
     def generate(self, prompt_ids: np.ndarray, max_tokens: int = 16, **kwargs: Any) -> list[int]:
         return list(self.generate_iter(prompt_ids, max_tokens=max_tokens, **kwargs))
 

@@ -398,3 +398,84 @@ class TestSandwichSpellingVariants:
         assert normalize("model.layers.0.post_attention_layernorm.weight", "pre") == (
             0, "ffn_norm"
         )
+
+
+def _decode_engine(vocab: int = 8, layers: int = 2):
+    """A small but non-degenerate engine for exercising the decode loop."""
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    hidden, heads = 8, 2
+    built = []
+    for _ in range(layers):
+        built.append(
+            LayerWeights(
+                attention_norm=np.ones(hidden, dtype=np.float32),
+                q_proj=rng.normal(size=(hidden, hidden)).astype(np.float32),
+                k_proj=rng.normal(size=(hidden, hidden)).astype(np.float32),
+                v_proj=rng.normal(size=(hidden, hidden)).astype(np.float32),
+                o_proj=rng.normal(size=(hidden, hidden)).astype(np.float32),
+                ffn_norm=np.ones(hidden, dtype=np.float32),
+                gate_proj=rng.normal(size=(16, hidden)).astype(np.float32),
+                up_proj=rng.normal(size=(16, hidden)).astype(np.float32),
+                down_proj=rng.normal(size=(hidden, 16)).astype(np.float32),
+            )
+        )
+    weights = ModelWeights(
+        embedding=rng.normal(size=(vocab, hidden)).astype(np.float32),
+        layers=built,
+        final_norm=np.ones(hidden, dtype=np.float32),
+        lm_head=rng.normal(size=(vocab, hidden)).astype(np.float32),
+    )
+    return CPUExecutionEngine(weights, num_heads=heads)
+
+
+class TestPipelinedDecode:
+    """The lookahead decode loop must be observationally identical."""
+
+    def test_greedy_tokens_match_the_reference_engine(self) -> None:
+        torch = pytest.importorskip("torch")
+        del torch
+        from aether.runtime.torch_engine import TorchAEGEngine
+
+        source = _decode_engine()
+        engine = TorchAEGEngine(source, "cpu")
+        prompt = np.asarray([1, 2, 3], dtype=np.int64)
+        # The NumPy reference engine uses the strict sample-then-forward order.
+        assert engine.generate(prompt, max_tokens=6, temperature=0.0) == source.generate(
+            prompt, max_tokens=6, temperature=0.0
+        )
+
+    def test_cache_length_matches_the_tokens_yielded(self) -> None:
+        pytest.importorskip("torch")
+        from aether.runtime.torch_engine import TorchAEGEngine
+
+        engine = TorchAEGEngine(_decode_engine(), "cpu")
+        prompt = np.asarray([1, 2, 3], dtype=np.int64)
+        tokens, cache = engine.generate_with_cache(prompt, max_tokens=5, temperature=0.0)
+        # The speculative lookahead step must not leave extra KV rows behind.
+        assert cache.length == len(prompt) + len(tokens)
+
+    def test_stop_token_ends_generation_and_rewinds_the_cache(self) -> None:
+        pytest.importorskip("torch")
+        from aether.runtime.torch_engine import TorchAEGEngine
+
+        engine = TorchAEGEngine(_decode_engine(), "cpu")
+        prompt = np.asarray([1, 2], dtype=np.int64)
+        first = engine.generate(prompt, max_tokens=8, temperature=0.0)
+        # Stopping on the first emitted token must yield exactly that token.
+        stopped, cache = engine.generate_with_cache(
+            prompt, max_tokens=8, temperature=0.0, eos_token_id=first[0]
+        )
+        assert stopped == [first[0]]
+        assert cache.length == len(prompt)
+
+    def test_streaming_matches_batch_generation(self) -> None:
+        pytest.importorskip("torch")
+        from aether.runtime.torch_engine import TorchAEGEngine
+
+        engine = TorchAEGEngine(_decode_engine(), "cpu")
+        prompt = np.asarray([2, 4], dtype=np.int64)
+        batch = engine.generate(prompt, max_tokens=6, temperature=0.0)
+        streamed = list(engine.generate_iter(prompt, max_tokens=6, temperature=0.0))
+        assert streamed == batch

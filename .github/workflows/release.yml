@@ -1,12 +1,12 @@
 name: Publish to PyPI
 
 # Triggers:
-#   1. When you push a version tag:  git tag v1.2.4.beta && git push origin v1.2.4.beta
+#   1. When you push a version tag:  git tag v1.2.4.charlie && git push origin v1.2.4.charlie
 #   2. Manually from GitHub Actions tab (workflow_dispatch)
 on:
   push:
     tags:
-      - "v*.*.*"        # v1.2.4.beta, v1.3.0, v2.0.0-beta.1, etc.
+      - "v*.*.*"        # v1.2.4.charlie, v1.3.0, v2.0.0-beta.1, etc.
   workflow_dispatch:
     inputs:
       target:
@@ -158,4 +158,4 @@ jobs:
           body_path: release-notes.md
           files: dist/*
           draft: false
-          prerelease: ${{ contains(env.TAG, 'alpha') || contains(env.TAG, 'beta') || contains(env.TAG, 'rc') }}
+          prerelease: ${{ contains(env.TAG, 'alpha') || contains(env.TAG, 'beta') || contains(env.TAG, 'charlie') || contains(env.TAG, 'rc') }}
