@@ -5,12 +5,12 @@ All notable changes to Aether Runtime will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.2.4.charlie] - 2026-08-24 -- Portable Decoder Numerics Charlie Pre-release
+## [1.2.5] - 2026-08-24 -- Portable Decoder Numerics Stable Release
 
 ### Changed
 
-- Continued the model-family execution-numerics and tensor-parity work from
-  the beta preview, including the latest decoder dispatch and profiling tools.
+- Promoted the model-family execution-numerics, tensor-parity, decoder
+  dispatch, and profiling work from the prerelease line to the stable release.
 
 ## [1.2.4.beta] - 2026-08-24 -- Portable Decoder Numerics Beta
 
@@ -522,8 +522,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OpenAI-compatible REST API.
 - Research-backed optimizer passes and runtime intelligence.
 
-[Unreleased]: https://github.com/iamkaleemsajjad-hue/Aether/compare/v1.2.4.charlie...HEAD
-[1.2.4.charlie]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.4.charlie
+[Unreleased]: https://github.com/iamkaleemsajjad-hue/Aether/compare/v1.2.5...HEAD
+[1.2.5]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.5
 [1.2.4.beta]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.4.beta
 [1.2.4.alpha]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.4.alpha
 [1.2.4]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.4

@@ -1,12 +1,12 @@
 name: Publish to PyPI
 
 # Triggers:
-#   1. When you push a version tag:  git tag v1.2.4.charlie && git push origin v1.2.4.charlie
+#   1. When you push a version tag:  git tag v1.2.5 && git push origin v1.2.5
 #   2. Manually from GitHub Actions tab (workflow_dispatch)
 on:
   push:
     tags:
-      - "v*.*.*"        # v1.2.4.charlie, v1.3.0, v2.0.0-beta.1, etc.
+      - "v*.*.*"        # v1.2.5, v1.3.0, v2.0.0-beta.1, etc.
   workflow_dispatch:
     inputs:
       target:

@@ -80,7 +80,7 @@ Expected output:
 ```
 [OK] Python 3.11.x
 [OK] PyTorch 2.5.x
-[OK] aether-runtime 1.2.4.charlie
+[OK] aether-runtime 1.2.5
 [OK] SafeTensors
 [OK] GGUF reader
 [OK] ONNX
