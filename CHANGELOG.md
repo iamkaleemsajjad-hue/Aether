@@ -5,6 +5,13 @@ All notable changes to Aether Runtime will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.6] - 2026-08-24 -- Portable Decoder Numerics Stable Release
+
+### Changed
+
+- Promoted the device-placement coverage and backend dispatch validation from
+  the `1.2.5.alpha` prerelease line to the stable release.
+
 ## [1.2.5.alpha] - 2026-08-24 -- Portable Decoder Numerics Alpha
 
 ### Added
@@ -529,7 +536,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OpenAI-compatible REST API.
 - Research-backed optimizer passes and runtime intelligence.
 
-[Unreleased]: https://github.com/iamkaleemsajjad-hue/Aether/compare/v1.2.5.alpha...HEAD
+[Unreleased]: https://github.com/iamkaleemsajjad-hue/Aether/compare/v1.2.6...HEAD
+[1.2.6]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.6
 [1.2.5.alpha]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.5.alpha
 [1.2.5]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.5
 [1.2.4.beta]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.4.beta
