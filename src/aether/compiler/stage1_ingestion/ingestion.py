@@ -497,10 +497,16 @@ class IngestionPipeline:
         """
         import numpy as np
 
+        # The architecture's normalization placement disambiguates the
+        # ``*_layernorm`` spellings shared by pre-, post-, and sandwich-normed
+        # blocks.  See ``_normalise_weight_name``.
+        placement = str(
+            getattr(getattr(graph, "architecture", None), "norm_placement", "pre") or "pre"
+        )
         lookup: dict[tuple[int | None, str | None], list[tuple[str, Any]]] = {}
         unresolvable: list[str] = []
         for name, tensor in tensors.items():
-            key = self._normalise_weight_name(name)
+            key = self._normalise_weight_name(name, placement)
             if key[1] is None:
                 unresolvable.append(name)
                 continue
@@ -516,7 +522,7 @@ class IngestionPipeline:
         for node in graph:
             if not hasattr(node, "add_attribute"):
                 continue
-            key = self._normalise_weight_name(getattr(node, "id", ""))
+            key = self._normalise_weight_name(getattr(node, "id", ""), placement)
             if key[1] is None:
                 continue
             candidates = lookup.get(key)
@@ -705,16 +711,65 @@ class IngestionPipeline:
         consumes linear weights as ``(out_features, in_features)``.  This is a
         structural property of the checkpoint tensor name, not a model-name
         special case, and is applied only to the GPT ``c_*`` layout.
+
+        Fused QKV projections are also normalized here.  GPT-NeoX, BLOOM and
+        Falcon interleave Q/K/V *within* each head or KV group rather than
+        stacking them, so reading the tensor as three contiguous blocks
+        permutes every attention head.  Rewriting it once at ingestion keeps
+        every downstream pass and every runtime on one layout.
         """
         import numpy as np
 
         array = np.asarray(value)
         lowered = name.lower()
+        if component == "qkv":
+            architecture = getattr(graph, "architecture", None)
+            layout = str(getattr(architecture, "fused_qkv_layout", "contiguous") or "contiguous")
+            if layout != "contiguous" and architecture is not None:
+                rewritten = IngestionPipeline._deinterleave_fused_qkv(array, architecture)
+                if rewritten is not None:
+                    return rewritten
         if array.ndim != 2 or not any(marker in lowered for marker in ("c_attn", "c_fc", "c_proj")):
             return value
         if component in {"qkv", "gate_proj", "out_proj", "ffn"}:
             return np.ascontiguousarray(array.T)
         return value
+
+    @staticmethod
+    def _deinterleave_fused_qkv(array: Any, architecture: Any) -> Any | None:
+        """Restack an interleaved fused QKV tensor as ``[all Q | all K | all V]``.
+
+        GPT-NeoX and BLOOM lay the projection out per head as
+        ``[q, k, v][q, k, v]...``; Falcon's new decoder architecture lays it out
+        per KV group as ``[q x heads_per_group, k, v]...``.  Both are the same
+        operation with different group widths: view the rows as
+        ``(groups, heads_per_group + 2, head_dim, ...)`` and gather the query
+        rows, then the key row, then the value row.
+
+        Returns ``None`` when the tensor does not match the declared geometry,
+        so a checkpoint that already uses the contiguous layout is left alone
+        rather than silently permuted.
+        """
+        import numpy as np
+
+        source = np.asarray(array)
+        if source.ndim not in (1, 2):
+            return None
+        heads = int(getattr(architecture, "num_attention_heads", 0) or 0)
+        kv_heads = int(getattr(architecture, "num_kv_heads", 0) or heads)
+        head_dim = int(getattr(architecture, "head_dim", 0) or 0)
+        if heads <= 0 or kv_heads <= 0 or head_dim <= 0 or heads % kv_heads:
+            return None
+        per_group = heads // kv_heads
+        expected_rows = (heads + 2 * kv_heads) * head_dim
+        if int(source.shape[0]) != expected_rows:
+            return None
+        trailing = source.shape[1:]
+        grouped = source.reshape(kv_heads, per_group + 2, head_dim, *trailing)
+        query = grouped[:, :per_group].reshape(heads * head_dim, *trailing)
+        key = grouped[:, per_group].reshape(kv_heads * head_dim, *trailing)
+        value = grouped[:, per_group + 1].reshape(kv_heads * head_dim, *trailing)
+        return np.ascontiguousarray(np.concatenate((query, key, value), axis=0))
 
     @staticmethod
     def _attach_projection_biases(node: Any, candidates: list[tuple[str, Any]]) -> None:
@@ -929,15 +984,53 @@ class IngestionPipeline:
     _IGNORED_SEGMENTS = frozenset({"model", "transformer", "module", "self_attn", "mlp", "blk", "weight"})
 
     @classmethod
-    def _normalise_weight_name(cls, name: str) -> tuple[int | None, str | None]:
+    def _normalise_weight_name(
+        cls, name: str, placement: str = "pre"
+    ) -> tuple[int | None, str | None]:
         """Reduce a tensor or node name to a ``(layer_index, component)`` key.
 
         Checkpoints and graph nodes disagree on both separators (``.`` vs ``_``)
         and component naming (``self_attn.q_proj`` vs ``qkv``), so names are parsed
         into a structured key instead of string-matched. Returns ``(None, None)``
         when nothing identifiable can be extracted.
+
+        ``placement`` resolves a genuine ambiguity in the ecosystem's naming.
+        ``post_attention_layernorm`` is the *pre-FFN* norm in Llama-style blocks
+        (the name is historical), but in OLMo-2 it really is the attention
+        *output* norm, and in Gemma-2/3 it is one of four norms per block.  The
+        architecture's declared normalization placement is what distinguishes
+        them; nothing in the tensor name alone can.
         """
         import re
+
+        lowered_placement = str(placement or "pre").lower()
+        if lowered_placement in {"post", "sandwich"}:
+            layer_scope = re.search(
+                r"(?:^|_)(?:layers?|blocks?|blk|h)[._](\d+)(?:[._]|$)",
+                name.lower().replace(".", "_"),
+            )
+            if layer_scope is not None:
+                scoped = name.lower().replace(".", "_")
+                index = int(layer_scope.group(1))
+                if lowered_placement == "post":
+                    # OLMo-2: the two stored norms are sublayer *output* norms
+                    # and fill the two standard slots.
+                    if re.search(r"(?:^|_)post_attention_layernorm(?:_|$)", scoped):
+                        return index, "rmsnorm"
+                    if re.search(r"(?:^|_)post_feedforward_layernorm(?:_|$)", scoped):
+                        return index, "ffn_norm"
+                else:
+                    # Gemma-2/3, EXAONE-4: four norms per block.
+                    if re.search(r"(?:^|_)post_attention_layernorm(?:_|$)", scoped):
+                        return index, "post_attention_norm"
+                    if re.search(r"(?:^|_)pre_feedforward_layernorm(?:_|$)", scoped):
+                        return index, "ffn_norm"
+                    if re.search(r"(?:^|_)post_feedforward_layernorm(?:_|$)", scoped):
+                        return index, "post_ffn_norm"
+                    if re.search(r"(?:^|_)post_attention_norm(?:_|$)", scoped):
+                        return index, "post_attention_norm"
+                    if re.search(r"(?:^|_)post_ffn_norm(?:_|$)", scoped):
+                        return index, "post_ffn_norm"
 
         normalized = name.lower().replace(".", "_")
         mtp_match = re.search(
@@ -2360,6 +2453,32 @@ class IngestionPipeline:
                 source=(norm_node.id if bool(getattr(architecture, "parallel_residual", False)) else residual_add_node.id),
                 target=ffn_norm_node.id,
             ))
+
+            # Sandwich-normalized blocks (Gemma-2/3, EXAONE-4) carry two extra
+            # learned norms per layer, applied to each sublayer's output before
+            # the residual add.  They must exist as parameter-bearing nodes or
+            # the source tensors would be dropped during binding.
+            if str(getattr(architecture, "norm_placement", "pre") or "pre").lower() == "sandwich":
+                for component, source_id in (
+                    ("post_attention_norm", out_proj_node.id),
+                    ("post_ffn_norm", ffn_norm_node.id),
+                ):
+                    sandwich_node = AEGGraphNode(
+                        id=f"{layer_prefix}_{component}",
+                        node_type=AEGGraphNodeType.OPERATION,
+                        name=f"Layer {layer} {component}",
+                        op_type=(
+                            "layernorm"
+                            if str(getattr(architecture, "norm_type", "RMSNorm")).lower() == "layernorm"
+                            else "rmsnorm"
+                        ),
+                        inputs=[source_id],
+                        attributes={"eps": architecture.norm_eps, "hidden_size": h},
+                        precision=None,
+                        layer_index=layer,
+                    )
+                    graph.add_node(sandwich_node)
+                    graph.add_edge(AEGGraphEdge(source=source_id, target=sandwich_node.id))
 
             if is_moe_layer:
                 # MoE FFN with a real router parameter and separate expert

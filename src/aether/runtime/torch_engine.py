@@ -23,6 +23,60 @@ import numpy as np
 from aether.runtime.positional import alibi_slopes
 
 
+def _multiplier(value: Any) -> float | None:
+    """Coerce a scalar multiplier, treating absence and ``1.0`` as "none".
+
+    A missing multiplier means the architecture declares none; an explicit
+    ``1.0`` is a no-op that should not cost a kernel launch per token.
+    """
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if number == 1.0 else number
+
+
+def _cap(value: Any) -> float | None:
+    """Coerce a soft-cap limit; only a positive value is meaningful."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+#: Execution-numerics fields carried by :class:`~aether.runtime.cpu_engine.ModelWeights`.
+#: Listed once so every accelerator executor that rebuilds a reduced weight
+#: container (tensor-parallel sharding) propagates the complete contract instead
+#: of silently reverting part of the model to Llama-style defaults.
+EXECUTION_NUMERICS_FIELDS: tuple[str, ...] = (
+    "attention_scale",
+    "attention_scale_by_layer_index",
+    "embedding_scale",
+    "residual_scale",
+    "logit_scale",
+    "attn_logit_softcap",
+    "final_logit_softcap",
+    "norm_offset_one",
+    "rope_partial_dim",
+    "rope_interleaved",
+    "rope_local_theta",
+    "norm_placement",
+    "qk_norm_scope",
+    "no_rope_layers",
+    "gelu_approximate",
+)
+
+
+def execution_numerics(source: Any) -> dict[str, Any]:
+    """Extract the execution-numerics contract from a weight container."""
+    return {name: getattr(source, name, None) for name in EXECUTION_NUMERICS_FIELDS}
+
+
 @dataclass
 class TorchKVCache:
     """Device-resident incremental KV state used by :class:`TorchAEGEngine`."""
@@ -76,23 +130,20 @@ class TorchAEGEngine:
         self._alibi_slopes = self._tensor(alibi_slopes(self.num_heads))
         if self.num_heads % self.num_kv_heads:
             raise ValueError("query heads must be divisible by KV heads")
-        # The AEG metadata may contain approximate sparse/KV plans selected by
-        # the CPU target.  Those plans are not portable PyTorch kernels: using
-        # them here would silently change the model's attention graph.  Keep
-        # the exact dense implementation as the safe accelerator fallback.
-        # This is intentionally a fallback, not an error: a compiled artifact
-        # must remain runnable on a different supported target.
-        self._ignored_optimized_plans = {
-            "sparse_attention": bool(cpu_engine.sparse_attention_plan),
-            "semantic_kv": bool(cpu_engine.semantic_kv_plan),
-            "cross_layer_kv": bool(cpu_engine.cross_layer_kv_plan),
-        }
+
+        # ── Execution numerics ─────────────────────────────────────────────
+        # Resolved once here so the decode loop performs no string handling,
+        # attribute probing, or Python-level branching per layer.  These are
+        # the source architecture's own constants; see
+        # aether.core.types.ModelArchitecture.
+        self._resolve_execution_numerics()
+
         self.embedding = self._tensor(self.weights.embedding)
-        self.final_norm = self._tensor(self.weights.final_norm)
+        self.final_norm = self._norm_tensor(self.weights.final_norm)
         self.final_norm_bias = self._optional_tensor(getattr(self.weights, "final_norm_bias", None))
         self.lm_head = self._tensor(self.weights.lm_head)
         self.embedding_norm = (
-            self._tensor(self.weights.embedding_norm)
+            self._norm_tensor(self.weights.embedding_norm)
             if self.weights.embedding_norm is not None else None
         )
         self.embedding_norm_bias = (
@@ -106,25 +157,150 @@ class TorchAEGEngine:
         self.layers = [self._convert_layer(layer) for layer in self.weights.layers]
         self._cos: Any | None = None
         self._sin: Any | None = None
+        self._local_cos: Any | None = None
+        self._local_sin: Any | None = None
+        # Cached key-position ranges, indexed by length.  ``torch.arange`` was
+        # previously allocated once per layer per decoded token.
+        self._positions_cache: Any | None = None
+        # The AEG metadata may contain approximate sparse/KV plans selected by
+        # the CPU target.  Those plans are not portable PyTorch kernels: using
+        # them here would silently change the model's attention graph.  Keep
+        # the exact dense implementation as the safe accelerator fallback.
+        # This is intentionally a fallback, not an error: a compiled artifact
+        # must remain runnable on a different supported target.
+        self._ignored_optimized_plans = {
+            "sparse_attention": bool(cpu_engine.sparse_attention_plan),
+            "semantic_kv": bool(cpu_engine.semantic_kv_plan),
+            "cross_layer_kv": bool(cpu_engine.cross_layer_kv_plan),
+        }
+
+    def _resolve_execution_numerics(self) -> None:
+        """Resolve the architecture's scalar constants and per-layer schedule.
+
+        Called once at construction.  Every value comes from the AEG's declared
+        execution numerics, so the decode loop performs no string handling,
+        attribute probing, or Python-level branching per layer — on a small model
+        that bookkeeping costs more than the GEMMs themselves.
+
+        Accelerator executors that rebuild a reduced weight container (the
+        tensor-parallel sharder) call this as well, so the complete contract is
+        never silently reverted to Llama-style defaults.
+        """
+        weights = self.weights
+        declared_rotary = getattr(weights, "rope_partial_dim", None)
+        rotary = int(declared_rotary) if declared_rotary else self.head_dim
+        rotary = max(2, min(rotary, self.head_dim))
+        if rotary % 2:
+            rotary -= 1
+        self.rotary_dim = rotary
+        self.rope_interleaved = bool(getattr(weights, "rope_interleaved", False))
+        self.rope_theta = float(weights.rope_theta)
+        local_theta = getattr(weights, "rope_local_theta", None)
+        self.rope_local_theta = (
+            float(local_theta)
+            if local_theta and float(local_theta) != self.rope_theta
+            else None
+        )
+        declared_scale = getattr(weights, "attention_scale", None)
+        self.base_attention_scale = (
+            float(declared_scale)
+            if declared_scale is not None and float(declared_scale) > 0
+            else 1.0 / float(np.sqrt(self.head_dim))
+        )
+        self.scale_by_layer_index = bool(
+            getattr(weights, "attention_scale_by_layer_index", False)
+        )
+        self.embedding_scale = _multiplier(getattr(weights, "embedding_scale", None))
+        self.residual_scale = _multiplier(getattr(weights, "residual_scale", None))
+        self.logit_scale = _multiplier(getattr(weights, "logit_scale", None))
+        self.attn_logit_softcap = _cap(getattr(weights, "attn_logit_softcap", None))
+        self.final_logit_softcap = _cap(getattr(weights, "final_logit_softcap", None))
+        self.norm_offset_one = bool(getattr(weights, "norm_offset_one", False))
+        self.norm_placement = str(getattr(weights, "norm_placement", "pre") or "pre").lower()
+        self.qk_norm_is_full = (
+            str(getattr(weights, "qk_norm_scope", "head") or "head").lower() == "full"
+        )
+        self.gelu_approximate = bool(getattr(weights, "gelu_approximate", True))
+        # PyTorch 2.4+ exposes a fused RMSNorm that accumulates in FP32.  It
+        # replaces a seven-op reduction per normalization — with four norms per
+        # layer that is the single largest source of launch overhead in decode.
+        self._fused_rms_norm = getattr(self.torch.nn.functional, "rms_norm", None)
+        self.parallel_residual = bool(getattr(weights, "parallel_residual", False))
+        self.is_layernorm = str(weights.norm_type).lower() == "layernorm"
+        position_type = str(weights.position_type or "RoPE").lower()
+        self.uses_rope = position_type in {"rope", "rotary", "rotary_embedding"}
+        self.is_alibi = position_type in {"alibi", "alibi_bias"}
+        self.norm_eps = float(weights.norm_eps)
+        ffn_kind = str(weights.ffn_type or "SwiGLU").lower()
+        self.ffn_is_gelu = ffn_kind in {"gelu", "geglu"}
+        self.ffn_is_relu = ffn_kind == "relu"
+        self.ffn_is_relu2 = ffn_kind == "relu2"
+        no_rope = getattr(weights, "no_rope_layers", None)
+        self._no_rope_layers = frozenset(int(value) for value in (no_rope or ()))
+
+        # Per-layer static schedule.  Reading ``attention_layers`` and
+        # ``attention_window`` inside the decode loop cost a string compare and
+        # two attribute lookups per layer per token; a small model spends more
+        # time on that than on its GEMMs.
+        attention_layers = getattr(weights, "attention_layers", None)
+        window = int(getattr(weights, "attention_window", 0) or 0)
+        self.layer_plan: list[tuple[bool, int | None, float, bool]] = []
+        for index in range(self.num_layers):
+            kind = (
+                str(attention_layers[index]).lower()
+                if isinstance(attention_layers, list) and index < len(attention_layers)
+                else "global"
+            )
+            local = kind in {"local", "sliding_window", "window"} and window > 0
+            scale = self.base_attention_scale
+            if self.scale_by_layer_index:
+                scale = scale / float(index + 1)
+            self.layer_plan.append(
+                (local, window if local else None, scale, self.uses_rope and index not in self._no_rope_layers)
+            )
 
     def _tensor(self, value: Any) -> Any:
         return self.torch.as_tensor(
             np.asarray(value, dtype=np.float32), device=self.device, dtype=self.compute_dtype
         )
 
+    def _norm_tensor(self, value: Any) -> Any:
+        """Materialize a normalization weight in its effective form.
+
+        Gemma stores normalization weights as offsets from unity, so the scale
+        actually applied is ``1 + w``.  Folding the offset in once at load time
+        keeps it out of the per-token path.
+        """
+        array = np.asarray(value, dtype=np.float32)
+        if self.norm_offset_one:
+            array = array + np.float32(1.0)
+        return self.torch.as_tensor(array, device=self.device, dtype=self.compute_dtype)
+
     def _optional_tensor(self, value: Any | None) -> Any | None:
         return None if value is None else self._tensor(value)
 
+    def _optional_norm_tensor(self, value: Any | None) -> Any | None:
+        return None if value is None else self._norm_tensor(value)
+
     def _convert_layer(self, layer: Any) -> dict[str, Any | None]:
-        converted = {
-            name: self._optional_tensor(getattr(layer, name))
+        converted: dict[str, Any | None] = {
+            name: self._optional_tensor(getattr(layer, name, None))
             for name in (
-                "attention_norm", "attention_norm_bias", "q_proj", "k_proj", "v_proj",
-                "o_proj", "q_norm", "k_norm", "ffn_norm", "ffn_norm_bias", "gate_proj",
-                "up_proj", "down_proj", "q_proj_bias", "k_proj_bias", "v_proj_bias",
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+                "attention_norm_bias", "ffn_norm_bias",
+                "q_proj_bias", "k_proj_bias", "v_proj_bias",
                 "o_proj_bias", "gate_proj_bias", "up_proj_bias", "down_proj_bias",
+                "post_attention_norm_bias", "post_ffn_norm_bias",
             )
         }
+        # Normalization weights carry the architecture's unity-offset
+        # convention, so they must be materialized through _norm_tensor.
+        for name in (
+            "attention_norm", "ffn_norm", "q_norm", "k_norm",
+            "post_attention_norm", "post_ffn_norm",
+        ):
+            converted[name] = self._optional_norm_tensor(getattr(layer, name, None))
         converted["router"] = self._optional_tensor(getattr(layer, "router", None))
         converted["experts"] = [
             {
@@ -139,21 +315,30 @@ class TorchAEGEngine:
         # The concatenation is algebraically lossless and removes two launch
         # boundaries from the decode hot path.  Keep the logical AEG layout in
         # the source engine; only the device resident representation is packed.
+        hidden = int(self.weights.embedding.shape[1])
+
+        def canonical(value: Any, role: str) -> Any:
+            """Return ``value`` oriented as ``(out_features, hidden)``.
+
+            Some source checkpoints store Conv1D weights transposed relative to
+            ``nn.Linear``.  Packing must happen in one orientation, otherwise
+            the concatenation joins the wrong axis and the fused GEMM contracts
+            over the output dimension.
+            """
+            if int(value.shape[1]) == hidden:
+                return value
+            if int(value.shape[0]) == hidden:
+                return value.transpose(0, 1)
+            raise ValueError(
+                f"{role} projection does not contract the model hidden size: "
+                f"{tuple(value.shape)} vs {hidden}"
+            )
+
         q, k, v = converted["q_proj"], converted["k_proj"], converted["v_proj"]
         if q is not None and k is not None and v is not None:
-            hidden = int(self.weights.hidden_size)
-
-            def canonical(value: Any) -> Any:
-                if int(value.shape[1]) == hidden:
-                    return value
-                if int(value.shape[0]) == hidden:
-                    return value.transpose(0, 1)
-                raise ValueError(
-                    "attention projection does not contract the model hidden size: "
-                    f"{tuple(value.shape)} vs {hidden}"
-                )
-
-            q, k, v = canonical(q), canonical(k), canonical(v)
+            q = canonical(q, "attention")
+            k = canonical(k, "attention")
+            v = canonical(v, "attention")
             biases = (
                 converted["q_proj_bias"],
                 converted["k_proj_bias"],
@@ -169,6 +354,10 @@ class TorchAEGEngine:
                 converted["q_proj_bias"] = converted["k_proj_bias"] = converted["v_proj_bias"] = None
 
         gate, up = converted["gate_proj"], converted["up_proj"]
+        if gate is not None and up is not None:
+            gate = canonical(gate, "FFN gate")
+            up = canonical(up, "FFN up")
+            converted["gate_proj"], converted["up_proj"] = gate, up
         if gate is not None and up is not None and int(gate.shape[1]) == int(up.shape[1]):
             gate_bias, up_bias = converted["gate_proj_bias"], converted["up_proj_bias"]
             if (gate_bias is None) == (up_bias is None):
@@ -186,25 +375,80 @@ class TorchAEGEngine:
         device = device or self.device
         if self._cos is not None and int(self._cos.shape[0]) >= required and self._cos.device == device:
             return
-        half = self.head_dim // 2
+        capacity = max(int(required), 2 * int(self._cos.shape[0]) if self._cos is not None else 0, 16)
+        self._cos, self._sin = self._rope_tables(self.rope_theta, capacity, device)
+        if self.rope_local_theta is not None:
+            self._local_cos, self._local_sin = self._rope_tables(
+                self.rope_local_theta, capacity, device
+            )
+
+    def _rope_tables(self, theta: float, required: int, device: Any) -> tuple[Any, Any]:
+        """Build cos/sin tables for one rotary base.
+
+        The table spans ``rotary_dim / 2`` frequencies, which is the full head
+        half-width unless the architecture rotates only a prefix of each head
+        (GPT-NeoX, GPT-J, StableLM, Phi).  Angles are computed in FP32 and the
+        result is stored in the compute dtype, so the per-token path performs no
+        dtype conversion.
+        """
+        half = self.rotary_dim // 2
         positions = self.torch.arange(required, device=device, dtype=self.torch.float32)[:, None]
-        exponent = self.torch.arange(half, device=device, dtype=self.torch.float32) * (2.0 / self.head_dim)
-        inv_freq = self.weights.rope_theta ** (-exponent)
+        exponent = self.torch.arange(half, device=device, dtype=self.torch.float32) * (
+            2.0 / self.rotary_dim
+        )
+        inv_freq = theta ** (-exponent)
         angles = positions * inv_freq[None, :]
-        self._cos = self.torch.cos(angles)
-        self._sin = self.torch.sin(angles)
+        return (
+            self.torch.cos(angles).to(dtype=self.compute_dtype),
+            self.torch.sin(angles).to(dtype=self.compute_dtype),
+        )
+
+    def _rope_slice(self, positions: Any, *, local: bool) -> tuple[Any, Any]:
+        """Gather the cos/sin rows for ``positions``, shaped for broadcasting.
+
+        Hoisted out of the layer loop: the rotation factors depend only on the
+        positions and the rotary base, so a decode step needs them once rather
+        than twice per layer.
+        """
+        cos_table, sin_table = (
+            (self._local_cos, self._local_sin)
+            if local and self._local_cos is not None
+            else (self._cos, self._sin)
+        )
+        assert cos_table is not None and sin_table is not None
+        return (
+            cos_table.index_select(0, positions).unsqueeze(1),
+            sin_table.index_select(0, positions).unsqueeze(1),
+        )
+
+    def _key_positions(self, total: int) -> Any:
+        """Return ``arange(total)`` from a cached, monotonically grown buffer.
+
+        The decode loop needs this once per layer per token.  Allocating it each
+        time dominates the step for a small model, so grow one buffer instead.
+        """
+        cache = self._positions_cache
+        if cache is None or int(cache.shape[0]) < total:
+            capacity = max(total, 2 * int(cache.shape[0]) if cache is not None else 0, 64)
+            cache = self.torch.arange(capacity, device=self.device, dtype=self.torch.long)
+            self._positions_cache = cache
+        return cache[:total]
 
     def _norm(self, x: Any, weight: Any, bias: Any | None = None) -> Any:
-        eps = float(self.weights.norm_eps)
-        if str(self.weights.norm_type).lower() == "layernorm":
+        if self.is_layernorm:
             return self.torch.nn.functional.layer_norm(
-                x, (int(x.shape[-1]),), weight, bias, eps
+                x, (int(x.shape[-1]),), weight, bias, self.norm_eps
             )
+        if self._fused_rms_norm is not None:
+            # One fused kernel instead of the seven-op reduction below.  It
+            # accumulates in FP32 internally, so it is both faster and at least
+            # as accurate as the manual form.
+            return self._fused_rms_norm(x, (int(x.shape[-1]),), weight, self.norm_eps)
         # Accumulate the RMS in FP32 even when activations use FP16.  This is
         # the standard stable RMSNorm evaluation and avoids quality loss from
         # a half-precision reduction over a large hidden dimension.
         rms = self.torch.rsqrt(
-            x.float().pow(2).mean(dim=-1, keepdim=True) + eps
+            x.float().pow(2).mean(dim=-1, keepdim=True) + self.norm_eps
         ).to(dtype=x.dtype)
         return x * rms * weight
 
@@ -230,29 +474,59 @@ class TorchAEGEngine:
             )
         return self.torch.nn.functional.linear(x, canonical, bias)
 
-    def _rope(self, x: Any, positions: Any) -> Any:
-        assert self._cos is not None and self._sin is not None
-        cos = self._cos.index_select(0, positions).unsqueeze(1).to(dtype=x.dtype)
-        sin = self._sin.index_select(0, positions).unsqueeze(1).to(dtype=x.dtype)
-        # AEG's canonical RoPE layout is the half-split form used by the
-        # reference CPU kernel: [x_0..x_h, x_h..x_2h], not an interleaved
-        # even/odd layout.  Keeping this convention makes CPU and accelerator
-        # execution numerically equivalent across model families.
-        half = self.head_dim // 2
-        first, second = x[..., :half], x[..., half:]
-        return self.torch.cat((first * cos - second * sin, second * cos + first * sin), dim=-1)
+    def _rope(self, x: Any, cos: Any, sin: Any) -> Any:
+        """Rotate ``(seq, heads, head_dim)`` using the declared RoPE convention.
+
+        Three source conventions are supported and are not interchangeable:
+        half-split pairing ``(x_i, x_{i+d/2})`` used by GPT-NeoX, Llama, Qwen
+        and Mistral; interleaved pairing ``(x_{2i}, x_{2i+1})`` published by
+        GPT-J and Cohere; and partial rotation, which leaves the trailing
+        ``head_dim - rotary_dim`` channels untouched.
+
+        ``cos``/``sin`` are prepared once per step by :meth:`_rope_slice`;
+        sliding-window layers may pass factors from a separate rotary base
+        (Gemma-3).
+        """
+        rotary = self.rotary_dim
+        half = rotary // 2
+        full = int(x.shape[-1])
+        if self.rope_interleaved:
+            even = x[..., 0:rotary:2]
+            odd = x[..., 1:rotary:2]
+            rotated = self.torch.stack(
+                (even * cos - odd * sin, odd * cos + even * sin), dim=-1
+            ).flatten(-2)
+        else:
+            first, second = x[..., :half], x[..., half:rotary]
+            rotated = self.torch.cat(
+                (first * cos - second * sin, second * cos + first * sin), dim=-1
+            )
+        if rotary == full:
+            return rotated
+        return self.torch.cat((rotated, x[..., rotary:]), dim=-1)
 
     def _activation(self, gate: Any, up: Any | None) -> Any:
-        kind = str(self.weights.ffn_type or "SwiGLU").lower()
+        torch = self.torch
         if up is None:
-            if kind == "relu":
-                return self.torch.relu(gate)
-            if kind == "relu2":
-                return self.torch.relu(gate).pow(2)
-            return self.torch.nn.functional.gelu(gate, approximate="tanh")
-        if kind in {"gelu", "geglu"}:
-            return self.torch.nn.functional.gelu(gate, approximate="tanh") * up
-        return self.torch.nn.functional.silu(gate) * up
+            if self.ffn_is_relu:
+                return torch.relu(gate)
+            if self.ffn_is_relu2:
+                return torch.relu(gate).pow(2)
+            return self._gelu(gate)
+        if self.ffn_is_gelu:
+            return self._gelu(gate) * up
+        return torch.nn.functional.silu(gate) * up
+
+    def _gelu(self, value: Any) -> Any:
+        """Evaluate GELU in the form the source architecture declares."""
+        return self.torch.nn.functional.gelu(
+            value, approximate="tanh" if self.gelu_approximate else "none"
+        )
+
+    def _softcap(self, value: Any, cap: float) -> Any:
+        """Bound a tensor with ``cap * tanh(value / cap)`` (Gemma-2)."""
+        limit = float(cap)
+        return self.torch.tanh(value / limit) * limit
 
     def _moe_ffn(self, hidden: Any, layer: dict[str, Any]) -> Any:
         """Execute top-k routed SwiGLU experts on the selected device."""
@@ -288,6 +562,7 @@ class TorchAEGEngine:
         query_positions: Any,
         key_positions: Any,
         window_size: int | None = None,
+        scale: float | None = None,
     ) -> Any:
         """Exact attention, dispatching to PyTorch's fused SDPA when possible.
 
@@ -297,8 +572,7 @@ class TorchAEGEngine:
         cache implementations that compact rows.
         """
         torch = self.torch
-        position_type = str(self.weights.position_type or "RoPE").lower()
-        is_alibi = position_type in {"alibi", "alibi_bias"}
+        is_alibi = self.is_alibi
         query_length = int(q.shape[0])
         key_length = int(k.shape[0])
         is_prefill = query_length > 1 and key_length == query_length
@@ -310,13 +584,24 @@ class TorchAEGEngine:
         # destroying decode throughput.
         contiguous = True
         local = window_size is not None and int(window_size) > 0
+        if local and key_length <= int(window_size):
+            # Every cached key is inside the window, so the sliding constraint
+            # is vacuous.  Dropping it lets SDPA keep its fused path instead of
+            # falling back to the math backend for an all-true mask — material
+            # for GPT-Neo and Gemma, where half or more of the layers are local.
+            local = False
+            window_size = None
+        scale = self.base_attention_scale if scale is None else float(scale)
+        softcap = self.attn_logit_softcap
 
         # SDPA accepts [batch, heads, query, dim].  enable_gqa avoids
         # materializing repeated KV heads on supported PyTorch versions.
-        q4 = q.transpose(0, 1).unsqueeze(0)
-        k4 = k.transpose(0, 1).unsqueeze(0)
-        v4 = v.transpose(0, 1).unsqueeze(0)
-        if not is_alibi:
+        # SDPA has no soft-capping stage, so architectures that declare one
+        # (Gemma-2) must take the exact path below.
+        if not is_alibi and not softcap:
+            q4 = q.transpose(0, 1).unsqueeze(0)
+            k4 = k.transpose(0, 1).unsqueeze(0)
+            v4 = v.transpose(0, 1).unsqueeze(0)
             attn_mask = None
             is_causal = bool(is_prefill and contiguous and not local)
             if not is_causal and not (query_length == 1 and not local):
@@ -335,6 +620,7 @@ class TorchAEGEngine:
                     "attn_mask": attn_mask,
                     "dropout_p": 0.0,
                     "is_causal": is_causal,
+                    "scale": scale,
                 }
                 if self.num_kv_heads != self.num_heads:
                     sdpa_kwargs["enable_gqa"] = True
@@ -353,10 +639,14 @@ class TorchAEGEngine:
         else:
             k_full = k.repeat_interleave(repeats, dim=1)
             v_full = v.repeat_interleave(repeats, dim=1)
-        scores = torch.einsum("qhd,khd->hqk", q, k_full) / np.sqrt(self.head_dim)
+        scores = torch.einsum("qhd,khd->hqk", q, k_full) * scale
         if is_alibi:
             distance = key_positions[None, :] - query_positions[:, None]
             scores = scores + self._alibi_slopes[:, None, None] * distance.to(dtype=scores.dtype)[None, :, :]
+        if softcap:
+            # Gemma-2 bounds attention logits before masking; capping after the
+            # mask would turn -inf into -cap and admit masked positions.
+            scores = self._softcap(scores, softcap)
         allowed = key_positions[None, :] <= query_positions[:, None]
         if local:
             allowed &= key_positions[None, :] >= query_positions[:, None] - int(window_size) + 1
@@ -364,12 +654,17 @@ class TorchAEGEngine:
         probs = torch.softmax(scores, dim=-1)
         return torch.einsum("hqk,khd->qhd", probs, v_full)
 
-    def _append_kv(self, old: Any | None, value: Any, past: int, total: int) -> Any:
-        """Append KV in amortized-linear storage instead of copying the prefix."""
+    def _append_kv(self, old: Any | None, value: Any, past: int, total: int, reserve: int = 0) -> Any:
+        """Append KV in amortized-linear storage instead of copying the prefix.
+
+        ``reserve`` lets a caller that already knows the final sequence length
+        allocate once, removing every reallocation and prefix copy from the
+        decode loop.
+        """
         torch = self.torch
         if old is None or int(old.shape[0]) < total:
             old_capacity = 0 if old is None else int(old.shape[0])
-            capacity = max(total, max(16, old_capacity * 2))
+            capacity = max(total, reserve, max(16, old_capacity * 2))
             result = torch.empty(
                 (capacity, *tuple(value.shape[1:])), dtype=value.dtype, device=value.device
             )
@@ -386,6 +681,7 @@ class TorchAEGEngine:
         cache: TorchKVCache | None = None,
         *,
         validate_ids: bool = False,
+        reserve: int = 0,
     ) -> tuple[Any, TorchKVCache]:
         """Forward pass that keeps logits on the accelerator for generation."""
         torch = self.torch
@@ -412,29 +708,43 @@ class TorchAEGEngine:
         past = int(cache.length)
         seq_len = int(ids.numel())
         positions = torch.arange(past, past + seq_len, device=self.device, dtype=torch.long)
-        uses_rope = str(self.weights.position_type or "RoPE").lower() in {"rope", "rotary", "rotary_embedding"}
-        if uses_rope:
+        if self.uses_rope:
             self._ensure_rope(past + seq_len)
         hidden = self.embedding.index_select(0, ids)
+        if self.embedding_scale is not None:
+            # Gemma scales embeddings by sqrt(hidden_size); Granite uses an
+            # explicit embedding_multiplier.  Both are part of the model.
+            hidden = hidden * hidden.new_tensor(self.embedding_scale)
         if self.embedding_norm is not None:
             hidden = self._norm(hidden, self.embedding_norm, self.embedding_norm_bias)
         if self.position_embedding is not None:
             hidden = hidden + self.position_embedding.index_select(0, positions)
 
+        post_norm = self.norm_placement == "post"
+        parallel = self.parallel_residual
+        residual_scale = self.residual_scale
+        # The rotation factors depend only on the positions and the rotary base,
+        # so gather them once per step instead of twice per layer.
+        rope_global = self._rope_slice(positions, local=False) if self.uses_rope else None
+        rope_local = (
+            self._rope_slice(positions, local=True)
+            if self.uses_rope and self._local_cos is not None
+            else rope_global
+        )
         with torch.inference_mode():
             for index, layer in enumerate(self.layers):
-                attention_layers = getattr(self.weights, "attention_layers", None)
-                attention_kind = (
-                    str(attention_layers[index]).lower()
-                    if isinstance(attention_layers, list) and index < len(attention_layers)
-                    else "global"
+                local_attention, attention_window, attention_scale, layer_uses_rope = (
+                    self.layer_plan[index]
                 )
-                local_attention = attention_kind in {"local", "sliding_window", "window"}
-                attention_window = (
-                    int(getattr(self.weights, "attention_window", 0) or 0)
-                    if local_attention else None
-                )
-                normed = self._norm(hidden, layer["attention_norm"], layer["attention_norm_bias"])
+                block_input = hidden
+                if post_norm:
+                    # OLMo-2 feeds the raw residual into each sublayer and
+                    # normalizes the sublayer output instead.
+                    normed = hidden
+                else:
+                    normed = self._norm(
+                        hidden, layer["attention_norm"], layer["attention_norm_bias"]
+                    )
                 if layer.get("qkv_weight") is not None:
                     qkv = self._linear(normed, layer["qkv_weight"], layer["qkv_bias"])
                     q_width = int(layer["q_width"])
@@ -446,23 +756,31 @@ class TorchAEGEngine:
                     q = self._linear(normed, layer["q_proj"], layer["q_proj_bias"])
                     k = self._linear(normed, layer["k_proj"], layer["k_proj_bias"])
                     v = self._linear(normed, layer["v_proj"], layer["v_proj_bias"])
+                if self.qk_norm_is_full:
+                    # OLMo-2 normalizes the whole projection, before it is
+                    # split into heads.
+                    if layer["q_norm"] is not None:
+                        q = self._norm(q, layer["q_norm"])
+                    if layer["k_norm"] is not None:
+                        k = self._norm(k, layer["k_norm"])
                 q = q.reshape(seq_len, self.num_heads, self.head_dim)
-                if layer["q_norm"] is not None:
-                    q = self._norm(q, layer["q_norm"])
-                if uses_rope:
-                    q = self._rope(q, positions)
                 k = k.reshape(seq_len, self.num_kv_heads, self.head_dim)
-                if layer["k_norm"] is not None:
-                    k = self._norm(k, layer["k_norm"])
+                if not self.qk_norm_is_full:
+                    if layer["q_norm"] is not None:
+                        q = self._norm(q, layer["q_norm"])
+                    if layer["k_norm"] is not None:
+                        k = self._norm(k, layer["k_norm"])
+                if layer_uses_rope:
+                    cos, sin = rope_local if local_attention else rope_global
+                    q = self._rope(q, cos, sin)
+                    k = self._rope(k, cos, sin)
                 v = v.reshape(seq_len, self.num_kv_heads, self.head_dim)
-                if uses_rope:
-                    k = self._rope(k, positions)
                 total = past + seq_len
-                k_all = self._append_kv(cache.keys[index], k, past, total)
-                v_all = self._append_kv(cache.values[index], v, past, total)
+                k_all = self._append_kv(cache.keys[index], k, past, total, reserve)
+                v_all = self._append_kv(cache.values[index], v, past, total, reserve)
                 context = self._attention(
                     q, k_all[:total], v_all[:total], positions,
-                    torch.arange(total, device=self.device), attention_window,
+                    self._key_positions(total), attention_window, attention_scale,
                 )
                 cache.keys[index] = k_all
                 cache.values[index] = v_all
@@ -470,12 +788,35 @@ class TorchAEGEngine:
                     context.reshape(seq_len, self.num_heads * self.head_dim),
                     layer["o_proj"], layer["o_proj_bias"],
                 )
-                if bool(getattr(self.weights, "parallel_residual", False)):
-                    # GPT-J and other parallel-residual blocks evaluate both
-                    # branches from the same normalized input:
-                    #   y = x + Attn(LN(x)) + FFN(LN(x)).
-                    # Treating them as sequential changes every later logit.
-                    ffn_input = normed
+                # ``sandwich`` blocks normalize the sublayer output too
+                # (Gemma-2/3, EXAONE-4); ``post`` blocks normalize it instead
+                # of the input (OLMo-2).  Both precede the residual add.
+                if layer["post_attention_norm"] is not None:
+                    attention_out = self._norm(
+                        attention_out,
+                        layer["post_attention_norm"],
+                        layer["post_attention_norm_bias"],
+                    )
+                elif post_norm:
+                    attention_out = self._norm(
+                        attention_out, layer["attention_norm"], layer["attention_norm_bias"]
+                    )
+                if residual_scale is not None:
+                    attention_out = attention_out * attention_out.new_tensor(residual_scale)
+
+                if parallel:
+                    # GPT-J, GPT-NeoX, Falcon and Cohere evaluate the
+                    # feed-forward branch from the *block input*, not from the
+                    # post-attention state:
+                    #   y = x + Attn(N1(x)) + FFN(N2(x)).
+                    # Checkpoints with a single block norm bind ffn_norm to the
+                    # same tensor, so one rule covers both spellings.
+                    ffn_input = self._norm(
+                        block_input, layer["ffn_norm"], layer["ffn_norm_bias"]
+                    )
+                elif post_norm:
+                    hidden = block_input + attention_out
+                    ffn_input = hidden
                 else:
                     hidden = hidden + attention_out
                     ffn_input = self._norm(
@@ -493,13 +834,24 @@ class TorchAEGEngine:
                         gate = self._linear(ffn_input, layer["gate_proj"], layer["gate_proj_bias"])
                         up = self._linear(ffn_input, layer["up_proj"], layer["up_proj_bias"]) if layer["up_proj"] is not None else None
                     ffn_out = self._linear(self._activation(gate, up), layer["down_proj"], layer["down_proj_bias"])
-                hidden = (
-                    hidden + attention_out + ffn_out
-                    if bool(getattr(self.weights, "parallel_residual", False))
-                    else hidden + ffn_out
-                )
+                if layer["post_ffn_norm"] is not None:
+                    ffn_out = self._norm(
+                        ffn_out, layer["post_ffn_norm"], layer["post_ffn_norm_bias"]
+                    )
+                elif post_norm:
+                    ffn_out = self._norm(ffn_out, layer["ffn_norm"], layer["ffn_norm_bias"])
+                if residual_scale is not None:
+                    ffn_out = ffn_out * ffn_out.new_tensor(residual_scale)
+                if parallel:
+                    hidden = block_input + attention_out + ffn_out
+                else:
+                    hidden = hidden + ffn_out
             hidden = self._norm(hidden, self.final_norm, self.final_norm_bias)
             logits = self._linear(hidden, self.lm_head)
+            if self.logit_scale is not None:
+                logits = logits * logits.new_tensor(self.logit_scale)
+            if self.final_logit_softcap:
+                logits = self._softcap(logits, self.final_logit_softcap)
             cache.length = past + seq_len
             cache.last_logits = logits[-1].detach()
         return logits, cache
@@ -536,7 +888,10 @@ class TorchAEGEngine:
             raise ValueError("max_tokens must be positive")
         ids = np.asarray(prompt_ids, dtype=np.int64).reshape(-1)
         if ids.size:
-            _, cache = self._forward_device(ids, cache, validate_ids=True)
+            # The final sequence length is known here, so the KV cache can be
+            # sized once instead of doubling during decode.
+            reserve = int(ids.size) + int(max_tokens) + (0 if cache is None else int(cache.length))
+            _, cache = self._forward_device(ids, cache, validate_ids=True, reserve=reserve)
             next_logits = cache.last_logits
         elif cache is not None and cache.last_logits is not None:
             next_logits = cache.last_logits

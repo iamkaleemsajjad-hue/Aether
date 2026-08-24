@@ -94,7 +94,7 @@ class ArchitectureDetector:
             try:
                 config = self._load_config_json(model)
                 if config:
-                    return self._from_config(config)
+                    return self._reconcile_with_checkpoint(self._from_config(config), model)
             except Exception as exc:  # noqa: BLE001 - continue to bounded fallbacks
                 logger.warning("local config detection failed for %s: %s", model, exc)
 
@@ -132,7 +132,7 @@ class ArchitectureDetector:
         try:
             config = self._load_config_json(model)
             if config:
-                return self._from_config(config)
+                return self._reconcile_with_checkpoint(self._from_config(config), model)
         except Exception as exc:  # noqa: BLE001 - fall through to name matching
             logger.warning(
                 "config.json detection failed for %s (%s); falling back to "
@@ -150,6 +150,87 @@ class ArchitectureDetector:
             )
         # Build a best-guess architecture only for a recognized family.
         return self._family_default_architecture(model, family)
+
+    @staticmethod
+    def _checkpoint_tensor_names(model: str) -> set[str] | None:
+        """Read a local checkpoint's tensor names without loading any tensor.
+
+        Returns ``None`` when the names cannot be determined cheaply, so every
+        caller must treat an unknown layout as "no evidence" rather than as
+        evidence of absence.
+        """
+        import json
+
+        root = Path(model)
+        if not root.is_dir():
+            return None
+        index = root / "model.safetensors.index.json"
+        if index.is_file():
+            try:
+                payload = json.loads(index.read_text(encoding="utf-8"))
+                weight_map = payload.get("weight_map")
+                if isinstance(weight_map, dict) and weight_map:
+                    return {str(key) for key in weight_map}
+            except (OSError, ValueError):
+                return None
+        shards = sorted(root.glob("*.safetensors"))
+        if not shards:
+            return None
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            return None
+        names: set[str] = set()
+        try:
+            for shard in shards:
+                with safe_open(str(shard), framework="numpy") as handle:
+                    names.update(str(key) for key in handle.keys())
+        except Exception:  # noqa: BLE001 - an unreadable shard is "no evidence"
+            return None
+        return names or None
+
+    def _reconcile_with_checkpoint(
+        self, architecture: ModelArchitecture, model: str
+    ) -> ModelArchitecture:
+        """Downgrade a declared norm placement the checkpoint cannot support.
+
+        A configuration's ``model_type`` and its actual tensor layout can
+        disagree — community re-uploads, merged models, and reduced test
+        fixtures all do this.  Sandwich normalization needs four norms per
+        block and post-normalization needs the two output norms; when those
+        tensors are absent the checkpoint is structurally a pre-norm decoder,
+        and building the sandwich graph would leave required nodes unbound.
+        The tensors present are the authority here, not the declared name.
+        """
+        placement = str(architecture.norm_placement or "pre").lower()
+        if placement == "pre":
+            return architecture
+        names = self._checkpoint_tensor_names(model)
+        if names is None:
+            return architecture
+        lowered = {name.lower().replace(".", "_") for name in names}
+
+        def has(marker: str) -> bool:
+            return any(marker in name for name in lowered)
+
+        if placement == "sandwich" and not has("pre_feedforward_layernorm"):
+            logger.warning(
+                "%s declares sandwich normalization but has no "
+                "pre_feedforward_layernorm tensors; compiling it as a pre-norm "
+                "decoder to match the weights present",
+                model,
+            )
+            architecture.norm_placement = "pre"
+        elif placement == "post" and not has("post_feedforward_layernorm"):
+            logger.warning(
+                "%s declares output normalization but has no "
+                "post_feedforward_layernorm tensors; compiling it as a pre-norm "
+                "decoder to match the weights present",
+                model,
+            )
+            architecture.norm_placement = "pre"
+            architecture.qk_norm_scope = "head"
+        return architecture
 
     @staticmethod
     def _family_default_architecture(model: str, family: str) -> ModelArchitecture:
@@ -329,7 +410,7 @@ class ArchitectureDetector:
         # than a generic 32-layer fallback.
         num_hidden_layers = config.get(
             "num_hidden_layers",
-            config.get("num_layers", config.get("n_layer", 32)),
+            config.get("num_layers", config.get("n_layers", config.get("n_layer", 32))),
         )
         hidden_size = config.get(
             "hidden_size",
@@ -341,7 +422,10 @@ class ArchitectureDetector:
         )
         num_kv_heads = config.get(
             "num_key_value_heads",
-            config.get("num_kv_heads", config.get("n_head")),
+            config.get(
+                "num_kv_heads",
+                config.get("n_head_kv", config.get("n_head", config.get("n_heads"))),
+            ),
         )
         vocab_size = config.get("vocab_size", 32000)
         context_length = config.get(
@@ -366,7 +450,13 @@ class ArchitectureDetector:
         )
         norm_eps = config.get(
             "rms_norm_eps",
-            config.get("layer_norm_eps", config.get("layer_norm_epsilon", 1e-5)),
+            config.get(
+                "layer_norm_eps",
+                config.get(
+                    "layer_norm_epsilon",
+                    config.get("norm_epsilon", config.get("layernorm_epsilon", 1e-5)),
+                ),
+            ),
         )
         rope_theta = config.get(
             "rope_theta",
@@ -386,8 +476,24 @@ class ArchitectureDetector:
             rope_theta = 10000.0
         architecture_name = str(arch_type).lower()
         model_type = str(config.get("model_type", "")).lower()
+        # Several decoder families nest their attention contract (MPT's
+        # ``attn_config`` is the common case).  Flatten it once so the rules
+        # below read one namespace.
+        nested_attention = config.get("attn_config")
+        attention_config = nested_attention if isinstance(nested_attention, dict) else {}
         hidden_act = str(
-            config.get("hidden_act", config.get("hidden_activation", config.get("activation_function", config.get("feed_forward_proj", ""))))
+            config.get(
+                "hidden_act",
+                config.get(
+                    "hidden_activation",
+                    config.get(
+                        "activation_function",
+                        # Falcon spells its FFN activation ``activation``; T5
+                        # uses ``feed_forward_proj``.
+                        config.get("activation", config.get("feed_forward_proj", "")),
+                    ),
+                ),
+            )
         ).lower()
         if "geglu" in hidden_act or "geglu" in architecture_name or model_type.startswith("gemma"):
             ffn_type = "GeGLU"
@@ -397,26 +503,52 @@ class ArchitectureDetector:
             ffn_type = "ReLU"
         elif any(marker in hidden_act for marker in ("gelu", "quick_gelu")) or model_type in {
             "gpt2", "gpt_neo", "gpt_neox", "bert", "roberta", "deberta", "electra", "albert",
+            "bloom", "falcon", "mpt", "gptj", "gpt_j", "starcoder2",
         }:
             ffn_type = "GELU"
         else:
             ffn_type = "SwiGLU"
         norm_type = str(config.get("norm_type", "")).strip()
+        # ``low_precision_layernorm`` and friends are LayerNorm dtype policies,
+        # not a distinct normalization family.
+        if norm_type and "layernorm" in norm_type.lower().replace("_", ""):
+            norm_type = "LayerNorm"
+        elif norm_type and "rmsnorm" in norm_type.lower().replace("_", ""):
+            norm_type = "RMSNorm"
+        elif norm_type:
+            norm_type = ""
         if not norm_type:
-            norm_type = "LayerNorm" if any(
-                marker in model_type or marker in architecture_name
-                for marker in ("bert", "roberta", "deberta", "electra", "albert", "gpt2", "gpt_neo", "gpt_neox")
-            ) else "RMSNorm"
+            # The epsilon field name is the checkpoint's own structural
+            # declaration of its normalization family and is far more reliable
+            # than matching class names: every RMSNorm family publishes
+            # ``rms_norm_eps`` while LayerNorm families publish one of the
+            # ``layer_norm_*``/``norm_epsilon`` spellings.
+            if config.get("rms_norm_eps") is not None:
+                norm_type = "RMSNorm"
+            elif any(
+                config.get(key) is not None
+                for key in ("layer_norm_eps", "layer_norm_epsilon", "norm_epsilon", "layernorm_epsilon")
+            ):
+                norm_type = "LayerNorm"
+            else:
+                norm_type = "LayerNorm" if any(
+                    marker in model_type or marker in architecture_name
+                    for marker in ("bert", "roberta", "deberta", "electra", "albert", "gpt2", "gpt_neo", "gpt_neox")
+                ) else "RMSNorm"
         position_type = str(config.get("position_type", "")).strip()
         if not position_type:
-            if bool(config.get("alibi", False)):
+            if bool(config.get("alibi", False)) or bool(attention_config.get("alibi", False)):
+                position_type = "ALiBi"
+            # BLOOM has no ``alibi`` switch: the architecture is defined with
+            # ALiBi, so a missing field must not be read as "absolute".
+            elif model_type == "bloom" or "bloom" in architecture_name:
                 position_type = "ALiBi"
             # Match complete model types here.  ``gpt_neo`` is a prefix of
             # ``gpt_neox``; a substring test silently turns GPT-NeoX's RoPE
             # contract into GPT-Neo's learned absolute positions and then
             # requires a position table that the checkpoint does not contain.
-            elif model_type in {"gpt2", "gpt_neo", "opt", "bloom"} or architecture_name in {
-                "gpt2", "gpt2lmheadmodel", "gptneoforcausallm", "optforcausallm", "bloomforcausallm"
+            elif model_type in {"gpt2", "gpt_neo", "opt"} or architecture_name in {
+                "gpt2", "gpt2lmheadmodel", "gptneoforcausallm", "optforcausallm",
             }:
                 position_type = "absolute"
             else:
@@ -426,6 +558,18 @@ class ArchitectureDetector:
         if isinstance(raw_attention_layers, list) and len(raw_attention_layers) == int(num_hidden_layers):
             if all(not isinstance(value, (list, tuple, dict)) for value in raw_attention_layers):
                 attention_layers = [str(value) for value in raw_attention_layers]
+        # Modern Transformers configs publish an explicit per-layer schedule as
+        # ``layer_types`` with the values ``sliding_attention``/``full_attention``
+        # (Gemma-2/3, EXAONE-4, Starcoder2, Ministral, ...).  Normalize it to the
+        # AEG vocabulary so the runtime never infers a window from a family name.
+        if attention_layers is None:
+            raw_layer_types = config.get("layer_types")
+            if isinstance(raw_layer_types, list) and len(raw_layer_types) == int(num_hidden_layers):
+                attention_layers = [
+                    "local" if "sliding" in str(value).lower() or "local" in str(value).lower()
+                    else "global"
+                    for value in raw_layer_types
+                ]
         # GPT-Neo stores the same contract as repeated groups, for example
         # ``[[["global", "local"], 12]]``.  Expand it once at ingestion so
         # every executor receives an unambiguous per-layer schedule.
@@ -450,10 +594,22 @@ class ArchitectureDetector:
                         attention_layers = expanded
                 except (TypeError, ValueError):
                     attention_layers = None
-        raw_attention_window = config.get("window_size", config.get("attention_window"))
+        raw_attention_window = config.get(
+            "window_size", config.get("attention_window", config.get("sliding_window"))
+        )
         try:
             attention_window = int(raw_attention_window) if raw_attention_window is not None else None
         except (TypeError, ValueError):
+            attention_window = None
+        # A declared window only takes effect where the schedule asks for it.
+        # Qwen2 and Mistral publish a ``sliding_window`` value together with an
+        # all-global schedule (or ``use_sliding_window: false``); applying it
+        # would truncate attention the source model never truncated.
+        if config.get("use_sliding_window") is False:
+            attention_window = None
+            if attention_layers is not None:
+                attention_layers = ["global"] * len(attention_layers)
+        if attention_window is not None and attention_layers is None:
             attention_window = None
         embedding_norm = bool(
             config.get("embedding_norm", False)
@@ -469,17 +625,55 @@ class ArchitectureDetector:
             else:
                 attention_type = "GQA"
         qk_norm = bool(
-            config.get("qk_norm", config.get("use_qk_norm", False))
+            config.get("qk_norm", config.get("use_qk_norm", config.get("qk_layernorm", False)))
             or "qwen3" in architecture_name
             or model_type == "qwen3"
+            # These families always normalize Q and K; the contract is
+            # structural rather than switchable, so their configs declare no
+            # flag for it.
+            or model_type in {"olmo2", "olmo_2", "exaone4"}
+            or model_type.startswith("gemma3")
+            or any(
+                marker in architecture_name
+                for marker in ("olmo2", "exaone4", "gemma3")
+            )
         )
+        # Falcon's legacy multi-query attention shares a single K/V head across
+        # every query head but publishes no ``num_kv_heads``.  Without this the
+        # fused projection is split with the wrong group width.
+        if (
+            not config.get("new_decoder_architecture", False)
+            and config.get("multi_query") is True
+            and config.get("num_kv_heads") is None
+            and config.get("num_key_value_heads") is None
+        ):
+            num_kv_heads = 1
         # GPT-J's published block computes attention and MLP from one shared
         # LayerNorm output and adds both branches to the residual together.
         # Preserve this structural capability in the AEG contract.
         parallel_residual = bool(
             config.get("parallel_residual", False)
-            or model_type in {"gptj", "gpt-j"}
+            or config.get("use_parallel_residual", False)
+            # Falcon spells the same block ``parallel_attn``; its new decoder
+            # architecture is always parallel and carries two input norms.
+            or config.get("parallel_attn", False)
+            or config.get("new_decoder_architecture", False)
+            or model_type in {"gptj", "gpt-j", "cohere", "cohere2"}
             or "gptj" in architecture_name.lower().replace("_", "")
+            or "cohere" in architecture_name.lower()
+        )
+
+        numerics = self._detect_execution_numerics(
+            config=config,
+            attention_config=attention_config,
+            model_type=model_type,
+            architecture_name=architecture_name,
+            hidden_size=int(hidden_size),
+            num_attention_heads=int(num_attention_heads or 1),
+            num_hidden_layers=int(num_hidden_layers),
+            head_dim=head_dim,
+            hidden_activation=hidden_act,
+            attention_schedule=attention_layers,
         )
 
         # Detect MoE
@@ -676,7 +870,240 @@ class ArchitectureDetector:
             attention_layers=attention_layers,
             attention_window=attention_window,
             embedding_norm=embedding_norm,
+            **numerics,
         )
+
+    @staticmethod
+    def _detect_execution_numerics(
+        *,
+        config: dict[str, Any],
+        attention_config: dict[str, Any],
+        model_type: str,
+        architecture_name: str,
+        hidden_size: int,
+        num_attention_heads: int,
+        num_hidden_layers: int,
+        head_dim: int | None,
+        hidden_activation: str = "",
+        attention_schedule: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Derive the scalar and structural execution constants of a decoder.
+
+        Every value here is read from the source configuration.  These are not
+        tuning knobs: each one is part of the model's definition, and omitting
+        one changes every logit the artifact produces.  Keeping them in the AEG
+        manifest is what lets a single executor run any family without
+        consulting a model class at runtime.
+
+        References are the published architectures: unscaled attention in
+        GPT-Neo (Black et al. 2021), partial rotary embeddings in GPT-NeoX (Black
+        et al. 2022) and the interleaved rotary convention in GPT-J (Wang & Komatsuzaki
+        2021), logit soft-capping and sandwich normalization in Gemma 2 (Gemma
+        Team 2024), local/global interleaving and a separate local rotary base in
+        Gemma 3 (Gemma Team 2025), output-normalized blocks in OLMo 2 (OLMo Team
+        2024), and the explicit multiplier set in Granite (IBM 2024).
+        """
+        effective_head_dim = int(head_dim or max(hidden_size // max(num_attention_heads, 1), 1))
+
+        def numeric(*keys: str) -> float | None:
+            for key in keys:
+                value = config.get(key, attention_config.get(key))
+                if value is None:
+                    continue
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        # ── Attention softmax scale ────────────────────────────────────────
+        attention_scale: float | None = None
+        explicit_softmax_scale = numeric("softmax_scale", "attention_softmax_scale")
+        query_pre_attn_scalar = numeric("query_pre_attn_scalar")
+        attention_multiplier = numeric("attention_multiplier")
+        if explicit_softmax_scale is not None and explicit_softmax_scale > 0:
+            attention_scale = explicit_softmax_scale
+        elif query_pre_attn_scalar is not None and query_pre_attn_scalar > 0:
+            # Gemma-2/3 normalize queries by a configured scalar that is
+            # deliberately decoupled from the head width.
+            attention_scale = float(query_pre_attn_scalar) ** -0.5
+        elif attention_multiplier is not None and attention_multiplier > 0:
+            attention_scale = float(attention_multiplier)
+        elif config.get("scale_attn_weights") is False:
+            attention_scale = 1.0
+        elif model_type == "gpt_neo" or architecture_name in {
+            "gptneoforcausallm", "gptneomodel",
+        }:
+            # GPT-Neo's published attention omits the 1/sqrt(d) factor
+            # entirely; it trained that way and depends on it.  Match the
+            # complete name: ``gpt_neo`` is a prefix of ``gpt_neox``, which
+            # does use the standard scale.
+            attention_scale = 1.0
+        if attention_scale is not None and attention_scale <= 0:
+            attention_scale = None
+
+        # ── Embedding / residual / logit multipliers ───────────────────────
+        embedding_scale = numeric("embedding_multiplier")
+        if embedding_scale is not None and embedding_scale == 1.0:
+            embedding_scale = None
+        if embedding_scale is None and (
+            model_type.startswith("gemma") or "gemma" in architecture_name
+        ):
+            # Gemma scales the embedding table by sqrt(hidden_size), applied in
+            # the model's compute dtype.
+            embedding_scale = float(hidden_size) ** 0.5
+        residual_scale = numeric("residual_multiplier")
+        if residual_scale is not None and residual_scale == 1.0:
+            residual_scale = None
+        logit_scale = numeric("logit_scale")
+        logits_scaling = numeric("logits_scaling")
+        if logits_scaling is not None and logits_scaling not in (0.0, 1.0):
+            # Granite divides the logits; express it as one multiplier.
+            logit_scale = (1.0 / logits_scaling) * (logit_scale or 1.0)
+        if logit_scale is not None and logit_scale == 1.0:
+            logit_scale = None
+
+        attn_logit_softcap = numeric("attn_logit_softcapping")
+        final_logit_softcap = numeric("final_logit_softcapping")
+        if attn_logit_softcap is not None and attn_logit_softcap <= 0:
+            attn_logit_softcap = None
+        if final_logit_softcap is not None and final_logit_softcap <= 0:
+            final_logit_softcap = None
+
+        # ── Normalization form and placement ──────────────────────────────
+        # Gemma stores normalization weights as offsets from unity, so the
+        # scale applied is (1 + w).  Reading them as plain weights zeroes the
+        # residual stream.
+        norm_offset_one = bool(
+            model_type.startswith("gemma")
+            or "gemma" in architecture_name
+            or config.get("norm_offset_one", False)
+        )
+        declared_placement = str(config.get("norm_placement", "") or "").strip().lower()
+        if declared_placement in {"pre", "post", "sandwich"}:
+            norm_placement = declared_placement
+        elif (
+            model_type.startswith("gemma2")
+            or model_type.startswith("gemma3")
+            or "gemma2" in architecture_name
+            or "gemma3" in architecture_name
+        ):
+            # Gemma-2/3 normalize both the input and the output of each
+            # sublayer (four norms per block).
+            norm_placement = "sandwich"
+        elif (
+            model_type in {"olmo2", "olmo_2", "exaone4"}
+            or "olmo2" in architecture_name
+            or "exaone4" in architecture_name
+        ):
+            # OLMo-2 and EXAONE-4 removed the input norms and normalize each
+            # sublayer's output before the residual add (two norms per block).
+            norm_placement = "post"
+        else:
+            norm_placement = "pre"
+
+        # OLMo-2 normalizes the whole Q/K projection rather than each head.
+        # EXAONE-4 shares the placement but keeps per-head Q/K norms.
+        qk_norm_scope = "full" if (
+            model_type in {"olmo2", "olmo_2"} or "olmo2" in architecture_name
+        ) else "head"
+
+        # ── Rotary geometry ───────────────────────────────────────────────
+        rope_partial_dim: int | None = None
+        rotary_dim = config.get("rotary_dim")
+        partial_factor = numeric("partial_rotary_factor", "rotary_pct")
+        if rotary_dim is not None:
+            try:
+                rope_partial_dim = int(rotary_dim)
+            except (TypeError, ValueError):
+                rope_partial_dim = None
+        elif partial_factor is not None and 0.0 < partial_factor < 1.0:
+            rope_partial_dim = int(effective_head_dim * partial_factor)
+        if rope_partial_dim is not None:
+            # An even count is required: RoPE rotates channel pairs.
+            rope_partial_dim = max(2, (min(rope_partial_dim, effective_head_dim) // 2) * 2)
+            if rope_partial_dim >= effective_head_dim:
+                rope_partial_dim = None
+
+        # GPT-J pairs adjacent channels; GPT-NeoX/Llama pair the two halves.
+        # Cohere/Command-R also publishes the interleaved form (its reference
+        # implementation builds the table with repeat_interleave rather than
+        # concatenation).
+        rope_interleaved = bool(
+            config.get("rope_interleaved", False)
+            or model_type in {"gptj", "gpt-j", "gpt_j", "cohere", "cohere2"}
+            or "gptj" in architecture_name.replace("_", "").replace("-", "")
+            or "cohere" in architecture_name
+        )
+        rope_local_theta = numeric("rope_local_base_freq", "rope_theta_local")
+
+        # ── Fused QKV memory layout ───────────────────────────────────────
+        if config.get("new_decoder_architecture"):
+            # Falcon's new architecture stores each KV group as
+            # [q * heads_per_group, k, v].
+            fused_qkv_layout = "group_interleaved"
+        elif model_type in {"gpt_neox", "bloom", "falcon", "refinedweb", "refinedwebmodel"} or (
+            "gptneox" in architecture_name.replace("_", "")
+            or "bloom" in architecture_name
+            or "falcon" in architecture_name
+        ):
+            # GPT-NeoX and BLOOM interleave [q, k, v] per head.
+            fused_qkv_layout = "head_interleaved"
+        else:
+            fused_qkv_layout = "contiguous"
+
+        # ── NoPE layers ───────────────────────────────────────────────────
+        no_rope_layers: list[int] | None = None
+        raw_no_rope = config.get("no_rope_layers")
+        if isinstance(raw_no_rope, list) and len(raw_no_rope) == num_hidden_layers:
+            # The published field is a per-layer *enable* flag: a falsy entry
+            # marks a layer that applies no rotation at all.
+            skipped = [index for index, flag in enumerate(raw_no_rope) if not flag]
+            no_rope_layers = skipped or None
+        if no_rope_layers is None and attention_schedule and config.get("sliding_window"):
+            # EXAONE-4's published hybrid attention rotates only its
+            # sliding-window layers and leaves the global layers without any
+            # positional encoding.  The indices follow from the schedule.
+            if model_type == "exaone4" or "exaone4" in architecture_name:
+                global_layers = [
+                    index
+                    for index, kind in enumerate(attention_schedule)
+                    if kind != "local"
+                ]
+                no_rope_layers = global_layers or None
+
+        return {
+            "attention_scale": attention_scale,
+            "attention_scale_by_layer_index": bool(
+                config.get("scale_attn_by_inverse_layer_idx", False)
+            ),
+            "embedding_scale": embedding_scale,
+            "residual_scale": residual_scale,
+            "logit_scale": logit_scale,
+            "attn_logit_softcap": attn_logit_softcap,
+            "final_logit_softcap": final_logit_softcap,
+            "norm_offset_one": norm_offset_one,
+            "rope_partial_dim": rope_partial_dim,
+            "rope_interleaved": rope_interleaved,
+            "rope_local_theta": rope_local_theta,
+            "norm_placement": norm_placement,
+            "qk_norm_scope": qk_norm_scope,
+            "fused_qkv_layout": fused_qkv_layout,
+            "no_rope_layers": no_rope_layers,
+            # ``gelu`` is the exact error-function form; every ``gelu_new`` /
+            # ``gelu_pytorch_tanh`` / ``gelu_fast`` spelling is the tanh
+            # approximation.  BLOOM's built-in activation is also the tanh form
+            # even though its config names no activation at all.
+            "gelu_approximate": bool(
+                any(
+                    marker in hidden_activation
+                    for marker in ("new", "tanh", "fast", "quick")
+                )
+                or model_type == "bloom"
+                or "bloom" in architecture_name
+                or not hidden_activation
+            ),
+        }
 
     @staticmethod
     def _is_generic_decoder_config(config: dict[str, Any], arch_type: str) -> bool:

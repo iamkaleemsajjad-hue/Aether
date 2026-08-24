@@ -29,7 +29,7 @@ from typing import Any
 import numpy as np
 
 from aether.parallelism.sharding import balanced_partition, capacity_weighted_partition
-from aether.runtime.torch_engine import TorchAEGEngine, TorchKVCache
+from aether.runtime.torch_engine import TorchAEGEngine, TorchKVCache, execution_numerics
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -122,14 +122,20 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
             norm_type=source_weights.norm_type,
             ffn_type=source_weights.ffn_type,
             position_type=source_weights.position_type,
+            parallel_residual=bool(getattr(source_weights, "parallel_residual", False)),
             attention_layers=getattr(source_weights, "attention_layers", None),
             attention_window=getattr(source_weights, "attention_window", None),
             final_norm_bias=getattr(source_weights, "final_norm_bias", None),
+            # The execution-numerics contract must survive sharding: dropping
+            # any of it here would silently execute the model as a Llama-style
+            # block regardless of what it actually is.
+            **execution_numerics(source_weights),
         )
         self.num_heads = int(cpu_engine.num_heads)
         self.num_kv_heads = int(cpu_engine.num_kv_heads)
         self.head_dim = int(cpu_engine.head_dim)
         self.num_layers = len(source_weights.layers)
+        self._resolve_execution_numerics()
         embedding = source_weights.embedding
         self.embedding_vocab_size = int(np.asarray(embedding).shape[0])
         self.embedding_hidden_size = int(np.asarray(embedding).shape[1])
@@ -179,6 +185,9 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         self.layers = [self._convert_sharded_layer(layer) for layer in source_weights.layers]
         self._cos: Any | None = None
         self._sin: Any | None = None
+        self._local_cos: Any | None = None
+        self._local_sin: Any | None = None
+        self._positions_cache: Any | None = None
 
     def _source_alibi(self) -> np.ndarray:
         # Use the same canonical helper as the base executor without creating
@@ -317,7 +326,16 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         return [self._tensor_on(array[start:end], device) for device, (start, end) in zip(self.devices, ranges)]
 
     def _convert_sharded_layer(self, layer: Any) -> dict[str, Any]:
-        primary_names = ("attention_norm", "attention_norm_bias", "q_norm", "k_norm", "ffn_norm", "ffn_norm_bias", "o_proj_bias", "down_proj_bias")
+        # Normalization weights are small and are replicated on the primary
+        # device; only the projections are sharded.  The sandwich/post-norm
+        # slots must be carried too, or a Gemma-2/3, OLMo-2 or EXAONE-4 model
+        # would silently execute as a plain pre-norm block on a multi-GPU mesh.
+        primary_names = (
+            "attention_norm", "attention_norm_bias", "q_norm", "k_norm",
+            "ffn_norm", "ffn_norm_bias", "o_proj_bias", "down_proj_bias",
+            "post_attention_norm", "post_attention_norm_bias",
+            "post_ffn_norm", "post_ffn_norm_bias",
+        )
         result: dict[str, Any] = {
             name: self._optional_primary(getattr(layer, name, None)) for name in primary_names
         }
@@ -484,10 +502,23 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         past = int(cache.length)
         seq_len = int(ids.numel())
         positions = torch.arange(past, past + seq_len, device=self.device, dtype=torch.long)
-        uses_rope = str(self.weights.position_type or "RoPE").lower() in {"rope", "rotary", "rotary_embedding"}
+        uses_rope = self.uses_rope
         if uses_rope:
             self._ensure_rope(past + seq_len)
+        # Rotation factors depend only on the positions and the rotary base, so
+        # gather them once per step rather than twice per layer.
+        rope_global = self._rope_slice(positions, local=False) if uses_rope else None
+        rope_local = (
+            self._rope_slice(positions, local=True)
+            if uses_rope and self._local_cos is not None
+            else rope_global
+        )
+        post_norm = self.norm_placement == "post"
+        parallel = self.parallel_residual
+        residual_scale = self.residual_scale
         hidden = self._embedding_lookup(ids)
+        if self.embedding_scale is not None:
+            hidden = hidden * self.embedding_scale
         if self.embedding_norm is not None:
             hidden = self._norm(hidden, self.embedding_norm, self.embedding_norm_bias)
         if self.position_embedding is not None:
@@ -495,51 +526,102 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
 
         with torch.inference_mode():
             for index, layer in enumerate(self.layers):
-                attention_layers = getattr(self.weights, "attention_layers", None)
-                attention_kind = (
-                    str(attention_layers[index]).lower()
-                    if isinstance(attention_layers, list) and index < len(attention_layers)
-                    else "global"
+                local_attention, attention_window, attention_scale, layer_uses_rope = (
+                    self.layer_plan[index]
                 )
-                local_attention = attention_kind in {"local", "sliding_window", "window"}
-                attention_window = (
-                    int(getattr(self.weights, "attention_window", 0) or 0)
-                    if local_attention else None
-                )
-                normed = self._norm(hidden, layer["attention_norm"], layer["attention_norm_bias"])
-                q = self._parallel_row_linear(normed, layer["q_proj"], layer["q_proj_bias"]).reshape(seq_len, self.num_heads, self.head_dim)
-                if layer["q_norm"] is not None:
-                    q = self._norm(q, layer["q_norm"])
-                if uses_rope:
-                    q = self._rope(q, positions)
-                k = self._parallel_row_linear(normed, layer["k_proj"], layer["k_proj_bias"]).reshape(seq_len, self.num_kv_heads, self.head_dim)
-                if layer["k_norm"] is not None:
-                    k = self._norm(k, layer["k_norm"])
-                if uses_rope:
-                    k = self._rope(k, positions)
+                layer_uses_rope = layer_uses_rope and uses_rope
+                rope_factors = rope_local if local_attention else rope_global
+                block_input = hidden
+                if post_norm:
+                    # OLMo-2 feeds the raw residual into each sublayer and
+                    # normalizes the sublayer output instead.
+                    normed = hidden
+                else:
+                    normed = self._norm(
+                        hidden, layer["attention_norm"], layer["attention_norm_bias"]
+                    )
+                q = self._parallel_row_linear(normed, layer["q_proj"], layer["q_proj_bias"])
+                k = self._parallel_row_linear(normed, layer["k_proj"], layer["k_proj_bias"])
+                if self.qk_norm_is_full:
+                    if layer["q_norm"] is not None:
+                        q = self._norm(q, layer["q_norm"])
+                    if layer["k_norm"] is not None:
+                        k = self._norm(k, layer["k_norm"])
+                q = q.reshape(seq_len, self.num_heads, self.head_dim)
+                k = k.reshape(seq_len, self.num_kv_heads, self.head_dim)
+                if not self.qk_norm_is_full:
+                    if layer["q_norm"] is not None:
+                        q = self._norm(q, layer["q_norm"])
+                    if layer["k_norm"] is not None:
+                        k = self._norm(k, layer["k_norm"])
+                if layer_uses_rope:
+                    q = self._rope(q, *rope_factors)
+                    k = self._rope(k, *rope_factors)
                 v = self._parallel_row_linear(normed, layer["v_proj"], layer["v_proj_bias"]).reshape(seq_len, self.num_kv_heads, self.head_dim)
                 total = past + seq_len
                 k_all = self._append_kv(cache.keys[index], k, past, total)
                 v_all = self._append_kv(cache.values[index], v, past, total)
                 context = self._attention(
                     q, k_all[:total], v_all[:total], positions,
-                    torch.arange(total, device=self.device), attention_window,
+                    self._key_positions(total), attention_window, attention_scale,
                 )
                 cache.keys[index] = k_all
                 cache.values[index] = v_all
                 attention_out = self._parallel_column_linear(
                     context.reshape(seq_len, self.num_heads * self.head_dim), layer["o_proj"], layer["o_proj_bias"]
                 )
-                hidden = hidden + attention_out
-                normed = self._norm(hidden, layer["ffn_norm"], layer["ffn_norm_bias"])
+                # Sandwich blocks normalize the sublayer output as well
+                # (Gemma-2/3, EXAONE-4); post-norm blocks normalize it instead
+                # of the input (OLMo-2).  Both precede the residual add.
+                if layer["post_attention_norm"] is not None:
+                    attention_out = self._norm(
+                        attention_out,
+                        layer["post_attention_norm"],
+                        layer["post_attention_norm_bias"],
+                    )
+                elif post_norm:
+                    attention_out = self._norm(
+                        attention_out, layer["attention_norm"], layer["attention_norm_bias"]
+                    )
+                if residual_scale is not None:
+                    attention_out = attention_out * residual_scale
+                if parallel:
+                    # GPT-J, GPT-NeoX, Falcon and Cohere evaluate the
+                    # feed-forward branch from the block input.
+                    normed = self._norm(
+                        block_input, layer["ffn_norm"], layer["ffn_norm_bias"]
+                    )
+                elif post_norm:
+                    hidden = block_input + attention_out
+                    normed = hidden
+                else:
+                    hidden = hidden + attention_out
+                    normed = self._norm(hidden, layer["ffn_norm"], layer["ffn_norm_bias"])
                 if layer["experts"]:
-                    hidden = hidden + self._moe_ffn(normed, layer)
+                    ffn_out = self._moe_ffn(normed, layer)
                 else:
                     gate = self._parallel_row_linear(normed, layer["gate_proj"], layer["gate_proj_bias"])
                     up = None if layer["up_proj"] is None else self._parallel_row_linear(normed, layer["up_proj"], layer["up_proj_bias"])
-                    hidden = hidden + self._parallel_column_linear(self._activation(gate, up), layer["down_proj"], layer["down_proj_bias"])
+                    ffn_out = self._parallel_column_linear(
+                        self._activation(gate, up), layer["down_proj"], layer["down_proj_bias"]
+                    )
+                if layer["post_ffn_norm"] is not None:
+                    ffn_out = self._norm(
+                        ffn_out, layer["post_ffn_norm"], layer["post_ffn_norm_bias"]
+                    )
+                elif post_norm:
+                    ffn_out = self._norm(ffn_out, layer["ffn_norm"], layer["ffn_norm_bias"])
+                if residual_scale is not None:
+                    ffn_out = ffn_out * residual_scale
+                hidden = (
+                    block_input + attention_out + ffn_out if parallel else hidden + ffn_out
+                )
             hidden = self._norm(hidden, self.final_norm, self.final_norm_bias)
             logits = self._parallel_row_linear(hidden, self.lm_head, None)
+            if self.logit_scale is not None:
+                logits = logits * self.logit_scale
+            if self.final_logit_softcap:
+                logits = self._softcap(logits, self.final_logit_softcap)
             cache.length = past + seq_len
             cache.last_logits = logits[-1].detach()
         return logits, cache

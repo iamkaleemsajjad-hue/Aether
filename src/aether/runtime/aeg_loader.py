@@ -213,6 +213,9 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
                     architecture.get("num_activated_experts", 0) or 0
                 ),
                 parallel_residual=bool(architecture.get("parallel_residual", False)),
+                norm_placement=str(architecture.get("norm_placement", "pre") or "pre"),
+                qk_norm_scope=str(architecture.get("qk_norm_scope", "head") or "head"),
+                num_kv_heads_for_norm=num_kv_heads,
                 is_moe_layer=(
                     bool(architecture.get("is_moe", False))
                     and (
@@ -297,6 +300,7 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
             int(architecture["attention_window"])
             if architecture.get("attention_window") is not None else None
         ),
+        **_execution_numerics(architecture),
     )
     kernels = get_native_kernels()
     _load_packaged_native_kernels(package, kernels)
@@ -1004,6 +1008,62 @@ def _load_packaged_native_kernels(package: Any, kernels: Any) -> None:
 
 
 
+def _execution_numerics(architecture: dict[str, Any]) -> dict[str, Any]:
+    """Extract the manifest's execution-numerics contract for ``ModelWeights``.
+
+    These constants are part of the source model's definition (attention scale,
+    embedding/residual/logit multipliers, logit soft caps, rotary geometry, and
+    block normalization placement).  A manifest written before they existed
+    simply omits them, and the defaults reproduce the standard Llama-style
+    block, so older artifacts keep their previous behaviour.
+    """
+
+    def number(key: str) -> float | None:
+        value = architecture.get(key)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def index_list(key: str) -> list[int] | None:
+        value = architecture.get(key)
+        if not isinstance(value, list):
+            return None
+        try:
+            return [int(item) for item in value]
+        except (TypeError, ValueError):
+            return None
+
+    placement = str(architecture.get("norm_placement", "pre") or "pre").lower()
+    if placement not in {"pre", "post", "sandwich"}:
+        raise AEGLoadError(f"unsupported norm placement {placement!r} in AEG manifest")
+    scope = str(architecture.get("qk_norm_scope", "head") or "head").lower()
+    if scope not in {"head", "full"}:
+        raise AEGLoadError(f"unsupported qk_norm scope {scope!r} in AEG manifest")
+    partial = architecture.get("rope_partial_dim")
+    return {
+        "attention_scale": number("attention_scale"),
+        "attention_scale_by_layer_index": bool(
+            architecture.get("attention_scale_by_layer_index", False)
+        ),
+        "embedding_scale": number("embedding_scale"),
+        "residual_scale": number("residual_scale"),
+        "logit_scale": number("logit_scale"),
+        "attn_logit_softcap": number("attn_logit_softcap"),
+        "final_logit_softcap": number("final_logit_softcap"),
+        "norm_offset_one": bool(architecture.get("norm_offset_one", False)),
+        "rope_partial_dim": int(partial) if partial else None,
+        "rope_interleaved": bool(architecture.get("rope_interleaved", False)),
+        "rope_local_theta": number("rope_local_theta"),
+        "norm_placement": placement,
+        "qk_norm_scope": scope,
+        "no_rope_layers": index_list("no_rope_layers"),
+        "gelu_approximate": bool(architecture.get("gelu_approximate", True)),
+    }
+
+
 def _architecture_dict(package: Any) -> dict[str, Any]:
     """Extract the architecture metadata from a package manifest."""
     manifest = package.manifest
@@ -1088,7 +1148,8 @@ def _dequantized_by_key(package: Any) -> dict[tuple[int | None, str | None], np.
         # projections, so preserve their exact component names here.
         match = re.match(
             r"^layer_(\d+)_((?:q_proj|k_proj|v_proj|q_norm|k_norm|o_proj|"
-            r"attention_norm|ffn_norm|gate_proj|up_proj|down_proj|moe_router|"
+            r"attention_norm|ffn_norm|post_attention_norm|post_ffn_norm|"
+            r"gate_proj|up_proj|down_proj|moe_router|"
             r"expert_\d+_(?:gate_proj|up_proj|down_proj)|q_a_proj|q_b_proj|"
             r"kv_a_proj|kv_b_proj|k_rope_proj|q_a_norm|kv_a_norm|ssm_norm|"
             r"ssm_in_proj|ssm_conv1d|ssm_x_proj|ssm_dt_proj|ssm_dt|ssm_a_log|ssm_d|"
@@ -1146,6 +1207,9 @@ def _build_layer(
     num_activated_experts: int = 0,
     is_moe_layer: bool = False,
     parallel_residual: bool = False,
+    norm_placement: str = "pre",
+    qk_norm_scope: str = "head",
+    num_kv_heads_for_norm: int | None = None,
 ) -> LayerWeights:
     """Assemble one :class:`LayerWeights` from the tensor index.
 
@@ -1158,6 +1222,14 @@ def _build_layer(
     head_dim = (q_proj.shape[0] // num_heads) if q_proj is not None and q_proj.ndim == 2 else (hidden_size // num_heads)
     kv_dim = num_kv_heads * head_dim
     intermediate = _infer_intermediate(tensors, index, hidden_size)
+    # OLMo-2 normalizes the whole Q/K projection rather than each head, so the
+    # stored vector spans ``heads * head_dim`` instead of ``head_dim``.
+    full_scope = str(qk_norm_scope).lower() == "full"
+    q_norm_size = num_heads * head_dim if full_scope else head_dim
+    k_norm_size = (
+        (num_kv_heads_for_norm or num_kv_heads) * head_dim if full_scope else head_dim
+    )
+    sandwich = str(norm_placement).lower() == "sandwich"
 
     k_proj = tensors.get((index, "k_proj"))
     v_proj = tensors.get((index, "v_proj"))
@@ -1285,13 +1357,25 @@ def _build_layer(
             if required["up_proj"] is not None else None
         ),
         down_proj=np.ascontiguousarray(required["down_proj"], dtype=np.float32),
+        post_attention_norm=(
+            _norm_vector(tensors.get((index, "post_attention_norm")), hidden_size)
+            if sandwich and tensors.get((index, "post_attention_norm")) is not None
+            else None
+        ),
+        post_attention_norm_bias=tensors.get((index, "post_attention_norm_bias")),
+        post_ffn_norm=(
+            _norm_vector(tensors.get((index, "post_ffn_norm")), hidden_size)
+            if sandwich and tensors.get((index, "post_ffn_norm")) is not None
+            else None
+        ),
+        post_ffn_norm_bias=tensors.get((index, "post_ffn_norm_bias")),
         q_norm=(
-            _norm_vector(tensors.get((index, "q_norm")), head_dim)
+            _norm_vector(tensors.get((index, "q_norm")), q_norm_size)
             if tensors.get((index, "q_norm")) is not None
             else None
         ),
         k_norm=(
-            _norm_vector(tensors.get((index, "k_norm")), head_dim)
+            _norm_vector(tensors.get((index, "k_norm")), k_norm_size)
             if tensors.get((index, "k_norm")) is not None
             else None
         ),

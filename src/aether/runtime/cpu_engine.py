@@ -37,6 +37,31 @@ __all__ = [
 ]
 
 
+def _erf(x: np.ndarray) -> np.ndarray:
+    """Vectorized error function for the exact GELU form.
+
+    Abramowitz & Stegun 7.1.26, whose maximum absolute error is 1.5e-7 — below
+    float32 resolution for the activation magnitudes involved.  NumPy has no
+    ``erf`` and SciPy is not a runtime dependency, so the series is evaluated
+    directly rather than pulling in an optional package on the hot path.
+    """
+    arr = np.asarray(x, dtype=np.float32)
+    sign = np.sign(arr)
+    absolute = np.abs(arr)
+    t = 1.0 / (1.0 + np.float32(0.3275911) * absolute)
+    poly = t * (
+        np.float32(0.254829592)
+        + t * (
+            np.float32(-0.284496736)
+            + t * (
+                np.float32(1.421413741)
+                + t * (np.float32(-1.453152027) + t * np.float32(1.061405429))
+            )
+        )
+    )
+    return (sign * (1.0 - poly * np.exp(-absolute * absolute))).astype(np.float32)
+
+
 @dataclass
 class ExpertWeights:
     """One routed expert's SwiGLU projections.
@@ -96,6 +121,14 @@ class LayerWeights:
     down_proj_bias: np.ndarray | None = None
     q_norm: np.ndarray | None = None
     k_norm: np.ndarray | None = None
+    #: Output normalization for the attention sublayer.  Populated only by
+    #: ``sandwich``-normalized architectures (Gemma-2/3, EXAONE-4), which
+    #: normalize both the input and the output of every sublayer.
+    post_attention_norm: np.ndarray | None = None
+    post_attention_norm_bias: np.ndarray | None = None
+    #: Output normalization for the feed-forward sublayer (``sandwich`` only).
+    post_ffn_norm: np.ndarray | None = None
+    post_ffn_norm_bias: np.ndarray | None = None
     router: np.ndarray | None = None
     experts: list[ExpertWeights] = field(default_factory=list)
     num_activated_experts: int = 1
@@ -161,6 +194,41 @@ class ModelWeights:
     parallel_residual: bool = False
     attention_layers: list[str] | None = None
     attention_window: int | None = None
+
+    # ── Execution numerics (see aether.core.types.ModelArchitecture) ────────
+    # These carry the source architecture's scalar constants and structural
+    # placements.  Defaults reproduce the standard Llama-style block, so an
+    # older artifact keeps its previous behaviour.
+    #: Explicit softmax scale; ``None`` means ``1/sqrt(head_dim)``.
+    attention_scale: float | None = None
+    #: Divide attention scores additionally by ``layer_index + 1``.
+    attention_scale_by_layer_index: bool = False
+    #: Multiplier applied to the token embedding output.
+    embedding_scale: float | None = None
+    #: Multiplier applied to each sublayer output before the residual add.
+    residual_scale: float | None = None
+    #: Multiplier applied to the final logits.
+    logit_scale: float | None = None
+    #: ``cap * tanh(scores / cap)`` applied to attention logits.
+    attn_logit_softcap: float | None = None
+    #: ``cap * tanh(logits / cap)`` applied to output logits.
+    final_logit_softcap: float | None = None
+    #: RMSNorm scales by ``(1 + weight)`` instead of ``weight``.
+    norm_offset_one: bool = False
+    #: Number of leading head channels RoPE rotates; ``None`` rotates all.
+    rope_partial_dim: int | None = None
+    #: Pair adjacent channels (GPT-J) instead of the two halves.
+    rope_interleaved: bool = False
+    #: Separate RoPE base used by sliding-window layers.
+    rope_local_theta: float | None = None
+    #: ``pre`` | ``post`` | ``sandwich`` block normalization placement.
+    norm_placement: str = "pre"
+    #: ``head`` | ``full`` scope of the Q/K normalization weights.
+    qk_norm_scope: str = "head"
+    #: Layer indices that apply no positional rotation at all.
+    no_rope_layers: list[int] | None = None
+    #: Whether a GELU activation uses the tanh approximation.
+    gelu_approximate: bool = True
 
     @property
     def hidden_size(self) -> int:
@@ -430,7 +498,9 @@ class CPUExecutionEngine:
             self.head_dim = weights.layers[0].q_proj.shape[0] // num_heads
         else:
             self.head_dim = weights.hidden_size // num_heads
-        if self.head_dim % 2 != 0:
+        if self.head_dim % 2 != 0 and str(weights.position_type or "RoPE").lower() in {
+            "rope", "rotary", "rotary_embedding"
+        }:
             msg = f"head_dim must be even for RoPE, got {self.head_dim}"
             raise ValueError(msg)
         self.kernels = kernels or get_native_kernels()
@@ -446,18 +516,111 @@ class CPUExecutionEngine:
             "cycles": 0,
         }
         self._validate_lora_adapters()
+        # Rotary geometry: the rotated width may be a prefix of the head.
+        declared_rotary = self.weights.rope_partial_dim
+        rotary = int(declared_rotary) if declared_rotary else self.head_dim
+        rotary = max(2, min(rotary, self.head_dim))
+        if rotary % 2:
+            rotary -= 1
+        self._rotary_dim = rotary
+        self._no_rope_layers = frozenset(int(v) for v in (self.weights.no_rope_layers or ()))
+        # Attention scale. ``None`` keeps the standard 1/sqrt(head_dim); an
+        # explicit value comes from the source architecture (GPT-Neo's unscaled
+        # attention, Gemma's query_pre_attn_scalar, Granite's multiplier).
+        declared_scale = self.weights.attention_scale
+        self._base_attention_scale = (
+            float(declared_scale)
+            if declared_scale is not None and float(declared_scale) > 0
+            else 1.0 / float(np.sqrt(self.head_dim))
+        )
+        self._norm_placement = str(self.weights.norm_placement or "pre").lower()
+        self._qk_norm_is_full = str(self.weights.qk_norm_scope or "head").lower() == "full"
+        self._offset_norm_cache: dict[int, np.ndarray] = {}
         self._cos, self._sin = self._build_rope_tables()
+        local_theta = self.weights.rope_local_theta
+        if local_theta is not None and float(local_theta) > 0 and float(local_theta) != float(
+            self.weights.rope_theta
+        ):
+            self._local_cos, self._local_sin = self._rope_tables_for_theta(
+                float(local_theta), int(self._cos.shape[0])
+            )
+        else:
+            self._local_cos = self._local_sin = None
 
     # ── Setup ────────────────────────────────────────────────────────────────
 
     def _build_rope_tables(self, max_positions: int = 4096) -> tuple[np.ndarray, np.ndarray]:
         """Precompute RoPE cos/sin tables for positions ``[0, max_positions)``."""
-        half = self.head_dim // 2
+        return self._rope_tables_for_theta(float(self.weights.rope_theta), max_positions)
+
+    def _rope_tables_for_theta(
+        self, theta: float, max_positions: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build cos/sin tables for one rotary base.
+
+        The table covers ``rotary_dim / 2`` frequencies, which equals the full
+        half-head width unless the architecture rotates only a prefix of each
+        head (GPT-NeoX, GPT-J, StableLM, Phi).
+        """
+        half = self._rotary_dim // 2
         inv_freq = 1.0 / (
-            self.weights.rope_theta ** (np.arange(0, half, dtype=np.float64) * 2.0 / self.head_dim)
+            theta ** (np.arange(0, half, dtype=np.float64) * 2.0 / self._rotary_dim)
         )
         angles = np.arange(max_positions, dtype=np.float64)[:, None] * inv_freq[None, :]
         return np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
+
+    def _apply_rope(
+        self, x: np.ndarray, position_offset: int, *, local: bool = False
+    ) -> np.ndarray:
+        """Rotate ``(seq, heads, head_dim)`` using the declared RoPE convention.
+
+        Three source conventions are supported and are *not* interchangeable:
+
+        * half-split (GPT-NeoX, Llama, Qwen, Mistral, ...) pairs channel ``i``
+          with channel ``i + d/2``;
+        * interleaved (GPT-J) pairs channel ``2i`` with ``2i + 1``;
+        * partial rotation leaves the trailing ``head_dim - rotary_dim``
+          channels untouched.
+
+        Sliding-window layers may use a separate rotary base (Gemma-3).
+        """
+        cos, sin = (self._local_cos, self._local_sin) if local else (self._cos, self._sin)
+        if cos is None or sin is None:
+            cos, sin = self._cos, self._sin
+        rotary = self._rotary_dim
+        full = int(x.shape[-1])
+        if (
+            rotary == full
+            and not self.weights.rope_interleaved
+            and self.kernels.is_native
+        ):
+            return self.kernels.rope(x, cos, sin, position_offset=position_offset)
+        arr = np.ascontiguousarray(x, dtype=np.float32)
+        out = arr.copy()
+        half = rotary // 2
+        c = cos[position_offset : position_offset + arr.shape[0], :half][:, None, :]
+        s = sin[position_offset : position_offset + arr.shape[0], :half][:, None, :]
+        if self.weights.rope_interleaved:
+            even = arr[..., 0:rotary:2]
+            odd = arr[..., 1:rotary:2]
+            out[..., 0:rotary:2] = even * c - odd * s
+            out[..., 1:rotary:2] = odd * c + even * s
+        else:
+            lo, hi = arr[..., :half], arr[..., half:rotary]
+            out[..., :half] = lo * c - hi * s
+            out[..., half:rotary] = hi * c + lo * s
+        return out
+
+    def _layer_uses_rope(self, index: int) -> bool:
+        """Whether layer ``index`` applies any positional rotation."""
+        return not (self._no_rope_layers and index in self._no_rope_layers)
+
+    def _layer_attention_scale(self, index: int) -> float:
+        """Softmax scale for layer ``index``."""
+        scale = self._base_attention_scale
+        if self.weights.attention_scale_by_layer_index:
+            scale = scale / float(index + 1)
+        return scale
 
     def with_task_deltas(self, deltas: dict[str, np.ndarray]) -> "CPUExecutionEngine":
         """Return a request-local engine with validated task-vector deltas applied.
@@ -718,7 +881,12 @@ class CPUExecutionEngine:
         """Grow the RoPE tables when a sequence runs past the precomputed range."""
         if required <= self._cos.shape[0]:
             return
-        self._cos, self._sin = self._build_rope_tables(max_positions=max(required, 2 * self._cos.shape[0]))
+        capacity = max(required, 2 * self._cos.shape[0])
+        self._cos, self._sin = self._build_rope_tables(max_positions=capacity)
+        if self._local_cos is not None:
+            self._local_cos, self._local_sin = self._rope_tables_for_theta(
+                float(self.weights.rope_local_theta or self.weights.rope_theta), capacity
+            )
 
     # ── Primitives ───────────────────────────────────────────────────────────
 
@@ -782,11 +950,59 @@ class CPUExecutionEngine:
             mean = np.mean(arr, axis=-1, keepdims=True)
             variance = np.mean((arr - mean) ** 2, axis=-1, keepdims=True)
             result = (arr - mean) / np.sqrt(variance + self.weights.norm_eps)
-            result = result * np.asarray(weight, dtype=np.float32)
+            result = result * self._norm_weight(weight)
             if bias is not None:
                 result = result + np.asarray(bias, dtype=np.float32)
             return np.ascontiguousarray(result, dtype=np.float32)
+        if self.weights.norm_offset_one:
+            # Gemma stores normalization weights as offsets from unity.  The
+            # native kernel multiplies by the raw weight, so materialize the
+            # effective scale once rather than changing the kernel contract.
+            return self.kernels.rmsnorm(x, self._norm_weight(weight), self.weights.norm_eps)
         return self.kernels.rmsnorm(x, weight, self.weights.norm_eps)
+
+    def _norm_weight(self, weight: np.ndarray) -> np.ndarray:
+        """Return the effective normalization scale for a stored weight vector."""
+        arr = np.asarray(weight, dtype=np.float32)
+        if not self.weights.norm_offset_one:
+            return arr
+        cached = self._offset_norm_cache.get(id(weight))
+        if cached is None:
+            cached = np.ascontiguousarray(arr + np.float32(1.0), dtype=np.float32)
+            self._offset_norm_cache[id(weight)] = cached
+        return cached
+
+    def _head_norm(self, x: np.ndarray, weight: np.ndarray) -> np.ndarray:
+        """Normalize per attention head using the declared normalization family.
+
+        Q/K normalization is RMSNorm in every family that publishes it, but
+        Gemma-3's weights are unity offsets, so the effective scale differs.
+        """
+        return self.kernels.rmsnorm(x, self._norm_weight(weight), self.weights.norm_eps)
+
+    def _scale_residual(self, value: np.ndarray) -> np.ndarray:
+        """Apply the architecture's residual multiplier, when it declares one."""
+        scale = self.weights.residual_scale
+        if scale is None:
+            return value
+        return np.ascontiguousarray(value * np.float32(scale), dtype=np.float32)
+
+    def _finalize_logits(self, logits: np.ndarray) -> np.ndarray:
+        """Apply the output soft cap and logit scale declared by the source.
+
+        Cohere multiplies logits by ``logit_scale``; Granite divides them by
+        ``logits_scaling`` (folded into one multiplier at ingestion); Gemma-2
+        bounds them with ``cap * tanh(logits / cap)``.
+        """
+        result = logits
+        scale = self.weights.logit_scale
+        if scale is not None:
+            result = result * np.float32(scale)
+        cap = self.weights.final_logit_softcap
+        if cap is not None and float(cap) > 0:
+            capf = np.float32(cap)
+            result = (np.tanh(result / capf) * capf).astype(np.float32)
+        return np.ascontiguousarray(result, dtype=np.float32)
 
     def _ffn_activation(self, gate: np.ndarray, up: np.ndarray | None) -> np.ndarray:
         """Evaluate the declared FFN variant without substituting weights."""
@@ -798,16 +1014,26 @@ class CPUExecutionEngine:
                     return np.maximum(gate, 0.0).astype(np.float32)
                 if ffn_type == "relu2":
                     return np.square(np.maximum(gate, 0.0)).astype(np.float32)
-                return (0.5 * gate * (1.0 + np.tanh(
-                    np.sqrt(2.0 / np.pi) * (gate + 0.044715 * gate**3)
-                ))).astype(np.float32)
+                return self._gelu(gate)
             raise ValueError(f"FFN type {self.weights.ffn_type!r} requires an up projection")
         if ffn_type in {"geglu", "gelu"}:
-            activated = 0.5 * gate * (1.0 + np.tanh(
-                np.sqrt(2.0 / np.pi) * (gate + 0.044715 * gate**3)
-            ))
-            return np.asarray(activated * up, dtype=np.float32)
+            return np.asarray(self._gelu(gate) * up, dtype=np.float32)
         return self.kernels.swiglu(gate, up)
+
+    def _gelu(self, x: np.ndarray) -> np.ndarray:
+        """Evaluate GELU in the form the source architecture declares.
+
+        ``gelu_new``/``gelu_pytorch_tanh`` use Hendrycks & Gimpel's tanh
+        approximation; a plain ``gelu`` uses the exact Gaussian CDF.  The forms
+        differ by up to ~1e-3, which accumulates over depth.
+        """
+        arr = np.asarray(x, dtype=np.float32)
+        if self.weights.gelu_approximate:
+            return (0.5 * arr * (1.0 + np.tanh(
+                np.sqrt(2.0 / np.pi) * (arr + 0.044715 * arr**3)
+            ))).astype(np.float32)
+        # 0.5 * x * (1 + erf(x / sqrt(2))) — the exact Gaussian CDF form.
+        return (0.5 * arr * (1.0 + _erf(arr / np.float32(np.sqrt(2.0))))).astype(np.float32)
 
     def _moe_ffn(self, hidden: np.ndarray, layer: LayerWeights) -> np.ndarray:
         """Execute top-k routed SwiGLU experts for a token batch.
@@ -877,6 +1103,7 @@ class CPUExecutionEngine:
         key_positions: np.ndarray | None = None,
         query_positions: np.ndarray | None = None,
         window_size: int | None = None,
+        scale: float | None = None,
     ) -> np.ndarray:
         """Scaled dot-product attention with causal masking and GQA broadcast.
 
@@ -899,7 +1126,7 @@ class CPUExecutionEngine:
         query_positions = np.asarray(query_positions, dtype=np.int64).reshape(-1)
         if key_positions.size != total or query_positions.size != seq_len:
             raise ValueError("attention position metadata does not match KV/query shapes")
-        scale = 1.0 / np.sqrt(self.head_dim)
+        scale = 1.0 / np.sqrt(self.head_dim) if scale is None else float(scale)
         repeats = self.num_heads // self.num_kv_heads
 
         # Decode is memory-bandwidth bound.  For GQA, repeating K/V from
@@ -930,9 +1157,20 @@ class CPUExecutionEngine:
             distance = key_positions[None, :] - query_positions[:, None]
             scores = scores + self._alibi_slopes[:, None, None] * distance[None, :, :]
 
+        softcap = self.weights.attn_logit_softcap
+        if softcap is not None and float(softcap) > 0:
+            # Gemma-2 bounds attention logits before masking:
+            #   scores <- cap * tanh(scores / cap)
+            # Applying it after the mask would turn -inf into -cap.
+            cap = np.float32(softcap)
+            scores = (np.tanh(scores / cap) * cap).astype(np.float32)
+
         # Causal mask uses original token positions, not compressed row indices.
         allowed = key_positions[None, :] <= query_positions[:, None]
-        if window_size is not None and window_size > 0:
+        if window_size is not None and window_size > 0 and total > int(window_size):
+            # Skip a vacuous sliding constraint: when the whole cache already
+            # fits inside the window every key is admissible, and building the
+            # extra all-true comparison per layer is pure overhead.
             allowed &= key_positions[None, :] >= (query_positions[:, None] - int(window_size) + 1)
         sparse_allowed = self._sparse_allowed_mask(
             seq_len=seq_len,
@@ -1080,6 +1318,10 @@ class CPUExecutionEngine:
             self._ensure_rope_capacity(past + seq_len)
 
         hidden = self.weights.embedding[ids].astype(np.float32)
+        if self.weights.embedding_scale is not None:
+            # Gemma multiplies embeddings by sqrt(hidden_size); Granite uses an
+            # explicit embedding_multiplier.  Both are part of the model.
+            hidden = hidden * np.float32(self.weights.embedding_scale)
         if self.weights.embedding_norm is not None:
             hidden = self._norm(
                 hidden,
@@ -1107,12 +1349,27 @@ class CPUExecutionEngine:
                 int(getattr(self.weights, "attention_window", 0) or 0)
                 if local_attention else None
             )
+            layer_uses_rope = uses_rope and self._layer_uses_rope(index)
+            attention_scale = self._layer_attention_scale(index)
+            # ``post``-normalized blocks (OLMo-2) feed the *raw* residual into
+            # each sublayer and normalize the sublayer output instead.  Keeping
+            # one ``block_input`` reference makes all three placements explicit.
+            block_input = hidden
+            post_norm = self._norm_placement == "post"
             # ── Attention block ──
             # For decode (seq_len == 1) with no LoRA: use the fused
             # rmsnorm_linear kernel to eliminate the intermediate normed buffer.
             # With LoRA active we must keep the separate path so the delta can
             # be applied after projection.
-            if (
+            if post_norm:
+                normed = hidden
+                q = self._linear(
+                    normed, layer.q_proj, (index, "q_proj"), layer.q_proj_bias
+                )
+                if layer.q_norm is not None and self._qk_norm_is_full:
+                    q = self._norm(q, layer.q_norm)
+                q = q.reshape(seq_len, self.num_heads, self.head_dim)
+            elif (
                 seq_len == 1
                 and self.active_lora_adapter is None
                 and ttt_slots is None
@@ -1125,6 +1382,8 @@ class CPUExecutionEngine:
                 # can turn an otherwise valid model into repetition garbage.
                 and str(self.weights.norm_type).lower() != "layernorm"
                 and layer.attention_norm_bias is None
+                and not self.weights.norm_offset_one
+                and layer.q_proj_bias is None
             ):
                 q = self.kernels.rmsnorm_linear(
                     hidden, layer.attention_norm, layer.q_proj, self.weights.norm_eps,
@@ -1137,10 +1396,10 @@ class CPUExecutionEngine:
                         normed, ttt_slots[index] if index < len(ttt_slots) else None
                     )
                 q = self._linear(normed, layer.q_proj, (index, "q_proj"), layer.q_proj_bias).reshape(seq_len, self.num_heads, self.head_dim)
-            if layer.q_norm is not None:
-                q = self.kernels.rmsnorm(q, layer.q_norm, self.weights.norm_eps)
-            if uses_rope:
-                q = self.kernels.rope(q, self._cos, self._sin, position_offset=past)
+            if layer.q_norm is not None and not self._qk_norm_is_full:
+                q = self._head_norm(q, layer.q_norm)
+            if layer_uses_rope:
+                q = self._apply_rope(q, past, local=local_attention)
 
             shared_source = self._cross_layer_kv_source(index)
             if shared_source is not None:
@@ -1153,16 +1412,17 @@ class CPUExecutionEngine:
                 # sharing, not a copied approximation of the source cache.
                 keys, values, key_positions = source_keys, source_values, source_positions
             else:
-                k = self._linear(normed, layer.k_proj, (index, "k_proj"), layer.k_proj_bias).reshape(
-                    seq_len, self.num_kv_heads, self.head_dim
-                )
-                if layer.k_norm is not None:
-                    k = self.kernels.rmsnorm(k, layer.k_norm, self.weights.norm_eps)
+                k = self._linear(normed, layer.k_proj, (index, "k_proj"), layer.k_proj_bias)
+                if layer.k_norm is not None and self._qk_norm_is_full:
+                    k = self._norm(k, layer.k_norm)
+                k = k.reshape(seq_len, self.num_kv_heads, self.head_dim)
+                if layer.k_norm is not None and not self._qk_norm_is_full:
+                    k = self._head_norm(k, layer.k_norm)
                 v = self._linear(normed, layer.v_proj, (index, "v_proj"), layer.v_proj_bias).reshape(
                     seq_len, self.num_kv_heads, self.head_dim
                 )
-                if uses_rope:
-                    k = self.kernels.rope(k, self._cos, self._sin, position_offset=past)
+                if layer_uses_rope:
+                    k = self._apply_rope(k, past, local=local_attention)
                 keys, values, key_positions = cache.append(
                     index,
                     k,
@@ -1179,6 +1439,11 @@ class CPUExecutionEngine:
                 and self.kernels.is_native
                 and not local_attention
                 and str(self.weights.position_type or "RoPE").lower() not in {"alibi", "alibi_bias"}
+                # The fused kernel hard-codes the 1/sqrt(head_dim) scale and has
+                # no soft-cap stage, so architectures that declare either must
+                # take the exact path.
+                and abs(attention_scale - 1.0 / float(np.sqrt(self.head_dim))) < 1e-12
+                and not self.weights.attn_logit_softcap
             ):
                 context = self.kernels.flash_attn(
                     q.reshape(self.num_heads, self.head_dim),
@@ -1195,6 +1460,7 @@ class CPUExecutionEngine:
                     key_positions=key_positions,
                     query_positions=np.arange(past, past + seq_len, dtype=np.int64),
                     window_size=attention_window,
+                    scale=attention_scale,
                 )
             compressed_keys, compressed_values, compressed_positions = self._compress_semantic_kv(
                 cache, index, keys, values, key_positions
@@ -1214,9 +1480,29 @@ class CPUExecutionEngine:
             attention_out = self._linear(
                 context.reshape(seq_len, self.num_heads * self.head_dim), layer.o_proj, (index, "o_proj"), layer.o_proj_bias
             )
+            # ``sandwich`` blocks normalize the sublayer output too (Gemma-2/3,
+            # EXAONE-4); ``post`` blocks normalize it *instead of* the input
+            # (OLMo-2), where the two stored norms are the sublayer *output*
+            # norms.  Both happen before the residual add.
+            if layer.post_attention_norm is not None:
+                attention_out = self._norm(
+                    attention_out, layer.post_attention_norm, layer.post_attention_norm_bias
+                )
+            elif post_norm:
+                attention_out = self._norm(
+                    attention_out, layer.attention_norm, layer.attention_norm_bias
+                )
+            attention_out = self._scale_residual(attention_out)
+
             if self.weights.parallel_residual:
-                # GPT-J computes both branches from one normalized state.
-                ffn_normed = normed
+                # GPT-J, GPT-NeoX, Falcon and Cohere evaluate the feed-forward
+                # branch from the *block input*, not from the post-attention
+                # state.  Checkpoints with a single block norm bind ffn_norm to
+                # the same tensor, so this one rule covers both spellings.
+                ffn_normed = self._norm(block_input, layer.ffn_norm, layer.ffn_norm_bias)
+            elif post_norm:
+                hidden = block_input + attention_out
+                ffn_normed = hidden
             else:
                 hidden = hidden + attention_out
                 ffn_normed = self._norm(hidden, layer.ffn_norm, layer.ffn_norm_bias)
@@ -1236,11 +1522,19 @@ class CPUExecutionEngine:
                 ffn_out = self._linear(
                     self._ffn_activation(gate, up), layer.down_proj, (index, "down_proj"), layer.down_proj_bias
                 )
-            hidden = hidden + attention_out + ffn_out if self.weights.parallel_residual else hidden + ffn_out
+            if layer.post_ffn_norm is not None:
+                ffn_out = self._norm(ffn_out, layer.post_ffn_norm, layer.post_ffn_norm_bias)
+            elif post_norm:
+                ffn_out = self._norm(ffn_out, layer.ffn_norm, layer.ffn_norm_bias)
+            ffn_out = self._scale_residual(ffn_out)
+            if self.weights.parallel_residual:
+                hidden = block_input + attention_out + ffn_out
+            else:
+                hidden = hidden + ffn_out
 
         hidden = self._norm(hidden, self.weights.final_norm, self.weights.final_norm_bias)
         cache.last_hidden = np.asarray(hidden[-1], dtype=np.float32).copy()
-        logits = self._linear(hidden, self.weights.lm_head)
+        logits = self._finalize_logits(self._linear(hidden, self.weights.lm_head))
         cache.advance(seq_len)
         cache.last_logits = np.asarray(logits[-1], dtype=np.float32).copy()
         return logits, cache

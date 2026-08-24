@@ -5,6 +5,18 @@ All notable changes to Aether Runtime will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4.alpha] - 2026-08-24 -- Portable Decoder Numerics Preview
+
+### Added
+
+- Expanded architecture execution-numerics metadata and family parity tooling.
+- Added decoder benchmark and numerical contract test utilities.
+
+### Fixed
+
+- Preserved family-specific attention scales, rotary geometry, normalization
+  placement, fused-QKV layouts, and other execution constants in AEG metadata.
+
 ## [1.2.4] - 2026-08-23 -- Portable Decoder Correctness and Throughput Release
 
 ### Fixed
@@ -496,7 +508,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OpenAI-compatible REST API.
 - Research-backed optimizer passes and runtime intelligence.
 
-[Unreleased]: https://github.com/iamkaleemsajjad-hue/Aether/compare/v1.2.4...HEAD
+[Unreleased]: https://github.com/iamkaleemsajjad-hue/Aether/compare/v1.2.4.alpha...HEAD
+[1.2.4.alpha]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.4.alpha
 [1.2.4]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.4
 [1.2.3]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.3
 [1.2.2]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.2

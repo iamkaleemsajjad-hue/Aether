@@ -1017,6 +1017,20 @@ class MemoryTier(enum.IntEnum):
         return self.label
 
 
+def _optional_float(value: Any) -> float | None:
+    """Coerce a manifest field to ``float`` while preserving an absent value.
+
+    A missing execution-numerics field means "use the architecture default",
+    which is semantically different from an explicit ``0.0``.
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class ModelArchitecture:
     """Describes the architecture of a model detected during ingestion."""
@@ -1151,6 +1165,113 @@ class ModelArchitecture:
     relative_attention_num_buckets: int = 32
     """Number of T5 relative-position buckets when declared by the source."""
 
+    # ── Execution numerics ──────────────────────────────────────────────────
+    # Decoder families agree on the *shape* of the transformer block but differ
+    # in a small set of scalar constants and structural placements.  Those
+    # differences are not stylistic: omitting one changes every logit.  They are
+    # read from the source configuration at ingestion and become part of the AEG
+    # execution contract, so no runtime code needs to branch on a family name.
+
+    attention_scale: float | None = None
+    """Softmax scale applied to ``QKᵀ``.  ``None`` means ``1/sqrt(head_dim)``.
+
+    GPT-Neo publishes unscaled attention (scale 1.0); Gemma-2/3 derive the
+    scale from ``query_pre_attn_scalar`` rather than the head width; Granite
+    uses an explicit ``attention_multiplier``.
+    """
+
+    attention_scale_by_layer_index: bool = False
+    """Whether to additionally divide scores by ``layer_index + 1``.
+
+    GPT-2's ``scale_attn_by_inverse_layer_idx`` training trick, which must be
+    reproduced at inference for checkpoints that enabled it.
+    """
+
+    embedding_scale: float | None = None
+    """Multiplier applied to the token embedding output.
+
+    Gemma scales embeddings by ``sqrt(hidden_size)``; Granite uses an explicit
+    ``embedding_multiplier``.
+    """
+
+    residual_scale: float | None = None
+    """Multiplier applied to each sublayer output before the residual add.
+
+    Granite's ``residual_multiplier``.
+    """
+
+    logit_scale: float | None = None
+    """Multiplier applied to the final logits (Cohere's ``logit_scale``)."""
+
+    attn_logit_softcap: float | None = None
+    """Gemma-2 attention logit soft cap: ``cap * tanh(scores / cap)``."""
+
+    final_logit_softcap: float | None = None
+    """Gemma-2 output logit soft cap: ``cap * tanh(logits / cap)``."""
+
+    norm_offset_one: bool = False
+    """Whether RMSNorm uses ``x * (1 + weight)`` instead of ``x * weight``.
+
+    Gemma stores its normalization weights as offsets from unity.
+    """
+
+    rope_partial_dim: int | None = None
+    """Number of leading head dimensions that RoPE rotates.
+
+    GPT-NeoX (``rotary_pct``), GPT-J (``rotary_dim``), StableLM and Phi
+    (``partial_rotary_factor``) rotate only a prefix of each head and pass the
+    remaining channels through unchanged.  ``None`` rotates the full head.
+    """
+
+    rope_interleaved: bool = False
+    """Whether RoPE pairs adjacent channels instead of half-split halves.
+
+    GPT-J's published ``rotate_every_two`` convention pairs ``(x0,x1)``,
+    ``(x2,x3)``, ...; the GPT-NeoX/Llama convention pairs ``(x_i, x_{i+d/2})``.
+    The two are not interchangeable.
+    """
+
+    rope_local_theta: float | None = None
+    """Separate RoPE base for sliding-window layers (Gemma-3's local base)."""
+
+    norm_placement: str = "pre"
+    """Where block normalization is applied: ``pre``, ``post``, or ``sandwich``.
+
+    ``pre`` is the standard pre-norm block.  ``post`` normalizes each sublayer
+    *output* before the residual add (OLMo-2).  ``sandwich`` normalizes both the
+    input and the output of each sublayer (Gemma-2/3, EXAONE-4).
+    """
+
+    qk_norm_scope: str = "head"
+    """Whether Q/K normalization spans one head (``head``) or the whole
+    projection (``full``).  OLMo-2 normalizes the full projection."""
+
+    fused_qkv_layout: str = "contiguous"
+    """Memory layout of a fused QKV projection in the source checkpoint.
+
+    ``contiguous`` stacks ``[all Q | all K | all V]`` (Phi-3, MPT, GPT-2).
+    ``head_interleaved`` stacks per head ``[q,k,v][q,k,v]...`` (GPT-NeoX,
+    BLOOM).  ``group_interleaved`` stacks per KV group
+    ``[q...q, k, v][q...q, k, v]...`` (Falcon's new decoder architecture).
+    Splitting the wrong way silently permutes every attention head.
+    """
+
+    no_rope_layers: list[int] | None = None
+    """Indices of layers that apply no positional rotation at all (NoPE).
+
+    SmolLM3 interleaves NoPE layers among RoPE layers.
+    """
+
+    gelu_approximate: bool = True
+    """Whether a GELU activation uses the tanh approximation.
+
+    ``gelu_new``/``gelu_pytorch_tanh``/``gelu_fast`` (GPT-2, GPT-Neo, GPT-J,
+    Gemma, Starcoder2, BLOOM) use the tanh form; a plain ``gelu``
+    (GPT-NeoX, Falcon, MPT) uses the exact error function.  The two differ by
+    up to ~1e-3 per activation, which is small per layer and visible in the
+    logits after accumulating over depth.
+    """
+
     def __post_init__(self) -> None:
         """Auto-compute derived fields."""
         if self.head_dim is None:
@@ -1235,6 +1356,22 @@ class ModelArchitecture:
             "embedding_norm": self.embedding_norm,
             "qk_norm": self.qk_norm,
             "parallel_residual": self.parallel_residual,
+            "attention_scale": self.attention_scale,
+            "attention_scale_by_layer_index": self.attention_scale_by_layer_index,
+            "embedding_scale": self.embedding_scale,
+            "residual_scale": self.residual_scale,
+            "logit_scale": self.logit_scale,
+            "attn_logit_softcap": self.attn_logit_softcap,
+            "final_logit_softcap": self.final_logit_softcap,
+            "norm_offset_one": self.norm_offset_one,
+            "rope_partial_dim": self.rope_partial_dim,
+            "rope_interleaved": self.rope_interleaved,
+            "rope_local_theta": self.rope_local_theta,
+            "norm_placement": self.norm_placement,
+            "qk_norm_scope": self.qk_norm_scope,
+            "fused_qkv_layout": self.fused_qkv_layout,
+            "no_rope_layers": self.no_rope_layers,
+            "gelu_approximate": self.gelu_approximate,
         }
 
     @staticmethod
@@ -1300,6 +1437,30 @@ class ModelArchitecture:
             embedding_norm=bool(data.get("embedding_norm", False)),
             qk_norm=bool(data.get("qk_norm", False)),
             parallel_residual=bool(data.get("parallel_residual", False)),
+            attention_scale=_optional_float(data.get("attention_scale")),
+            attention_scale_by_layer_index=bool(
+                data.get("attention_scale_by_layer_index", False)
+            ),
+            embedding_scale=_optional_float(data.get("embedding_scale")),
+            residual_scale=_optional_float(data.get("residual_scale")),
+            logit_scale=_optional_float(data.get("logit_scale")),
+            attn_logit_softcap=_optional_float(data.get("attn_logit_softcap")),
+            final_logit_softcap=_optional_float(data.get("final_logit_softcap")),
+            norm_offset_one=bool(data.get("norm_offset_one", False)),
+            rope_partial_dim=(
+                int(data["rope_partial_dim"])
+                if data.get("rope_partial_dim") is not None else None
+            ),
+            rope_interleaved=bool(data.get("rope_interleaved", False)),
+            rope_local_theta=_optional_float(data.get("rope_local_theta")),
+            norm_placement=str(data.get("norm_placement", "pre") or "pre"),
+            qk_norm_scope=str(data.get("qk_norm_scope", "head") or "head"),
+            fused_qkv_layout=str(data.get("fused_qkv_layout", "contiguous") or "contiguous"),
+            no_rope_layers=(
+                [int(value) for value in data["no_rope_layers"]]
+                if data.get("no_rope_layers") is not None else None
+            ),
+            gelu_approximate=bool(data.get("gelu_approximate", True)),
         )
 
     def __repr__(self) -> str:
