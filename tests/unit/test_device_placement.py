@@ -9,6 +9,7 @@ decides between the two.
 
 from __future__ import annotations
 
+import pathlib
 from types import SimpleNamespace
 
 import numpy as np
@@ -216,3 +217,31 @@ class TestRotaryTableGrowth:
         engine = self._engine(context_length=32)
         with pytest.raises(ValueError, match="exceeds the compiled context length"):
             engine._ensure_rope(64)
+
+
+def test_every_runtime_engine_module_imports_cleanly() -> None:
+    """Import each accelerator engine and touch its module-level names.
+
+    Ruff's undefined-name check does not flag a global referenced only inside a
+    method body, so a missing import in one of these modules surfaces as a
+    ``NameError`` at model-load time — on whichever architecture happens to use
+    that engine, which may be none of the ones a given test run exercises.
+    Importing every engine and resolving the shared helpers they reference makes
+    that failure mode cheap to catch here instead.
+    """
+    import importlib
+
+    pytest.importorskip("torch")
+    engines = (
+        "aether.runtime.torch_engine",
+        "aether.runtime.torch_tensor_parallel",
+        "aether.runtime.torch_state_engine",
+        "aether.runtime.torch_transformer_engine",
+    )
+    for name in engines:
+        module = importlib.import_module(name)
+        source = pathlib.Path(module.__file__).read_text(encoding="utf-8")
+        # Any shared helper a module references must actually resolve in it.
+        for helper in ("_resolve_device", "execution_numerics", "TorchKVCache"):
+            if helper in source:
+                assert hasattr(module, helper), f"{name} references {helper} without importing it"

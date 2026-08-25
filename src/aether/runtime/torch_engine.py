@@ -349,34 +349,52 @@ class TorchAEGEngine:
         ]
         converted["num_activated_experts"] = int(getattr(layer, "num_activated_experts", 1) or 1)
 
-        # Pack projections that share the same input into one device GEMM.
+        # ── Settle every projection's orientation once, at load time ───────
+        # Some checkpoints (GPT-2 and GPT-Neo's Conv1D) store linear weights as
+        # ``(in, out)``.  Deriving that per call, as the public ``_linear`` does,
+        # costs a handful of Python operations for every projection in every
+        # layer for every token — on a small model that is a real share of the
+        # step.  Orienting them here lets the decode loop call the GEMM directly.
+        hidden = int(self.weights.embedding.shape[1])
+        attention_width = self.num_heads * self.head_dim
+        for name in ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"):
+            if converted[name] is not None:
+                converted[name] = self._orient(converted[name], hidden, name)
+        if converted["o_proj"] is not None:
+            converted["o_proj"] = self._orient(
+                converted["o_proj"], attention_width, "o_proj"
+            )
+        # The FFN input width follows from whichever gate/up projection exists;
+        # a GELU block (GPT-2, GPT-Neo) has only the one.
+        ffn_width = next(
+            (int(converted[name].shape[0]) for name in ("gate_proj", "up_proj")
+             if converted[name] is not None),
+            None,
+        )
+        if converted["down_proj"] is not None and ffn_width is not None:
+            converted["down_proj"] = self._orient(
+                converted["down_proj"], ffn_width, "down_proj"
+            )
+        for expert in converted["experts"]:
+            for name in ("gate_proj", "up_proj"):
+                if expert[name] is not None:
+                    expert[name] = self._orient(expert[name], hidden, f"expert {name}")
+            expert_width = next(
+                (int(expert[name].shape[0]) for name in ("gate_proj", "up_proj")
+                 if expert[name] is not None),
+                None,
+            )
+            if expert["down_proj"] is not None and expert_width is not None:
+                expert["down_proj"] = self._orient(
+                    expert["down_proj"], expert_width, "expert down_proj"
+                )
+
+        # ── Pack projections that share an input into one device GEMM ───────
         # The concatenation is algebraically lossless and removes two launch
         # boundaries from the decode hot path.  Keep the logical AEG layout in
-        # the source engine; only the device resident representation is packed.
-        hidden = int(self.weights.embedding.shape[1])
-
-        def canonical(value: Any, role: str) -> Any:
-            """Return ``value`` oriented as ``(out_features, hidden)``.
-
-            Some source checkpoints store Conv1D weights transposed relative to
-            ``nn.Linear``.  Packing must happen in one orientation, otherwise
-            the concatenation joins the wrong axis and the fused GEMM contracts
-            over the output dimension.
-            """
-            if int(value.shape[1]) == hidden:
-                return value
-            if int(value.shape[0]) == hidden:
-                return value.transpose(0, 1)
-            raise ValueError(
-                f"{role} projection does not contract the model hidden size: "
-                f"{tuple(value.shape)} vs {hidden}"
-            )
-
+        # the source engine; only the device-resident representation is packed.
         q, k, v = converted["q_proj"], converted["k_proj"], converted["v_proj"]
         if q is not None and k is not None and v is not None:
-            q = canonical(q, "attention")
-            k = canonical(k, "attention")
-            v = canonical(v, "attention")
             biases = (
                 converted["q_proj_bias"],
                 converted["k_proj_bias"],
@@ -392,10 +410,6 @@ class TorchAEGEngine:
                 converted["q_proj_bias"] = converted["k_proj_bias"] = converted["v_proj_bias"] = None
 
         gate, up = converted["gate_proj"], converted["up_proj"]
-        if gate is not None and up is not None:
-            gate = canonical(gate, "FFN gate")
-            up = canonical(up, "FFN up")
-            converted["gate_proj"], converted["up_proj"] = gate, up
         if gate is not None and up is not None and int(gate.shape[1]) == int(up.shape[1]):
             gate_bias, up_bias = converted["gate_proj_bias"], converted["up_proj_bias"]
             if (gate_bias is None) == (up_bias is None):
@@ -408,6 +422,24 @@ class TorchAEGEngine:
                 converted["gate_proj"] = converted["up_proj"] = None
                 converted["gate_proj_bias"] = converted["up_proj_bias"] = None
         return converted
+
+    @staticmethod
+    def _orient(value: Any, in_features: int, role: str) -> Any:
+        """Return ``value`` laid out as ``(out_features, in_features)``.
+
+        Some source checkpoints (GPT-2's Conv1D) store linear weights
+        transposed relative to ``nn.Linear``.  Settling the orientation once, at
+        load time, is what allows both the fused packing below and the decode
+        loop to assume a single layout.
+        """
+        if int(value.shape[1]) == in_features:
+            return value
+        if int(value.shape[0]) == in_features:
+            return value.transpose(0, 1).contiguous()
+        raise ValueError(
+            f"{role} projection does not contract {in_features} input features: "
+            f"got shape {tuple(value.shape)}"
+        )
 
     def _ensure_rope(self, required: int, device: Any | None = None) -> None:
         """Grow the rotary tables to cover ``required`` positions.
@@ -439,13 +471,19 @@ class TorchAEGEngine:
             )
 
     def _rope_tables(self, theta: float, required: int, device: Any) -> tuple[Any, Any]:
-        """Build cos/sin tables for one rotary base.
+        """Build cos/sin tables for one rotary base, pre-expanded to full width.
 
-        The table spans ``rotary_dim / 2`` frequencies, which is the full head
-        half-width unless the architecture rotates only a prefix of each head
-        (GPT-NeoX, GPT-J, StableLM, Phi).  Angles are computed in FP32 and the
-        result is stored in the compute dtype, so the per-token path performs no
-        dtype conversion.
+        The angles span ``rotary_dim / 2`` frequencies — the full head half-width
+        unless the architecture rotates only a prefix of each head (GPT-NeoX,
+        GPT-J, StableLM, Phi, GLM-4).  Each frequency is then duplicated to the
+        rotated width *in the layout the model's convention needs*, so the
+        per-token path applies the rotation as
+
+            x·cos + rotate(x)·sin
+
+        with no table reshaping and no dtype conversion at all.  Storing the
+        expansion once, at table-build time, removes several tensor operations
+        per layer per token, which is the dominant cost of small-model decode.
         """
         half = self.rotary_dim // 2
         positions = self.torch.arange(required, device=device, dtype=self.torch.float32)[:, None]
@@ -454,10 +492,18 @@ class TorchAEGEngine:
         )
         inv_freq = theta ** (-exponent)
         angles = positions * inv_freq[None, :]
-        return (
-            self.torch.cos(angles).to(dtype=self.compute_dtype),
-            self.torch.sin(angles).to(dtype=self.compute_dtype),
-        )
+        cos, sin = self.torch.cos(angles), self.torch.sin(angles)
+        if self.rope_interleaved:
+            # Adjacent-channel pairing (GPT-J, Cohere, GLM-4): frequency i covers
+            # channels 2i and 2i+1.
+            cos = cos.repeat_interleave(2, dim=-1)
+            sin = sin.repeat_interleave(2, dim=-1)
+        else:
+            # Half-split pairing (Llama, Qwen, Mistral, GPT-NeoX): frequency i
+            # covers channels i and i + rotary/2.
+            cos = self.torch.cat((cos, cos), dim=-1)
+            sin = self.torch.cat((sin, sin), dim=-1)
+        return cos.to(dtype=self.compute_dtype), sin.to(dtype=self.compute_dtype)
 
     def _rope_slice(self, positions: Any, *, local: bool) -> tuple[Any, Any]:
         """Gather the cos/sin rows for ``positions``, shaped for broadcasting.
@@ -508,6 +554,17 @@ class TorchAEGEngine:
         ).to(dtype=x.dtype)
         return x * rms * weight
 
+    def _matmul(self, x: Any, weight: Any, bias: Any | None = None) -> Any:
+        """Apply a projection whose orientation was settled at load time.
+
+        ``_linear`` re-derives the layout and re-validates shapes on every call.
+        That is the right behaviour at the public boundary, but inside the decode
+        loop it is several Python operations per projection per layer, repeated
+        for every token — enough to matter on a small model where each kernel is
+        only microseconds of real work.
+        """
+        return self.torch.nn.functional.linear(x, weight, bias)
+
     def _linear(self, x: Any, weight: Any, bias: Any | None = None) -> Any:
         if weight.ndim != 2:
             raise ValueError(f"linear weight must be rank-2, got shape {tuple(weight.shape)}")
@@ -533,33 +590,47 @@ class TorchAEGEngine:
     def _rope(self, x: Any, cos: Any, sin: Any) -> Any:
         """Rotate ``(seq, heads, head_dim)`` using the declared RoPE convention.
 
+        Evaluated as the single expression ``x·cos + rotate(x)·sin``, which is the
+        published form and needs five tensor operations regardless of pairing
+        convention.  Writing out the two halves explicitly instead costs seven,
+        and rotary is applied twice per layer, so on a small model that
+        difference is a measurable share of the whole decode step.
+
         Three source conventions are supported and are not interchangeable:
-        half-split pairing ``(x_i, x_{i+d/2})`` used by GPT-NeoX, Llama, Qwen
-        and Mistral; interleaved pairing ``(x_{2i}, x_{2i+1})`` published by
-        GPT-J and Cohere; and partial rotation, which leaves the trailing
+        half-split pairing ``(x_i, x_{i+d/2})`` used by GPT-NeoX, Llama, Qwen and
+        Mistral; interleaved pairing ``(x_{2i}, x_{2i+1})`` published by GPT-J,
+        Cohere and GLM-4; and partial rotation, which leaves the trailing
         ``head_dim - rotary_dim`` channels untouched.
 
-        ``cos``/``sin`` are prepared once per step by :meth:`_rope_slice`;
-        sliding-window layers may pass factors from a separate rotary base
-        (Gemma-3).
+        ``cos``/``sin`` come pre-expanded to the rotated width from
+        :meth:`_rope_tables`; sliding-window layers may pass factors built from a
+        separate rotary base (Gemma-3).
         """
         rotary = self.rotary_dim
-        half = rotary // 2
-        full = int(x.shape[-1])
+        if rotary == int(x.shape[-1]):
+            return x * cos + self._rotate(x) * sin
+        prefix = x[..., :rotary]
+        return self.torch.cat(
+            (prefix * cos + self._rotate(prefix) * sin, x[..., rotary:]), dim=-1
+        )
+
+    @staticmethod
+    def _has_qk_norm(layer: dict[str, Any]) -> bool:
+        """Whether this layer normalizes Q or K between projection and rotary."""
+        return layer["q_norm"] is not None or layer["k_norm"] is not None
+
+    def _rotate(self, x: Any) -> Any:
+        """Return the 90°-rotated companion of ``x`` for its pairing convention.
+
+        Half-split yields ``[-x_h .. -x_2h, x_0 .. x_h]``; interleaved yields
+        ``[-x_1, x_0, -x_3, x_2, ...]``.  Both are the standard formulations.
+        """
         if self.rope_interleaved:
-            even = x[..., 0:rotary:2]
-            odd = x[..., 1:rotary:2]
-            rotated = self.torch.stack(
-                (even * cos - odd * sin, odd * cos + even * sin), dim=-1
-            ).flatten(-2)
-        else:
-            first, second = x[..., :half], x[..., half:rotary]
-            rotated = self.torch.cat(
-                (first * cos - second * sin, second * cos + first * sin), dim=-1
-            )
-        if rotary == full:
-            return rotated
-        return self.torch.cat((rotated, x[..., rotary:]), dim=-1)
+            even = x[..., 0::2]
+            odd = x[..., 1::2]
+            return self.torch.stack((-odd, even), dim=-1).flatten(-2)
+        half = int(x.shape[-1]) // 2
+        return self.torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
     def _activation(self, gate: Any, up: Any | None) -> Any:
         torch = self.torch
@@ -779,7 +850,7 @@ class TorchAEGEngine:
         if self.embedding_scale is not None:
             # Gemma scales embeddings by sqrt(hidden_size); Granite uses an
             # explicit embedding_multiplier.  Both are part of the model.
-            hidden = hidden * hidden.new_tensor(self.embedding_scale)
+            hidden = hidden * self.embedding_scale
         if self.embedding_norm is not None:
             hidden = self._norm(hidden, self.embedding_norm, self.embedding_norm_bias)
         if self.position_embedding is not None:
@@ -811,34 +882,60 @@ class TorchAEGEngine:
                         hidden, layer["attention_norm"], layer["attention_norm_bias"]
                     )
                 if layer.get("qkv_weight") is not None:
-                    qkv = self._linear(normed, layer["qkv_weight"], layer["qkv_bias"])
+                    qkv = self._matmul(normed, layer["qkv_weight"], layer["qkv_bias"])
                     q_width = int(layer["q_width"])
                     k_width = int(layer["k_width"])
                     q = qkv[..., :q_width]
                     k = qkv[..., q_width:q_width + k_width]
                     v = qkv[..., q_width + k_width:]
+                    # Q and K are adjacent in the fused output and share
+                    # ``head_dim``, so when no Q/K normalization intervenes the
+                    # pair can be viewed as one head-major tensor and rotated in
+                    # a single pass — halving the rotary work per layer.
+                    qk_fused = (
+                        qkv[..., : q_width + k_width]
+                        if not self._has_qk_norm(layer)
+                        else None
+                    )
                 else:
-                    q = self._linear(normed, layer["q_proj"], layer["q_proj_bias"])
-                    k = self._linear(normed, layer["k_proj"], layer["k_proj_bias"])
-                    v = self._linear(normed, layer["v_proj"], layer["v_proj_bias"])
-                if self.qk_norm_is_full:
-                    # OLMo-2 normalizes the whole projection, before it is
-                    # split into heads.
-                    if layer["q_norm"] is not None:
-                        q = self._norm(q, layer["q_norm"])
-                    if layer["k_norm"] is not None:
-                        k = self._norm(k, layer["k_norm"])
-                q = q.reshape(seq_len, self.num_heads, self.head_dim)
-                k = k.reshape(seq_len, self.num_kv_heads, self.head_dim)
-                if not self.qk_norm_is_full:
-                    if layer["q_norm"] is not None:
-                        q = self._norm(q, layer["q_norm"])
-                    if layer["k_norm"] is not None:
-                        k = self._norm(k, layer["k_norm"])
-                if layer_uses_rope:
+                    q = self._matmul(normed, layer["q_proj"], layer["q_proj_bias"])
+                    k = self._matmul(normed, layer["k_proj"], layer["k_proj_bias"])
+                    v = self._matmul(normed, layer["v_proj"], layer["v_proj_bias"])
+                    qk_fused = None
+                if layer_uses_rope and qk_fused is not None:
                     cos, sin = rope_local if local_attention else rope_global
-                    q = self._rope(q, cos, sin)
-                    k = self._rope(k, cos, sin)
+                    rotated = self._rope(
+                        qk_fused.reshape(
+                            seq_len, self.num_heads + self.num_kv_heads, self.head_dim
+                        ),
+                        cos,
+                        sin,
+                    )
+                    q = rotated[:, : self.num_heads]
+                    k = rotated[:, self.num_heads :]
+                else:
+                    if self.qk_norm_is_full:
+                        # OLMo-2 and OLMoE normalize the whole projection, before
+                        # it is split into heads.
+                        if layer["q_norm"] is not None:
+                            q = self._norm(q, layer["q_norm"])
+                        if layer["k_norm"] is not None:
+                            k = self._norm(k, layer["k_norm"])
+                    q = q.reshape(seq_len, self.num_heads, self.head_dim)
+                    k = k.reshape(seq_len, self.num_kv_heads, self.head_dim)
+                    if not self.qk_norm_is_full:
+                        if layer["q_norm"] is not None:
+                            q = self._norm(q, layer["q_norm"])
+                        if layer["k_norm"] is not None:
+                            k = self._norm(k, layer["k_norm"])
+                    if layer_uses_rope:
+                        cos, sin = rope_local if local_attention else rope_global
+                        # Normalized Q and K are separate tensors but still share
+                        # the rotation, so one concatenation still beats rotating
+                        # each of them independently.
+                        rotated = self._rope(torch.cat((q, k), dim=1), cos, sin)
+                        q = rotated[:, : self.num_heads]
+                        k = rotated[:, self.num_heads :]
                 v = v.reshape(seq_len, self.num_kv_heads, self.head_dim)
                 total = past + seq_len
                 k_all = self._append_kv(cache.keys[index], k, past, total, reserve)
@@ -849,7 +946,7 @@ class TorchAEGEngine:
                 )
                 cache.keys[index] = k_all
                 cache.values[index] = v_all
-                attention_out = self._linear(
+                attention_out = self._matmul(
                     context.reshape(seq_len, self.num_heads * self.head_dim),
                     layer["o_proj"], layer["o_proj_bias"],
                 )
@@ -867,7 +964,7 @@ class TorchAEGEngine:
                         attention_out, layer["attention_norm"], layer["attention_norm_bias"]
                     )
                 if residual_scale is not None:
-                    attention_out = attention_out * attention_out.new_tensor(residual_scale)
+                    attention_out = attention_out * residual_scale
 
                 if parallel:
                     # GPT-J, GPT-NeoX, Falcon and Cohere evaluate the
@@ -891,14 +988,14 @@ class TorchAEGEngine:
                     ffn_out = self._moe_ffn(ffn_input, layer)
                 else:
                     if layer.get("gate_up_weight") is not None:
-                        gate_up = self._linear(ffn_input, layer["gate_up_weight"], layer["gate_up_bias"])
+                        gate_up = self._matmul(ffn_input, layer["gate_up_weight"], layer["gate_up_bias"])
                         gate_width = int(layer["gate_width"])
                         gate = gate_up[..., :gate_width]
                         up = gate_up[..., gate_width:]
                     else:
-                        gate = self._linear(ffn_input, layer["gate_proj"], layer["gate_proj_bias"])
-                        up = self._linear(ffn_input, layer["up_proj"], layer["up_proj_bias"]) if layer["up_proj"] is not None else None
-                    ffn_out = self._linear(self._activation(gate, up), layer["down_proj"], layer["down_proj_bias"])
+                        gate = self._matmul(ffn_input, layer["gate_proj"], layer["gate_proj_bias"])
+                        up = self._matmul(ffn_input, layer["up_proj"], layer["up_proj_bias"]) if layer["up_proj"] is not None else None
+                    ffn_out = self._matmul(self._activation(gate, up), layer["down_proj"], layer["down_proj_bias"])
                 if layer["post_ffn_norm"] is not None:
                     ffn_out = self._norm(
                         ffn_out, layer["post_ffn_norm"], layer["post_ffn_norm_bias"]
@@ -906,7 +1003,7 @@ class TorchAEGEngine:
                 elif post_norm:
                     ffn_out = self._norm(ffn_out, layer["ffn_norm"], layer["ffn_norm_bias"])
                 if residual_scale is not None:
-                    ffn_out = ffn_out * ffn_out.new_tensor(residual_scale)
+                    ffn_out = ffn_out * residual_scale
                 if parallel:
                     hidden = block_input + attention_out + ffn_out
                 else:
@@ -914,7 +1011,7 @@ class TorchAEGEngine:
             hidden = self._norm(hidden, self.final_norm, self.final_norm_bias)
             logits = self._linear(hidden, self.lm_head)
             if self.logit_scale is not None:
-                logits = logits * logits.new_tensor(self.logit_scale)
+                logits = logits * self.logit_scale
             if self.final_logit_softcap:
                 logits = self._softcap(logits, self.final_logit_softcap)
             cache.length = past + seq_len

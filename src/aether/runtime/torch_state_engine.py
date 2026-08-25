@@ -12,6 +12,8 @@ from typing import Any, Iterator
 
 import numpy as np
 
+from aether.runtime.torch_engine import _resolve_device
+
 
 def _apply_torch_grammar_mask(logits: Any, grammar_session: Any, torch: Any) -> Any:
     """Mask a Torch logits vector using the authenticated byte-mask FSM."""

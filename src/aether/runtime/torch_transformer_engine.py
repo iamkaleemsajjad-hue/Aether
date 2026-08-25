@@ -11,6 +11,8 @@ from typing import Any, Iterator
 
 import numpy as np
 
+from aether.runtime.torch_engine import _resolve_device
+
 
 class TorchEncoderAEGEngine:
     """Device-resident BERT-style bidirectional encoder."""

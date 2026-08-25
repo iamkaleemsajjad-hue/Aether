@@ -479,3 +479,140 @@ class TestPipelinedDecode:
         batch = engine.generate(prompt, max_tokens=6, temperature=0.0)
         streamed = list(engine.generate_iter(prompt, max_tokens=6, temperature=0.0))
         assert streamed == batch
+
+
+class TestRotaryFormulation:
+    """The decode-path rotary must equal the explicit two-half definition.
+
+    The engine evaluates ``x·cos + rotate(x)·sin`` with pre-expanded tables
+    because it costs fewer tensor operations, and rotary runs twice per layer.
+    These tests pin it against the textbook form written out directly, for both
+    pairing conventions and for partial rotation.
+    """
+
+    def _engine(self, *, interleaved: bool = False, partial: int | None = None):
+        pytest.importorskip("torch")
+        import numpy as np
+
+        from aether.runtime.torch_engine import TorchAEGEngine
+
+        hidden, heads, vocab = 16, 2, 8
+        layer = LayerWeights(
+            attention_norm=np.ones(hidden, dtype=np.float32),
+            q_proj=np.eye(hidden, dtype=np.float32),
+            k_proj=np.eye(hidden, dtype=np.float32),
+            v_proj=np.eye(hidden, dtype=np.float32),
+            o_proj=np.eye(hidden, dtype=np.float32),
+            ffn_norm=np.ones(hidden, dtype=np.float32),
+            gate_proj=np.zeros((hidden, hidden), dtype=np.float32),
+            up_proj=np.zeros((hidden, hidden), dtype=np.float32),
+            down_proj=np.zeros((hidden, hidden), dtype=np.float32),
+        )
+        weights = ModelWeights(
+            embedding=np.eye(vocab, hidden, dtype=np.float32),
+            layers=[layer],
+            final_norm=np.ones(hidden, dtype=np.float32),
+            lm_head=np.eye(vocab, hidden, dtype=np.float32),
+            rope_interleaved=interleaved,
+            rope_partial_dim=partial,
+        )
+        return TorchAEGEngine(CPUExecutionEngine(weights, num_heads=heads), "cpu")
+
+    @staticmethod
+    def _reference(torch, x, cos, sin, rotary: int, interleaved: bool):
+        """The rotation written out as two explicit halves."""
+        head = int(x.shape[-1])
+        body = x[..., :rotary]
+        half = rotary // 2
+        if interleaved:
+            even, odd = body[..., 0::2], body[..., 1::2]
+            c, s = cos[..., 0::2], sin[..., 0::2]
+            out = torch.stack((even * c - odd * s, odd * c + even * s), dim=-1).flatten(-2)
+        else:
+            first, second = body[..., :half], body[..., half:]
+            c, s = cos[..., :half], sin[..., :half]
+            out = torch.cat((first * c - second * s, second * c + first * s), dim=-1)
+        if rotary == head:
+            return out
+        return torch.cat((out, x[..., rotary:]), dim=-1)
+
+    @pytest.mark.parametrize("interleaved", [False, True])
+    @pytest.mark.parametrize("partial", [None, 4])
+    def test_matches_the_explicit_two_half_form(self, interleaved: bool, partial: int | None) -> None:
+        torch = pytest.importorskip("torch")
+
+        engine = self._engine(interleaved=interleaved, partial=partial)
+        engine._ensure_rope(8)
+        positions = torch.arange(3, dtype=torch.long)
+        cos, sin = engine._rope_slice(positions, local=False)
+        x = torch.randn(3, engine.num_heads, engine.head_dim)
+        expected = self._reference(
+            torch, x, cos, sin, engine.rotary_dim, interleaved
+        )
+        torch.testing.assert_close(engine._rope(x, cos, sin), expected, rtol=1e-6, atol=1e-6)
+
+    @pytest.mark.parametrize("interleaved", [False, True])
+    def test_tables_are_pre_expanded_to_the_rotated_width(self, interleaved: bool) -> None:
+        pytest.importorskip("torch")
+        engine = self._engine(interleaved=interleaved)
+        engine._ensure_rope(4)
+        # Pre-expansion is what lets the per-token path skip reshaping the table.
+        assert int(engine._cos.shape[-1]) == engine.rotary_dim
+
+    def test_rotating_q_and_k_together_matches_rotating_them_apart(self) -> None:
+        """The fused path concatenates along heads; both must agree exactly."""
+        torch = pytest.importorskip("torch")
+
+        engine = self._engine()
+        engine._ensure_rope(8)
+        positions = torch.arange(2, dtype=torch.long)
+        cos, sin = engine._rope_slice(positions, local=False)
+        q = torch.randn(2, 3, engine.head_dim)
+        k = torch.randn(2, 1, engine.head_dim)
+        separate = torch.cat((engine._rope(q, cos, sin), engine._rope(k, cos, sin)), dim=1)
+        together = engine._rope(torch.cat((q, k), dim=1), cos, sin)
+        torch.testing.assert_close(together, separate, rtol=1e-6, atol=1e-6)
+
+
+class TestProjectionOrientation:
+    """Conv1D-style transposed weights must be handled before the decode loop."""
+
+    def test_transposed_projections_are_oriented_at_load(self) -> None:
+        pytest.importorskip("torch")
+        import numpy as np
+
+        from aether.runtime.torch_engine import TorchAEGEngine
+
+        hidden, heads, vocab, inter = 8, 2, 6, 20
+        rng = np.random.default_rng(3)
+        # A GELU block with a single intermediate projection, stored (in, out) as
+        # GPT-2 and GPT-Neo do.
+        layer = LayerWeights(
+            attention_norm=np.ones(hidden, dtype=np.float32),
+            q_proj=rng.normal(size=(hidden, hidden)).astype(np.float32),
+            k_proj=rng.normal(size=(hidden, hidden)).astype(np.float32),
+            v_proj=rng.normal(size=(hidden, hidden)).astype(np.float32),
+            o_proj=rng.normal(size=(hidden, hidden)).astype(np.float32),
+            ffn_norm=np.ones(hidden, dtype=np.float32),
+            gate_proj=rng.normal(size=(hidden, inter)).astype(np.float32),
+            up_proj=None,
+            down_proj=rng.normal(size=(inter, hidden)).astype(np.float32),
+        )
+        weights = ModelWeights(
+            embedding=rng.normal(size=(vocab, hidden)).astype(np.float32),
+            layers=[layer],
+            final_norm=np.ones(hidden, dtype=np.float32),
+            lm_head=rng.normal(size=(vocab, hidden)).astype(np.float32),
+            ffn_type="GELU",
+            position_type="none",
+        )
+        source = CPUExecutionEngine(weights, num_heads=heads)
+        engine = TorchAEGEngine(source, "cpu")
+        # Oriented as (out, in): the FFN expands hidden -> intermediate.
+        assert tuple(engine.layers[0]["gate_proj"].shape) == (inter, hidden)
+        assert tuple(engine.layers[0]["down_proj"].shape) == (hidden, inter)
+        # And the executor still agrees with the reference engine.
+        ids = np.asarray([1, 2, 3], dtype=np.int64)
+        reference, _ = source.forward(ids)
+        actual, _ = engine.forward(ids)
+        np.testing.assert_allclose(actual, reference, rtol=2e-5, atol=2e-5)

@@ -162,6 +162,24 @@ dequantized on load.
 
 ---
 
+## A note on decode throughput
+
+Small-model decode is bound by the *number of tensor operations per layer*, not
+by arithmetic. A 135M model with 30 layers issues more work per token than a
+350M model with 24, which is why parameter count alone does not predict speed.
+Measure the per-layer operation count for any family with:
+
+```bash
+python scripts/benchmark_dispatch.py llama     # Aether vs HuggingFace, per layer
+python scripts/profile_decode.py model.aeg cuda 100
+```
+
+Architectures without rotary embeddings (GPT-2, GPT-Neo, BLOOM, MPT — all of
+which use learned or ALiBi positions) issue roughly a third fewer operations per
+layer than rotary families, so they decode faster at equal depth. The rotary
+path is evaluated in its minimal five-operation form, with the sin/cos tables
+pre-expanded at build time and Q/K rotated in a single pass.
+
 ## A note on accelerator memory
 
 Position-indexed tables (rotary sin/cos) are sized by sequence length and capped
