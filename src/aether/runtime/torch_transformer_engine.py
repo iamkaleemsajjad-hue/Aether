@@ -21,8 +21,8 @@ class TorchEncoderAEGEngine:
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("PyTorch is required for portable encoder execution") from exc
         self.torch = torch
-        self.device = torch.device(device)
-        self.devices = [torch.device(value) for value in (devices or [device])]
+        self.device = _resolve_device(torch, device)
+        self.devices = [_resolve_device(torch, value) for value in (devices or [device])]
         self.source_engine = source_engine
         self.weights = source_engine.weights
         self.num_heads = int(source_engine.num_heads)
@@ -136,8 +136,8 @@ class TorchSeq2SeqAEGEngine:
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("PyTorch is required for portable seq2seq execution") from exc
         self.torch = torch
-        self.device = torch.device(device)
-        self.devices = [torch.device(value) for value in (devices or [device])]
+        self.device = _resolve_device(torch, device)
+        self.devices = [_resolve_device(torch, value) for value in (devices or [device])]
         self.source_engine = source_engine
         self.embedding = self._tensor(source_engine.embedding)
         self.encoder_final_norm = self._tensor(source_engine.encoder_final_norm)

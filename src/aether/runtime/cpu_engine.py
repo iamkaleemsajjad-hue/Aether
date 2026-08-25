@@ -231,6 +231,8 @@ class ModelWeights:
     gelu_approximate: bool = True
     #: Whether routed-MoE top-k weights are renormalized to sum to one.
     moe_renormalize_topk: bool = True
+    #: Declared maximum sequence length, used to bound position-indexed tables.
+    context_length: int | None = None
 
     @property
     def hidden_size(self) -> int:

@@ -29,7 +29,7 @@ from typing import Any
 import numpy as np
 
 from aether.parallelism.sharding import balanced_partition, capacity_weighted_partition
-from aether.runtime.torch_engine import TorchAEGEngine, TorchKVCache, execution_numerics
+from aether.runtime.torch_engine import TorchAEGEngine, TorchKVCache, execution_numerics, _resolve_device
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -63,7 +63,7 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         except ImportError as exc:  # pragma: no cover - guarded by backend
             raise RuntimeError("PyTorch is required for tensor-parallel execution") from exc
         self.torch = torch
-        self.devices = [torch.device(value) for value in devices]
+        self.devices = [_resolve_device(torch, value) for value in devices]
         self.device = self.devices[0]
         requested_dtype = str(os.environ.get("AETHER_TORCH_DTYPE", "auto")).lower()
         if requested_dtype in {"fp16", "float16", "half"}:

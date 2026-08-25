@@ -23,6 +23,21 @@ import numpy as np
 from aether.runtime.positional import alibi_slopes
 
 
+def _resolve_device(torch: Any, spec: Any) -> Any:
+    """Return a fully qualified device, with an explicit index where one applies.
+
+    ``torch.device("cuda")`` carries no index, but every tensor placed on it
+    reports ``cuda:0``, and the two compare **unequal**.  Any cache keyed on
+    "is this tensor already on my device?" therefore misses forever, silently
+    rebuilding or re-copying on every step.  Resolving the index once here makes
+    those comparisons meaningful.
+    """
+    device = torch.device(spec)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 def _multiplier(value: Any) -> float | None:
     """Coerce a scalar multiplier, treating absence and ``1.0`` as "none".
 
@@ -70,6 +85,9 @@ EXECUTION_NUMERICS_FIELDS: tuple[str, ...] = (
     "no_rope_layers",
     "gelu_approximate",
     "moe_renormalize_topk",
+    # Not a numeric constant, but it bounds every position-indexed table, so it
+    # must survive a rebuilt weight container exactly as the rest does.
+    "context_length",
 )
 
 
@@ -99,13 +117,23 @@ class TorchKVCache:
 class TorchAEGEngine:
     """Execute a standard dense decoder AEG on a PyTorch device."""
 
+    #: Extra rotary positions materialized beyond the current requirement, so a
+    #: growing sequence rebuilds the tables rarely without over-reserving.
+    _ROPE_HEADROOM = 512
+
+    #: Ceiling used when the artifact declares no context length.
+    _DEFAULT_MAX_POSITIONS = 1 << 20
+
     def __init__(self, cpu_engine: Any, device: str) -> None:
         try:
             import torch
         except ImportError as exc:  # pragma: no cover - guarded by backend
             raise RuntimeError("PyTorch is required for portable AEG execution") from exc
         self.torch = torch
-        self.device = torch.device(device)
+        # Resolve the device index up front: an index-less ``cuda`` never
+        # compares equal to a tensor's ``cuda:0``, which would defeat every
+        # "already on my device?" check in the decode path.
+        self.device = _resolve_device(torch, device)
         # The portable executor used to materialize every artifact as FP32.
         # That is needlessly expensive on CUDA and also defeats the fused
         # half-precision kernels used by PyTorch.  Keep an explicit override
@@ -223,6 +251,14 @@ class TorchAEGEngine:
         )
         self.gelu_approximate = bool(getattr(weights, "gelu_approximate", True))
         self.moe_renormalize_topk = bool(getattr(weights, "moe_renormalize_topk", True))
+        # A learned position table is a hard ceiling; RoPE models are bounded by
+        # the declared context length, falling back to a generous cap.
+        position_table = getattr(weights, "position_embedding", None)
+        if position_table is not None:
+            self.max_positions = int(np.asarray(position_table).shape[0])
+        else:
+            declared = int(getattr(weights, "context_length", 0) or 0)
+            self.max_positions = declared if declared > 0 else self._DEFAULT_MAX_POSITIONS
         # PyTorch 2.4+ exposes a fused RMSNorm that accumulates in FP32.  It
         # replaces a seven-op reduction per normalization — with four norms per
         # layer that is the single largest source of launch overhead in decode.
@@ -374,10 +410,28 @@ class TorchAEGEngine:
         return converted
 
     def _ensure_rope(self, required: int, device: Any | None = None) -> None:
+        """Grow the rotary tables to cover ``required`` positions.
+
+        Growth is bounded by a fixed headroom rather than by doubling.  The
+        tables are indexed by absolute position, so their height tracks sequence
+        length, and a multiplicative policy would keep reserving positions the
+        model can never reach — for a 40960-position context that is gigabytes
+        of sin/cos on the accelerator.  Adding a slab amortizes the rebuild just
+        as well without the runaway.
+        """
         device = device or self.device
-        if self._cos is not None and int(self._cos.shape[0]) >= required and self._cos.device == device:
+        current = 0 if self._cos is None else int(self._cos.shape[0])
+        if self._cos is not None and current >= required and self._cos.device == device:
             return
-        capacity = max(int(required), 2 * int(self._cos.shape[0]) if self._cos is not None else 0, 16)
+        capacity = min(
+            max(int(required) + self._ROPE_HEADROOM, self._ROPE_HEADROOM),
+            self.max_positions,
+        )
+        if capacity < int(required):
+            raise ValueError(
+                f"sequence length {required} exceeds the compiled context length "
+                f"{self.max_positions}"
+            )
         self._cos, self._sin = self._rope_tables(self.rope_theta, capacity, device)
         if self.rope_local_theta is not None:
             self._local_cos, self._local_sin = self._rope_tables(
@@ -1096,8 +1150,8 @@ class TorchHybridAEGEngine:
         except ImportError as exc:  # pragma: no cover - guarded by backend
             raise RuntimeError("PyTorch is required for portable hybrid execution") from exc
         self.torch = torch
-        self.device = torch.device(device)
-        self.devices = [torch.device(value) for value in (devices or [device])]
+        self.device = _resolve_device(torch, device)
+        self.devices = [_resolve_device(torch, value) for value in (devices or [device])]
         self.source_engine = hybrid_engine
         self.weights = hybrid_engine.weights
         self.layer_types = [str(value).lower() for value in hybrid_engine.layer_types]

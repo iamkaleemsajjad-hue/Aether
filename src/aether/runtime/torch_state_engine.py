@@ -39,8 +39,8 @@ class _TorchStateBase:
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("PyTorch is required for portable state execution") from exc
         self.torch = torch
-        self.device = torch.device(device)
-        self.devices = [torch.device(value) for value in (devices or [device])]
+        self.device = _resolve_device(torch, device)
+        self.devices = [_resolve_device(torch, value) for value in (devices or [device])]
         self.layer_devices = [self.devices[index % len(self.devices)] for index in range(len(source_engine.weights.layers))]
         self.source_engine = source_engine
         self.weights = source_engine.weights
@@ -315,8 +315,8 @@ class TorchMLAAEGEngine:
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("PyTorch is required for portable MLA execution") from exc
         self.torch = torch
-        self.device = torch.device(device)
-        self.devices = [torch.device(value) for value in (devices or [device])]
+        self.device = _resolve_device(torch, device)
+        self.devices = [_resolve_device(torch, value) for value in (devices or [device])]
         self.source_engine = source_engine
         self.weights = source_engine.weights
         self.config = source_engine.config

@@ -115,3 +115,104 @@ class TestShardingPolicy:
 
         monkeypatch.setattr(TorchBackend, "_smallest_free_accelerator_bytes", explode)
         assert backend._should_shard(_engine()) is False
+
+
+class TestDeviceResolution:
+    """An index-less accelerator device breaks every device-equality cache."""
+
+    def test_cuda_spec_gains_an_explicit_index(self) -> None:
+        torch = pytest.importorskip("torch")
+        from aether.runtime.torch_engine import _resolve_device
+
+        if not torch.cuda.is_available():
+            pytest.skip("no CUDA device on this host")
+        resolved = _resolve_device(torch, "cuda")
+        assert resolved.index is not None
+        # The whole point: a tensor placed here must compare equal to it.
+        assert torch.empty(1, device=resolved).device == resolved
+
+    def test_index_less_cuda_would_not_compare_equal(self) -> None:
+        torch = pytest.importorskip("torch")
+        # Documents the trap this resolution exists to avoid.  It holds whether
+        # or not CUDA is present, since it is a property of torch.device.
+        assert torch.device("cuda") != torch.device("cuda:0")
+
+    def test_cpu_is_unchanged_and_compares_equal(self) -> None:
+        torch = pytest.importorskip("torch")
+        from aether.runtime.torch_engine import _resolve_device
+
+        resolved = _resolve_device(torch, "cpu")
+        assert torch.empty(1, device=resolved).device == resolved
+
+
+class TestRotaryTableGrowth:
+    """Position-indexed tables must not grow without bound.
+
+    They are sized by sequence length, so a multiplicative growth policy keeps
+    reserving positions the model can never reach.  Combined with a device
+    comparison that never matches, that turned a 112-token generation into a
+    multi-gigabyte allocation.
+    """
+
+    def _engine(self, context_length: int | None = None):
+        pytest.importorskip("torch")
+        import numpy as np
+
+        from aether.runtime.cpu_engine import (
+            CPUExecutionEngine, LayerWeights, ModelWeights,
+        )
+        from aether.runtime.torch_engine import TorchAEGEngine
+
+        hidden, heads, vocab = 8, 2, 16
+        layer = LayerWeights(
+            attention_norm=np.ones(hidden, dtype=np.float32),
+            q_proj=np.eye(hidden, dtype=np.float32),
+            k_proj=np.eye(hidden, dtype=np.float32),
+            v_proj=np.eye(hidden, dtype=np.float32),
+            o_proj=np.eye(hidden, dtype=np.float32),
+            ffn_norm=np.ones(hidden, dtype=np.float32),
+            gate_proj=np.zeros((hidden, hidden), dtype=np.float32),
+            up_proj=np.zeros((hidden, hidden), dtype=np.float32),
+            down_proj=np.zeros((hidden, hidden), dtype=np.float32),
+        )
+        weights = ModelWeights(
+            embedding=np.eye(vocab, hidden, dtype=np.float32),
+            layers=[layer],
+            final_norm=np.ones(hidden, dtype=np.float32),
+            lm_head=np.eye(vocab, hidden, dtype=np.float32),
+            context_length=context_length,
+        )
+        return TorchAEGEngine(CPUExecutionEngine(weights, num_heads=heads), "cpu")
+
+    def test_repeated_calls_do_not_grow_the_table(self) -> None:
+        engine = self._engine()
+        engine._ensure_rope(16)
+        first = int(engine._cos.shape[0])
+        for _ in range(40):
+            engine._ensure_rope(16)
+        assert int(engine._cos.shape[0]) == first
+
+    def test_growth_is_additive_not_multiplicative(self) -> None:
+        engine = self._engine()
+        engine._ensure_rope(16)
+        engine._ensure_rope(int(engine._cos.shape[0]) + 1)
+        # Additive headroom, so height stays proportional to sequence length
+        # rather than doubling on every extension.
+        assert int(engine._cos.shape[0]) <= 16 + 2 * engine._ROPE_HEADROOM + 2
+
+    def test_generation_keeps_the_table_proportional_to_length(self) -> None:
+        import numpy as np
+
+        engine = self._engine()
+        engine.generate(np.asarray([1, 2, 3], dtype=np.int64), max_tokens=40, temperature=0.0)
+        assert int(engine._cos.shape[0]) <= 43 + engine._ROPE_HEADROOM + 1
+
+    def test_a_declared_context_length_caps_the_table(self) -> None:
+        engine = self._engine(context_length=64)
+        engine._ensure_rope(8)
+        assert int(engine._cos.shape[0]) <= 64
+
+    def test_exceeding_the_context_length_is_reported(self) -> None:
+        engine = self._engine(context_length=32)
+        with pytest.raises(ValueError, match="exceeds the compiled context length"):
+            engine._ensure_rope(64)

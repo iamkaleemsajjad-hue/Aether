@@ -162,6 +162,14 @@ dequantized on load.
 
 ---
 
+## A note on accelerator memory
+
+Position-indexed tables (rotary sin/cos) are sized by sequence length and capped
+by the artifact's declared context length, so their footprint stays proportional
+to the tokens actually generated. They are never grown multiplicatively: a
+40960-position context would otherwise reserve gigabytes of accelerator memory
+for positions the request can never reach.
+
 ## A note on multi-GPU
 
 Tensor-parallel sharding is a **memory-capacity** mechanism, not a throughput

@@ -1070,6 +1070,10 @@ def _execution_numerics(architecture: dict[str, Any]) -> dict[str, Any]:
         "no_rope_layers": index_list("no_rope_layers"),
         "gelu_approximate": bool(architecture.get("gelu_approximate", True)),
         "moe_renormalize_topk": bool(architecture.get("moe_renormalize_topk", True)),
+        "context_length": (
+            int(architecture["context_length"])
+            if architecture.get("context_length") else None
+        ),
     }
 
 
