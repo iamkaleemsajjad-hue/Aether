@@ -13,14 +13,14 @@ from typing import ClassVar
 # ── Aether version ────────────────────────────────────────────────────────────
 # NOTE: the Aether software version and the AEG format version are SEPARATE
 # version namespaces and are intentionally not synchronized (see
-# docs/PRD_COMPLIANCE_MATRIX.md § AEG versioning). Aether 1.2.7.alpha reads and
+# docs/PRD_COMPLIANCE_MATRIX.md § AEG versioning). Aether 1.2.8 reads and
 # writes AEG/1.1 by default (AEG/2.0 and AEG/3.0 when v4/v5 optimizer passes
 # are applied).
 
-AETHER_VERSION: str = "1.2.7.alpha"
+AETHER_VERSION: str = "1.2.8"
 """Current version of the Aether Runtime package (matches pyproject.toml)."""
 
-AETHER_VERSION_TUPLE: tuple[int, int, int] = (1, 2, 7)
+AETHER_VERSION_TUPLE: tuple[int, int, int] = (1, 2, 8)
 """Machine-readable version tuple (major, minor, patch)."""
 
 # ── AEG format version ─────────────────────────────────────────────────────────
