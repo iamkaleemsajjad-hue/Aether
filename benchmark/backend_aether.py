@@ -39,6 +39,25 @@ def _default_target() -> str:
 
         if torch.cuda.is_available():
             major, minor = torch.cuda.get_device_capability(0)
+            # Map compute capability to the nearest supported target using the
+            # same tiered logic as hardware_detector._cuda_target_id, so that
+            # e.g. sm_75 (Tesla T4) resolves to cuda_sm70 (Volta) rather than
+            # the non-existent cuda_sm75.
+            sm = major * 10 + minor
+            if sm >= 130:
+                return "cuda_sm130"
+            if sm >= 120:
+                return "cuda_sm120"
+            if sm >= 100:
+                return "cuda_sm100"
+            if sm >= 90:
+                return "cuda_sm90"
+            if sm >= 89:
+                return "cuda_sm89"
+            if sm >= 80:
+                return "cuda_sm80"
+            if sm >= 70:
+                return "cuda_sm70"
             return f"cuda_sm{major}{minor}"
     except Exception:  # noqa: BLE001
         pass

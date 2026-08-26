@@ -248,3 +248,38 @@ def test_aether_runtime_config_still_defaults_the_cache_on() -> None:
     from aether.runtime.config import RuntimeConfig
 
     assert RuntimeConfig().enable_semantic_cache is True
+
+
+def test_default_target_cuda_capability_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CUDA sm_75 (e.g. Tesla T4) must resolve to nearest supported target cuda_sm70."""
+    import torch
+    from benchmark.backend_aether import _default_target
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _idx=0: (7, 5))
+
+    target = _default_target()
+    assert target == "cuda_sm70"
+
+
+def test_multigpu_formatting_handles_none() -> None:
+    """multigpu_section must handle None engine/status fields gracefully without TypeError."""
+    from benchmark.reporting import multigpu_section
+
+    payload = {
+        "cases": [
+            {
+                "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+                "configuration": "aether forced tensor-parallel",
+                "gpus": 2,
+                "tokens_per_s": {"median": None},
+                "latency_s": {"median": None},
+                "per_gpu_peak_bytes": [],
+                "engine": None,
+                "status": None,
+            }
+        ],
+        "notes": ["test note"]
+    }
+    result = multigpu_section(payload)
+    assert "—" in result

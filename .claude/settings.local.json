@@ -134,7 +134,8 @@
       "Bash(touch benchmark/__init__.py)",
       "Bash(mkdir -p benchmark/results)",
       "Bash(touch benchmark/results/.gitkeep)",
-      "Read(//tmp/bench_smoke/**)"
+      "Read(//tmp/bench_smoke/**)",
+      "Bash(python -m pytest tests/benchmarks/test_benchmark_runner.py -v)"
     ]
   }
 }

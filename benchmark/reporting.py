@@ -489,8 +489,8 @@ def multigpu_section(payload: dict[str, Any] | None) -> str:
             _fmt((entry.get("tokens_per_s") or {}).get("median"), 2),
             _fmt((entry.get("latency_s") or {}).get("median"), 4),
             ", ".join(_bytes(v) for v in (entry.get("per_gpu_peak_bytes") or [])) or "—",
-            entry.get("engine", "—"),
-            entry.get("status", "—"),
+            _fmt(entry.get("engine")),
+            _fmt(entry.get("status")),
         ])
     lines.append(_table(
         ["Model", "Configuration", "GPUs", "tok/s (med)", "latency s (med)",
