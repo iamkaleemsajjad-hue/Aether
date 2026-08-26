@@ -154,3 +154,9 @@ qwen*/
 # name contains "qwen".
 !benchmarks/results/
 !benchmarks/results/*.json
+
+# Benchmark outputs: the harness is versioned, its results are not.
+# REPORT.md, results.json/csv and charts are regenerated per host, and the
+# compiled .aeg artifacts are large build products.
+benchmark/results/*
+!benchmark/results/.gitkeep

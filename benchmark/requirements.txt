@@ -1,0 +1,13 @@
+# Dependencies the benchmark needs beyond Aether Runtime's own install.
+# Aether itself is installed with:  pip install -e ".[pytorch]"
+#
+# Kaggle GPU images already ship torch, transformers, psutil and matplotlib;
+# these pins are the versions the harness is written against, and pip will keep
+# whatever newer version the image already has.
+
+transformers>=4.40.0     # the baseline runtime under test
+accelerate>=0.30.0       # used by transformers for device placement
+psutil>=5.9.0            # process RSS, CPU utilization, core counts
+nvidia-ml-py>=12.535.0   # NVML: GPU utilization, power, temperature, clocks
+matplotlib>=3.7.0        # charts; the benchmark degrades gracefully without it
+huggingface-hub>=0.27.0  # model download and revision resolution
