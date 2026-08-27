@@ -787,9 +787,12 @@ LIMITATIONS = (
     "Batched throughput is an aggregate figure. The harness normalizes tokens per "
     "second by batch width, so a batch>1 cell reports the work the whole pass "
     "completed; per-request latency in a batch is at least what it would be alone.",
-    "Aether's tensor-parallel (multi-GPU sharded) executor is single-sequence. "
-    "Batched cells therefore measure single-device execution, and a sharded "
-    "configuration is reported separately in the multi-GPU section.",
+    "Aether's tensor-parallel (multi-GPU sharded) executor carries a batch axis, so "
+    "a sharded configuration can serve a batch. Sharding is still selected only "
+    "when a model does not fit on the smallest visible device, so the batched cells "
+    "in this matrix are single-device unless AETHER_FORCE_TENSOR_PARALLEL is set; "
+    "the multi-GPU section reports the sharded configuration separately and labels "
+    "it, because a 2-GPU row must never be compared against a 1-GPU one.",
     "Aether's compiled artifact stores weights at BF16 (the compiler's default "
     "residency). At fp16 and fp32 the two backends therefore do not hold "
     "bit-identical weights, since Transformers loads the published checkpoint "

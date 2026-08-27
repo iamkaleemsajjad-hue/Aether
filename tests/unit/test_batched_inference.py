@@ -819,21 +819,172 @@ def test_release_can_be_declined_by_the_operator() -> None:
             os.environ["AETHER_KEEP_HOST_WEIGHTS"] = previous
 
 
-def test_tensor_parallel_refuses_batching_rather_than_flattening() -> None:
-    """The sharded executor must say no, not silently splice the batch."""
+# ── Batched tensor parallelism ──────────────────────────────────────────────
+#
+# Sharding splits each weight matrix across devices; batching adds a leading axis
+# to the activations. They are orthogonal, and these tests are what makes that a
+# fact rather than a hope. The oracle is the single-device batched executor: a
+# sharded batch must produce what an unsharded batch produces, because the
+# collectives reduce over the *feature* axis only.
+
+
+def _sharded(source=None, devices=("cpu:0", "cpu:1")):
+    pytest.importorskip("torch")
+    from aether.runtime.torch_tensor_parallel import TorchTensorParallelAEGEngine
+
+    return TorchTensorParallelAEGEngine(source or _reference_engine(), list(devices))
+
+
+def test_tensor_parallel_keeps_the_base_forward_contract() -> None:
+    """A drifted signature is a failure that only appears on a multi-device host."""
     pytest.importorskip("torch")
     import inspect
 
     from aether.runtime.torch_engine import TorchAEGEngine
     from aether.runtime.torch_tensor_parallel import TorchTensorParallelAEGEngine
 
-    # Contract parity is enforced elsewhere; here we assert the refusal exists so
-    # a batch can never reach a single-sequence layer loop.
-    source = inspect.getsource(TorchTensorParallelAEGEngine._forward_device)
-    assert "NotImplementedError" in source
     assert inspect.signature(TorchAEGEngine._forward_device) == inspect.signature(
         TorchTensorParallelAEGEngine._forward_device
     )
+
+
+def test_tensor_parallel_advertises_and_accepts_batches() -> None:
+    sharded = _sharded()
+    assert sharded.supports_batch(1)
+    assert sharded.supports_batch(4)
+    logits, cache = sharded.forward_batch(
+        [np.asarray([1, 2, 3], dtype=np.int64)] * 3
+    )
+    assert tuple(logits.shape) == (3, 3, VOCAB)
+    assert cache.batch_size == 3
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+def test_sharded_batch_matches_the_single_device_batch(batch_size: int) -> None:
+    """Uniform rows: sharding must not change a single logit beyond rounding."""
+    source = _reference_engine()
+    single = _engine(source)
+    sharded = _sharded(source)
+    prompts = [
+        np.asarray([(index * 3 + step) % VOCAB for step in range(5)], dtype=np.int64)
+        for index in range(batch_size)
+    ]
+
+    _, single_cache = single.forward_batch(prompts)
+    _, sharded_cache = sharded.forward_batch(prompts)
+    np.testing.assert_allclose(
+        _numpy(sharded_cache.last_logits),
+        _numpy(single_cache.last_logits),
+        rtol=LOGIT_TOLERANCE,
+        atol=LOGIT_TOLERANCE,
+    )
+    assert sharded.generate_batch(
+        prompts, max_tokens=6, temperature=0.0
+    ) == single.generate_batch(prompts, max_tokens=6, temperature=0.0)
+
+
+def test_sharded_ragged_batch_matches_solo_runs() -> None:
+    """The hard case: sharded *and* padded at once.
+
+    Left padding, per-row positions, the validity mask and the sharded collectives
+    all have to be right simultaneously. A row's result must equal decoding that
+    row alone on the same sharded engine.
+    """
+    sharded = _sharded()
+    prompts = [
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([3, 4, 5, 6], dtype=np.int64),
+        np.asarray([7, 8, 9, 10, 11, 12], dtype=np.int64),
+    ]
+
+    _, cache = sharded.forward_batch(prompts)
+    assert cache.live is not None, "a ragged batch must materialize a validity mask"
+    assert cache.layout is not None and cache.layout.pad_counts == (4, 2, 0)
+
+    final = _numpy(cache.last_logits)
+    for index, prompt in enumerate(prompts):
+        reference, _ = sharded.forward(prompt)
+        np.testing.assert_allclose(
+            final[index],
+            np.asarray(reference)[-1],
+            rtol=LOGIT_TOLERANCE,
+            atol=LOGIT_TOLERANCE,
+            err_msg=f"sharded row {index} (length {prompt.size}) diverged from its solo run",
+        )
+
+    alone = [
+        sharded.generate(prompt, max_tokens=5, temperature=0.0) for prompt in prompts
+    ]
+    assert sharded.generate_batch(prompts, max_tokens=5, temperature=0.0) == alone
+
+
+def test_sharded_batch_isolates_rows() -> None:
+    """Row 0 must not move when its neighbours change, sharded included."""
+    sharded = _sharded()
+    subject = np.asarray([1, 2, 3, 4], dtype=np.int64)
+    solo = sharded.generate(subject, max_tokens=5, temperature=0.0)
+
+    pair = sharded.generate_batch(
+        [subject, np.asarray([9, 10], dtype=np.int64)], max_tokens=5, temperature=0.0
+    )
+    trio = sharded.generate_batch(
+        [subject, np.asarray([5, 6, 7, 8, 9], dtype=np.int64),
+         np.asarray([11], dtype=np.int64)],
+        max_tokens=5, temperature=0.0,
+    )
+    assert pair[0] == solo
+    assert trio[0] == solo
+
+
+def test_sharded_single_sequence_path_is_unchanged() -> None:
+    """The regression guard: generalizing the loop must not move B=1 sharded output."""
+    source = _reference_engine()
+    single = _engine(source)
+    sharded = _sharded(source)
+    ids = np.asarray([1, 3, 5, 2], dtype=np.int64)
+
+    np.testing.assert_allclose(
+        np.asarray(sharded.forward(ids)[0]),
+        np.asarray(single.forward(ids)[0]),
+        rtol=LOGIT_TOLERANCE,
+        atol=LOGIT_TOLERANCE,
+    )
+    assert sharded.generate(ids, max_tokens=6, temperature=0.0) == single.generate(
+        ids, max_tokens=6, temperature=0.0
+    )
+
+
+def test_sharded_batch_rejects_a_rank_one_batched_call() -> None:
+    sharded = _sharded()
+    with pytest.raises(ValueError, match="rank-2"):
+        sharded._forward_device(np.asarray([1, 2, 3], dtype=np.int64), batched=True)
+
+
+def test_sharded_learned_absolute_positions_survive_padding() -> None:
+    """Position sharding plus left padding: the table is split *and* re-based."""
+    reference = _reference_engine()
+    reference.weights.norm_type = "LayerNorm"
+    reference.weights.position_type = "absolute"
+    reference.weights.position_embedding = (
+        np.arange(32 * HIDDEN, dtype=np.float32).reshape(32, HIDDEN) / 100.0
+    )
+    sharded = _sharded(reference)
+
+    prompts = [
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([3, 4, 5, 6, 7], dtype=np.int64),
+    ]
+    _, cache = sharded.forward_batch(prompts)
+    final = _numpy(cache.last_logits)
+    for index, prompt in enumerate(prompts):
+        reference_logits, _ = sharded.forward(prompt)
+        np.testing.assert_allclose(
+            final[index],
+            np.asarray(reference_logits)[-1],
+            rtol=LOGIT_TOLERANCE,
+            atol=LOGIT_TOLERANCE,
+            err_msg=f"sharded row {index} was positioned by its padded index",
+        )
 
 
 # ── The backend boundary ────────────────────────────────────────────────────

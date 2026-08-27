@@ -214,11 +214,18 @@ This is true of every batched runtime, Transformers included. Greedy decoding
   TTT, speculative decoding) are unchanged and keep using `TorchKVCache`.
 - Batched callers use the new explicitly-batched entry points and
   `BatchedKVCache`.
-- The tensor-parallel executor (`torch_tensor_parallel.py`) carries its own copy
-  of the forward loop and is **not** batched by this change. It remains
-  single-sequence and refuses a batched call explicitly rather than flattening it.
-  Batching it is mechanical but doubles the validation surface, and it is selected
-  only for models that do not fit on one device — a different problem.
+- The tensor-parallel executor (`torch_tensor_parallel.py`) **is** batched, and by
+  the same rank generalization. Sharding and batching are orthogonal: every
+  collective in the sharded pass reduces or concatenates over the *feature* axis —
+  the sharded one — and never over batch or sequence.
+  `_parallel_row_linear` splits output features and concatenates along the last
+  axis; `_parallel_column_linear` splits input features, so each device contributes
+  a partial sum over its slice and the results are added (the all-reduce of
+  Megatron-LM §3.3, Shoeybi et al. 2019, arXiv:1909.08053). A sum over feature
+  slices commutes with any leading batch axis, so the batched sharded pass is the
+  batched single-device pass with two primitives swapped, and each device's KV
+  cache stays local to the heads it owns. The oracle in
+  `tests/unit/test_batched_inference.py` is the single-device batched executor.
 - The NumPy CPU executor keeps its sequence-major kernels; they remain the faster
   path for one sequence, and single-sequence CPU requests are unchanged. A batched
   request on a CPU host is served by promoting the same authenticated weights onto

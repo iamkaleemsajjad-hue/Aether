@@ -452,25 +452,52 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         return self.torch.cat([value.to(self.device) for value in values], dim=-1)
 
     def _embedding_lookup(self, ids: Any) -> Any:
-        output = self.torch.empty((int(ids.numel()), self.embedding_hidden_size), device=self.device, dtype=self.embedding[0].dtype)
+        """Gather rows of a vocabulary-sharded embedding table.
+
+        Rank-generic: ``ids`` may be ``(seq,)`` or ``(batch, seq)``.  The gather
+        itself is per token and carries no positional meaning, so flattening the
+        leading axes is lossless here — each id is looked up independently, and the
+        result is restored to the caller's shape.  Contrast attention, where the
+        same flatten would splice independent sequences together.
+        """
+        lead = tuple(ids.shape)
+        flat = ids.reshape(-1)
+        output = self.torch.empty(
+            (int(flat.numel()), self.embedding_hidden_size),
+            device=self.device,
+            dtype=self.embedding[0].dtype,
+        )
         for shard, (start, end), device in zip(self.embedding, self._embedding_ranges, self.devices):
-            mask = (ids >= start) & (ids < end)
+            mask = (flat >= start) & (flat < end)
             positions = self.torch.where(mask)[0]
             if positions.numel():
-                local_ids = ids.index_select(0, positions).to(device) - start
+                local_ids = flat.index_select(0, positions).to(device) - start
                 output.index_copy_(0, positions, shard.index_select(0, local_ids).to(self.device))
-        return output
+        return output.reshape(*lead, self.embedding_hidden_size)
 
     def _position_lookup(self, positions: Any) -> Any:
+        """Gather rows of a position-sharded learned table.
+
+        Rank-generic for the same reason as :meth:`_embedding_lookup`.  In a batch
+        the positions are per row — a padded row's real tokens still start at 0 —
+        so this must be driven by the layout's positions, never by padded indices.
+        """
         assert self.position_embedding is not None and self._position_ranges is not None
-        output = self.torch.empty((int(positions.numel()), int(self.position_hidden_size)), device=self.device, dtype=self.position_embedding[0].dtype)
+        lead = tuple(positions.shape)
+        flat = positions.reshape(-1)
+        width = int(self.position_hidden_size)
+        output = self.torch.empty(
+            (int(flat.numel()), width),
+            device=self.device,
+            dtype=self.position_embedding[0].dtype,
+        )
         for shard, (start, end), device in zip(self.position_embedding, self._position_ranges, self.devices):
-            mask = (positions >= start) & (positions < end)
+            mask = (flat >= start) & (flat < end)
             indexes = self.torch.where(mask)[0]
             if indexes.numel():
-                local = positions.index_select(0, indexes).to(device) - start
+                local = flat.index_select(0, indexes).to(device) - start
                 output.index_copy_(0, indexes, shard.index_select(0, local).to(self.device))
-        return output
+        return output.reshape(*lead, width)
 
     def _parallel_row_linear(self, x: Any, weights: list[Any], biases: list[Any] | None) -> Any:
         values = []
@@ -491,7 +518,15 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
     def _moe_ffn(self, hidden: Any, layer: dict[str, Any]) -> Any:
         if layer["router"] is None or not layer["experts"]:
             raise ValueError("portable MoE layer is missing its router or experts")
-        router_logits = self._parallel_row_linear(hidden, layer["router"], None)
+        # Expert routing is strictly per token: a token's expert choice and output
+        # depend on nothing but that token.  Collapsing a batch's leading axes into
+        # one token axis is therefore lossless, and it keeps the scatter/gather
+        # dispatch rank-2 for every batch width.  The same flatten applied to
+        # attention would splice independent sequences together; that is why it is
+        # confined to this one operation.
+        lead = tuple(hidden.shape[:-1])
+        flat = hidden.reshape(-1, int(hidden.shape[-1])) if len(lead) > 1 else hidden
+        router_logits = self._parallel_row_linear(flat, layer["router"], None)
         top_k = min(layer["num_activated_experts"], len(layer["experts"]))
         # Probabilities come from a softmax over the complete expert set; only
         # architectures declaring ``norm_topk_prob`` renormalize the selected k.
@@ -499,19 +534,19 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         routing, selected = self.torch.topk(probabilities, top_k, dim=-1)
         if self.moe_renormalize_topk:
             routing = routing / routing.sum(dim=-1, keepdim=True)
-        routing = routing.to(dtype=hidden.dtype)
-        output = self.torch.zeros_like(hidden)
+        routing = routing.to(dtype=flat.dtype)
+        output = self.torch.zeros_like(flat)
         for expert_index, expert in enumerate(layer["experts"]):
             rows, slots = self.torch.where(selected == expert_index)
             if not rows.numel():
                 continue
-            source = hidden.index_select(0, rows)
+            source = flat.index_select(0, rows)
             gate = self._parallel_row_linear(source, expert["gate_proj"], expert["gate_proj_bias"])
             up = None if expert["up_proj"] is None else self._parallel_row_linear(source, expert["up_proj"], expert["up_proj_bias"])
             activated = self._activation(gate, up)
             value = self._parallel_column_linear(activated, expert["down_proj"], expert["down_proj_bias"])
             output.index_add_(0, rows, value * routing[rows, slots].unsqueeze(-1))
-        return output
+        return output.reshape(*lead, int(output.shape[-1])) if len(lead) > 1 else output
 
     def _forward_device(
         self,
@@ -523,49 +558,78 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         batched: bool = False,
         logits: str = "all",
     ) -> tuple[Any, TorchKVCache | BatchedKVCache]:
-        """Run one sharded step.
+        """Run one sharded step, for a single sequence or for a batch.
 
         The signature must stay compatible with
         :meth:`TorchAEGEngine._forward_device`: the inherited generation loop
         calls it directly, so a missing keyword here is a runtime failure that
         only appears on a multi-device host.
 
-        Batched execution is **not** implemented for the sharded path.  Sharding
-        is selected only when a model does not fit on one device, which is a
-        capacity problem rather than a throughput one, and this executor carries
-        its own copy of the layer loop — batching it would double the validation
-        surface for a configuration that batching does not help. The parameter is
-        accepted so the contract matches, and refused explicitly rather than
-        silently ignored, because silently running a batch as one flattened
-        sequence is exactly the corruption the batched layout exists to prevent.
+        Batching and sharding are orthogonal, and this method is where that becomes
+        true.  Sharding splits each weight matrix across devices; batching adds a
+        leading axis to the activations.  Neither touches the other, because every
+        collective here reduces or concatenates over the *feature* axis — the
+        sharded dimension — and never over the batch or sequence axes:
+
+        * ``_parallel_row_linear`` splits output features, so it concatenates the
+          shards' results along the last axis. Rank-agnostic.
+        * ``_parallel_column_linear`` splits input features, so each device
+          contributes a partial sum over its slice and the results are added. This
+          is the all-reduce of Megatron-LM §3.3 (Shoeybi et al. 2019,
+          arXiv:1909.08053), and a sum over feature slices commutes with any
+          leading batch axis.
+
+        So the batched sharded pass is the single-device batched pass with the two
+        linear primitives swapped, and the KV cache stays local to the device that
+        owns those heads.  The five rank-dependent sites branch on ``batched``; the
+        architecture-variant handling is shared with the single-sequence path rather
+        than duplicated, for the same reason it is shared in the base class.
         """
-        if batched:
-            raise NotImplementedError(
-                "tensor-parallel execution is single-sequence; batched inference is "
-                "available on the single-device portable executor "
-                "(TorchAEGEngine.generate_batch)"
-            )
         torch = self.torch
         if isinstance(token_ids, torch.Tensor):
-            ids = token_ids.reshape(-1)
+            ids = token_ids if batched else token_ids.reshape(-1)
             if ids.device != self.device or ids.dtype != torch.long:
                 ids = ids.to(device=self.device, dtype=torch.long)
         else:
+            array = np.asarray(token_ids, dtype=np.int64)
             ids = torch.as_tensor(
-                np.asarray(token_ids, dtype=np.int64).reshape(-1),
-                device=self.device,
+                array if batched else array.reshape(-1), device=self.device
+            )
+        if batched and ids.dim() != 2:
+            raise ValueError(
+                "a batched forward pass requires rank-2 (batch, seq) ids, got rank "
+                f"{ids.dim()}"
             )
         if ids.numel() == 0:
             raise ValueError("forward() requires at least one token")
         if validate_ids and (int(ids.min()) < 0 or int(ids.max()) >= self.embedding_vocab_size):
             raise ValueError("token id is outside the compiled vocabulary")
-        cache = cache or TorchKVCache([None] * self.num_layers, [None] * self.num_layers)
+        if cache is None:
+            cache = (
+                self._new_batched_cache(batch_size=int(ids.shape[0]), reserve=reserve)
+                if batched
+                else TorchKVCache([None] * self.num_layers, [None] * self.num_layers)
+            )
         past = int(cache.length)
-        seq_len = int(ids.numel())
-        positions = torch.arange(past, past + seq_len, device=self.device, dtype=torch.long)
+        lead = tuple(ids.shape)
+        seq_len = int(ids.shape[-1])
+        total = past + seq_len
+        span = torch.arange(past, total, device=self.device, dtype=torch.long)
+        if batched:
+            # A row's position is its padded index minus its own pad count, so a
+            # short row is not rotated as though it began mid-sequence.
+            positions = (span.unsqueeze(0) - cache.pad_counts).clamp_(min=0)
+            key_positions = (
+                self._key_positions(total).unsqueeze(0) - cache.pad_counts
+            ).clamp_(min=0)
+            live_view = cache.live_view(total)
+        else:
+            positions = span
+            key_positions = self._key_positions(total)
+            live_view = None
         uses_rope = self.uses_rope
         if uses_rope:
-            self._ensure_rope(past + seq_len)
+            self._ensure_rope(total)
         # Rotation factors depend only on the positions and the rotary base, so
         # gather them once per step rather than twice per layer.
         rope_global = self._rope_slice(positions, local=False) if uses_rope else None
@@ -608,8 +672,8 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
                         q = self._norm(q, layer["q_norm"])
                     if layer["k_norm"] is not None:
                         k = self._norm(k, layer["k_norm"])
-                q = q.reshape(seq_len, self.num_heads, self.head_dim)
-                k = k.reshape(seq_len, self.num_kv_heads, self.head_dim)
+                q = q.reshape(*lead, self.num_heads, self.head_dim)
+                k = k.reshape(*lead, self.num_kv_heads, self.head_dim)
                 if not self.qk_norm_is_full:
                     if layer["q_norm"] is not None:
                         q = self._norm(q, layer["q_norm"])
@@ -618,18 +682,27 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
                 if layer_uses_rope:
                     q = self._rope(q, *rope_factors)
                     k = self._rope(k, *rope_factors)
-                v = self._parallel_row_linear(normed, layer["v_proj"], layer["v_proj_bias"]).reshape(seq_len, self.num_kv_heads, self.head_dim)
-                total = past + seq_len
+                v = self._parallel_row_linear(
+                    normed, layer["v_proj"], layer["v_proj_bias"]
+                ).reshape(*lead, self.num_kv_heads, self.head_dim)
                 k_all = self._append_kv(cache.keys[index], k, past, total, reserve)
                 v_all = self._append_kv(cache.values[index], v, past, total, reserve)
                 context = self._attention(
-                    q, k_all[:total], v_all[:total], positions,
-                    self._key_positions(total), attention_window, attention_scale,
+                    q,
+                    k_all[:, :total] if batched else k_all[:total],
+                    v_all[:, :total] if batched else v_all[:total],
+                    positions,
+                    key_positions,
+                    attention_window,
+                    attention_scale,
+                    live=live_view,
                 )
                 cache.keys[index] = k_all
                 cache.values[index] = v_all
                 attention_out = self._parallel_column_linear(
-                    context.reshape(seq_len, self.num_heads * self.head_dim), layer["o_proj"], layer["o_proj_bias"]
+                    context.reshape(*lead, self.num_heads * self.head_dim),
+                    layer["o_proj"],
+                    layer["o_proj_bias"],
                 )
                 # Sandwich blocks normalize the sublayer output as well
                 # (Gemma-2/3, EXAONE-4); post-norm blocks normalize it instead
@@ -683,7 +756,7 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
             # Slicing before the projection is exact, since the projection is
             # per-position.
             if logits == "last":
-                hidden = hidden[-1:]
+                hidden = hidden[:, -1:] if batched else hidden[-1:]
             elif logits != "all":
                 raise ValueError(f"logits mode must be 'all' or 'last', got {logits!r}")
             hidden = self._norm(hidden, self.final_norm, self.final_norm_bias)
@@ -692,8 +765,10 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
                 projected = projected * self.logit_scale
             if self.final_logit_softcap:
                 projected = self._softcap(projected, self.final_logit_softcap)
-            cache.length = past + seq_len
-            cache.last_logits = projected[-1].detach()
+            cache.length = total
+            cache.last_logits = (
+                projected[:, -1] if batched else projected[-1]
+            ).detach()
         return projected, cache
 
     def forward(self, token_ids: np.ndarray | Any, cache: TorchKVCache | None = None) -> tuple[np.ndarray, TorchKVCache]:
