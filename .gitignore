@@ -161,3 +161,8 @@ qwen*/
 # compiled .aeg artifacts are large build products.
 benchmark/results/*
 !benchmark/results/.gitkeep
+
+# Internal product requirements and publishing guides
+PRD.md
+PRD_v2.md
+PUBLISHING.md
