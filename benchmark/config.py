@@ -86,7 +86,7 @@ def parse_args(argv: list[str] | None = None) -> BenchmarkConfig:
     parser.add_argument(
         "--mode",
         default="performance",
-        choices=["performance", "memory", "correctness", "profile", "multigpu", "all"],
+        choices=["performance", "memory", "correctness", "profile", "multigpu", "batch", "all"],
         help="Which experiment to run. Each mode is independent; 'all' runs them in sequence.",
     )
     parser.add_argument("--models", type=_str_list, default=None,

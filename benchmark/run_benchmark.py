@@ -411,6 +411,127 @@ def run_multigpu(config: BenchmarkConfig) -> dict[str, Any] | None:
     return {"cases": cases, "notes": notes}
 
 
+def run_batch_scaling(config: BenchmarkConfig) -> dict[str, Any]:
+    """Mode 6: what batching actually buys, with latency and throughput separated.
+
+    The performance matrix already sweeps batch sizes, but it reports one
+    throughput column, and for batching that single number hides the trade-off:
+    aggregate tokens per second rises while each individual request gets no
+    faster — and usually gets slower. This mode reports both figures side by side
+    for every batch width, so a reader cannot mistake one for the other.
+
+    ``batch tok/s`` is the whole pass's output over the pass's wall time.
+    ``per-request tok/s`` is one row's output over that same wall time: what a
+    single caller waiting in the batch experiences. At batch 1 they coincide,
+    which is the baseline both are measured against.
+    """
+    cases: list[dict[str, Any]] = []
+    precision = config.precisions[0]
+    prompt_tokens = config.prompt_tokens[0]
+    notes = [
+        "Each cell replicates one prompt to the batch width, which is what the "
+        "Transformers backend does for its own batch cells, so both runtimes are "
+        "measured on identical work and neither batch carries padding.",
+        "`batch tok/s` is aggregate output per second of wall time; "
+        "`per-request tok/s` is what one caller inside the batch sees. Batching is "
+        "a throughput mechanism, so the first is expected to rise and the second "
+        "is not.",
+        "`scaling` divides a cell's aggregate throughput by that backend's own "
+        "batch-1 aggregate throughput. 1.00x means batching bought nothing.",
+        "The `engine` column records which executor served each cell. On a host "
+        "with no accelerator, Aether's batch>1 cells run on the portable tensor "
+        "executor while batch=1 runs on the NumPy kernels, so a scaling ratio "
+        "across those two rows compares different engines; such rows are flagged "
+        "rather than presented as a batching speedup.",
+    ]
+    for model in config.models:
+        _log(f"\n=== batch scaling: {model} @ {precision} ===")
+        backends, loads, _ = _load_pair(config, model, precision)
+        if not backends:
+            cases.append({
+                "model": model, "precision": precision, "status": "load-failed",
+                "message": "neither backend loaded; see load records",
+            })
+            continue
+        reference_tokenizer = next(iter(backends.values())).tokenizer()
+        prompt_set = prompts.build_prompt_set(reference_tokenizer, [prompt_tokens])
+        prompt = next(iter(prompt_set.values()))
+        baseline: dict[str, float] = {}
+        baseline_engine: dict[str, Any] = {}
+        for batch in config.batch_sizes:
+            for name in BACKENDS:
+                backend = backends.get(name)
+                entry: dict[str, Any] = {
+                    "model": model, "precision": precision,
+                    "prompt_tokens": prompt["achieved_tokens"], "batch_size": batch,
+                    "backend": name,
+                }
+                if backend is None:
+                    entry.update(status="load-failed", message="backend did not load")
+                    cases.append(entry)
+                    continue
+                _log(f"  [{name}] b{batch} ...")
+                measurement = runner.measure_generation(
+                    backend, prompt["text"],
+                    max_new_tokens=config.max_new_tokens,
+                    temperature=config.temperature, top_p=config.top_p,
+                    top_k=config.top_k, seed=config.seed, batch_size=batch,
+                    warmup_iters=config.warmup_iters,
+                    measure_iters=config.measure_iters,
+                    gpu_interval_s=config.gpu_sample_interval_s,
+                )
+                entry["status"] = measurement.get("status")
+                if measurement.get("status") != "ok":
+                    entry["message"] = measurement.get("message", "")
+                    _log(f"      {entry['status']}: {entry['message'][:110]}")
+                    cases.append(entry)
+                    continue
+                latency = (measurement.get("latency_s") or {}).get("median")
+                # ``measure_generation`` already scales by batch width, so this is
+                # the aggregate figure; one row's share is it divided by the width.
+                aggregate = (measurement.get("tokens_per_s") or {}).get("median")
+                row_tokens = int(measurement.get("completion_tokens") or 0)
+                entry.update({
+                    "latency_s": measurement.get("latency_s"),
+                    "batch_tokens_per_s": aggregate,
+                    "per_request_tokens_per_s": (
+                        None if aggregate is None else aggregate / max(batch, 1)
+                    ),
+                    "requests_per_s": (
+                        None if not latency else batch / latency
+                    ),
+                    "row_completion_tokens": row_tokens,
+                    "gpu_inference_delta_bytes": measurement.get("gpu_inference_delta_bytes"),
+                    "cold_latency_s": measurement.get("cold_latency_s"),
+                    "backend_metrics": measurement.get("backend_metrics"),
+                    # Which executor actually served the cell.  On a CPU host
+                    # Aether's batch>1 cells run on the portable tensor executor
+                    # while batch=1 runs on the NumPy kernels, so a scaling ratio
+                    # across them would compare two different engines.  Recording
+                    # the engine is what lets the report say so instead of hiding it.
+                    "engine": (measurement.get("backend_metrics") or {}).get("engine"),
+                })
+                if batch == 1 and aggregate:
+                    baseline[name] = float(aggregate)
+                    baseline_engine[name] = entry.get("engine")
+                if aggregate and baseline.get(name):
+                    entry["scaling_vs_batch1"] = float(aggregate) / baseline[name]
+                    entry["scaling_is_same_engine"] = (
+                        entry.get("engine") == baseline_engine.get(name)
+                    )
+                _log(
+                    f"      batch {aggregate:.2f} tok/s, "
+                    f"per-request {aggregate / max(batch, 1):.2f} tok/s, "
+                    f"latency {latency:.4f}s"
+                )
+                cases.append(entry)
+            runner.cooldown(config.cooldown_s)
+        for backend in backends.values():
+            backend.unload()
+        gpu_monitor.empty_cache()
+    return {"cases": cases, "notes": notes, "loads": {}}
+
+
 def main(argv: list[str] | None = None) -> int:
     config = parse_args(argv)
     _limit_devices(config.devices)
@@ -449,8 +570,8 @@ def main(argv: list[str] | None = None) -> int:
     if off_charter:
         payload["harness_validation_only"] = off_charter
 
-    modes = ["performance", "correctness", "profile", "multigpu"] if config.mode == "all" \
-        else [config.mode]
+    modes = ["performance", "correctness", "profile", "batch", "multigpu"] \
+        if config.mode == "all" else [config.mode]
     if config.mode == "memory":
         # Memory is measured inside the performance path; the mode exists to make
         # that explicit rather than to run a second, differently-timed experiment.
@@ -470,6 +591,8 @@ def main(argv: list[str] | None = None) -> int:
             payload["correctness"] = run_correctness(config)
         elif mode == "profile":
             payload["kernels"] = run_profile(config)
+        elif mode == "batch":
+            payload["batch_scaling"] = run_batch_scaling(config)
         elif mode == "multigpu":
             if config.multi_gpu:
                 payload["multigpu"] = run_multigpu(config)

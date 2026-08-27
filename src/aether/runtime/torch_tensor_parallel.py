@@ -29,7 +29,13 @@ from typing import Any
 import numpy as np
 
 from aether.parallelism.sharding import balanced_partition, capacity_weighted_partition
-from aether.runtime.torch_engine import TorchAEGEngine, TorchKVCache, execution_numerics, _resolve_device
+from aether.runtime.torch_engine import (
+    BatchedKVCache,
+    TorchAEGEngine,
+    TorchKVCache,
+    execution_numerics,
+    _resolve_device,
+)
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -510,18 +516,34 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
     def _forward_device(
         self,
         token_ids: np.ndarray | Any,
-        cache: TorchKVCache | None = None,
+        cache: TorchKVCache | BatchedKVCache | None = None,
         *,
         validate_ids: bool = False,
         reserve: int = 0,
-    ) -> tuple[Any, TorchKVCache]:
+        batched: bool = False,
+    ) -> tuple[Any, TorchKVCache | BatchedKVCache]:
         """Run one sharded step.
 
         The signature must stay compatible with
         :meth:`TorchAEGEngine._forward_device`: the inherited generation loop
         calls it directly, so a missing keyword here is a runtime failure that
         only appears on a multi-device host.
+
+        Batched execution is **not** implemented for the sharded path.  Sharding
+        is selected only when a model does not fit on one device, which is a
+        capacity problem rather than a throughput one, and this executor carries
+        its own copy of the layer loop — batching it would double the validation
+        surface for a configuration that batching does not help. The parameter is
+        accepted so the contract matches, and refused explicitly rather than
+        silently ignored, because silently running a batch as one flattened
+        sequence is exactly the corruption the batched layout exists to prevent.
         """
+        if batched:
+            raise NotImplementedError(
+                "tensor-parallel execution is single-sequence; batched inference is "
+                "available on the single-device portable executor "
+                "(TorchAEGEngine.generate_batch)"
+            )
         torch = self.torch
         if isinstance(token_ids, torch.Tensor):
             ids = token_ids.reshape(-1)

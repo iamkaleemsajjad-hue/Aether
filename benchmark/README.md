@@ -70,6 +70,7 @@ display(Markdown(open('benchmark/results/REPORT.md').read()))
 ```python
 !python benchmark/run_benchmark.py --mode correctness
 !python benchmark/run_benchmark.py --mode profile
+!python benchmark/run_benchmark.py --mode batch
 !python benchmark/run_benchmark.py --mode multigpu
 ```
 
@@ -89,7 +90,30 @@ Or everything in sequence, which takes considerably longer:
 | `memory` | Runs the performance path and surfaces its memory sections. |
 | `correctness` | Do both runtimes compute the same logits, the same greedy tokens, the same text? |
 | `profile` | Kernel counts and per-kernel time attribution. Instrumented — never feeds a throughput number. |
+| `batch` | What batching buys, with aggregate throughput and per-request throughput reported separately. |
 | `multigpu` | How each runtime uses more than one accelerator, with configurations labelled so a 2-GPU run is never compared against a 1-GPU one. |
+
+### Reading the `batch` mode
+
+Batching is a **throughput** mechanism, not a latency one. The mode therefore
+prints two rates per cell and never collapses them:
+
+- **`batch tok/s`** — the whole pass's output over its wall time. This is the
+  number batching is supposed to raise.
+- **`per-request tok/s`** — one row's output over that same wall time: what a
+  single caller waiting inside the batch experiences. This is *not* expected to
+  improve, and usually falls.
+
+`scaling` compares a cell against **that same backend's** batch-1 aggregate
+throughput, so each runtime is measured against itself rather than against the
+other.
+
+Both backends replicate one prompt to the batch width (`tokenizer([prompt] * B)`
+on the Transformers side, the same ids repeated on Aether's), so the two are given
+identical work and neither batch carries padding. Aether decodes the rows
+concurrently in one KV tensor; if the loaded engine cannot batch, the cell is
+recorded as unsupported rather than being quietly serialized into a loop.
+
 
 ## Useful switches
 
@@ -97,7 +121,7 @@ Or everything in sequence, which takes considerably longer:
 --models Qwen/Qwen3-0.6B          # subset of the three
 --precisions bf16,fp16,fp32       # default: bf16 only (see below)
 --prompt-tokens 32,256,1024       # exact token counts, not characters
---batch-sizes 1,2,4               # batch>1 is reported unsupported for Aether
+--batch-sizes 1,2,4               # both runtimes execute these as real batches
 --max-new-tokens 128
 --warmup-iters 2 --measure-iters 5
 --devices 1                       # pin visibility to the first N GPUs

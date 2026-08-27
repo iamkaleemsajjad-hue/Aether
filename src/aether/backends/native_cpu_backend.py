@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
+from aether.backends import batched_generation
 from aether.backends.compiled_handle import CompiledAEGHandle
 from aether.core.constants import AETHER_VERSION
 from aether.core.exceptions import BackendError
@@ -279,6 +280,50 @@ class NativeCPUBackend(Backend):
                 count = index
                 break
         return text[:cutoff], count, True
+
+    def supports_batched_generation(self, model_id: str, batch_size: int = 2) -> bool:
+        """Whether ``model_id`` can be served as a real batch of this width.
+
+        A probe: it loads nothing and promotes nothing, so it is safe to call before
+        deciding whether to assemble a batch.
+        """
+        return batched_generation.can_batch(self._models.get(model_id), batch_size)
+
+    def generate_batch(self, requests: list[GenerationRequest]) -> list[GenerationResult]:
+        """Serve several requests in one batched forward pass.
+
+        This backend's own kernels are sequence-major, which is the faster shape for
+        a single sequence and the reason they stay that way. A batch is served by
+        promoting the same authenticated weights onto the portable tensor executor,
+        which carries a batch axis; the shared helper does that once per loaded
+        model and refuses outright if it cannot, rather than looping over the
+        requests and calling the result a batch.
+        """
+        if not requests:
+            return []
+        if len(requests) == 1:
+            return [self.generate(requests[0])]
+
+        model_ids = {request.model_id for request in requests}
+        if len(model_ids) != 1:
+            raise BackendError(
+                "every request in a batch must name the same model; got "
+                f"{sorted(model_ids)}",
+                backend_name=self.name,
+            )
+        model_id = next(iter(model_ids))
+        if model_id not in self._models:
+            self.load_model(model_id, aeg_path=requests[0].extra.get("aeg_path"))
+        return batched_generation.generate_batch(
+            self._models[model_id],
+            requests,
+            backend_name=self.name,
+            request_text=self._request_text,
+            truncate_stop_text=lambda tokenizer, ids, stops: self._stop_text(
+                tokenizer, list(ids), stops
+            ),
+            default_device="cpu",
+        )
 
     def release_session_cache(self, model_id: str, session_id: str) -> None:
         """Release request-local KV state without importing PyTorch."""

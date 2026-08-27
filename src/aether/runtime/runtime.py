@@ -895,6 +895,143 @@ class Runtime:
                 cache.store(prompt, result.text, model_id, cache_config, tokens_saved=0)
         return response
 
+    def generate_batch(
+        self,
+        model_id: str,
+        prompts: list[str],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int = 0,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> list[GenerationResponse]:
+        """Generate for several prompts in one batched forward pass.
+
+        The prompts are decoded together in a single KV tensor, each row
+        independent: one row's tokens, positions and stop condition cannot affect
+        another's. Responses come back in prompt order.
+
+        This is a throughput interface, not a latency one. Batching raises tokens
+        per second in aggregate while each individual response takes at least as
+        long as it would alone, so a single-prompt caller should keep using
+        :meth:`generate`.
+
+        A single-prompt list is forwarded to :meth:`generate`, so callers can size
+        batches dynamically without special-casing one.
+
+        The semantic response cache is deliberately not consulted here: a partial
+        hit would split the batch and make the measured work depend on cache
+        contents. Route cacheable single prompts through :meth:`generate`.
+        """
+        if not prompts:
+            return []
+        if not all(isinstance(prompt, str) for prompt in prompts):
+            raise ValueError("prompts must be a list of strings")
+        resolved_max = max_tokens or self.config.default_max_tokens
+        resolved_temperature = (
+            temperature if temperature is not None else self.config.default_temperature
+        )
+        resolved_top_p = top_p if top_p is not None else self.config.default_top_p
+        if len(prompts) == 1:
+            return [
+                self.generate(
+                    model_id,
+                    prompts[0],
+                    max_tokens=resolved_max,
+                    temperature=resolved_temperature,
+                    top_p=resolved_top_p,
+                    top_k=top_k,
+                    stop=stop,
+                    **kwargs,
+                )
+            ]
+
+        for prompt in prompts:
+            self._check_safety_prompt(prompt)
+
+        backend = self._load_model(model_id)
+        run_batch = getattr(backend, "generate_batch", None)
+        if run_batch is None:
+            raise AetherRuntimeError(
+                f"backend {backend.name!r} does not implement batched generation; "
+                "submit the prompts individually rather than expecting this call to "
+                "loop over them"
+            )
+        requests = [
+            GenerationRequest(
+                model_id=model_id,
+                prompt=prompt,
+                max_tokens=resolved_max,
+                temperature=resolved_temperature,
+                top_p=resolved_top_p,
+                top_k=top_k,
+                stop=stop,
+                extra=dict(kwargs),
+            )
+            for prompt in prompts
+        ]
+
+        start = datetime.datetime.now(datetime.timezone.utc)
+        start_ns = time.time_ns()
+        try:
+            results = run_batch(requests)
+        except Exception as exc:
+            error_span = self.tracer.start_span(
+                "aether.inference.batch",
+                attributes={"model_id": model_id, "batch_size": len(prompts), "error": str(exc)},
+            )
+            error_span.set_error(str(exc))
+            self.tracer.finish_span(error_span)
+            self.metrics_collector.record(
+                0.0, 0.0, (time.time_ns() - start_ns) / 1_000_000, is_error=True
+            )
+            raise
+        duration_s = (
+            datetime.datetime.now(datetime.timezone.utc) - start
+        ).total_seconds()
+
+        produced = sum(result.completion_tokens for result in results)
+        responses: list[GenerationResponse] = []
+        for result in results:
+            result.text = self._check_safety_output(result.text)
+            backend_metrics = {
+                key: value
+                for key, value in result.metrics.items()
+                if key not in {"ttft_ms", "throughput_tps"}
+            }
+            backend_metrics.setdefault("batch_size", len(prompts))
+            # The wall time belongs to the batch, so the aggregate rate is the
+            # figure batching actually improves.  Both are labelled rather than
+            # letting a per-row number stand in for batch throughput.
+            backend_metrics["batch_throughput_tps"] = produced / max(duration_s, 1e-9)
+            responses.append(
+                GenerationResponse(
+                    text=result.text,
+                    usage={
+                        "prompt_tokens": result.prompt_tokens,
+                        "completion_tokens": result.completion_tokens,
+                        "total_tokens": result.prompt_tokens + result.completion_tokens,
+                    },
+                    metrics=InferenceMetrics(
+                        throughput_tps=result.completion_tokens / max(duration_s, 1e-6),
+                        ttft_ms=result.metrics.get("ttft_ms", duration_s * 1000),
+                        kernel_target=self.fingerprint.target_id,
+                        active_precision="mixed",
+                        backend_name=result.backend_name or backend.name,
+                        extra=backend_metrics,
+                    ),
+                    finish_reason=result.finish_reason,
+                )
+            )
+        self.metrics_collector.record(
+            duration_s * 1000,
+            produced / max(duration_s, 1e-9),
+            duration_s * 1000,
+        )
+        return responses
+
     def _check_safety_prompt(self, prompt: str) -> str:
         """Apply the configured prompt safety policy before inference."""
         if self.safety_engine is None:

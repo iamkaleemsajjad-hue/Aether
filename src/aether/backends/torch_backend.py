@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
+from aether.backends import batched_generation
 from aether.backends.compiled_handle import CompiledAEGHandle
 from aether.core.constants import AETHER_VERSION
 from aether.core.exceptions import BackendError
@@ -760,6 +761,54 @@ class TorchBackend(Backend):
             f"AEG {handle.aeg_path} contains compiled graph data but no tokenizer-backed "
             "generation adapter for the PyTorch backend. Refusing to return fabricated output.",
             backend_name=self.name,
+        )
+
+    def supports_batched_generation(self, model_id: str, batch_size: int = 2) -> bool:
+        """Whether ``model_id`` can be served as a real batch of this width.
+
+        A probe: it loads nothing, so a caller that has not loaded the model yet
+        gets ``False`` rather than paying for a load inside a capability check.
+        """
+        return batched_generation.can_batch(self._models.get(model_id), batch_size)
+
+    def generate_batch(self, requests: list[GenerationRequest]) -> list[GenerationResult]:
+        """Serve several requests in one batched forward pass.
+
+        Delegates to :mod:`aether.backends.batched_generation`, which is shared with
+        the native CPU backend so the packing, promotion and row-splitting logic
+        exists once. A batch that cannot be executed as one pass is refused there
+        rather than looped over here.
+        """
+        if not requests:
+            return []
+        if len(requests) == 1:
+            return [self.generate(requests[0])]
+
+        model_ids = {request.model_id for request in requests}
+        if len(model_ids) != 1:
+            raise BackendError(
+                "every request in a batch must name the same model; got "
+                f"{sorted(model_ids)}",
+                backend_name=self.name,
+            )
+        model_id = next(iter(model_ids))
+        handle = self._models.get(model_id)
+        if not isinstance(handle, CompiledAEGHandle):
+            self.load_model(model_id)
+            handle = self._models.get(model_id)
+        if not isinstance(handle, CompiledAEGHandle):
+            raise BackendError(
+                "batched generation requires a compiled AEG; "
+                f"{model_id!r} did not load as one",
+                backend_name=self.name,
+            )
+        return batched_generation.generate_batch(
+            handle,
+            requests,
+            backend_name=self.name,
+            request_text=self._request_text,
+            truncate_stop_text=self._truncate_stop_text,
+            default_device=self._device,
         )
 
     @staticmethod

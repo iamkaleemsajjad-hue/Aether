@@ -240,16 +240,16 @@ class AetherBackend:
         seed: int,
         batch_size: int = 1,
     ) -> GenerationOutcome:
-        if batch_size != 1:
-            # Verified by inspection of ``TorchAEGEngine._forward_device``: the
-            # decode path carries no batch dimension, and a 2-D input is
-            # flattened into one sequence.  Reported as unsupported rather than
-            # run incorrectly.
-            raise UnsupportedConfiguration(
-                "Aether's portable engine has no batch dimension; batch_size > 1 "
-                "is not supported and is reported rather than approximated"
-            )
         set_seed(seed)
+        if batch_size != 1:
+            return self._generate_batched(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                batch_size=batch_size,
+            )
         result = self._runtime.generate(
             str(self._artifact),
             prompt=prompt,
@@ -275,6 +275,75 @@ class AetherBackend:
             backend_metrics=(
                 metrics.to_dict() if hasattr(metrics, "to_dict") else dict(metrics or {})
             ),
+        )
+
+    def _generate_batched(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        batch_size: int,
+    ) -> GenerationOutcome:
+        """Run ``batch_size`` copies of the prompt as one batched pass.
+
+        The prompt is replicated because that is exactly what the Transformers
+        backend does for its own batch cells (``tokenizer([prompt] * batch_size)``),
+        so the two backends are measured on the same work.  Replication also makes
+        every row the same length, so the batch carries no padding — the rows are
+        genuinely independent sequences that merely happen to be identical.
+
+        This goes through ``Runtime.generate_batch``, the same public surface the
+        ``batch_size=1`` cell uses via ``Runtime.generate``, so both cells are
+        measured through the full runtime stack rather than one at the engine level
+        and one above it.  The runtime decodes the rows together in one KV tensor;
+        if no executor can batch, it raises and the cell is recorded as unsupported
+        rather than being quietly serialized into a loop.
+        """
+        try:
+            responses = self._runtime.generate_batch(
+                str(self._artifact),
+                [prompt] * batch_size,
+                max_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A backend that cannot batch says so; record that, do not approximate.
+            raise UnsupportedConfiguration(str(exc)[:400]) from exc
+        if len(responses) != batch_size:
+            raise UnsupportedConfiguration(
+                f"batched generation returned {len(responses)} rows for batch {batch_size}"
+            )
+        first = responses[0]
+        metrics = getattr(first, "metrics", None)
+        extra = dict(getattr(metrics, "extra", {}) or {}) if metrics is not None else {}
+        usage = dict(getattr(first, "usage", {}) or {})
+        ids = (
+            flatten_ids(self._tokenizer(first.text, add_special_tokens=False)["input_ids"])
+            if self._tokenizer else []
+        )
+        # The harness normalizes throughput by one row's tokens times the batch
+        # width, matching how it treats the Transformers backend, so report the
+        # first row here and carry the per-row counts as evidence.
+        return GenerationOutcome(
+            text=first.text,
+            token_ids=ids,
+            prompt_tokens=int(usage.get("prompt_tokens", 0)),
+            completion_tokens=int(usage.get("completion_tokens", len(ids))),
+            backend_metrics={
+                **extra,
+                "batch_size": batch_size,
+                "returned_rows": len(responses),
+                "row_completion_tokens": [
+                    int(dict(getattr(item, "usage", {}) or {}).get("completion_tokens", 0))
+                    for item in responses
+                ],
+                "execution": "batched AEG forward pass (single KV tensor)",
+            },
         )
 
     def generate_token_ids(
@@ -321,7 +390,29 @@ class AetherBackend:
         return elapsed
 
     def supports_batch(self, batch_size: int) -> bool:
-        return batch_size == 1
+        """Whether this backend can execute ``batch_size`` rows as one real pass.
+
+        Asked of the loaded backend rather than the raw engine, because a CPU-loaded
+        AEG can be promoted onto the portable tensor executor for batched work — a
+        capability the engine object alone does not report.
+        """
+        if batch_size == 1:
+            return True
+        handle = self._runtime_handle()
+        for registry_name in ("_loaded_backends", "_backends"):
+            registry = getattr(self._runtime, registry_name, None)
+            if not isinstance(registry, dict):
+                continue
+            for backend in registry.values():
+                probe = getattr(backend, "supports_batched_generation", None)
+                if callable(probe) and handle is not None:
+                    return bool(probe(handle.model_id, batch_size))
+        supports = getattr(self._engine, "supports_batch", None)
+        return bool(
+            getattr(self._engine, "generate_batch", None) is not None
+            and callable(supports)
+            and supports(batch_size)
+        )
 
     def unload(self) -> None:
         import gc

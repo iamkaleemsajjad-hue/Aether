@@ -211,8 +211,113 @@ def test_report_renders_with_no_successful_measurement() -> None:
         ],
     }
     text = build_report(payload, charts=[])
-    assert "supports no performance conclusion" in text
+    assert "supports no conclusion" in text
     assert "load-failed" in text
+
+
+def test_a_failed_performance_matrix_says_so_without_silencing_other_modes() -> None:
+    """The throughput verdict is scoped to the performance matrix.
+
+    A run whose performance cells all failed must say that, and must still report
+    what its other modes measured. Collapsing the whole Conclusions section into
+    "no conclusion" would drop findings the run actually produced.
+    """
+    from benchmark.reporting import build_report
+
+    latency = {"median": 1.0, "p95": 1.1, "n": 3}
+    ok_record = {
+        "status": "ok", "tokens_per_s": {"median": 10.0, "stdev": 0.1},
+        "latency_s": dict(latency), "completion_tokens": 8, "cold_latency_s": 1.2,
+    }
+    cell = {"model": "m", "precision": "bf16", "prompt_tokens": 32, "batch_size": 1}
+    payload = {
+        "generated_at": "now", "config": {"mode": "all"}, "environment": {}, "skips": [],
+        "performance": [{
+            "cell": dict(cell),
+            "backends": {
+                "aether": {"status": "error", "message": "boom"},
+                "transformers": ok_record,
+            },
+        }],
+        "batch_scaling": {"cases": [
+            {
+                "model": "m/x", "batch_size": 1, "backend": "aether", "status": "ok",
+                "latency_s": {"median": 1.0}, "batch_tokens_per_s": 10.0,
+                "per_request_tokens_per_s": 10.0, "requests_per_s": 1.0,
+                "engine": "TorchAEGEngine", "scaling_vs_batch1": 1.0,
+                "scaling_is_same_engine": True,
+            },
+            {
+                "model": "m/x", "batch_size": 4, "backend": "aether", "status": "ok",
+                "latency_s": {"median": 1.4}, "batch_tokens_per_s": 29.0,
+                "per_request_tokens_per_s": 7.25, "requests_per_s": 2.9,
+                "engine": "TorchAEGEngine", "scaling_vs_batch1": 2.9,
+                "scaling_is_same_engine": True,
+            },
+        ], "notes": []},
+    }
+    text = build_report(payload, charts=[])
+    conclusions = text.split("## Conclusions")[-1]
+    assert "supports no throughput comparison" in conclusions
+    assert "2.90x" in conclusions, "the batch finding was dropped"
+
+
+def test_a_cross_engine_ratio_is_not_reported_as_a_batching_speedup() -> None:
+    """Aether's batch>1 cells may run on a different executor than batch=1.
+
+    On a host with no accelerator the AEG loads onto the NumPy executor for a
+    single sequence and is promoted onto the portable tensor executor to batch.
+    A ratio between those two rows measures the engine change, not batching, so it
+    must not be presented as a batching gain.
+    """
+    from benchmark.reporting import batch_scaling_section, build_report
+
+    cases = [
+        {
+            "model": "m/x", "batch_size": 1, "backend": "aether", "status": "ok",
+            "latency_s": {"median": 1.0}, "batch_tokens_per_s": 10.0,
+            "per_request_tokens_per_s": 10.0, "requests_per_s": 1.0,
+            "engine": "CPUExecutionEngine", "scaling_vs_batch1": 1.0,
+            "scaling_is_same_engine": True,
+        },
+        {
+            "model": "m/x", "batch_size": 4, "backend": "aether", "status": "ok",
+            "latency_s": {"median": 1.4}, "batch_tokens_per_s": 29.0,
+            "per_request_tokens_per_s": 7.25, "requests_per_s": 2.9,
+            "engine": "TorchAEGEngine", "scaling_vs_batch1": 2.9,
+            "scaling_is_same_engine": False,
+        },
+    ]
+    section = batch_scaling_section({"cases": cases, "notes": []})
+    assert "different engine" in section
+    assert "CPUExecutionEngine" in section and "TorchAEGEngine" in section
+
+    conclusions = build_report(
+        {
+            "generated_at": "now", "config": {"mode": "batch"}, "environment": {},
+            "skips": [], "batch_scaling": {"cases": cases, "notes": []},
+        },
+        charts=[],
+    ).split("## Conclusions")[-1]
+    assert "supports no batching-speedup claim" in conclusions
+    assert "2.90x" not in conclusions
+
+
+def test_batch_section_separates_aggregate_from_per_request_throughput() -> None:
+    """Batching raises aggregate throughput, not per-request; both must be shown."""
+    from benchmark.reporting import batch_scaling_section
+
+    section = batch_scaling_section({
+        "cases": [{
+            "model": "m/x", "batch_size": 4, "backend": "aether", "status": "ok",
+            "latency_s": {"median": 1.4}, "batch_tokens_per_s": 29.0,
+            "per_request_tokens_per_s": 7.25, "requests_per_s": 2.9,
+            "engine": "TorchAEGEngine",
+        }],
+        "notes": [],
+    })
+    assert "batch tok/s" in section and "per-request tok/s" in section
+    assert "29.00" in section and "7.25" in section
 
 
 def test_semantic_response_cache_is_disabled_for_measured_runs() -> None:

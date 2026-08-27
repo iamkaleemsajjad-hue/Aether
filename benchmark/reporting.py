@@ -502,6 +502,83 @@ def multigpu_section(payload: dict[str, Any] | None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def batch_scaling_section(payload: dict[str, Any] | None) -> str:
+    """What batching bought, with aggregate throughput and per-request kept apart."""
+    lines = ["## Batch scaling\n"]
+    if not payload:
+        lines.append("_Not run._\n")
+        return "\n".join(lines)
+    lines.append(
+        "Batching is a **throughput** mechanism, not a latency one. Aggregate "
+        "tokens per second is expected to rise with batch width; the tokens per "
+        "second an individual caller inside the batch experiences is not, and "
+        "usually falls. Both are printed so neither can be read as the other.\n\n"
+        "`batch tok/s` is the whole pass's output over its wall time. "
+        "`per-request tok/s` is one row's output over that same wall time. "
+        "`scaling` divides a cell's aggregate throughput by *that backend's own* "
+        "batch-1 figure, so the two backends are each measured against themselves "
+        "rather than against each other.\n"
+    )
+    rows = []
+    for entry in payload.get("cases", []):
+        if entry.get("status") != "ok":
+            rows.append([
+                entry.get("model", "—").split("/")[-1],
+                _fmt(entry.get("batch_size")), _fmt(entry.get("backend")),
+                f"**{entry.get('status', 'missing')}**",
+                _fmt((entry.get("message") or "")[:60]),
+                "—", "—", "—", "—", "—",
+            ])
+            continue
+        scaling = "—"
+        if entry.get("scaling_vs_batch1") is not None:
+            scaling = f"{entry['scaling_vs_batch1']:.2f}x"
+            if entry.get("scaling_is_same_engine") is False:
+                # A ratio across two different executors is not a batching
+                # speedup; say so in the cell rather than in a footnote.
+                scaling += " (different engine)"
+        rows.append([
+            entry["model"].split("/")[-1],
+            _fmt(entry.get("batch_size")), _fmt(entry.get("backend")), "ok",
+            _fmt(entry.get("batch_tokens_per_s")),
+            _fmt(entry.get("per_request_tokens_per_s")),
+            _fmt(entry.get("requests_per_s"), 3),
+            _fmt((entry.get("latency_s") or {}).get("median"), 4),
+            _fmt(entry.get("engine")),
+            scaling,
+        ])
+    lines.append(_table(
+        ["Model", "Batch", "Backend", "Status", "batch tok/s", "per-request tok/s",
+         "req/s", "latency s (med)", "engine", "scaling"],
+        rows,
+    ))
+
+    memory_rows = [
+        [
+            entry["model"].split("/")[-1], _fmt(entry.get("batch_size")),
+            _fmt(entry.get("backend")),
+            _bytes(entry.get("gpu_inference_delta_bytes")),
+            _fmt(entry.get("cold_latency_s"), 4),
+        ]
+        for entry in payload.get("cases", [])
+        if entry.get("status") == "ok"
+    ]
+    if memory_rows:
+        lines.append("\n### Inference memory by batch width\n")
+        lines.append(
+            "The KV cache and activations grow with the batch, so this column is "
+            "the memory cost of the throughput above. It is the allocator delta "
+            "attributable to the backend's own decoding.\n"
+        )
+        lines.append(_table(
+            ["Model", "Batch", "Backend", "GPU inference delta", "cold s"],
+            memory_rows,
+        ))
+    for note in payload.get("notes", []):
+        lines.append(f"- {note}")
+    return "\n".join(lines) + "\n"
+
+
 def write_charts(results: list[dict[str, Any]], output_dir: Path) -> list[str]:
     """Plot the raw measurements. Linear axes from zero, no rescaling."""
     try:
@@ -605,9 +682,18 @@ def save_raw(payload: dict[str, Any], output_dir: Path) -> dict[str, str]:
 #: Everything the measurements cannot settle.  Stated in the report so a reader
 #: does not extrapolate past what was actually observed.
 LIMITATIONS = (
-    "Aether's portable engine has no batch dimension, so batch sizes above 1 are "
-    "reported as unsupported rather than measured. Any batch>1 row is a "
-    "Transformers-only observation and not a comparison.",
+    "Aether executes a batch as one forward pass over a left-padded batch axis "
+    "with one KV tensor per layer, so batch>1 rows are genuinely concurrent rather "
+    "than serialized. Rows are padded to the longest prompt in the batch; the "
+    "benchmark replicates one prompt per cell, as the Transformers backend does, so "
+    "its batches carry no padding. A batch of mixed lengths would pay for the pad "
+    "region, which this matrix therefore does not measure.",
+    "Batched throughput is an aggregate figure. The harness normalizes tokens per "
+    "second by batch width, so a batch>1 cell reports the work the whole pass "
+    "completed; per-request latency in a batch is at least what it would be alone.",
+    "Aether's tensor-parallel (multi-GPU sharded) executor is single-sequence. "
+    "Batched cells therefore measure single-device execution, and a sharded "
+    "configuration is reported separately in the multi-GPU section.",
     "Aether's compiled artifact stores weights at BF16 (the compiler's default "
     "residency). At fp16 and fp32 the two backends therefore do not hold "
     "bit-identical weights, since Transformers loads the published checkpoint "
@@ -694,6 +780,8 @@ def build_report(payload: dict[str, Any], charts: list[str]) -> str:
         parts += [correctness_section(payload["correctness"]), ""]
     if payload.get("kernels"):
         parts += [kernel_section(payload["kernels"]), ""]
+    if payload.get("batch_scaling") is not None:
+        parts += [batch_scaling_section(payload.get("batch_scaling")), ""]
     if payload.get("multigpu") is not None:
         parts += [multigpu_section(payload.get("multigpu")), ""]
     parts += [failures_section(payload.get("performance", []), payload.get("skips", [])), ""]
@@ -708,34 +796,45 @@ def build_report(payload: dict[str, Any], charts: list[str]) -> str:
 
 
 def _conclusions(payload: dict[str, Any]) -> str:
-    """State only what the collected measurements support."""
+    """State only what the collected measurements support.
+
+    Every mode contributes its own findings, and a mode that was not run
+    contributes nothing.  The performance verdict in particular is scoped to the
+    performance matrix: a ``--mode batch`` or ``--mode correctness`` run has no
+    throughput matrix to draw from, and must still report what it *did* measure
+    rather than printing "no conclusion" over the whole section.
+    """
     performance = payload.get("performance", [])
     comparable = [
         cell for cell in performance
         if cell["backends"].get("aether", {}).get("status") == "ok"
         and cell["backends"].get("transformers", {}).get("status") == "ok"
     ]
-    if not comparable:
-        return (
-            "No cell produced a successful measurement on both backends, so this run "
-            "supports no performance conclusion. See the failures table above."
-        )
-    ratios = []
-    for cell in comparable:
-        a = cell["backends"]["aether"]["tokens_per_s"]["median"]
-        b = cell["backends"]["transformers"]["tokens_per_s"]["median"]
-        if b:
-            ratios.append((a / b, cell["cell"]))
-    ratios.sort(key=lambda item: item[0])
-    faster = [r for r, _ in ratios if r > 1.05]
-    slower = [r for r, _ in ratios if r < 0.95]
-    parity = [r for r, _ in ratios if 0.95 <= r <= 1.05]
-    lines = [
-        f"Comparable cells: **{len(ratios)}**. Aether faster by more than 5% in "
-        f"**{len(faster)}**, Transformers faster by more than 5% in **{len(slower)}**, "
-        f"within plus/minus 5% in **{len(parity)}**.",
-        "",
-    ]
+    lines: list[str] = []
+    ratios: list[tuple[float, dict[str, Any]]] = []
+    if performance and not comparable:
+        lines += [
+            "No cell in the performance matrix produced a successful measurement on "
+            "both backends, so this run supports no throughput comparison. See the "
+            "failures table above.",
+            "",
+        ]
+    elif comparable:
+        for cell in comparable:
+            a = cell["backends"]["aether"]["tokens_per_s"]["median"]
+            b = cell["backends"]["transformers"]["tokens_per_s"]["median"]
+            if b:
+                ratios.append((a / b, cell["cell"]))
+        ratios.sort(key=lambda item: item[0])
+        faster = [r for r, _ in ratios if r > 1.05]
+        slower = [r for r, _ in ratios if r < 0.95]
+        parity = [r for r, _ in ratios if 0.95 <= r <= 1.05]
+        lines += [
+            f"Comparable cells: **{len(ratios)}**. Aether faster by more than 5% in "
+            f"**{len(faster)}**, Transformers faster by more than 5% in "
+            f"**{len(slower)}**, within plus/minus 5% in **{len(parity)}**.",
+            "",
+        ]
     if ratios:
         worst, worst_cell = ratios[0]
         best, best_cell = ratios[-1]
@@ -756,12 +855,46 @@ def _conclusions(payload: dict[str, Any]) -> str:
             "numerically equivalent to Transformers within the stated logit "
             "tolerance. Per-case deviations are in the correctness table."
         )
+    batch_cases = [
+        case for case in ((payload.get("batch_scaling") or {}).get("cases") or [])
+        if case.get("status") == "ok" and case.get("scaling_vs_batch1") is not None
+    ]
+    if batch_cases:
+        scalings = [
+            (case["scaling_vs_batch1"], case["backend"], case["batch_size"])
+            for case in batch_cases
+            # A ratio taken across two different executors is not a batching
+            # speedup, so it must not become the headline number.
+            if case.get("batch_size") != 1 and case.get("scaling_is_same_engine") is not False
+        ]
+        if scalings:
+            best = max(scalings)
+            lines.append(
+                f"- Batch scaling: the largest aggregate-throughput gain over the "
+                f"same backend's batch-1 figure was **{best[0]:.2f}x** "
+                f"(`{best[1]}`, batch {best[2]}). This is a throughput figure; "
+                "per-request throughput in the same table did not improve, which is "
+                "the expected behaviour of batching rather than a shortfall."
+            )
+        else:
+            lines.append(
+                "- Batch scaling: no cell compared two batch widths on the same "
+                "executor, so this run supports no batching-speedup claim. The batch "
+                "table states which engine served each cell."
+            )
     if (payload.get("kernels") or {}).get("dispatch"):
         lines.append(
             "- Kernel counts are reported per decoded token per layer for both "
             "backends. Every attribution of a throughput difference is labelled in "
             "the kernel section as confirmed by counting, confirmed by the profiler, "
             "or inferred."
+        )
+    if not any(line.strip() for line in lines):
+        # Nothing was measured at all: say that plainly rather than leaving a
+        # section that reads as though findings had been omitted.
+        return (
+            "This run collected no comparable measurement, so it supports no "
+            "conclusion. See the failures table above."
         )
     lines += [
         "",

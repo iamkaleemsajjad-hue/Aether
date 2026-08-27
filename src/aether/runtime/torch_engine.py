@@ -20,6 +20,12 @@ from typing import Any, Iterator
 
 import numpy as np
 
+from aether.runtime.batch import (
+    DEFAULT_PAD_TOKEN_ID,
+    BatchLayout,
+    PackedBatch,
+    pack_left_padded,
+)
 from aether.runtime.positional import alibi_slopes
 
 
@@ -112,6 +118,75 @@ class TorchKVCache:
             length=self.length,
             last_logits=None if self.last_logits is None else self.last_logits.clone(),
         )
+
+
+@dataclass
+class BatchedKVCache:
+    """Device-resident KV state for a left-padded batch of independent sequences.
+
+    Each layer's tensors are ``(batch, capacity, kv_heads, head_dim)``: batch-major
+    and contiguous.  Two properties follow from that choice and are the reason for
+    it.  Appending a decode step is one slice assignment across every row, because
+    left padding puts every row's frontier at the same index.  And
+    ``transpose(1, 2)`` yields the ``(batch, heads, seq, dim)`` view that fused
+    attention wants, as a view rather than a copy.
+
+    Isolation is structural rather than enforced.  The batch axis is the outermost
+    axis of every cache tensor and every activation, and a row is only ever written
+    through its own index, so row ``i`` has no code path that reaches row ``j``'s
+    state.  See ``docs/adr-batched-inference.md`` for the two operations where that
+    is not automatic (expert routing and sampling) and how each is handled.
+    """
+
+    keys: list[Any | None]
+    values: list[Any | None]
+
+    pad_counts: Any
+    """``(batch, 1)`` int64 leading pad count per row — the row's position offset.
+
+    Row ``b``'s token at padded index ``i`` sits at position ``max(0, i - pad)``.
+    Carrying the offset here is what lets a batched result equal the same sequence
+    decoded alone; using the padded index as the position would rotate every short
+    row as though it began mid-sequence.
+    """
+
+    batch_size: int = 1
+
+    live: Any | None = None
+    """``(batch, capacity)`` bool, or ``None`` when the batch carries no padding.
+
+    ``None`` means "every slot is real", which is both true and the trigger for
+    keeping fused attention: a uniform batch needs no mask, so prefill stays
+    ``is_causal=True`` and decode passes no mask at all.
+    """
+
+    length: int = 0
+    """Uniform write frontier.  One value is correct only because rows are
+    right-aligned; with right padding this would have to be per row."""
+
+    layout: BatchLayout | None = None
+    last_logits: Any | None = None
+    """``(batch, vocab)`` logits at each row's final real position."""
+
+    finished: Any | None = None
+    """``(batch,)`` bool: has this row emitted its stop token."""
+
+    def clone(self) -> "BatchedKVCache":
+        return BatchedKVCache(
+            keys=[None if value is None else value.clone() for value in self.keys],
+            values=[None if value is None else value.clone() for value in self.values],
+            pad_counts=self.pad_counts.clone(),
+            batch_size=self.batch_size,
+            live=None if self.live is None else self.live.clone(),
+            length=self.length,
+            layout=self.layout,
+            last_logits=None if self.last_logits is None else self.last_logits.clone(),
+            finished=None if self.finished is None else self.finished.clone(),
+        )
+
+    def live_view(self, total: int) -> Any | None:
+        """The validity mask over the first ``total`` slots, or ``None`` if unpadded."""
+        return None if self.live is None else self.live[:, :total]
 
 
 class TorchAEGEngine:
@@ -511,6 +586,12 @@ class TorchAEGEngine:
         Hoisted out of the layer loop: the rotation factors depend only on the
         positions and the rotary base, so a decode step needs them once rather
         than twice per layer.
+
+        ``positions`` is rank-1 ``(seq,)`` for a single sequence and rank-2
+        ``(batch, seq)`` for a batch, where each row carries its *own* positions
+        because left padding shifts a short row's padded indices but must not
+        shift its angles.  The result broadcasts against the matching activation
+        layout — ``(seq, 1, dim)`` or ``(batch, seq, 1, dim)``.
         """
         cos_table, sin_table = (
             (self._local_cos, self._local_sin)
@@ -518,6 +599,16 @@ class TorchAEGEngine:
             else (self._cos, self._sin)
         )
         assert cos_table is not None and sin_table is not None
+        if positions.dim() == 2:
+            flat = positions.reshape(-1)
+            batch, seq = int(positions.shape[0]), int(positions.shape[1])
+            cos = cos_table.index_select(0, flat)
+            sin = sin_table.index_select(0, flat)
+            width = int(cos.shape[-1])
+            return (
+                cos.reshape(batch, seq, 1, width),
+                sin.reshape(batch, seq, 1, width),
+            )
         return (
             cos_table.index_select(0, positions).unsqueeze(1),
             sin_table.index_select(0, positions).unsqueeze(1),
@@ -668,7 +759,17 @@ class TorchAEGEngine:
         experts = layer["experts"]
         if router is None or not experts:
             raise ValueError("portable MoE layer is missing its router or experts")
-        router_logits = self._linear(hidden, router)
+        # Expert routing is strictly per token: a token's expert choice and output
+        # depend on nothing but that token.  Collapsing a batch's leading axes into
+        # one token axis is therefore lossless here, and it keeps the scatter/gather
+        # dispatch below rank-2 for every batch size.
+        #
+        # This is the one place a flatten is safe.  The same flatten applied to
+        # attention would splice independent sequences into one — the exact defect
+        # the batched layout exists to prevent.
+        lead = tuple(hidden.shape[:-1])
+        flat = hidden.reshape(-1, int(hidden.shape[-1])) if len(lead) > 1 else hidden
+        router_logits = self._linear(flat, router)
         top_k = min(int(layer["num_activated_experts"]), len(experts))
         if top_k <= 0:
             raise ValueError("portable MoE top-k must be positive")
@@ -676,19 +777,19 @@ class TorchAEGEngine:
         routing, selected = torch.topk(probabilities, top_k, dim=-1)
         if self.moe_renormalize_topk:
             routing = routing / routing.sum(dim=-1, keepdim=True)
-        routing = routing.to(dtype=hidden.dtype)
-        output = torch.zeros_like(hidden)
+        routing = routing.to(dtype=flat.dtype)
+        output = torch.zeros_like(flat)
         for expert_index, expert in enumerate(experts):
             rows, slots = torch.where(selected == expert_index)
             if rows.numel() == 0:
                 continue
-            source = hidden.index_select(0, rows)
+            source = flat.index_select(0, rows)
             gate = self._linear(source, expert["gate_proj"], expert["gate_proj_bias"])
             up = self._linear(source, expert["up_proj"], expert["up_proj_bias"])
             activated = self._activation(gate, up)
             value = self._linear(activated, expert["down_proj"], expert["down_proj_bias"])
             output.index_put_((rows,), value * routing[rows, slots].unsqueeze(-1), accumulate=True)
-        return output
+        return output.reshape(*lead, int(output.shape[-1])) if len(lead) > 1 else output
 
     def _attention(
         self,
@@ -699,18 +800,34 @@ class TorchAEGEngine:
         key_positions: Any,
         window_size: int | None = None,
         scale: float | None = None,
+        *,
+        live: Any | None = None,
     ) -> Any:
         """Exact attention, dispatching to PyTorch's fused SDPA when possible.
 
-        The boolean mask is intentionally expressed in source token
-        positions, not cache row indices.  That keeps the same semantics for
-        normal prefill, incremental decode, local GPT-Neo layers, and future
-        cache implementations that compact rows.
+        Rank-generic: ``q``/``k``/``v`` are ``(seq, heads, dim)`` for a single
+        sequence or ``(batch, seq, heads, dim)`` for a batch, and the batch axis —
+        being outermost — never mixes rows in any operation below.
+
+        The boolean mask is intentionally expressed in source token positions, not
+        cache row indices.  That keeps the same semantics for normal prefill,
+        incremental decode, local GPT-Neo layers, and future cache
+        implementations that compact rows.  In a padded batch the positions are
+        per row, since a row's position at a padded slot is that slot minus the
+        row's own pad count.
+
+        ``live`` marks which key slots hold a real token, per row.  It is ``None``
+        whenever nothing is masked — every single-sequence call, and every batch
+        whose rows are equal length — and that is what preserves the fused path:
+        a ``None`` mask lets prefill stay ``is_causal=True`` and lets a one-token
+        decode pass no mask at all.
         """
         torch = self.torch
         is_alibi = self.is_alibi
-        query_length = int(q.shape[0])
-        key_length = int(k.shape[0])
+        batched = q.dim() == 4
+        seq_axis = 1 if batched else 0
+        query_length = int(q.shape[seq_axis])
+        key_length = int(k.shape[seq_axis])
         is_prefill = query_length > 1 and key_length == query_length
         # TorchAEGEngine owns a monotonic, zero-based cache.  The caller passes
         # ``arange(total)`` as key positions, so this invariant is known from
@@ -730,23 +847,42 @@ class TorchAEGEngine:
         scale = self.base_attention_scale if scale is None else float(scale)
         softcap = self.attn_logit_softcap
 
+        # Broadcast the positions to (..., query, key) once; the causal/window mask
+        # and the ALiBi distance both consume this shape.
+        query_pos = query_positions.unsqueeze(-1)
+        key_pos = key_positions.unsqueeze(1) if batched else key_positions.unsqueeze(0)
+
+        def allowed_mask() -> Any:
+            allowed = key_pos <= query_pos
+            if local:
+                allowed = allowed & (
+                    key_pos >= query_pos - int(window_size) + 1
+                )
+            if live is not None:
+                allowed = allowed & (live.unsqueeze(1) if batched else live)
+            return allowed
+
         # SDPA accepts [batch, heads, query, dim].  enable_gqa avoids
         # materializing repeated KV heads on supported PyTorch versions.
         # SDPA has no soft-capping stage, so architectures that declare one
         # (Gemma-2) must take the exact path below.
         if not is_alibi and not softcap:
-            q4 = q.transpose(0, 1).unsqueeze(0)
-            k4 = k.transpose(0, 1).unsqueeze(0)
-            v4 = v.transpose(0, 1).unsqueeze(0)
+            if batched:
+                q4 = q.transpose(1, 2)
+                k4 = k.transpose(1, 2)
+                v4 = v.transpose(1, 2)
+            else:
+                q4 = q.transpose(0, 1).unsqueeze(0)
+                k4 = k.transpose(0, 1).unsqueeze(0)
+                v4 = v.transpose(0, 1).unsqueeze(0)
             attn_mask = None
-            is_causal = bool(is_prefill and contiguous and not local)
-            if not is_causal and not (query_length == 1 and not local):
-                allowed = key_positions[None, :] <= query_positions[:, None]
-                if local:
-                    allowed &= key_positions[None, :] >= (
-                        query_positions[:, None] - int(window_size) + 1
-                    )
-                attn_mask = allowed
+            is_causal = bool(is_prefill and contiguous and not local and live is None)
+            if not is_causal and not (
+                query_length == 1 and not local and live is None
+            ):
+                attn_mask = allowed_mask()
+                if batched:
+                    attn_mask = attn_mask.unsqueeze(1)
             try:
                 # Passing enable_gqa=True for ordinary MHA can prevent the
                 # backend from selecting its fastest FlashAttention path on
@@ -763,6 +899,8 @@ class TorchAEGEngine:
                 context = torch.nn.functional.scaled_dot_product_attention(
                     q4, k4, v4, **sdpa_kwargs,
                 )
+                if batched:
+                    return context.transpose(1, 2)
                 return context.squeeze(0).transpose(0, 1)
             except (TypeError, RuntimeError):
                 # Older PyTorch builds do not expose enable_gqa or may lack a
@@ -773,53 +911,93 @@ class TorchAEGEngine:
         if repeats == 1:
             k_full, v_full = k, v
         else:
-            k_full = k.repeat_interleave(repeats, dim=1)
-            v_full = v.repeat_interleave(repeats, dim=1)
-        scores = torch.einsum("qhd,khd->hqk", q, k_full) * scale
+            # The head axis is second-from-last in both ranks.
+            k_full = k.repeat_interleave(repeats, dim=-2)
+            v_full = v.repeat_interleave(repeats, dim=-2)
+        if batched:
+            scores = torch.einsum("bqhd,bkhd->bhqk", q, k_full) * scale
+        else:
+            scores = torch.einsum("qhd,khd->hqk", q, k_full) * scale
         if is_alibi:
-            distance = key_positions[None, :] - query_positions[:, None]
-            scores = scores + self._alibi_slopes[:, None, None] * distance.to(dtype=scores.dtype)[None, :, :]
+            distance = (key_pos - query_pos).to(dtype=scores.dtype)
+            if batched:
+                scores = scores + self._alibi_slopes[None, :, None, None] * distance.unsqueeze(1)
+            else:
+                scores = scores + self._alibi_slopes[:, None, None] * distance.unsqueeze(0)
         if softcap:
             # Gemma-2 bounds attention logits before masking; capping after the
             # mask would turn -inf into -cap and admit masked positions.
             scores = self._softcap(scores, softcap)
-        allowed = key_positions[None, :] <= query_positions[:, None]
-        if local:
-            allowed &= key_positions[None, :] >= query_positions[:, None] - int(window_size) + 1
-        scores = scores.masked_fill(~allowed.unsqueeze(0), -torch.finfo(scores.dtype).max)
+        allowed = allowed_mask()
+        mask = allowed.unsqueeze(1) if batched else allowed.unsqueeze(0)
+        scores = scores.masked_fill(~mask, -torch.finfo(scores.dtype).max)
         probs = torch.softmax(scores, dim=-1)
+        if batched:
+            return torch.einsum("bhqk,bkhd->bqhd", probs, v_full)
         return torch.einsum("hqk,khd->qhd", probs, v_full)
 
-    def _append_kv(self, old: Any | None, value: Any, past: int, total: int, reserve: int = 0) -> Any:
+    def _append_kv(
+        self, old: Any | None, value: Any, past: int, total: int, reserve: int = 0
+    ) -> Any:
         """Append KV in amortized-linear storage instead of copying the prefix.
 
         ``reserve`` lets a caller that already knows the final sequence length
         allocate once, removing every reallocation and prefix copy from the
         decode loop.
+
+        Handles both ``(seq, heads, dim)`` and ``(batch, seq, heads, dim)``.  In
+        the batched case the write is a single slice across every row, which is
+        exactly what right-aligning the sequences buys: one frontier for the whole
+        batch instead of a per-row scatter.
         """
         torch = self.torch
-        if old is None or int(old.shape[0]) < total:
-            old_capacity = 0 if old is None else int(old.shape[0])
+        batched = value.dim() == 4
+        axis = 1 if batched else 0
+        if old is None or int(old.shape[axis]) < total:
+            old_capacity = 0 if old is None else int(old.shape[axis])
             capacity = max(total, reserve, max(16, old_capacity * 2))
-            result = torch.empty(
-                (capacity, *tuple(value.shape[1:])), dtype=value.dtype, device=value.device
+            shape = (
+                (int(value.shape[0]), capacity, *tuple(value.shape[2:]))
+                if batched
+                else (capacity, *tuple(value.shape[1:]))
             )
+            result = torch.empty(shape, dtype=value.dtype, device=value.device)
             if old is not None and past:
-                result[:past].copy_(old[:past])
+                if batched:
+                    result[:, :past].copy_(old[:, :past])
+                else:
+                    result[:past].copy_(old[:past])
         else:
             result = old
-        result[past:total].copy_(value)
+        if batched:
+            result[:, past:total].copy_(value)
+        else:
+            result[past:total].copy_(value)
         return result
 
     def _forward_device(
         self,
         token_ids: np.ndarray | Any,
-        cache: TorchKVCache | None = None,
+        cache: TorchKVCache | BatchedKVCache | None = None,
         *,
         validate_ids: bool = False,
         reserve: int = 0,
-    ) -> tuple[Any, TorchKVCache]:
-        """Forward pass that keeps logits on the accelerator for generation."""
+        batched: bool = False,
+    ) -> tuple[Any, TorchKVCache | BatchedKVCache]:
+        """Forward pass that keeps logits on the accelerator for generation.
+
+        One implementation serves both shapes.  With ``batched=False`` the ids are
+        rank-1 ``(seq,)`` and every activation is ``(seq, heads, dim)`` — the
+        single-sequence path, behaviourally unchanged.  With ``batched=True`` the
+        ids are rank-2 ``(batch, seq)`` and the batch axis rides outermost through
+        the same layer loop.
+
+        The architecture-variant handling below — MoE, ALiBi, parallel residual,
+        post and sandwich norm, Q/K norm scope, partial and interleaved rotary,
+        sliding window, logit softcap — is deliberately *not* duplicated per rank.
+        Two copies would drift, and a drifted variant is a silent numerical error
+        rather than a crash.  Only the rank-dependent sites branch.
+        """
         torch = self.torch
         # Keep decode tokens on the execution device.  The old path converted
         # every one-token decode step through NumPy, which forced a host-to-
@@ -828,25 +1006,56 @@ class TorchAEGEngine:
         # validation; internally generated tokens are already produced by the
         # model and do not need a second round trip through the host.
         if isinstance(token_ids, torch.Tensor):
-            ids = token_ids.reshape(-1)
+            ids = token_ids if batched else token_ids.reshape(-1)
             if ids.device != self.device or ids.dtype != torch.long:
                 ids = ids.to(device=self.device, dtype=torch.long)
         else:
+            array = np.asarray(token_ids, dtype=np.int64)
             ids = torch.as_tensor(
-                np.asarray(token_ids, dtype=np.int64).reshape(-1),
-                device=self.device,
+                array if batched else array.reshape(-1), device=self.device
+            )
+        if batched and ids.dim() != 2:
+            raise ValueError(
+                "a batched forward pass requires rank-2 (batch, seq) ids, got rank "
+                f"{ids.dim()}"
             )
         if ids.numel() == 0:
             raise ValueError("forward() requires at least one token")
         if validate_ids and (int(ids.min()) < 0 or int(ids.max()) >= self.embedding.shape[0]):
             raise ValueError("token id is outside the compiled vocabulary")
-        cache = cache or TorchKVCache([None] * self.num_layers, [None] * self.num_layers)
+        if cache is None:
+            cache = (
+                self._new_batched_cache(batch_size=int(ids.shape[0]), reserve=reserve)
+                if batched
+                else TorchKVCache([None] * self.num_layers, [None] * self.num_layers)
+            )
         past = int(cache.length)
-        seq_len = int(ids.numel())
-        positions = torch.arange(past, past + seq_len, device=self.device, dtype=torch.long)
+        lead = tuple(ids.shape)
+        seq_len = int(ids.shape[-1])
+        total = past + seq_len
+        span = torch.arange(past, total, device=self.device, dtype=torch.long)
+        if batched:
+            # A row's position is its padded index minus its *own* pad count, so a
+            # short row is not rotated as though it began mid-sequence.  Clamped
+            # because a pad slot has no position; the mask excludes it from
+            # attention, so the clamped value is never observable.
+            positions = (span.unsqueeze(0) - cache.pad_counts).clamp_(min=0)
+            key_positions = (
+                self._key_positions(total).unsqueeze(0) - cache.pad_counts
+            ).clamp_(min=0)
+            live_view = cache.live_view(total)
+        else:
+            positions = span
+            key_positions = self._key_positions(total)
+            live_view = None
         if self.uses_rope:
-            self._ensure_rope(past + seq_len)
-        hidden = self.embedding.index_select(0, ids)
+            self._ensure_rope(total)
+        if batched:
+            hidden = self.embedding.index_select(0, ids.reshape(-1)).reshape(
+                *lead, int(self.embedding.shape[1])
+            )
+        else:
+            hidden = self.embedding.index_select(0, ids)
         if self.embedding_scale is not None:
             # Gemma scales embeddings by sqrt(hidden_size); Granite uses an
             # explicit embedding_multiplier.  Both are part of the model.
@@ -854,7 +1063,17 @@ class TorchAEGEngine:
         if self.embedding_norm is not None:
             hidden = self._norm(hidden, self.embedding_norm, self.embedding_norm_bias)
         if self.position_embedding is not None:
-            hidden = hidden + self.position_embedding.index_select(0, positions)
+            # Learned absolute positions read the same per-row positions as rotary
+            # does.  Indexing this table by the padded slot instead would shift
+            # every short row's embedding — the failure is invisible in shapes and
+            # is why positions are computed once, above, for both consumers.
+            table = self.position_embedding
+            if batched:
+                hidden = hidden + table.index_select(0, positions.reshape(-1)).reshape(
+                    *lead, int(table.shape[1])
+                )
+            else:
+                hidden = hidden + table.index_select(0, positions)
 
         post_norm = self.norm_placement == "post"
         parallel = self.parallel_residual
@@ -906,13 +1125,15 @@ class TorchAEGEngine:
                     cos, sin = rope_local if local_attention else rope_global
                     rotated = self._rope(
                         qk_fused.reshape(
-                            seq_len, self.num_heads + self.num_kv_heads, self.head_dim
+                            *lead, self.num_heads + self.num_kv_heads, self.head_dim
                         ),
                         cos,
                         sin,
                     )
-                    q = rotated[:, : self.num_heads]
-                    k = rotated[:, self.num_heads :]
+                    # Index the head axis explicitly: it is second-from-last in both
+                    # ranks, whereas ``[:, :n]`` would slice the sequence in a batch.
+                    q = rotated[..., : self.num_heads, :]
+                    k = rotated[..., self.num_heads :, :]
                 else:
                     if self.qk_norm_is_full:
                         # OLMo-2 and OLMoE normalize the whole projection, before
@@ -921,8 +1142,8 @@ class TorchAEGEngine:
                             q = self._norm(q, layer["q_norm"])
                         if layer["k_norm"] is not None:
                             k = self._norm(k, layer["k_norm"])
-                    q = q.reshape(seq_len, self.num_heads, self.head_dim)
-                    k = k.reshape(seq_len, self.num_kv_heads, self.head_dim)
+                    q = q.reshape(*lead, self.num_heads, self.head_dim)
+                    k = k.reshape(*lead, self.num_kv_heads, self.head_dim)
                     if not self.qk_norm_is_full:
                         if layer["q_norm"] is not None:
                             q = self._norm(q, layer["q_norm"])
@@ -933,21 +1154,26 @@ class TorchAEGEngine:
                         # Normalized Q and K are separate tensors but still share
                         # the rotation, so one concatenation still beats rotating
                         # each of them independently.
-                        rotated = self._rope(torch.cat((q, k), dim=1), cos, sin)
-                        q = rotated[:, : self.num_heads]
-                        k = rotated[:, self.num_heads :]
-                v = v.reshape(seq_len, self.num_kv_heads, self.head_dim)
-                total = past + seq_len
+                        rotated = self._rope(torch.cat((q, k), dim=-2), cos, sin)
+                        q = rotated[..., : self.num_heads, :]
+                        k = rotated[..., self.num_heads :, :]
+                v = v.reshape(*lead, self.num_kv_heads, self.head_dim)
                 k_all = self._append_kv(cache.keys[index], k, past, total, reserve)
                 v_all = self._append_kv(cache.values[index], v, past, total, reserve)
                 context = self._attention(
-                    q, k_all[:total], v_all[:total], positions,
-                    self._key_positions(total), attention_window, attention_scale,
+                    q,
+                    k_all[:, :total] if batched else k_all[:total],
+                    v_all[:, :total] if batched else v_all[:total],
+                    positions,
+                    key_positions,
+                    attention_window,
+                    attention_scale,
+                    live=live_view,
                 )
                 cache.keys[index] = k_all
                 cache.values[index] = v_all
                 attention_out = self._matmul(
-                    context.reshape(seq_len, self.num_heads * self.head_dim),
+                    context.reshape(*lead, self.num_heads * self.head_dim),
                     layer["o_proj"], layer["o_proj_bias"],
                 )
                 # ``sandwich`` blocks normalize the sublayer output too
@@ -1014,8 +1240,8 @@ class TorchAEGEngine:
                 logits = logits * self.logit_scale
             if self.final_logit_softcap:
                 logits = self._softcap(logits, self.final_logit_softcap)
-            cache.length = past + seq_len
-            cache.last_logits = logits[-1].detach()
+            cache.length = total
+            cache.last_logits = (logits[:, -1] if batched else logits[-1]).detach()
         return logits, cache
 
     def forward(self, token_ids: np.ndarray | Any, cache: TorchKVCache | None = None) -> tuple[np.ndarray, TorchKVCache]:
@@ -1031,20 +1257,28 @@ class TorchAEGEngine:
         Returning a device tensor is what allows the caller to queue the next
         forward pass before reading this token back to the host.  Reading it
         immediately would drain the whole queue first.
+
+        Rank-generic: a rank-1 ``(vocab,)`` input yields a 0-dim token, and a
+        rank-2 ``(batch, vocab)`` input yields ``(batch,)`` — one token per row,
+        every reduction taken over the last axis so rows never interact.
         """
         torch = self.torch
+        batched = logits.dim() == 2
         values = logits.float()
         if temperature <= 0:
-            return torch.argmax(values)
+            return torch.argmax(values, dim=-1)
         values = values / float(temperature)
         if top_k > 0:
-            top_k = min(int(top_k), int(values.numel()))
-            threshold = torch.topk(values, top_k).values[-1]
+            top_k = min(int(top_k), int(values.shape[-1]))
+            # Keep the threshold as a trailing singleton so it broadcasts against
+            # both ranks; each row is cut at its own k-th best logit.
+            threshold = torch.topk(values, top_k, dim=-1).values[..., -1:]
             values = values.masked_fill(values < threshold, -torch_inf(torch, values.dtype))
         probs = torch.softmax(values, dim=-1)
         if 0.0 < top_p < 1.0:
             return self._sample_top_p(probs, float(top_p))
-        return torch.multinomial(probs, 1).reshape(())
+        drawn = torch.multinomial(probs, 1)
+        return drawn.reshape(-1) if batched else drawn.reshape(())
 
     def _sample_top_p(self, probs: Any, top_p: float) -> Any:
         """Nucleus sampling, entirely on the execution device.
@@ -1055,16 +1289,22 @@ class TorchAEGEngine:
         reached ``p``, and testing that requires reading a value back to the
         host.  One extra sort kernel is much cheaper than the pipeline drain a
         host read would cause on every token, so this keeps the sort.
+
+        Every reduction is over the last axis, so a batched call computes an
+        independent nucleus per row.
         """
         torch = self.torch
-        ordered, order = torch.sort(probs, descending=True)
+        batched = probs.dim() == 2
+        ordered, order = torch.sort(probs, descending=True, dim=-1)
         # ``cumulative - ordered`` is the mass strictly before each entry, so
         # this keeps the first entry whose predecessors have not yet reached p,
         # always retaining at least the most probable token.
         cumulative = ordered.cumsum(dim=-1)
         selected = ordered * (cumulative - ordered <= top_p).to(dtype=ordered.dtype)
-        selected = selected / selected.sum()
-        return order[torch.multinomial(selected, 1)].reshape(())
+        selected = selected / selected.sum(dim=-1, keepdim=True)
+        drawn = torch.multinomial(selected, 1)
+        picked = order.gather(-1, drawn)
+        return picked.reshape(-1) if batched else picked.reshape(())
 
     def generate_iter(self, prompt_ids: np.ndarray, max_tokens: int = 16, temperature: float = 0.0,
                       top_k: int = 0, top_p: float = 1.0, eos_token_id: int | None = None,
@@ -1203,6 +1443,191 @@ class TorchAEGEngine:
         if final[0] is None:
             raise RuntimeError("generation completed without a KV cache")
         return result, final[0]
+
+    # ── Batched execution ───────────────────────────────────────────────────
+    #
+    # These are the explicitly-batched entry points.  They are separate from
+    # ``forward``/``generate`` rather than replacing them because the
+    # single-sequence signatures are public and return rank-1 results; a caller
+    # passing a ``(1, seq)`` array to ``forward`` has always meant one sequence,
+    # and still does.
+
+    def supports_batch(self, batch_size: int = 1) -> bool:
+        """Whether this executor can run ``batch_size`` sequences in one pass.
+
+        There is no architectural bound.  The batch axis is a property of a call,
+        not of the artifact — the AEG IR already declares it dynamic and the
+        portable path emits no shape-specialized kernel — so the only real limit
+        is device memory for the KV cache.
+        """
+        return int(batch_size) >= 1
+
+    @property
+    def max_batch_size(self) -> int | None:
+        """``None``: no compiled-in bound, device memory is the only limit."""
+        return None
+
+    def _new_batched_cache(
+        self,
+        *,
+        batch_size: int | None = None,
+        reserve: int = 0,
+        packed: PackedBatch | None = None,
+    ) -> BatchedKVCache:
+        """Allocate batched KV state, either from a packed batch or bare.
+
+        Built from a :class:`PackedBatch` the cache inherits that batch's pad
+        counts and validity mask.  Built bare (a decode-only continuation) it
+        assumes no padding, which is the correct reading of "no layout given".
+        """
+        torch = self.torch
+        if packed is not None:
+            batch = packed.batch_size
+            pad_counts = torch.as_tensor(
+                packed.layout.pad_counts, device=self.device, dtype=torch.long
+            ).reshape(batch, 1)
+            layout: BatchLayout | None = packed.layout
+            live = None
+            if not layout.is_uniform:
+                # Only a padded batch materializes a mask.  A uniform batch leaves
+                # it None so prefill keeps ``is_causal=True`` and decode passes no
+                # mask, matching the single-sequence path kernel for kernel.
+                capacity = max(int(reserve), layout.padded_length)
+                live = torch.zeros(
+                    (batch, capacity), dtype=torch.bool, device=self.device
+                )
+                live[:, : layout.padded_length] = torch.as_tensor(
+                    packed.live, device=self.device
+                )
+        elif batch_size is not None:
+            batch = int(batch_size)
+            pad_counts = torch.zeros((batch, 1), dtype=torch.long, device=self.device)
+            layout = None
+            live = None
+        else:
+            raise ValueError("a batched cache needs either a batch size or a packed batch")
+        return BatchedKVCache(
+            keys=[None] * self.num_layers,
+            values=[None] * self.num_layers,
+            pad_counts=pad_counts,
+            batch_size=batch,
+            live=live,
+            layout=layout,
+            finished=torch.zeros(batch, dtype=torch.bool, device=self.device),
+        )
+
+    def _extend_live(self, cache: BatchedKVCache, total: int) -> None:
+        """Mark the slots about to be written as holding real tokens.
+
+        A no-op for an unpadded batch: ``live is None`` already means "every slot
+        is real", and keeping it None is what preserves the fused attention path.
+        """
+        if cache.live is None:
+            return
+        torch = self.torch
+        capacity = int(cache.live.shape[1])
+        if capacity < total:
+            grown = torch.zeros(
+                (cache.batch_size, max(total, capacity * 2)),
+                dtype=torch.bool,
+                device=cache.live.device,
+            )
+            grown[:, :capacity] = cache.live
+            cache.live = grown
+        cache.live[:, cache.length : total] = True
+
+    def forward_batch(
+        self,
+        sequences: Any,
+        *,
+        pad_token_id: int = DEFAULT_PAD_TOKEN_ID,
+        reserve: int = 0,
+    ) -> tuple[Any, BatchedKVCache]:
+        """Prefill a batch of independent sequences in one pass.
+
+        ``sequences`` is a list of rank-1 id arrays (or a rank-2 array of equal-
+        length rows).  Returns ``(logits, cache)`` with logits shaped
+        ``(batch, padded_seq, vocab)``.  Because rows are right-aligned,
+        ``logits[:, -1]`` is every row's final *real* position whatever its length
+        — which is the whole reason for left padding.
+        """
+        packed = pack_left_padded(sequences, pad_token_id=pad_token_id)
+        reserve = max(int(reserve), packed.padded_length)
+        cache = self._new_batched_cache(packed=packed, reserve=reserve)
+        return self._forward_device(
+            packed.token_ids, cache, validate_ids=True, reserve=reserve, batched=True
+        )
+
+    def generate_batch(
+        self,
+        prompts: Any,
+        *,
+        max_tokens: int = 16,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        eos_token_id: int | None = None,
+        pad_token_id: int = DEFAULT_PAD_TOKEN_ID,
+        **_: Any,
+    ) -> list[list[int]]:
+        """Decode several independent sequences concurrently.
+
+        One prefill pass over the padded batch, then one forward pass per decode
+        step carrying all rows.  Returns one token list per input prompt, in input
+        order.
+
+        Per-row stopping: a row that emits ``eos_token_id`` stops *recording*, and
+        the batch keeps its width until every row has stopped.  Continuing to
+        compute a finished row cannot perturb the others — rows share no state —
+        so this costs some arithmetic on skewed batches and buys a decode loop with
+        no mid-flight reshaping.
+
+        Note on determinism: with ``temperature > 0`` all rows are drawn in one
+        ``multinomial`` call, so a batched sampled run is not token-identical to N
+        separately-seeded single-sequence runs.  That is true of every batched
+        runtime.  Greedy decoding is comparable, and is what the equivalence tests
+        assert.
+        """
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
+        torch = self.torch
+        packed = pack_left_padded(prompts, pad_token_id=pad_token_id)
+        batch = packed.batch_size
+        # The final length is known, so the KV cache is sized once here rather
+        # than doubling during decode.
+        reserve = packed.padded_length + int(max_tokens)
+        cache = self._new_batched_cache(packed=packed, reserve=reserve)
+        _, cache = self._forward_device(
+            packed.token_ids, cache, validate_ids=True, reserve=reserve, batched=True
+        )
+        outputs: list[list[int]] = [[] for _ in range(batch)]
+        finished = [False] * batch
+        stop = None if eos_token_id is None else int(eos_token_id)
+        tokens = self._sample_device(cache.last_logits, temperature, top_k, top_p)
+        for _ in range(int(max_tokens)):
+            # Queue the next step before reading this one back, for the reason
+            # documented on ``_generate_pipelined``: the host's launch cost then
+            # overlaps device execution instead of following it.
+            self._extend_live(cache, cache.length + 1)
+            _, cache = self._forward_device(
+                tokens.reshape(batch, 1), cache, reserve=reserve, batched=True
+            )
+            following = self._sample_device(cache.last_logits, temperature, top_k, top_p)
+            # One host synchronization per step — the same count the
+            # single-sequence path pays — but it now covers the whole batch.
+            row_tokens = tokens.tolist()
+            for index in range(batch):
+                if finished[index]:
+                    continue
+                token = int(row_tokens[index])
+                outputs[index].append(token)
+                if stop is not None and token == stop:
+                    finished[index] = True
+            if all(finished):
+                break
+            tokens = following
+        cache.finished = torch.as_tensor(finished, dtype=torch.bool, device=self.device)
+        return outputs
 
     def speculative_stats(self) -> dict[str, int]:
         return {"draft_tokens": 0, "accepted_tokens": 0, "cycles": 0}

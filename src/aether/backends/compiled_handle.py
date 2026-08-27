@@ -26,6 +26,16 @@ class CompiledAEGHandle:
     tokenizer: Any | None = None
     lora_adapters: dict[str, dict[tuple[int, str], tuple[Any, Any, float]]] = field(default_factory=dict)
     session_caches: dict[str, tuple[Any, Any]] = field(default_factory=dict)
+    batched_engine: Any | None = None
+    """Executor used for batched requests, when it differs from ``engine``.
+
+    Populated lazily and at most once per handle.  On a CPU host the AEG loads
+    onto the NumPy reference executor, which is sequence-major; batched requests
+    are served by promoting the same authenticated weights onto the portable
+    tensor executor, which does carry a batch axis.  Holding it here means the
+    promotion is paid for once rather than per request, and only if a batch is
+    actually asked for.
+    """
 
     def clear_session_cache(self, session_id: str) -> None:
         """Release the incremental KV state owned by one session."""
