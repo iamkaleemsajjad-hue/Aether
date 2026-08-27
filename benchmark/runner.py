@@ -199,6 +199,91 @@ def _inference_delta(baseline: dict[str, Any], peak: dict[str, Any]) -> int | No
     after = sum(d["peak_allocated_bytes"] for d in peak["devices"])
     return max(0, after - before)
 
+def measure_mixed_batch(
+    backend: Any,
+    prompts: list[str],
+    *,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    seed: int,
+    warmup_iters: int,
+    measure_iters: int,
+) -> dict[str, Any]:
+    """Time one batched pass over prompts that genuinely differ in length.
+
+    Distinct from :func:`measure_generation`, which replicates a single prompt to the
+    batch width. Here every row is a different prompt, so the batch carries real
+    padding and the measurement includes what padding costs.
+
+    Throughput is the aggregate: total tokens the pass produced over its wall time.
+    Every row shares that wall time, so the latency percentiles describe the pass,
+    not individual rows — a per-row percentile would be the same number repeated.
+    """
+    from benchmark.backends import set_seed
+
+    call = getattr(backend, "generate_mixed", None)
+    if call is None:
+        return {
+            "status": "unsupported",
+            "phase": "mixed_batch",
+            "message": (
+                f"{type(backend).__name__} cannot run a batch of differing prompts; "
+                "reported rather than serialized into a loop"
+            ),
+        }
+
+    def once() -> Any:
+        set_seed(seed)
+        return call(
+            prompts,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
+
+    try:
+        outcome = once()
+    except BaseException as exc:  # noqa: BLE001
+        return {**_failure(exc), "phase": "mixed_batch"}
+    for _ in range(max(0, warmup_iters)):
+        try:
+            once()
+        except BaseException as exc:  # noqa: BLE001
+            return {**_failure(exc), "phase": "mixed_warmup"}
+
+    gpu_monitor.reset_peak_stats()
+    baseline_gpu = gpu_monitor.memory_snapshot()
+    latencies: list[float] = []
+    for _ in range(max(1, measure_iters)):
+        try:
+            with metrics.timed(latencies):
+                outcome = once()
+        except BaseException as exc:  # noqa: BLE001
+            return {**_failure(exc), "phase": "mixed_measure",
+                    "completed_iterations": len(latencies)}
+    peak_gpu = gpu_monitor.memory_snapshot()
+
+    produced = sum(outcome.row_completion_tokens)
+    return {
+        "status": "ok",
+        "rows": len(outcome.row_completion_tokens),
+        "row_completion_tokens": list(outcome.row_completion_tokens),
+        "total_completion_tokens": produced,
+        "latency_s": metrics.summarize(latencies),
+        "tokens_per_s": metrics.summarize(
+            metrics.throughput_samples(latencies, produced)
+        ),
+        "requests_per_s": metrics.summarize(
+            [len(outcome.row_completion_tokens) / value for value in latencies if value > 0]
+        ),
+        "gpu_peak": peak_gpu,
+        "gpu_inference_delta_bytes": _inference_delta(baseline_gpu, peak_gpu),
+    }
+
+
 def measure_prefill(
     backend: Any, prompt: str, *, warmup_iters: int, measure_iters: int
 ) -> dict[str, Any]:
@@ -217,6 +302,39 @@ def measure_prefill(
                 backend.prefill(prompt)
     except BaseException as exc:  # noqa: BLE001
         return {**_failure(exc), "phase": "prefill"}
+    return {"status": "ok", "latency_s": metrics.summarize(latencies)}
+
+
+def measure_serving_prefill(
+    backend: Any, prompt: str, *, warmup_iters: int, measure_iters: int
+) -> dict[str, Any]:
+    """Time prefill as a served request pays for it: final-position logits only.
+
+    ``measure_prefill`` asks for logits at every prompt position. That is a fair
+    like-for-like comparison of that operation, but it is not the work generation
+    does: a served request reads one row of logits, and both runtimes can skip the
+    rest. Measuring both configurations keeps the comparison honest in either
+    direction — neither backend is credited with a shortcut the other was denied.
+
+    A backend without a last-position path reports ``unsupported`` rather than
+    falling back to the full-logits measurement under this label.
+    """
+    call = getattr(backend, "serving_prefill", None)
+    if call is None:
+        return {
+            "status": "unsupported",
+            "phase": "serving_prefill",
+            "message": f"{type(backend).__name__} exposes no last-position prefill path",
+        }
+    try:
+        for _ in range(max(1, warmup_iters)):
+            call(prompt)
+        latencies: list[float] = []
+        for _ in range(max(1, measure_iters)):
+            with metrics.timed(latencies):
+                call(prompt)
+    except BaseException as exc:  # noqa: BLE001
+        return {**_failure(exc), "phase": "serving_prefill"}
     return {"status": "ok", "latency_s": metrics.summarize(latencies)}
 
 

@@ -71,6 +71,7 @@ display(Markdown(open('benchmark/results/REPORT.md').read()))
 !python benchmark/run_benchmark.py --mode correctness
 !python benchmark/run_benchmark.py --mode profile
 !python benchmark/run_benchmark.py --mode batch
+!python benchmark/run_benchmark.py --mode mixed
 !python benchmark/run_benchmark.py --mode multigpu
 ```
 
@@ -91,7 +92,35 @@ Or everything in sequence, which takes considerably longer:
 | `correctness` | Do both runtimes compute the same logits, the same greedy tokens, the same text? |
 | `profile` | Kernel counts and per-kernel time attribution. Instrumented — never feeds a throughput number. |
 | `batch` | What batching buys, with aggregate throughput and per-request throughput reported separately. |
+| `mixed` | Batches whose rows genuinely differ in length, with the padding overhead reported next to the throughput. |
 | `multigpu` | How each runtime uses more than one accelerator, with configurations labelled so a 2-GPU run is never compared against a 1-GPU one. |
+
+### Reading the two prefill columns
+
+`performance` reports prefill twice, because the two answer different questions:
+
+- **prefill (all logits)** — one forward pass returning logits at *every* prompt
+  position. A like-for-like comparison of that operation.
+- **prefill (serving)** — the same pass returning only the final position's logits,
+  which is all generation reads. Both backends get the same option: Transformers via
+  `logits_to_keep=1` (what its own `generate` uses), Aether via its last-position
+  projection.
+
+The `discarded` column is the ratio between them: work spent on logits nothing
+reads. It grows with prompt length and vocabulary size — on Qwen3-0.6B, whose
+`lm_head` is 156M of ~596M matmul parameters, a 1024-token prompt was projecting
+1024 positions to a 151936-wide vocabulary and using one.
+
+End-to-end throughput, TTFT and the decode column reflect the serving
+configuration.
+
+### Reading the `mixed` mode
+
+Rows within a batch differ in length, so both runtimes pay for padding. `pad %` is
+the fraction of padded slots holding no real token. `uniform-256` is the control —
+same row count, zero padding — so the gap between it and the ragged profiles is
+what raggedness costs. Latency percentiles describe the whole batched pass; every
+row in a batch shares one wall time.
 
 ### Reading the `batch` mode
 

@@ -16,6 +16,7 @@ from typing import Any
 from benchmark.backends import (
     GenerationOutcome,
     LoadOutcome,
+    MixedBatchOutcome,
     UnsupportedConfiguration,
     resolve_dtype,
     set_seed,
@@ -111,6 +112,43 @@ class TransformersBackend:
             output = self._model(**inputs)
         return output.logits[0, -1].detach().float().cpu()
 
+    def serving_prefill(self, prompt: str) -> Any:
+        """Prefill the way generation actually pays for it: final logits only.
+
+        ``prefill`` above asks for logits at every prompt position, which is a fair
+        like-for-like comparison of that operation but is *not* what a served
+        request needs — generation reads one row. Transformers' own ``generate``
+        does not compute the discarded rows either; it passes ``logits_to_keep=1``
+        to the model call. This measures that configuration so both backends can be
+        compared on the work serving really does.
+
+        Raises :class:`UnsupportedConfiguration` when the installed Transformers
+        does not accept the argument, rather than silently measuring the full-logits
+        path and labelling it as this one.
+        """
+        import inspect
+
+        import torch
+
+        signature = inspect.signature(self._model.forward)
+        keyword = next(
+            (
+                name for name in ("logits_to_keep", "num_logits_to_keep")
+                if name in signature.parameters
+            ),
+            None,
+        )
+        if keyword is None:
+            raise UnsupportedConfiguration(
+                "this Transformers version's forward() accepts neither "
+                "logits_to_keep nor num_logits_to_keep, so a last-position prefill "
+                "cannot be requested"
+            )
+        inputs = self._encode(prompt, 1)
+        with torch.no_grad():
+            output = self._model(**inputs, **{keyword: 1})
+        return output.logits[0, -1].detach().float().cpu()
+
     def generate(
         self,
         prompt: str,
@@ -179,6 +217,76 @@ class TransformersBackend:
         elapsed = time.perf_counter() - start
         thread.join(timeout=300.0)
         return elapsed
+
+    def generate_mixed(
+        self,
+        prompts: list[str],
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> Any:
+        """One batched pass over prompts that genuinely differ in length.
+
+        Left padding with an attention mask, which is what Transformers' own
+        batched ``generate`` requires for decoder-only models — and the same
+        arrangement Aether uses — so both runtimes are given identical ragged work.
+
+        ``min_new_tokens`` is deliberately *not* pinned here, unlike the uniform
+        path: the point of a ragged batch is that rows finish differently, and
+        forcing every row to the same length would erase the effect being measured.
+        """
+        import torch
+
+        tokenizer = self._tokenizer
+        previous_side = tokenizer.padding_side
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+        try:
+            encoded = tokenizer(list(prompts), return_tensors="pt", padding=True)
+        finally:
+            tokenizer.padding_side = previous_side
+        inputs = {key: value.to(self.device) for key, value in encoded.items()}
+        prompt_lengths = inputs["attention_mask"].sum(dim=1).tolist()
+        padded_length = int(inputs["input_ids"].shape[1])
+
+        sample = temperature > 0.0
+        kwargs: dict[str, Any] = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": sample,
+            "use_cache": True,
+            "pad_token_id": tokenizer.pad_token_id,
+        }
+        if sample:
+            kwargs.update(temperature=temperature, top_p=top_p)
+            if top_k > 0:
+                kwargs["top_k"] = top_k
+        with torch.no_grad():
+            output = self._model.generate(**inputs, **kwargs)
+
+        texts: list[str] = []
+        completions: list[int] = []
+        for index in range(output.shape[0]):
+            generated = output[index, padded_length:]
+            # Trailing pad is not generated output; counting it would credit the
+            # backend with tokens it did not produce.
+            kept = [
+                int(value) for value in generated.tolist()
+                if value != tokenizer.pad_token_id
+            ]
+            completions.append(len(kept))
+            texts.append(tokenizer.decode(kept, skip_special_tokens=True))
+        return MixedBatchOutcome(
+            texts=texts,
+            row_prompt_tokens=[int(value) for value in prompt_lengths],
+            row_completion_tokens=completions,
+            backend_metrics={
+                "padded_length": padded_length,
+                "returned_rows": int(output.shape[0]),
+            },
+        )
 
     def supports_batch(self, batch_size: int) -> bool:
         return batch_size >= 1

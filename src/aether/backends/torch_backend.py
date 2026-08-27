@@ -30,6 +30,19 @@ from aether.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _release_host_weights_enabled() -> bool:
+    """Whether to reclaim host weights after an accelerator load.
+
+    On by default: holding a second full copy of the weights in host RAM serves no
+    execution purpose once the device has its own.  ``AETHER_KEEP_HOST_WEIGHTS=1``
+    keeps them, which is what an operator wants when driving a host-weight-dependent
+    path (task-vector merging, compiled LoRA selection, or R5 fast weights) against
+    an accelerator-resident engine.
+    """
+    keep = os.environ.get("AETHER_KEEP_HOST_WEIGHTS", "").strip().lower()
+    return keep not in {"1", "true", "yes"}
+
+
 class TorchBackend(Backend):
     """PyTorch-based backend for model inference."""
 
@@ -418,6 +431,23 @@ class TorchBackend(Backend):
                         engine = TorchRWKVAEGEngine(engine, self._device, self._devices)
                     else:
                         engine = TorchAEGEngine(engine, self._device)
+                    # The loader's host FP32 arrays and the executor's device
+                    # tensors are two full copies of the same weights, and only the
+                    # device copy is read again.  Reclaiming the host set is a no-op
+                    # where the two alias (a CPU device at FP32), so this is safe to
+                    # ask for unconditionally; see
+                    # TorchAEGEngine.release_host_weights.  The cost it removes is
+                    # linear in parameter count, which is what makes it a
+                    # large-model requirement rather than a tidy-up.
+                    reclaim = getattr(engine, "release_host_weights", None)
+                    if callable(reclaim) and _release_host_weights_enabled():
+                        freed = reclaim()
+                        if freed:
+                            logger.info(
+                                "Released %.2f GiB of host-resident weights after "
+                                "materializing the device copy.",
+                                freed / 1024**3,
+                            )
                 tokenizer_root = root / "tokenizer"
                 if tokenizer_root.exists():
                     # The tokenizer is part of the authenticated AEG.  Do

@@ -26,6 +26,21 @@ class GenerationOutcome:
 
 
 @dataclass
+class MixedBatchOutcome:
+    """The result of one batched pass over prompts that differ in length.
+
+    Separate from :class:`GenerationOutcome` because the interesting quantity is
+    per row: a mixed batch's rows produce different token counts, and collapsing
+    them into one number is what hides the cost of raggedness.
+    """
+
+    texts: list[str]
+    row_prompt_tokens: list[int]
+    row_completion_tokens: list[int]
+    backend_metrics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class LoadOutcome:
     """What happened while bringing a model up, timed in distinct phases."""
 

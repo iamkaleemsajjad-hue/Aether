@@ -23,6 +23,7 @@ nonetheless wrong:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -543,6 +544,279 @@ def test_batched_entry_points_reject_invalid_input() -> None:
         engine.forward_batch([np.asarray([VOCAB], dtype=np.int64)])
     with pytest.raises(ValueError, match="rank-2"):
         engine._forward_device(ids, batched=True)
+
+
+# ── The vocabulary projection ───────────────────────────────────────────────
+#
+# Generation reads one row of logits per sequence, so projecting every prompt
+# position to the vocabulary and discarding all but the last is wasted work. The
+# projection is per-position, so in exact arithmetic `(W·X)[-1] == W·X[-1]`.
+#
+# In floating point the two are *not* bit-identical: BLAS blocks a one-row GEMV
+# differently from an S-row GEMM, so the sum over the contracted hidden dimension
+# accumulates in a different order. The observed disagreement is at rounding scale
+# (order 1e-8 absolute, 1e-6 relative on FP32 logits), which is the same class of
+# difference the suite already tolerates between batched and unbatched GEMMs. A
+# logic error would show up orders of magnitude larger, so these tests assert a
+# tolerance far tighter than a real defect could pass, and separately assert that
+# greedy decoding is unaffected.
+
+#: Tolerance for "same arithmetic, different kernel blocking". Two decimal orders
+#: tighter than LOGIT_TOLERANCE, because these comparisons share inputs and weights
+#: exactly and differ only in reduction order.
+PROJECTION_TOLERANCE = dict(rtol=1e-4, atol=1e-6)
+
+
+def test_last_position_logits_agree_with_the_all_position_projection() -> None:
+    """Slicing before the projection must equal slicing after it."""
+    torch = pytest.importorskip("torch")
+    engine = _engine()
+    ids = np.asarray([1, 3, 5, 2, 7, 4], dtype=np.int64)
+
+    full, _ = engine._forward_device(ids, None, validate_ids=True, logits="all")
+    last, _ = engine._forward_device(ids, None, validate_ids=True, logits="last")
+
+    assert tuple(full.shape) == (ids.size, VOCAB)
+    assert tuple(last.shape) == (1, VOCAB)
+    torch.testing.assert_close(last[0], full[-1], **PROJECTION_TOLERANCE)
+
+
+def test_batched_last_position_logits_agree_per_row() -> None:
+    """Same guarantee per row, including when rows are left-padded."""
+    torch = pytest.importorskip("torch")
+    engine = _engine()
+    prompts = [
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([3, 4, 5, 6, 7], dtype=np.int64),
+    ]
+    packed = pack_left_padded(prompts)
+
+    full_cache = engine._new_batched_cache(packed=packed, reserve=packed.padded_length)
+    full, _ = engine._forward_device(
+        packed.token_ids, full_cache, validate_ids=True, batched=True, logits="all"
+    )
+    last_cache = engine._new_batched_cache(packed=packed, reserve=packed.padded_length)
+    last, _ = engine._forward_device(
+        packed.token_ids, last_cache, validate_ids=True, batched=True, logits="last"
+    )
+
+    assert tuple(full.shape) == (2, packed.padded_length, VOCAB)
+    assert tuple(last.shape) == (2, 1, VOCAB)
+    torch.testing.assert_close(last[:, 0], full[:, -1], **PROJECTION_TOLERANCE)
+
+
+def test_cache_last_logits_is_identical_under_both_modes() -> None:
+    """Whatever the mode, the cache must carry the same final-row logits.
+
+    The decode loop reads only ``cache.last_logits``, so this is the property that
+    makes the shortcut invisible to generation.
+    """
+    torch = pytest.importorskip("torch")
+    engine = _engine()
+    ids = np.asarray([2, 4, 6, 8], dtype=np.int64)
+
+    _, full_cache = engine._forward_device(ids, None, validate_ids=True, logits="all")
+    _, last_cache = engine._forward_device(ids, None, validate_ids=True, logits="last")
+    torch.testing.assert_close(
+        last_cache.last_logits, full_cache.last_logits, **PROJECTION_TOLERANCE
+    )
+
+
+def test_public_forward_still_returns_every_position() -> None:
+    """``forward`` and ``forward_batch`` promise all-position logits; they keep it.
+
+    The shortcut belongs to generation, not to the public "give me the logits"
+    surface. A caller doing its own scoring would silently receive one row.
+    """
+    engine = _engine()
+    ids = np.asarray([1, 3, 5, 2], dtype=np.int64)
+
+    logits, _ = engine.forward(ids)
+    assert np.asarray(logits).shape == (ids.size, VOCAB)
+
+    batched, _ = engine.forward_batch([ids, ids])
+    assert tuple(batched.shape) == (2, ids.size, VOCAB)
+
+
+def test_generation_is_unchanged_by_the_projection_shortcut() -> None:
+    """End-to-end: greedy tokens must be identical to the all-logits path.
+
+    Rather than trusting that every generation call site passes the right mode,
+    this drives the public API and compares against a reference decode driven
+    entirely by full-logits forward passes.
+    """
+    engine = _engine()
+    prompt = np.asarray([1, 3, 5, 2], dtype=np.int64)
+
+    # Reference: decode by hand, always projecting every position.
+    reference: list[int] = []
+    cache = None
+    ids: Any = prompt
+    for _ in range(6):
+        logits, cache = engine._forward_device(
+            ids, cache, validate_ids=True, logits="all"
+        )
+        token = int(engine.torch.argmax(logits[-1]).item())
+        reference.append(token)
+        ids = np.asarray([token], dtype=np.int64)
+
+    assert engine.generate(prompt, max_tokens=6, temperature=0.0) == reference
+    assert engine.generate_batch([prompt], max_tokens=6, temperature=0.0) == [reference]
+
+
+def test_projection_mode_is_validated() -> None:
+    engine = _engine()
+    ids = np.asarray([1, 2, 3], dtype=np.int64)
+    with pytest.raises(ValueError, match="logits mode"):
+        engine._forward_device(ids, None, logits="final")
+
+
+def test_tensor_parallel_honours_the_projection_mode() -> None:
+    """The sharded executor must not silently ignore the request.
+
+    Its vocabulary projection is the widest GEMM in the pass, and it inherits the
+    generation loop that now asks for one row. An override that accepted the
+    keyword and ignored it would quietly forfeit the saving.
+    """
+    pytest.importorskip("torch")
+    import inspect
+
+    from aether.runtime.torch_tensor_parallel import TorchTensorParallelAEGEngine
+
+    source = inspect.getsource(TorchTensorParallelAEGEngine._forward_device)
+    assert 'logits == "last"' in source, "sharded path ignores the logits mode"
+    assert "hidden[-1:]" in source
+
+
+# ── Host weight residency ───────────────────────────────────────────────────
+#
+# The AEG loader materializes every weight as a host FP32 array; the executor then
+# materializes a device copy. Both stay live, so a model costs its parameter count
+# twice — once where it executes and once in host RAM where nothing reads it again.
+# That cost is linear in parameter count, so these tests guard a large-model
+# requirement, not a tidy-up.
+
+
+def test_release_is_a_noop_when_device_tensors_alias_the_host_arrays() -> None:
+    """A CPU engine at FP32 shares storage with the loader; nothing to free.
+
+    ``torch.as_tensor`` returns a view when the dtype already matches, so the
+    "host" arrays *are* the device tensors. Dropping the reference would free
+    nothing and leave the executor pointing at storage nothing owns.
+    """
+    engine = _engine()
+    assert engine.compute_dtype is engine.torch.float32
+    assert engine.device_tensors_alias_host()
+
+    assert engine.release_host_weights() == 0
+    assert engine.host_weights_released is False
+    # And the weights are still there, so execution is unaffected.
+    assert engine.weights.embedding is not None
+    engine.generate(np.asarray([1, 2, 3], dtype=np.int64), max_tokens=2, temperature=0.0)
+
+
+def test_release_frees_the_duplicate_when_the_device_holds_its_own_copy() -> None:
+    """With a dtype cast the device copy is distinct, so the host set is duplicate."""
+    torch = pytest.importorskip("torch")
+    from aether.runtime.torch_engine import TorchAEGEngine
+
+    reference = _reference_engine()
+    expected_bytes = sum(
+        int(np.asarray(getattr(layer, name)).nbytes)
+        for layer in reference.weights.layers
+        for name in ("q_proj", "k_proj", "v_proj", "o_proj",
+                     "gate_proj", "up_proj", "down_proj")
+        if getattr(layer, name, None) is not None
+    ) + int(reference.weights.embedding.nbytes) + int(reference.weights.lm_head.nbytes)
+
+    import os
+
+    previous = os.environ.get("AETHER_TORCH_DTYPE")
+    os.environ["AETHER_TORCH_DTYPE"] = "fp16"
+    try:
+        engine = TorchAEGEngine(reference, "cpu")
+    finally:
+        if previous is None:
+            os.environ.pop("AETHER_TORCH_DTYPE", None)
+        else:
+            os.environ["AETHER_TORCH_DTYPE"] = previous
+
+    assert engine.compute_dtype is torch.float16
+    assert not engine.device_tensors_alias_host()
+
+    freed = engine.release_host_weights()
+    assert freed == expected_bytes, "released bytes do not match the bulk arrays"
+    assert engine.host_weights_released is True
+    assert engine.weights.embedding is None
+    assert all(layer.q_proj is None for layer in engine.weights.layers)
+
+    # Calling twice must not double-count or fail.
+    assert engine.release_host_weights() == 0
+
+
+def test_release_preserves_everything_execution_reads() -> None:
+    """Generation must be identical after the host set is dropped.
+
+    This is the load-bearing assertion: the decode path is supposed to read device
+    tensors exclusively. If anything in the forward pass still reached into
+    ``self.weights``, this test is where it surfaces.
+    """
+    torch = pytest.importorskip("torch")
+    from aether.runtime.torch_engine import TorchAEGEngine
+
+    import os
+
+    previous = os.environ.get("AETHER_TORCH_DTYPE")
+    os.environ["AETHER_TORCH_DTYPE"] = "fp16"
+    try:
+        before = TorchAEGEngine(_reference_engine(), "cpu")
+        after = TorchAEGEngine(_reference_engine(), "cpu")
+    finally:
+        if previous is None:
+            os.environ.pop("AETHER_TORCH_DTYPE", None)
+        else:
+            os.environ["AETHER_TORCH_DTYPE"] = previous
+
+    prompt = np.asarray([1, 3, 5, 2], dtype=np.int64)
+    expected_single = before.generate(prompt, max_tokens=6, temperature=0.0)
+    expected_batch = before.generate_batch(
+        [prompt, np.asarray([4, 5], dtype=np.int64)], max_tokens=6, temperature=0.0
+    )
+    expected_logits = before.forward(prompt)[0]
+
+    assert after.release_host_weights() > 0
+    assert after.generate(prompt, max_tokens=6, temperature=0.0) == expected_single
+    assert after.generate_batch(
+        [prompt, np.asarray([4, 5], dtype=np.int64)], max_tokens=6, temperature=0.0
+    ) == expected_batch
+    np.testing.assert_array_equal(after.forward(prompt)[0], expected_logits)
+
+    # The execution-numerics contract and the small arrays must survive: several
+    # code paths read them after load, and they are metadata-scale anyway.
+    assert after.weights.final_norm is not None
+    assert all(layer.attention_norm is not None for layer in after.weights.layers)
+    assert after.weights.rope_theta == before.weights.rope_theta
+    assert after.num_layers == before.num_layers
+
+
+def test_release_can_be_declined_by_the_operator() -> None:
+    """An operator driving a host-weight-dependent path can keep them."""
+    import os
+
+    from aether.backends.torch_backend import _release_host_weights_enabled
+
+    previous = os.environ.get("AETHER_KEEP_HOST_WEIGHTS")
+    try:
+        os.environ.pop("AETHER_KEEP_HOST_WEIGHTS", None)
+        assert _release_host_weights_enabled() is True
+        for value in ("1", "true", "yes", "YES"):
+            os.environ["AETHER_KEEP_HOST_WEIGHTS"] = value
+            assert _release_host_weights_enabled() is False, value
+    finally:
+        if previous is None:
+            os.environ.pop("AETHER_KEEP_HOST_WEIGHTS", None)
+        else:
+            os.environ["AETHER_KEEP_HOST_WEIGHTS"] = previous
 
 
 def test_tensor_parallel_refuses_batching_rather_than_flattening() -> None:

@@ -102,6 +102,19 @@ def execution_numerics(source: Any) -> dict[str, Any]:
     return {name: getattr(source, name, None) for name in EXECUTION_NUMERICS_FIELDS}
 
 
+#: Host-resident weight attributes large enough to matter, in the order a reader
+#: would expect them.  Normalization weights, biases and routers are deliberately
+#: absent: they are metadata-scale, several code paths read them after load, and
+#: freeing them would buy kilobytes while adding failure modes.
+_BULK_MODEL_ARRAYS: tuple[str, ...] = (
+    "embedding", "lm_head", "position_embedding",
+)
+_BULK_LAYER_ARRAYS: tuple[str, ...] = (
+    "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+)
+_BULK_EXPERT_ARRAYS: tuple[str, ...] = ("gate_proj", "up_proj", "down_proj")
+
+
 @dataclass
 class TorchKVCache:
     """Device-resident incremental KV state used by :class:`TorchAEGEngine`."""
@@ -227,6 +240,9 @@ class TorchAEGEngine:
             self.compute_dtype = torch.float32
         self.source_engine = cpu_engine
         self.weights = cpu_engine.weights
+        #: Set once ``release_host_weights`` has dropped the bulk host arrays, so
+        #: a caller that needs them can detect it instead of meeting a ``None``.
+        self.host_weights_released = False
         self.num_heads = int(cpu_engine.num_heads)
         self.num_kv_heads = int(cpu_engine.num_kv_heads)
         self.head_dim = int(cpu_engine.head_dim)
@@ -983,6 +999,7 @@ class TorchAEGEngine:
         validate_ids: bool = False,
         reserve: int = 0,
         batched: bool = False,
+        logits: str = "all",
     ) -> tuple[Any, TorchKVCache | BatchedKVCache]:
         """Forward pass that keeps logits on the accelerator for generation.
 
@@ -997,6 +1014,19 @@ class TorchAEGEngine:
         sliding window, logit softcap — is deliberately *not* duplicated per rank.
         Two copies would drift, and a drifted variant is a silent numerical error
         rather than a crash.  Only the rank-dependent sites branch.
+
+        ``logits`` selects how much of the vocabulary projection to evaluate:
+
+        ``"all"``
+            Every position, ``(seq, vocab)`` or ``(batch, seq, vocab)``.  What the
+            public :meth:`forward` and :meth:`forward_batch` contracts promise.
+        ``"last"``
+            Only each row's final position.  The vocabulary projection is applied
+            per position independently, so in exact arithmetic
+            ``(W x)[-1] == W x[-1]``: this declines to compute discarded rows rather
+            than approximating them.  Generation reads nothing but the final row, so
+            every generation path uses it.  See :meth:`_project_logits` for the
+            floating-point caveat.
         """
         torch = self.torch
         # Keep decode tokens on the execution device.  The old path converted
@@ -1234,15 +1264,60 @@ class TorchAEGEngine:
                     hidden = block_input + attention_out + ffn_out
                 else:
                     hidden = hidden + ffn_out
-            hidden = self._norm(hidden, self.final_norm, self.final_norm_bias)
-            logits = self._linear(hidden, self.lm_head)
-            if self.logit_scale is not None:
-                logits = logits * self.logit_scale
-            if self.final_logit_softcap:
-                logits = self._softcap(logits, self.final_logit_softcap)
+            logits_out = self._project_logits(hidden, batched=batched, mode=logits)
             cache.length = total
-            cache.last_logits = (logits[:, -1] if batched else logits[-1]).detach()
-        return logits, cache
+            cache.last_logits = (
+                logits_out[:, -1] if batched else logits_out[-1]
+            ).detach()
+        return logits_out, cache
+
+    def _project_logits(self, hidden: Any, *, batched: bool, mode: str) -> Any:
+        """Normalize and project hidden states to vocabulary logits.
+
+        ``mode="last"`` slices to each row's final position *before* the projection
+        rather than after.  Both the final normalization and the vocabulary
+        projection act on one position at a time — the norm reduces over the hidden
+        axis, and the projection is a per-position matrix product — so in exact
+        arithmetic
+
+            (W · X)[..., -1, :]  ==  W · X[..., -1, :]
+
+        Slicing first therefore declines to compute rows the caller discards; it
+        does not approximate them.
+
+        In floating point the two are close but not bit-identical: BLAS blocks a
+        one-row GEMV differently from an S-row GEMM, so the sum over the contracted
+        hidden dimension accumulates in a different order.  Measured disagreement is
+        at rounding scale — order 1e-8 absolute and 1e-6 relative on FP32 logits —
+        which is the same class of difference that already exists between this
+        executor's batched and unbatched paths.  It is far below the gap between
+        competing greedy candidates in practice, and
+        ``tests/unit/test_batched_inference.py`` asserts both the numerical bound and
+        that greedy decoding is unchanged.
+
+        The saving is substantial on any model with a large vocabulary.  For
+        Qwen3-0.6B the ``lm_head`` is 156M of ~596M matmul parameters — 26% of the
+        prefill matmul work — and at a 1024-token prompt 1023/1024 of that was being
+        thrown away.  The discarded logits also had to be *materialized*:
+        ``(4, 1024, 151936)`` in FP16 is 1.19 GiB of allocation and write bandwidth.
+        Measured on a real Qwen3-0.6B AEG (FP32, CPU), restricting the projection cut
+        a 1024-token prefill by 39% (1.64x) and a 512-token prefill by 23% (1.30x);
+        see ``scripts/profile_prefill.py``.
+
+        Decode is unaffected either way, since a decode step already has one
+        position per row.
+        """
+        if mode not in {"all", "last"}:
+            raise ValueError(f"logits mode must be 'all' or 'last', got {mode!r}")
+        if mode == "last":
+            hidden = hidden[:, -1:] if batched else hidden[-1:]
+        hidden = self._norm(hidden, self.final_norm, self.final_norm_bias)
+        logits = self._linear(hidden, self.lm_head)
+        if self.logit_scale is not None:
+            logits = logits * self.logit_scale
+        if self.final_logit_softcap:
+            logits = self._softcap(logits, self.final_logit_softcap)
+        return logits
 
     def forward(self, token_ids: np.ndarray | Any, cache: TorchKVCache | None = None) -> tuple[np.ndarray, TorchKVCache]:
         logits, cache = self._forward_device(token_ids, cache, validate_ids=True)
@@ -1317,7 +1392,9 @@ class TorchAEGEngine:
             # The final sequence length is known here, so the KV cache can be
             # sized once instead of doubling during decode.
             reserve = int(ids.size) + int(max_tokens) + (0 if cache is None else int(cache.length))
-            _, cache = self._forward_device(ids, cache, validate_ids=True, reserve=reserve)
+            _, cache = self._forward_device(
+                ids, cache, validate_ids=True, reserve=reserve, logits="last"
+            )
             next_logits = cache.last_logits
         elif cache is not None and cache.last_logits is not None:
             next_logits = cache.last_logits
@@ -1370,7 +1447,9 @@ class TorchAEGEngine:
         stop = None if eos_token_id is None else int(eos_token_id)
         for _ in range(int(max_tokens)):
             checkpoint = int(cache.length)
-            _, cache = self._forward_device(token_device.reshape(1), cache)
+            _, cache = self._forward_device(
+                token_device.reshape(1), cache, logits="last"
+            )
             following = self._sample_device(cache.last_logits, temperature, top_k, top_p)
             # The queue now holds a complete step; syncing here costs only the
             # residual device time rather than the whole step.
@@ -1427,7 +1506,9 @@ class TorchAEGEngine:
             if eos_token_id is not None and token == int(eos_token_id):
                 break
             _, cache = self._forward_device(
-                torch.tensor([token], dtype=torch.long, device=self.device), cache
+                torch.tensor([token], dtype=torch.long, device=self.device),
+                cache,
+                logits="last",
             )
             next_logits = cache.last_logits
 
@@ -1451,6 +1532,90 @@ class TorchAEGEngine:
     # single-sequence signatures are public and return rank-1 results; a caller
     # passing a ``(1, seq)`` array to ``forward`` has always meant one sequence,
     # and still does.
+
+    def device_tensors_alias_host(self) -> bool:
+        """Whether the device weights share storage with the host arrays.
+
+        ``torch.as_tensor`` on a host array whose dtype already matches returns a
+        *view*: on a CPU device at FP32 the executor's weights and the loader's
+        arrays are the same memory. Distinguishing that from a genuine second copy
+        is what makes :meth:`release_host_weights` safe to call unconditionally —
+        where the two alias, there is nothing duplicated to free, and dropping the
+        reference would leave the executor pointing at storage nothing owns.
+        """
+        source = getattr(self.weights, "embedding", None)
+        if source is None or not isinstance(source, np.ndarray):
+            return False
+        try:
+            host_pointer = source.__array_interface__["data"][0]
+        except (AttributeError, KeyError, TypeError):
+            return False
+        return int(self.embedding.data_ptr()) == int(host_pointer)
+
+    def release_host_weights(self) -> int:
+        """Free host-resident weight matrices once the device owns its own copy.
+
+        Returns the number of bytes released.
+
+        The AEG loader materializes every weight as a host FP32 array, and the
+        executor then materializes a device copy — on CUDA usually at FP16. Both
+        stay live for the executor's whole lifetime, so a model costs its parameter
+        count *twice*: once on the accelerator where it executes, and once in host
+        RAM where nothing reads it again. Measured on a real Qwen3-0.6B AEG, the host
+        set is 2.80 GiB over 751.6M elements at 4 bytes each
+        (``scripts/profile_host_memory.py``), which matches the host-RSS gap the
+        benchmark reports against Transformers.
+
+        That cost is linear in parameter count, so it is not a small-model curiosity:
+        the same ratio at 70B is ~280 GiB of host RAM, and at that point it is the
+        difference between a model loading and not loading. Releasing it is therefore
+        a scaling fix rather than a tidy-up.
+
+        Safety comes from three properties rather than from a flag:
+
+        * It is a no-op when the device tensors *alias* the host arrays
+          (:meth:`device_tensors_alias_host`), which is the CPU-at-FP32 case, so a
+          CPU-hosted engine and a promoted batched executor are untouched.
+        * Only bulk matrices are dropped. Normalization weights, biases, routers and
+          every scalar of the execution-numerics contract stay resident, because
+          those are read after load and are metadata-scale.
+        * The decode path reads device tensors exclusively. Nothing in
+          ``_forward_device`` touches ``self.weights``.
+
+        ``host_weights_released`` records that this happened so a caller that does
+        need the host set can detect it rather than meeting a ``None``.
+        """
+        if self.host_weights_released:
+            return 0
+        if self.device_tensors_alias_host():
+            # Nothing is duplicated: the "host" arrays *are* the device tensors.
+            return 0
+        freed = 0
+        seen: set[int] = set()
+
+        def drop(owner: Any, name: str) -> None:
+            nonlocal freed
+            value = getattr(owner, name, None)
+            if not isinstance(value, np.ndarray):
+                return
+            if id(value) not in seen:
+                seen.add(id(value))
+                freed += int(value.nbytes)
+            try:
+                setattr(owner, name, None)
+            except (AttributeError, TypeError):  # frozen or slotted container
+                pass
+
+        for name in _BULK_MODEL_ARRAYS:
+            drop(self.weights, name)
+        for layer in getattr(self.weights, "layers", None) or []:
+            for name in _BULK_LAYER_ARRAYS:
+                drop(layer, name)
+            for expert in getattr(layer, "experts", None) or []:
+                for name in _BULK_EXPERT_ARRAYS:
+                    drop(expert, name)
+        self.host_weights_released = True
+        return freed
 
     def supports_batch(self, batch_size: int = 1) -> bool:
         """Whether this executor can run ``batch_size`` sequences in one pass.
@@ -1598,7 +1763,8 @@ class TorchAEGEngine:
         reserve = packed.padded_length + int(max_tokens)
         cache = self._new_batched_cache(packed=packed, reserve=reserve)
         _, cache = self._forward_device(
-            packed.token_ids, cache, validate_ids=True, reserve=reserve, batched=True
+            packed.token_ids, cache, validate_ids=True, reserve=reserve,
+            batched=True, logits="last",
         )
         outputs: list[list[int]] = [[] for _ in range(batch)]
         finished = [False] * batch
@@ -1610,7 +1776,8 @@ class TorchAEGEngine:
             # overlaps device execution instead of following it.
             self._extend_live(cache, cache.length + 1)
             _, cache = self._forward_device(
-                tokens.reshape(batch, 1), cache, reserve=reserve, batched=True
+                tokens.reshape(batch, 1), cache, reserve=reserve,
+                batched=True, logits="last",
             )
             following = self._sample_device(cache.last_logits, temperature, top_k, top_p)
             # One host synchronization per step — the same count the

@@ -127,7 +127,8 @@ def run_performance(config: BenchmarkConfig) -> tuple[list[dict], list[dict]]:
                             "requested_prompt_tokens": requested,
                             "batch_size": batch, "order": list(order),
                         },
-                        "backends": {}, "load": loads, "prefill": {}, "ttft": {},
+                        "backends": {}, "load": loads, "prefill": {},
+                        "serving_prefill": {}, "ttft": {},
                     }
                     for name in order:
                         backend = backends.get(name)
@@ -155,6 +156,10 @@ def run_performance(config: BenchmarkConfig) -> tuple[list[dict], list[dict]]:
                             _log(f"      {status}: {cell['backends'][name].get('message','')[:110]}")
                         if batch == 1:
                             cell["prefill"][name] = runner.measure_prefill(
+                                backend, prompt["text"],
+                                warmup_iters=1, measure_iters=max(3, config.measure_iters),
+                            )
+                            cell["serving_prefill"][name] = runner.measure_serving_prefill(
                                 backend, prompt["text"],
                                 warmup_iters=1, measure_iters=max(3, config.measure_iters),
                             )
@@ -532,6 +537,122 @@ def run_batch_scaling(config: BenchmarkConfig) -> dict[str, Any]:
     return {"cases": cases, "notes": notes, "loads": {}}
 
 
+#: Prompt-length mixes for the mixed-length batch mode, in tokens.  Named so the
+#: report can say which distribution a row came from rather than printing a list.
+#: These are shapes real traffic has: a batch dominated by short turns with one
+#: long document in it is the case padding hurts most, and it is exactly the case a
+#: uniform-batch matrix cannot show.
+MIXED_LENGTH_PROFILES: dict[str, list[int]] = {
+    "uniform-256": [256, 256, 256, 256],
+    "mild-spread": [128, 192, 256, 320],
+    "one-long-tail": [32, 32, 32, 1024],
+    "wide-spread": [32, 128, 512, 1024],
+}
+
+
+def run_mixed_length(config: BenchmarkConfig) -> dict[str, Any]:
+    """Mode 7: batches whose rows genuinely differ in length.
+
+    Every other mode replicates one prompt to the batch width, so its batches carry
+    no padding.  That is the right control for comparing execution, but it cannot
+    show what padding costs, and real traffic is never uniform.  This mode builds
+    batches from a stated length distribution and reports the padding overhead
+    alongside the throughput, so a reader can see the two together.
+
+    Aether pays for padding directly: rows are right-aligned into one tensor, so pad
+    slots occupy KV rows and pass through the prefill GEMMs.  ``padding overhead`` is
+    the fraction of padded slots that are pad — the share of prefill work that exists
+    only because the rows differ.
+
+    Transformers is measured on the same batches through its own left-padded
+    ``generate``, so both runtimes are given identical ragged work.
+    """
+    from aether.runtime.batch import BatchLayout
+
+    cases: list[dict[str, Any]] = []
+    precision = config.precisions[0]
+    notes = [
+        "Rows within a batch differ in length, so both runtimes pay for padding. "
+        "The `pad %` column is the fraction of padded slots that hold no real token: "
+        "it is the share of prefill work that exists only because the batch is "
+        "ragged.",
+        "Latency percentiles are over measured iterations of the whole batched pass, "
+        "not over individual rows: every row in a batch shares one wall time.",
+        "`uniform-256` is the control. It has the same row count and the same total "
+        "real tokens per row as a uniform cell, and zero padding, so the difference "
+        "between it and the ragged profiles is what raggedness costs.",
+    ]
+    for model in config.models:
+        _log(f"\n=== mixed-length batching: {model} @ {precision} ===")
+        backends, loads, _ = _load_pair(config, model, precision)
+        if not backends:
+            cases.append({
+                "model": model, "precision": precision, "status": "load-failed",
+                "message": "neither backend loaded; see load records",
+            })
+            continue
+        tokenizer = next(iter(backends.values())).tokenizer()
+        # Build one prompt per distinct length, to the exact token count, with the
+        # same helper the uniform matrix uses.
+        wanted = sorted({length for lengths in MIXED_LENGTH_PROFILES.values() for length in lengths})
+        prompt_set = prompts.build_prompt_set(tokenizer, wanted)
+        by_length = {
+            entry["achieved_tokens"]: entry["text"] for entry in prompt_set.values()
+        }
+        available = sorted(by_length)
+        for name, lengths in MIXED_LENGTH_PROFILES.items():
+            texts: list[str] = []
+            achieved: list[int] = []
+            for length in lengths:
+                # build_prompt_set may land a token or two off the request; use the
+                # closest achieved length rather than silently mislabelling the row.
+                closest = min(available, key=lambda value: abs(value - length))
+                texts.append(by_length[closest])
+                achieved.append(closest)
+            layout = BatchLayout(
+                lengths=tuple(achieved), padded_length=max(achieved)
+            )
+            _log(f"  [{name}] lengths={achieved} pad={layout.padding_overhead * 100:.1f}%")
+            for backend_name in BACKENDS:
+                backend = backends.get(backend_name)
+                entry: dict[str, Any] = {
+                    "model": model, "precision": precision, "profile": name,
+                    "backend": backend_name, "lengths": achieved,
+                    "padded_length": layout.padded_length,
+                    "padding_overhead": layout.padding_overhead,
+                    "total_real_tokens": layout.total_real_tokens,
+                }
+                if backend is None:
+                    entry.update(status="load-failed", message="backend did not load")
+                    cases.append(entry)
+                    continue
+                measurement = runner.measure_mixed_batch(
+                    backend, texts,
+                    max_new_tokens=config.max_new_tokens,
+                    temperature=config.temperature, top_p=config.top_p,
+                    top_k=config.top_k, seed=config.seed,
+                    warmup_iters=config.warmup_iters,
+                    measure_iters=config.measure_iters,
+                )
+                entry.update(measurement)
+                if measurement.get("status") == "ok":
+                    latency = (measurement.get("latency_s") or {})
+                    _log(
+                        f"    {backend_name}: {measurement['tokens_per_s']['median']:.2f} "
+                        f"tok/s aggregate, p50 {latency.get('median', 0):.4f}s "
+                        f"p95 {latency.get('p95', 0):.4f}s"
+                    )
+                else:
+                    _log(f"    {backend_name}: {measurement.get('status')}: "
+                         f"{str(measurement.get('message', ''))[:100]}")
+                cases.append(entry)
+            runner.cooldown(config.cooldown_s)
+        for backend in backends.values():
+            backend.unload()
+        gpu_monitor.empty_cache()
+    return {"cases": cases, "notes": notes, "profiles": MIXED_LENGTH_PROFILES}
+
+
 def main(argv: list[str] | None = None) -> int:
     config = parse_args(argv)
     _limit_devices(config.devices)
@@ -593,6 +714,8 @@ def main(argv: list[str] | None = None) -> int:
             payload["kernels"] = run_profile(config)
         elif mode == "batch":
             payload["batch_scaling"] = run_batch_scaling(config)
+        elif mode == "mixed":
+            payload["mixed_length"] = run_mixed_length(config)
         elif mode == "multigpu":
             if config.multi_gpu:
                 payload["multigpu"] = run_multigpu(config)

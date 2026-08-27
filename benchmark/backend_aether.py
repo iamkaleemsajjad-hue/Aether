@@ -22,6 +22,7 @@ from benchmark.prompts import flatten_ids
 from benchmark.backends import (
     GenerationOutcome,
     LoadOutcome,
+    MixedBatchOutcome,
     UnsupportedConfiguration,
     set_seed,
 )
@@ -216,7 +217,8 @@ class AetherBackend:
         """One forward pass over the prompt, at the engine level.
 
         Deliberately the same abstraction the Transformers side is measured at
-        (``model(**inputs)``): a single forward, no sampling, no generation loop.
+        (``model(**inputs)``): a single forward, no sampling, no generation loop,
+        logits at every position.
         """
         import numpy as np
 
@@ -227,6 +229,37 @@ class AetherBackend:
             dtype=np.int64,
         )
         logits, _cache = self._engine.forward(ids)
+        return _to_cpu_float(logits[-1])
+
+    def serving_prefill(self, prompt: str) -> Any:
+        """Prefill the way generation actually pays for it: final logits only.
+
+        The vocabulary projection is applied per position, so projecting only the
+        last one computes the same value to floating-point rounding — and it is
+        all generation reads.
+        On a large-vocabulary model that is most of the projection: for
+        Qwen3-0.6B the ``lm_head`` is 156M of ~600M matmul parameters, so a
+        1024-token prompt was projecting 1024 positions to a 151936-wide vocabulary
+        and discarding 1023 of them, plus allocating and writing the tensor that
+        held them.
+
+        Measured here so it can be compared against the same configuration on the
+        Transformers side, which its ``generate`` also uses.
+        """
+        import numpy as np
+
+        if self._engine is None:
+            raise UnsupportedConfiguration("engine unavailable for prefill measurement")
+        forward = getattr(self._engine, "_forward_device", None)
+        if forward is None:
+            raise UnsupportedConfiguration(
+                f"{type(self._engine).__name__} exposes no last-position prefill path"
+            )
+        ids = np.asarray(
+            flatten_ids(self._tokenizer(prompt, return_tensors="np")["input_ids"]),
+            dtype=np.int64,
+        )
+        logits, _cache = forward(ids, None, validate_ids=True, logits="last")
         return _to_cpu_float(logits[-1])
 
     def generate(
@@ -388,6 +421,45 @@ class AetherBackend:
         for _ in stream:  # drain, so the next measurement starts clean
             pass
         return elapsed
+
+    def generate_mixed(
+        self,
+        prompts: list[str],
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> Any:
+        """One batched pass over prompts that genuinely differ in length.
+
+        Unlike :meth:`_generate_batched`, which replicates one prompt, the rows here
+        are different prompts, so the batch is ragged and Aether pays for the pad
+        region: pad slots occupy KV rows and pass through the prefill GEMMs. That
+        cost is what this measurement exists to expose.
+        """
+        responses = self._runtime.generate_batch(
+            str(self._artifact),
+            list(prompts),
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
+        if len(responses) != len(prompts):
+            raise UnsupportedConfiguration(
+                f"mixed batch returned {len(responses)} rows for {len(prompts)} prompts"
+            )
+        usages = [dict(getattr(item, "usage", {}) or {}) for item in responses]
+        metrics = getattr(responses[0], "metrics", None)
+        return MixedBatchOutcome(
+            texts=[item.text for item in responses],
+            row_prompt_tokens=[int(usage.get("prompt_tokens", 0)) for usage in usages],
+            row_completion_tokens=[
+                int(usage.get("completion_tokens", 0)) for usage in usages
+            ],
+            backend_metrics=dict(getattr(metrics, "extra", {}) or {}) if metrics else {},
+        )
 
     def supports_batch(self, batch_size: int) -> bool:
         """Whether this backend can execute ``batch_size`` rows as one real pass.

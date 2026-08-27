@@ -521,6 +521,7 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         validate_ids: bool = False,
         reserve: int = 0,
         batched: bool = False,
+        logits: str = "all",
     ) -> tuple[Any, TorchKVCache | BatchedKVCache]:
         """Run one sharded step.
 
@@ -676,15 +677,24 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
                 hidden = (
                     block_input + attention_out + ffn_out if parallel else hidden + ffn_out
                 )
+            # Honour the caller's logits request here too, for the same reason the
+            # single-device executor does: the sharded vocabulary projection is the
+            # widest GEMM in the pass, and generation reads only its final row.
+            # Slicing before the projection is exact, since the projection is
+            # per-position.
+            if logits == "last":
+                hidden = hidden[-1:]
+            elif logits != "all":
+                raise ValueError(f"logits mode must be 'all' or 'last', got {logits!r}")
             hidden = self._norm(hidden, self.final_norm, self.final_norm_bias)
-            logits = self._parallel_row_linear(hidden, self.lm_head, None)
+            projected = self._parallel_row_linear(hidden, self.lm_head, None)
             if self.logit_scale is not None:
-                logits = logits * self.logit_scale
+                projected = projected * self.logit_scale
             if self.final_logit_softcap:
-                logits = self._softcap(logits, self.final_logit_softcap)
+                projected = self._softcap(projected, self.final_logit_softcap)
             cache.length = past + seq_len
-            cache.last_logits = logits[-1].detach()
-        return logits, cache
+            cache.last_logits = projected[-1].detach()
+        return projected, cache
 
     def forward(self, token_ids: np.ndarray | Any, cache: TorchKVCache | None = None) -> tuple[np.ndarray, TorchKVCache]:
         """Run a public forward pass and materialize logits as NumPy."""

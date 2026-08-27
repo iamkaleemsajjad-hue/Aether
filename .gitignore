@@ -131,6 +131,7 @@ config.json
 # CI/CD artifacts
 artifacts/
 .coverage.xml
+coverage.xml
 junit/
 test-results/
 

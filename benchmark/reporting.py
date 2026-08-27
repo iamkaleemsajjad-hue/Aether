@@ -174,11 +174,28 @@ def phase_section(results: list[dict[str, Any]]) -> str:
     """Prefill and time-to-first-token, kept apart from end-to-end throughput."""
     lines = ["## Prefill, decode and time-to-first-token\n"]
     lines.append(
-        "Prefill is a single forward pass over the prompt at the same abstraction "
-        "on both backends. Decode is derived as the remainder of the end-to-end "
-        "generation, so it inherits prefill's uncertainty. TTFT is measured "
-        "through each library's own streaming API and is therefore reported as its "
-        "own experiment rather than folded into throughput.\n"
+        "Prefill is reported in two configurations, because they answer different "
+        "questions and a single column would conflate them.\n\n"
+        "- **prefill (all logits)** — one forward pass returning logits at *every* "
+        "prompt position. A like-for-like comparison of that operation: "
+        "`model(**inputs)` on the Transformers side, `engine.forward(ids)` on "
+        "Aether's.\n"
+        "- **prefill (serving)** — the same forward pass returning only the final "
+        "position's logits, which is all generation reads. Both backends are given "
+        "the same option: Transformers via `logits_to_keep=1` (what its own "
+        "`generate` uses), Aether via its last-position projection. This is the "
+        "figure a served request actually pays.\n\n"
+        "The vocabulary projection is applied per position, so restricting it to "
+        "the last position computes the same value to floating-point rounding "
+        "(BLAS blocks a one-row GEMV differently from an S-row GEMM, so the "
+        "contracted sum accumulates in a different order; the disagreement is at "
+        "rounding scale and greedy tokens are unchanged). The gap between the two "
+        "columns is therefore discarded work, and it grows with prompt length and "
+        "vocabulary size.\n\n"
+        "Decode is derived as the remainder of the end-to-end generation, so it "
+        "inherits prefill's uncertainty. TTFT is measured through each library's "
+        "own streaming API and is therefore reported as its own experiment rather "
+        "than folded into throughput.\n"
     )
     rows = []
     for cell in results:
@@ -186,13 +203,19 @@ def phase_section(results: list[dict[str, Any]]) -> str:
         for backend in ("transformers", "aether"):
             record = cell["backends"].get(backend, {})
             prefill = (cell.get("prefill") or {}).get(backend, {})
+            serving = (cell.get("serving_prefill") or {}).get(backend, {})
             ttft = (cell.get("ttft") or {}).get(backend, {})
             prefill_median = (prefill.get("latency_s") or {}).get("median")
+            serving_median = (serving.get("latency_s") or {}).get("median")
             total_median = (record.get("latency_s") or {}).get("median")
             generated = record.get("completion_tokens") or 0
+            # Decode is the remainder after the prefill a served request pays for,
+            # falling back to the all-logits figure when the serving path was not
+            # measurable, so the column never silently changes meaning.
+            basis = serving_median if serving_median is not None else prefill_median
             decode_median = (
-                total_median - prefill_median
-                if total_median is not None and prefill_median is not None
+                total_median - basis
+                if total_median is not None and basis is not None
                 else None
             )
             rows.append([
@@ -200,14 +223,21 @@ def phase_section(results: list[dict[str, Any]]) -> str:
                 backend,
                 _fmt(prefill_median, 4) if prefill.get("status") == "ok"
                 else prefill.get("status", "—"),
+                _fmt(serving_median, 4) if serving.get("status") == "ok"
+                else serving.get("status", "—"),
+                (
+                    f"{prefill_median / serving_median:.2f}x"
+                    if prefill_median and serving_median else "—"
+                ),
                 _fmt(decode_median, 4),
                 _fmt(decode_median / generated * 1000.0, 3) if decode_median and generated else "—",
                 _fmt(((ttft.get("ttft_s") or {}).get("median")), 4)
                 if ttft.get("status") == "ok" else ttft.get("status", "—"),
             ])
     lines.append(_table(
-        ["Model", "Prec", "Prompt", "Backend", "prefill s", "decode s",
-         "ms / decoded token", "TTFT s"],
+        ["Model", "Prec", "Prompt", "Backend", "prefill s (all logits)",
+         "prefill s (serving)", "discarded", "decode s", "ms / decoded token",
+         "TTFT s"],
         rows,
     ))
     return "\n".join(lines)
@@ -579,6 +609,59 @@ def batch_scaling_section(payload: dict[str, Any] | None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def mixed_length_section(payload: dict[str, Any] | None) -> str:
+    """Ragged batches: throughput next to the padding it paid for."""
+    lines = ["## Mixed-length batching\n"]
+    if not payload:
+        lines.append("_Not run._\n")
+        return "\n".join(lines)
+    lines.append(
+        "Every other mode replicates one prompt to the batch width, so its batches "
+        "carry no padding. Real traffic is never uniform, and padding is the cost a "
+        "uniform matrix cannot show. Each row here is a batch built from a stated "
+        "length distribution, run through both runtimes' left-padded batched paths.\n\n"
+        "`pad %` is the fraction of padded slots holding no real token — the share of "
+        "prefill work that exists only because the rows differ. `uniform-256` is the "
+        "control: same row count, zero padding, so the gap between it and the ragged "
+        "profiles is what raggedness costs.\n\n"
+        "Latency percentiles describe the whole batched pass, not individual rows: "
+        "every row in a batch shares one wall time.\n"
+    )
+    rows = []
+    for entry in payload.get("cases", []):
+        latency = entry.get("latency_s") or {}
+        throughput = entry.get("tokens_per_s") or {}
+        base = [
+            entry.get("model", "—").split("/")[-1],
+            _fmt(entry.get("profile")),
+            _fmt(entry.get("backend")),
+            ",".join(str(value) for value in (entry.get("lengths") or [])) or "—",
+            _fmt((entry.get("padding_overhead") or 0.0) * 100, 1, "%"),
+        ]
+        if entry.get("status") != "ok":
+            rows.append(base + [
+                f"**{entry.get('status', 'missing')}**",
+                _fmt((entry.get("message") or "")[:48]), "—", "—", "—", "—",
+            ])
+            continue
+        rows.append(base + [
+            "ok",
+            _fmt(throughput.get("median")),
+            _fmt(latency.get("median"), 4),
+            _fmt(latency.get("p95"), 4),
+            _fmt(entry.get("total_completion_tokens")),
+            _bytes(entry.get("gpu_inference_delta_bytes")),
+        ])
+    lines.append(_table(
+        ["Model", "Profile", "Backend", "row lengths", "pad %", "Status",
+         "tok/s (agg)", "p50 s", "p95 s", "gen tokens", "GPU infer delta"],
+        rows,
+    ))
+    for note in payload.get("notes", []):
+        lines.append(f"- {note}")
+    return "\n".join(lines) + "\n"
+
+
 def write_charts(results: list[dict[str, Any]], output_dir: Path) -> list[str]:
     """Plot the raw measurements. Linear axes from zero, no rescaling."""
     try:
@@ -682,6 +765,19 @@ def save_raw(payload: dict[str, Any], output_dir: Path) -> dict[str, str]:
 #: Everything the measurements cannot settle.  Stated in the report so a reader
 #: does not extrapolate past what was actually observed.
 LIMITATIONS = (
+    "Prefill is reported in two configurations. The `all logits` column returns "
+    "logits at every prompt position on both backends; the `serving` column returns "
+    "only the final position, which is what generation reads and what both "
+    "runtimes' own generate paths use. End-to-end throughput, TTFT and the decode "
+    "column reflect the serving configuration. Neither backend is given a shortcut "
+    "the other was denied: Transformers is asked via `logits_to_keep=1`, and a "
+    "version that does not accept it is recorded as unsupported rather than "
+    "measured in the other configuration.",
+    "Restricting the vocabulary projection to the last position is the same "
+    "arithmetic, but not bit-identical: a one-row GEMV accumulates the contracted "
+    "sum in a different order than an S-row GEMM. Measured disagreement is at "
+    "rounding scale and greedy tokens are unchanged, but a near-tied argmax could "
+    "in principle differ from the all-logits path.",
     "Aether executes a batch as one forward pass over a left-padded batch axis "
     "with one KV tensor per layer, so batch>1 rows are genuinely concurrent rather "
     "than serialized. Rows are padded to the longest prompt in the batch; the "
@@ -782,6 +878,8 @@ def build_report(payload: dict[str, Any], charts: list[str]) -> str:
         parts += [kernel_section(payload["kernels"]), ""]
     if payload.get("batch_scaling") is not None:
         parts += [batch_scaling_section(payload.get("batch_scaling")), ""]
+    if payload.get("mixed_length") is not None:
+        parts += [mixed_length_section(payload.get("mixed_length")), ""]
     if payload.get("multigpu") is not None:
         parts += [multigpu_section(payload.get("multigpu")), ""]
     parts += [failures_section(payload.get("performance", []), payload.get("skips", [])), ""]

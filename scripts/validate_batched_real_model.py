@@ -201,8 +201,49 @@ def main(argv: list[str] | None = None) -> int:
         f"max|delta| = {shift:.3e}",
     )
 
+    # -- Vocabulary projection ------------------------------------------------
+    print("\n[7] Restricting the vocabulary projection must not change decoding")
+    # Generation projects only each row's final position. That is the same
+    # arithmetic as projecting every position and discarding the rest, but a
+    # one-row GEMV accumulates the contracted sum in a different order than an
+    # S-row GEMM, so the logits differ at rounding scale. With a 151936-wide
+    # vocabulary the question is whether that can flip an argmax. Decode a
+    # reference sequence driven entirely by all-position projections and compare.
+    subject = ids[2]
+    reference: list[int] = []
+    cache = None
+    step_ids = subject
+    for _ in range(args.max_tokens):
+        step_logits, cache = engine._forward_device(
+            step_ids, cache, validate_ids=True, logits="all"
+        )
+        token = int(engine.torch.argmax(step_logits[-1]).item())
+        reference.append(token)
+        step_ids = np.asarray([token], dtype=np.int64)
+
+    production = engine.generate(subject, max_tokens=args.max_tokens, temperature=0.0)
+    passed &= _check(
+        "greedy tokens identical to an all-logits reference decode",
+        production == reference,
+        "" if production == reference else f"last={production} all={reference}",
+    )
+
+    full_logits, _ = engine._forward_device(subject, None, validate_ids=True, logits="all")
+    last_logits, _ = engine._forward_device(subject, None, validate_ids=True, logits="last")
+    deviation = float(
+        np.abs(
+            last_logits[0].detach().float().cpu().numpy()
+            - full_logits[-1].detach().float().cpu().numpy()
+        ).max()
+    )
+    passed &= _check(
+        "final-position logits agree at rounding scale",
+        deviation <= LOGIT_TOLERANCE,
+        f"max|delta| = {deviation:.3e}",
+    )
+
     # -- Throughput, for the record ------------------------------------------
-    print("\n[7] Throughput by batch width (CPU, informational)")
+    print("\n[8] Throughput by batch width (CPU, informational)")
     baseline = None
     for width in (1, 2, 4):
         subset = [ids[0]] * width
