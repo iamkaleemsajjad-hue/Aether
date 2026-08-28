@@ -46,7 +46,7 @@ Aether is an AI model compiler and runtime. The PRD maps to established systems 
 | LoRA serving | LoRA, S-LoRA, Punica | `LoRAHotSwapEngine` applies per-request low-rank deltas in one batch. |
 | Hybrid SSM models | Mamba, Mamba-2, Jamba, RWKV | `HybridMemoryPool` snapshots KV and recurrent SSM state for speculative rollback. |
 | Watermarking | SynthID-Text and green-list token watermarking | `AetherOutputWatermark` applies deterministic green-list logit bias and z-score detection. |
-| Provenance | C2PA and EU AI Act transparency obligations | `ProvenanceManifest` records source model, compiler passes, eval gate results, and compliance status. |
+| Provenance | C2PA 2.x Content Credentials and EU AI Act transparency | `aether.provenance.c2pa` writes a signed JUMBF manifest store: deterministic-CBOR `c2pa.claim.v2`, detached `COSE_Sign1` (Ed25519, RFC 8032/9052), and a `c2pa.hash.collection.data` binding over every file. `ProvenanceManifest` carries the readable pass chain and points at it. |
 
 Additional source links:
 

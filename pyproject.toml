@@ -175,6 +175,29 @@ distributed = [
     "protobuf>=5.28.3",
 ]
 
+# ── Observability extras ──────────────────────────────────────────────────────
+# The base runtime speaks OTLP/HTTP directly with no dependency (see
+# aether.observability.otel). Install this only to route Aether spans through an
+# OpenTelemetry SDK pipeline the host application already configures — span
+# processors, resource detectors, propagators and exporters.
+# Install: pip install "aether-runtime[otel]"
+otel = [
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
+]
+
+# ── Provenance extras ─────────────────────────────────────────────────────────
+# C2PA signing and verification work with the standard library alone: Aether
+# implements deterministic CBOR (RFC 8949), COSE_Sign1 (RFC 9052), Ed25519
+# (RFC 8032) and JUMBF in pure Python. Install this for a faster Ed25519 and for
+# the ECDSA (ES256/384/512) claim-signature algorithms, which have no
+# pure-Python implementation here on purpose.
+# Install: pip install "aether-runtime[provenance]"
+provenance = [
+    "cryptography>=43.0.0",
+]
+
 # ── Safety / compliance extras (uses stdlib only — no extra packages required) ─
 safety = []
 
@@ -186,7 +209,7 @@ eval = [
 # ── CPU-only dev (no torch required) ──────────────────────────────────────────
 # Proves framework independence. Aether core + native CPU engine only.
 dev = [
-    "aether-runtime[lint,test,docs,benchmark,distributed,eval,formats,server]",
+    "aether-runtime[lint,test,docs,benchmark,distributed,eval,formats,server,otel,provenance]",
 ]
 
 # ── Full install including PyTorch frontend ────────────────────────────────────

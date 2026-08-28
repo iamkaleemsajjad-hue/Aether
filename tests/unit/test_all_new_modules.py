@@ -518,39 +518,44 @@ class TestDistributedExecution:
         np.testing.assert_array_equal(result, x)
 
     def test_socket_collective_all_reduce_sum_multi_rank(self) -> None:
-        from aether.parallelism.distributed import SocketCollective
-        # Simulate 4-worker all-reduce (sum = tensor * world_size)
+        """Faking ``_connected`` must not fake a result.
+
+        This test used to assert ``tensor * world_size`` from a single process with
+        no peers. That was the implementation fabricating an answer: it multiplied
+        its local chunks by the rank count and returned a number no other rank had
+        contributed to. The collective now fails closed.
+        """
+        from aether.parallelism.distributed import CollectiveError, SocketCollective
         coll = SocketCollective(rank=0, world_size=4)
         coll._connected = True
-        x = np.ones((3, 4))
-        result = coll.all_reduce(x, op="sum")
-        np.testing.assert_allclose(result, np.ones((3, 4)) * 4.0)
+        with pytest.raises(CollectiveError, match="not connected"):
+            coll.all_reduce(np.ones((3, 4)), op="sum")
 
     def test_socket_collective_all_gather(self) -> None:
-        from aether.parallelism.distributed import SocketCollective
+        from aether.parallelism.distributed import CollectiveError, SocketCollective
         coll = SocketCollective(rank=0, world_size=2)
         coll._connected = True
-        x = np.array([1.0, 2.0, 3.0])
-        result = coll.all_gather(x, axis=0)
-        assert result.shape == (6,)  # Concatenated along axis 0
+        with pytest.raises(CollectiveError, match="not connected"):
+            coll.all_gather(np.array([1.0, 2.0, 3.0]), axis=0)
 
     def test_socket_collective_reduce_scatter(self) -> None:
-        from aether.parallelism.distributed import SocketCollective
+        """reduce_scatter has to reduce; a local slice is not a reduction."""
+        from aether.parallelism.distributed import CollectiveError, SocketCollective
         coll = SocketCollective(rank=0, world_size=4)
         coll._connected = True
-        x = np.ones(8)
-        result = coll.reduce_scatter(x, axis=0)
-        assert result.shape == (2,)  # 8 / 4 = 2 per rank
+        with pytest.raises(CollectiveError, match="not connected"):
+            coll.reduce_scatter(np.ones(8), axis=0)
 
     def test_collective_backend_backward_compat(self) -> None:
+        """A device-id list does not create peers, so world_size stays 1."""
         from aether.parallelism.distributed import CollectiveBackend
         cb = CollectiveBackend([0, 1])
-        assert cb.world_size == 2
+        assert cb.world_size == 1
+        assert cb.device_count == 2
         group = cb.register_group("tp", [0, 1])
         assert group.group_id == "tp"
         x = np.array([1.0, 2.0])
-        result = cb.all_reduce(x, op="sum")
-        assert result is not None
+        np.testing.assert_array_equal(cb.all_reduce(x, op="sum"), x)
 
     def test_tensor_parallel_column_linear(self) -> None:
         from aether.parallelism.distributed import TensorParallelLinear

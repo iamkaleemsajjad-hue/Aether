@@ -70,6 +70,7 @@ class ProvenanceManifest:
     transformations: list[dict[str, Any]] = field(default_factory=list)
     eu_ai_act_risk_category: str = "limited_risk"
     c2pa_binding: str = ""
+    """``urn:c2pa:<uuid>`` label of the signed manifest, empty when unsigned."""
     eval_gate_passed: bool = False
     eval_results: dict[str, float] = field(default_factory=dict)
     certified_targets: list[str] = field(default_factory=list)

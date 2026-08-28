@@ -865,7 +865,11 @@ class TestProvenanceBuilder:
         )
         assert final.watermark_enabled is True
         assert len(final.watermark_key_fingerprint) == 32
-        assert final.c2pa_binding.startswith("c2pa://")
+        # finalize() does not invent a C2PA identifier. Content Credentials need
+        # a signature, and an unsigned artifact must report itself as unsigned
+        # rather than carrying a "c2pa://…" string that resolves nowhere.
+        assert final.c2pa_binding == ""
+        assert final.c2pa_signed is False
 
 
 class TestKGWWatermark:

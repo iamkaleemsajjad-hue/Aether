@@ -5,6 +5,36 @@ metadata, or structural graph analysis — **not** from the model name. Any mode
 whose architecture is recognized by the detector can be compiled to a
 self-contained `.aeg` artifact and executed on any supported target.
 
+## Support at a glance
+
+Aether classifies **40 architecture families** — distinct computation contracts,
+each one code path through the compiler and the runtime — reached through **164**
+model-name and Hugging Face architecture-class spellings.
+
+| Level | Families | Meaning |
+|-------|---------:|---------|
+| ✅ Parity-verified | **26** | every logit matches the reference (~1e-6) on the CPU, PyTorch and tensor-parallel engines, prefill and decode |
+| 🟡 Runs, not gated | **6** | compiles and executes with round-trip tests; no per-logit comparison yet |
+| 🔬 Known-incorrect | **4** | executes with *measured* divergence from the reference |
+| ❌ Refused | **4** | detected, then rejected at compile time rather than emitting a wrong artifact |
+| **Executable** | **36** | parity-verified + runs + known-incorrect |
+
+Three quantities are easy to conflate, so they are kept apart here:
+**families** are computation contracts (40); **detection keys** are the names and
+class spellings that resolve to one (164); **checkpoints** are individual
+published weights, which Aether does not count and makes no claim about — a
+family covers every checkpoint that shares its contract.
+
+These numbers are not prose. They are computed from
+[`src/aether/core/model_families.py`](src/aether/core/model_families.py), the
+single source of truth, and `tests/unit/test_model_family_registry.py` fails the
+build if this document and the registry disagree. Reproduce them with:
+
+```bash
+aether models --counts
+python -c "from aether.core.model_families import support_summary; print(support_summary())"
+```
+
 ## How this matrix is verified
 
 Every family marked **✅ Parity-verified** is checked by
@@ -38,7 +68,7 @@ python scripts/validate_family_parity.py llama qwen3 gemma2 gpt_neo   # etc.
 
 ---
 
-## Decoder families — parity-verified ✅
+## Decoder families — parity-verified ✅ (26)
 
 These share the standard decoder graph and are verified against Transformers on
 every execution path. Each row's *distinguishing numerics* are the constants
@@ -60,7 +90,7 @@ wrong changes every logit, which is why they are individually pinned by
 | **GPT-Neo** | GPT-Neo 125M/1.3B/2.7B | **unscaled attention** (no 1/√d) · local/global layer schedule |
 | **GPT-NeoX** | GPT-NeoX-20B, Pythia 70M–12B | 25% partial rotary · per-head-interleaved fused QKV · parallel residual · exact-erf GELU |
 | **GPT-J** | GPT-J-6B | interleaved (rotate-every-two) rotary · partial rotary · parallel residual |
-| **Phi-3** | Phi-3-mini/small/medium | fused QKV · SwiGLU |
+| **Phi-3** | Phi-3-mini/small/medium, Phi-4 | fused QKV · SwiGLU · LongRoPE factor tables keyed on the pretrained context length |
 | **Falcon** | Falcon-7B/40B (new decoder arch) | per-KV-group interleaved fused QKV · parallel residual · single/dual block norms |
 | **BLOOM** | BLOOM 560M–176B | **ALiBi** positions · per-head-interleaved fused QKV · embedding LayerNorm |
 | **MPT** | MPT-7B/30B | ALiBi · `d_model`/`n_heads`/`n_layers` config spellings · low-precision LayerNorm |
@@ -85,7 +115,7 @@ parity-gated.
 
 ---
 
-## Encoder & encoder-decoder — runs, not parity-gated 🟡
+## Encoder & encoder-decoder — runs, not parity-gated 🟡 (6)
 
 These have dedicated engines with round-trip tests (compile → load → execute,
 with the portable and CPU engines cross-checked), but no automatic per-logit
@@ -99,11 +129,11 @@ bit-for-bit.
 | **DeBERTa** | DeBERTa-v3-base/large | bidirectional encoder |
 | **ELECTRA** | ELECTRA-base/large | bidirectional encoder |
 | **ALBERT** | ALBERT-v2 | shared-layer encoder |
-| **T5 / mT5 / FLAN-T5** | T5-small → T5-11B | encoder-decoder + relative attention |
+| **T5 / mT5 / FLAN-T5** | T5-small → T5-11B, BART, Pegasus | encoder-decoder + relative attention |
 
 ---
 
-## State-space & hybrid — specialized engine, currently incorrect 🔬
+## State-space & hybrid — specialized engine, currently incorrect 🔬 (4)
 
 These ingest and run through their own engines, but **do not currently match the
 reference implementation** when checked with `validate_family_parity.py`, so they
@@ -115,17 +145,18 @@ earlier documentation, which asserted support without a parity check:
 | **Mamba** | Runs; selective-scan output diverges from the reference (cosine ≈ 0.97). Not correct. |
 | **Mamba-2 / SSD** | Runs; output badly diverges (cosine ≈ 0.21). Not correct. |
 | **RWKV-7** | Does not currently bind its time-mix/channel-mix weights during compile. |
-| **Jamba** | Hybrid attention+SSM+MoE; the reference path requires CUDA Mamba kernels, so it is unverified on CPU. |
+| **Jamba** | Hybrid attention+SSM+MoE (also Zamba2, Hymba, Falcon-H1, Bamba, PLaMo); the reference path requires CUDA Mamba kernels, so it is unverified on CPU. |
 
 ---
 
-## Not yet supported ❌
+## Not yet supported ❌ (4)
 
 | Family | Reason |
 |--------|--------|
 | **DeepSeek V3 / R1 (MLA)** | Multi-head latent attention fuses `k_rope` into `kv_a_proj`, adds shared experts alongside routed ones, and uses sigmoid group-limited routing. The MLA engine does not yet reconstruct this contract; compile fails on the fused projection. |
 | **MiniMax** | Lightning attention (alternating linear/softmax layers) is a distinct architecture class without an engine. |
-| **Whisper / vision-language** | Audio and multimodal encoders are detected but have no verified execution contract. |
+| **Vision-language** | LLaVA, InternVL, PaliGemma, Qwen2-VL, Pixtral are detected and ingested, but the vision tower has no verified execution contract. |
+| **Whisper / audio** | The Conv1D log-Mel front-end is detected and ingested, but has no verified execution contract. |
 
 ---
 

@@ -273,7 +273,45 @@ plan = planner.plan_for_devices([
 print(plan.weight_fractions)   # {"cuda:0": 0.667, "cuda:1": 0.333}
 ```
 
-The compiler embeds sharding plans for 1–8 GPUs in every AEG artifact (Pass 6: Parallelism Discovery). At runtime, the distributed engine reads the matching plan and launches a custom ring-allreduce collective — no NCCL, no PyTorch distributed required.
+The compiler embeds sharding plans for 1–8 GPUs in every AEG artifact (Pass 6: Parallelism Discovery). At runtime the distributed engine reads the matching plan and reduces with Aether's own collectives.
+
+**Which collective runs where — precisely.** "No NCCL" is true of two of the three paths, and the difference matters:
+
+| Execution mode | Collective | NCCL / `torch.distributed`? |
+|----------------|-----------|------------------------------|
+| CPU, multi-process | `SocketCollective` — ring reduce-scatter + all-gather over TCP | **Not required.** Verified across real processes up to 8 ranks. |
+| Single-process, multi-GPU | `aether.parallelism.p2p_ring` — one-shot / two-shot / ring over CUDA-ROCm peer-to-peer device copies | **Not required.** This is the path the tensor-parallel executor uses. |
+| Multi-process or multi-node GPU | NCCL (CUDA) or RCCL (ROCm) via `torch.distributed` | **Required.** Aether does not reimplement inter-node GPU transport, and asking for this backend on a host without it fails closed. |
+
+The peer-to-peer path picks its schedule per call from the α–β cost model, using the
+detected link latency and bandwidth — because no single schedule is right at both
+ends of the size range:
+
+```
+one-shot   α + (P−1)·D/B            volume (P−1)·D        — small payloads, latency-bound
+two-shot   2α + 2(P−1)/P·D/B        volume 2(P−1)/P·D     — large payloads, fully peer-connected
+ring       2(P−1)·α + 2(P−1)/P·D/B  volume 2(P−1)/P·D     — meshes without full peer access
+```
+
+Crossover, from setting the first two equal: `D* = α·P·B / ((P−1)(P−2))` for `P > 2`.
+At `P = 2` one-shot is never worse — same volume, half the hops.
+
+Every collective fails closed. A ring that loses a peer raises `CollectiveError`
+rather than returning an approximation. Reductions run in a fixed device order, so
+results are bit-reproducible and every device gets identical bytes.
+
+```python
+from aether.parallelism.p2p_ring import P2PRingCollective
+
+collective = P2PRingCollective(["cuda:0", "cuda:1", "cuda:2", "cuda:3"])
+reduced = collective.all_reduce(per_device_partials)   # every device: the full sum
+root    = collective.reduce_to_root(per_device_partials)  # tree, ceil(log2 P) rounds
+print(collective.stats()["requires_nccl"])            # False
+```
+
+References: Patarasuk & Yuan, *JPDC* 69(2), 2009 (ring bandwidth bound); Thakur,
+Rabenseifner & Gropp, *IJHPCA* 19(1), 2005 (algorithm choice by message size);
+Shoeybi et al., arXiv:1909.08053 §3.3 (why this all-reduce dominates TP cost).
 
 ---
 
@@ -323,23 +361,64 @@ No compiler toolchain? Every kernel has a NumPy fallback — the module always i
 
 ## Supported Model Families
 
-See [SUPPORTED_MODELS.md](SUPPORTED_MODELS.md) for the full matrix. Detection covers 100+ model families. Currently validated for end-to-end compile + AEG execution:
+Aether classifies **40 architecture families**, reached through **164** model-name
+and Hugging Face architecture-class spellings. Support is graded, because "it
+runs" and "its logits match the reference" are different claims:
 
-| Family | Models | Architecture |
-|--------|--------|-------------|
-| Llama | Llama-3.1-8B, 3.2-1B, 3.3-70B | GQA + SwiGLU + RMSNorm |
-| Qwen | Qwen3-0.6B → 72B, Qwen2.5-VL | GQA + QKNorm + YaRN RoPE |
-| Mistral | Mistral-7B, Mixtral-8x7B/8x22B | GQA + SwiGLU + MoE |
-| Gemma | Gemma-2-2B/9B/27B | MQA + GeGLU |
-| DeepSeek | DeepSeek-V3, DeepSeek-R1-671B | MLA + MoE (256 experts) |
-| Phi | Phi-3, Phi-4 | GQA + GELU |
-| BERT / RoBERTa | BERT-base/large, RoBERTa, DeBERTa | Bidirectional encoder |
-| Mamba / RWKV | Mamba-3, RWKV-7, Jamba | Selective scan SSM |
-| GPT-2 / GPT-NeoX | GPT-2, GPT-Neo, Pythia | Causal MHA |
-| Generic decoder | OLMo, Granite, Command R/A, GLM, Kimi, 60+ more | Config-driven |
-| Encoder-decoder | T5, mT5, FLAN-T5, BART | Cross-attention seq2seq |
-| Vision-Language | LLaVA, InternVL, PaliGemma, Qwen2-VL | ViT encoder + decoder |
-| Whisper | Whisper-{tiny…large} | Conv + cross-attention |
+| Level | Families | Meaning |
+|-------|---------:|---------|
+| ✅ Parity-verified | **26** | Every logit compared against the 🤗 Transformers reference (~1e-6) on the CPU, PyTorch, and tensor-parallel engines, for prefill and decode |
+| 🟡 Runs, not gated | **6** | Compile → load → execute round-trip tested; no automatic per-logit comparison yet (5 encoders + T5/BART-class seq2seq) |
+| 🔬 Known-incorrect | **4** | Executes, but measured output diverges from the reference — documented, not relied upon (Mamba, Mamba-2, RWKV-7, Jamba) |
+| ❌ Refused | **4** | Detected and then rejected at compile time rather than producing a wrong artifact (DeepSeek MLA, MiniMax, VLM, Whisper) |
+
+**36 families are executable; 26 are verified.** The exact numbers come from
+[`src/aether/core/model_families.py`](src/aether/core/model_families.py) and are
+asserted against this table by `tests/unit/test_model_family_registry.py`, so
+they cannot drift. Print them yourself:
+
+```bash
+aether models              # the full graded matrix
+aether models --counts     # just the numbers
+```
+
+A fine-tune of a verified family is covered by that family — detection keys on
+structure, not on name — which is why Vicuna, Zephyr, Dolphin, Tulu,
+Nous-Hermes, OpenChat, TinyLlama, Yi, InternLM, MiniCPM, SOLAR and the rest of
+the Llama/Qwen/Mistral derivative space add detection keys rather than families.
+See [SUPPORTED_MODELS.md](SUPPORTED_MODELS.md) for the per-family matrix with the
+distinguishing numerics Aether derives from each checkpoint.
+
+### The 26 parity-verified families
+
+| Family | Models | Distinguishing contract |
+|--------|--------|-------------------------|
+| Llama 3.x | Llama-3.1-8B, 3.2-1B/3B, 3.3-70B | GQA + SwiGLU + RMSNorm + RoPE (baseline) |
+| Qwen 2 / 2.5 | Qwen2-7B/72B, Qwen2.5, CodeQwen | GQA + SwiGLU, schedule-gated sliding window |
+| Qwen 3 | Qwen3-0.6B → 72B | per-head Q/K-norm, decoupled `head_dim` |
+| Qwen 3 MoE | Qwen3-MoE | experts **without** top-k renormalization |
+| Mistral | Mistral-7B v0.1–v0.3, Ministral | GQA + SwiGLU |
+| Mixtral | Mixtral-8x7B/8x22B | top-2 of 8 experts **with** renormalization |
+| Gemma 2 | Gemma-2-2B/9B/27B | ×√H embeddings, (1+w) norms, sandwich norm, logit soft-caps, GeGLU |
+| Gemma 3 (text) | Gemma-3-1B/4B/12B/27B | Gemma 2 + separate local rotary base |
+| GPT-2 | GPT-2 117M–1.5B, DialoGPT | Conv1D layout, GELU-tanh, learned positions |
+| GPT-Neo | GPT-Neo 125M/1.3B/2.7B | **unscaled attention**, local/global schedule |
+| GPT-NeoX | GPT-NeoX-20B, Pythia 70M–12B | 25% partial rotary, head-interleaved QKV, parallel residual |
+| GPT-J | GPT-J-6B | interleaved rotary, parallel residual |
+| Phi-3 / Phi-4 | Phi-3-mini/small/medium, Phi-4 | fused QKV, LongRoPE factor tables |
+| Falcon | Falcon-7B/40B | per-KV-group interleaved QKV, parallel residual |
+| BLOOM | BLOOM 560M–176B, BLOOMZ | **ALiBi**, embedding LayerNorm |
+| MPT | MPT-7B/30B | ALiBi, nested `attn_config` spellings |
+| StarCoder2 | StarCoder2-3B/7B/15B | GQA, GELU-tanh, `layer_types` window |
+| Cohere / Command-R | Command-R/R+/A, Aya Expanse | interleaved rotary, `logit_scale` |
+| OLMo 2 | OLMo-2-7B/13B | **post-norm** block, full-projection Q/K-norm |
+| OLMoE | OLMoE-1B-7B | full-projection Q/K-norm, unnormalized experts |
+| StableLM | StableLM-2, StableLM-3B | 25% partial rotary |
+| Granite | Granite-3.x, Granite Code | embedding/residual/attention/logit multipliers |
+| EXAONE 4 | EXAONE-4-32B | post-norm, **NoPE global layers** |
+| SmolLM 3 | SmolLM3-3B | interleaved NoPE layers |
+| GLM-4 | GLM-4-9B/32B | interleaved + 50% partial rotary, GLM sandwich norm |
+| Nemotron | Nemotron-4, Nemotron-Mini | `LayerNorm1P`, squared-ReLU FFN |
 
 ---
 
@@ -368,25 +447,94 @@ Full list: 30+ targets in [`src/aether/core/constants.py`](src/aether/core/const
 
 ## Phase 5 — Observability
 
+Aether emits **OTLP directly** — the wire protocol, not a JSON file that resembles
+it. `trace_id`/`span_id` widths, typed `AnyValue` attributes (`intValue` as a
+string, per the protobuf JSON mapping), `timeUnixNano` events, per-span `kind`,
+real gzip when `Content-Encoding: gzip` is advertised, W3C `traceparent`
+propagation, trace-ID-ratio sampling, and the standard `OTEL_*` environment
+variables. No dependency is needed for any of it; conformance is pinned by
+[`tests/unit/test_otlp_conformance.py`](tests/unit/test_otlp_conformance.py).
+
 ```python
-from aether.observability.otel import AetherTracer, OTLPExporter
+from aether.observability.otel import AetherTracer, OTLPExporter, MetricsCollector
+
+tracer = AetherTracer(service_name="aether-prod", sample_rate=0.01)
+exporter = OTLPExporter()          # honours OTEL_EXPORTER_OTLP_ENDPOINT/HEADERS/TIMEOUT
+exporter.export_to_endpoint(tracer)
+
+metrics = MetricsCollector()
+exporter.export_metrics_to_endpoint(metrics)   # real explicit-bucket histograms
+```
+
+Joining a trace that started upstream, and a span that records its own failure:
+
+```python
+with tracer.span("aether.prefill", traceparent=request.headers.get("traceparent")) as span:
+    span.add_event("kv_built", {"blocks": 128})
+```
+
+**Routing through an existing OpenTelemetry SDK pipeline** — span processors,
+resource detectors, propagators, exporters configured by the host application —
+is the one thing that needs the dependency:
+
+```bash
+pip install "aether-runtime[otel]"
+```
+
+```python
+from aether.observability.otel_sdk import OpenTelemetryBridge, is_available
+
+if is_available():
+    OpenTelemetryBridge("aether-prod").emit_all(tracer.get_finished_spans())
+    # spans keep Aether's trace_id, so they correlate rather than duplicating
+```
+
+```python
 from aether.observability.ci_pipeline import CIEvalPipeline
 from aether.observability.gates import DriftMonitor, ABRolloutController
 
-# OpenTelemetry distributed tracing
-tracer = AetherTracer(service_name="aether-prod", sample_rate=0.01)
-exporter = OTLPExporter(endpoint='http://otel-collector:4318/v1/traces')
-
-# CI eval gate (blocks regressions > 2% on HellaSwag/MMLU/GSM8K)
 pipeline = CIEvalPipeline(aeg_path='model.aeg', max_regression=0.02)
 report = pipeline.run_and_save('eval_report.json', benchmarks=['hellaswag', 'mmlu', 'gsm8k'])
 
-# A/B rollout with auto drift detection
 ctrl = ABRolloutController('exp-001', candidate_percent=0.01)
 monitor = DriftMonitor(baseline_win_rate=0.80, alert_drop=0.05, min_samples=20)
 ```
 
 **Prometheus metrics:** `aether_request_total`, `aether_ttft_ms{quantile=p50|p95|p99}`, `aether_tokens_per_second`, `aether_kv_hit_rate`, `aether_eagle_accept_rate`
+
+---
+
+## Content Credentials (C2PA)
+
+`aether sign` writes a real [C2PA](https://c2pa.org) manifest store to
+`provenance/c2pa.manifest` inside the package — not a hash chain with C2PA-shaped
+field names:
+
+* a **`c2pa.claim.v2` claim** in deterministic CBOR (RFC 8949 §4.2.1), referencing
+  every assertion by hashed URI;
+* an **assertion store** with the hard binding, `c2pa.actions.v2`,
+  `c2pa.ingredient.v3` for the source checkpoint, and the compiler-pass chain;
+* a **`COSE_Sign1` claim signature** (RFC 9052), detached, with the signer's X.509
+  chain in the `x5chain` protected header;
+* the tree serialized as **JUMBF** boxes (ISO/IEC 19566-5);
+* a **`c2pa.hash.collection.data` hard binding** — one digest per file, so
+  verification reports *which* file changed.
+
+Ed25519 (RFC 8032), CBOR, COSE and JUMBF are implemented in pure Python, so signing
+works on a stock CPython install; `cryptography` is used when present for speed and
+for the ECDSA algorithms.
+
+```bash
+aether sign   ./model.aeg                      # generates a key on first use
+aether verify ./model.aeg                      # exits non-zero if integrity fails
+aether verify ./model.aeg --trust-anchor ca.pem
+```
+
+Verification reports five checks independently — manifest present, structure,
+claim signature, assertion hashes, file binding — because the failures mean
+different things. **Integrity is not identity:** a self-signed manifest proves the
+artifact is unmodified and says nothing about who produced it, and `aether verify`
+states that rather than printing "verified".
 
 ---
 
@@ -412,11 +560,12 @@ RustSDKGenerator().write('./sdk/rust/src/')           # aether_client.rs
 | `aether serve <path.aeg>` | Start inference server |
 | `aether eval <path.aeg>` | Run eval gate CI check |
 | `aether hardware` | Show hardware profile |
+| `aether models` | Show the graded model-family support matrix |
 | `aether hub push <path.aeg>` | Push to Aether Hub CDN |
 | `aether hub pull <model-id>` | Pull from Aether Hub CDN |
 | `aether sdk generate` | Generate TypeScript/Go/Rust SDKs |
-| `aether sign <path.aeg>` | Sign package (C2PA binding) |
-| `aether verify <path.aeg>` | Verify signature + fingerprint |
+| `aether sign <path.aeg>` | Sign with C2PA Content Credentials (CBOR claim + COSE_Sign1 + JUMBF) |
+| `aether verify <path.aeg>` | Verify the claim signature, assertion hashes, and per-file binding |
 
 ---
 

@@ -582,7 +582,7 @@ aether [COMMAND] [OPTIONS]
 | `aether targets list` | List all supported hardware targets |
 | `aether hub push <path.aeg>` | Push artifact to Aether Hub CDN |
 | `aether hub pull <model-id>` | Pull artifact from Aether Hub CDN |
-| `aether sign <path.aeg>` | Sign artifact with C2PA key |
+| `aether sign <path.aeg>` | Sign artifact with C2PA Content Credentials (CBOR claim + COSE_Sign1 + JUMBF manifest store) |
 | `aether verify <path.aeg>` | Verify artifact signature and integrity |
 | `aether sdk generate` | Generate TypeScript / Go / Rust SDK |
 | `aether --help` | Show help for any command |

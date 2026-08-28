@@ -221,5 +221,5 @@ New backends are registered via `BackendRegistry.register()` without changing th
 | `aether.distillation.pipeline` | Logit/feature/reasoning/self-distillation plans |
 | `aether.inference.multimodal` | Unified multimodal graph with ViT-DP and LLM-TP hints |
 | `aether.hub.client` | Content-addressed model registry, push/pull/search |
-| `aether.safety.production_safety` | Jailbreak detection, C2PA watermarking, tenant isolation |
-| `aether.parallelism.distributed` | Ring all-reduce, tensor/pipeline/expert parallelism |
+| `aether.safety.production_safety` | Jailbreak detection, HMAC output disclosure markers, tenant isolation |
+| `aether.parallelism.distributed` | TCP ring collectives (CPU multi-process), tensor/pipeline/expert parallelism |

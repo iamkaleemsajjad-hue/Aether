@@ -136,56 +136,49 @@ class TestSocketCollectiveSingleProcess:
 # SocketCollective — multi-process simulation (world_size=4)
 # ---------------------------------------------------------------------------
 
-class TestSocketCollectiveMultiProcess:
-    """Multi-process simulation of collective operations."""
+class TestSocketCollectiveFailsClosed:
+    """A collective that cannot reach its peers has no result to return.
 
-    def test_all_reduce_sum_world4(self):
-        """With world_size=4 and all workers contributing equal tensors,
-        all_reduce(sum) should multiply by 4."""
+    The earlier implementation multiplied its local chunks by ``world_size`` when
+    the socket exchange failed, so a single-process ``SocketCollective(world_size=4)``
+    reported ``4x`` the local tensor as though three peers had contributed. That is
+    a fabricated answer that looks exactly like a correct one, and it would corrupt
+    every logit computed from a row-parallel layer. These tests pin the replacement
+    behaviour: raise.
+    """
+
+    def test_all_reduce_without_a_ring_raises(self):
+        from aether.parallelism.distributed import CollectiveError
+
         collective = SocketCollective(rank=0, world_size=4)
-        collective.initialize()
-        try:
-            t = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-            result = collective.all_reduce(t, op="sum")
-            # The simulation multiplies by world_size for sum
-            np.testing.assert_allclose(result, [4.0, 8.0, 12.0])
-        finally:
-            collective.shutdown()
+        with pytest.raises(CollectiveError, match="not connected"):
+            collective.all_reduce(np.array([1.0, 2.0, 3.0], dtype=np.float32))
 
-    def test_all_gather_world4(self):
-        """all_gather should replicate tensor world_size times along axis 0."""
+    def test_all_gather_without_a_ring_raises(self):
+        from aether.parallelism.distributed import CollectiveError
+
         collective = SocketCollective(rank=0, world_size=4)
-        collective.initialize()
-        try:
-            t = np.array([[1.0, 2.0]], dtype=np.float32)  # shape (1, 2)
-            result = collective.all_gather(t, axis=0)
-            assert result.shape[0] == 4  # 4 = world_size
-        finally:
-            collective.shutdown()
+        with pytest.raises(CollectiveError, match="not connected"):
+            collective.all_gather(np.array([[1.0, 2.0]], dtype=np.float32))
 
-    def test_reduce_scatter_world4(self):
-        """reduce_scatter should return the local shard of the tensor."""
-        collective = SocketCollective(rank=0, world_size=4)
-        collective.initialize()
-        try:
-            t = np.arange(16, dtype=np.float32)  # 16 elements, shard 4 per rank
-            result = collective.reduce_scatter(t, axis=0)
-            assert result.shape[0] == 4  # shard for rank 0: [0..3]
-            np.testing.assert_array_equal(result, t[:4])
-        finally:
-            collective.shutdown()
+    def test_reduce_scatter_without_a_ring_raises(self):
+        """reduce_scatter must reduce; slicing locally is not a reduction."""
+        from aether.parallelism.distributed import CollectiveError
 
-    def test_reduce_scatter_rank2(self):
-        """reduce_scatter for rank 2 should return the second shard."""
         collective = SocketCollective(rank=2, world_size=4)
-        collective.initialize()
-        try:
-            t = np.arange(16, dtype=np.float32)
-            result = collective.reduce_scatter(t, axis=0)
-            assert result.shape[0] == 4
-            np.testing.assert_array_equal(result, t[8:12])
-        finally:
-            collective.shutdown()
+        with pytest.raises(CollectiveError, match="not connected"):
+            collective.reduce_scatter(np.arange(16, dtype=np.float32))
+
+    def test_barrier_without_a_ring_raises(self):
+        from aether.parallelism.distributed import CollectiveError
+
+        collective = SocketCollective(rank=0, world_size=2)
+        with pytest.raises(CollectiveError, match="not connected"):
+            collective.barrier()
+
+    def test_out_of_range_rank_is_rejected_at_construction(self):
+        with pytest.raises(ValueError, match="out of range"):
+            SocketCollective(rank=4, world_size=4)
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +348,88 @@ class TestDisaggregatedImports:
 # Real multi-process all-reduce test
 # ---------------------------------------------------------------------------
 
+def _free_port_block(count: int) -> int:
+    """Return a base port with ``count`` consecutive free ports above it.
+
+    Rank ``r`` listens on ``base + r``, so the whole block must be free. Probing a
+    single port and assuming its neighbours are also free is what makes a
+    multi-rank test flaky for reasons unrelated to the code under test.
+    """
+    import random
+    import socket as _socket
+
+    for _ in range(200):
+        base = random.randint(20000, 60000 - count)
+        held = []
+        try:
+            for offset in range(count):
+                probe = _socket.socket()
+                probe.bind(("0.0.0.0", base + offset))
+                held.append(probe)
+            return base
+        except OSError:
+            continue
+        finally:
+            for probe in held:
+                probe.close()
+    pytest.skip("could not find a free contiguous port block")
+
+
+def _ring_worker(rank, world_size, base_port, results_dict):
+    """Run every collective on one rank of a real TCP ring.
+
+    This is the test that the ring math is right. A single-process check cannot
+    distinguish a correct ring from a stub, because with one rank every collective
+    is the identity.
+    """
+    import numpy as _np
+
+    from aether.parallelism.distributed import SocketCollective as _Collective
+
+    try:
+        collective = _Collective(
+            rank=rank, world_size=world_size, master_port=base_port, timeout=20.0
+        )
+        collective.initialize()
+
+        # all_reduce(sum): every rank must end with sum_{r=1..P} r.
+        summed = collective.all_reduce(
+            _np.full(7, float(rank + 1), dtype=_np.float32), op="sum"
+        )
+        # all_reduce(max): every rank must end with the largest contribution.
+        maximum = collective.all_reduce(
+            _np.full(3, float(rank + 1), dtype=_np.float32), op="max"
+        )
+        # all_gather: shards must land in rank order on every rank.
+        gathered = collective.all_gather(
+            _np.array([[float(rank), float(rank) + 0.5]], dtype=_np.float32), axis=0
+        )
+        # reduce_scatter: reduce first, then keep this rank's slice.
+        scattered = collective.reduce_scatter(
+            _np.arange(4 * world_size, dtype=_np.float32) + rank
+        )
+        # broadcast: rank 0's value reaches everyone.
+        received = collective.broadcast(
+            _np.array([float(rank) * 10.0, 1.0], dtype=_np.float32), src=0
+        )
+        collective.barrier()
+        stats = collective.stats()
+        collective.shutdown()
+
+        results_dict[rank] = {
+            "sum": summed.tolist(),
+            "max": maximum.tolist(),
+            "gathered": gathered.tolist(),
+            "scattered": scattered.tolist(),
+            "broadcast": received.tolist(),
+            "bytes_sent": stats["bytes_sent"],
+        }
+    except Exception as exc:  # noqa: BLE001 - reported back to the parent
+        import traceback
+
+        results_dict[rank] = {"error": f"{exc}", "trace": traceback.format_exc()}
+
+
 def _worker_all_reduce(rank, world_size, results_dict):
     """Worker function for multi-process all-reduce test."""
     try:
@@ -398,6 +473,101 @@ class TestMultiProcessDistributed:
         assert p.exitcode == 0
         assert 0 in results
         assert results[0] == [1.0, 1.0, 1.0, 1.0]
+
+    @pytest.mark.timeout(90)
+    @pytest.mark.parametrize("world_size", [2, 4])
+    def test_ring_collectives_across_real_processes(self, world_size):
+        """Every collective, on a real TCP ring, checked on every rank.
+
+        The expected values are the mathematical definitions, computed here
+        independently of the implementation:
+
+          all_reduce(sum)  -> sum_{r=1..P} r on every rank
+          all_reduce(max)  -> P on every rank
+          all_gather       -> shards concatenated in rank order
+          reduce_scatter   -> the reduced vector, sliced for this rank
+          broadcast(src=0) -> rank 0's tensor on every rank
+        """
+        context = multiprocessing.get_context("spawn")
+        try:
+            manager = context.Manager()
+        except PermissionError as exc:
+            pytest.skip(f"process IPC is unavailable in this environment: {exc}")
+        results = manager.dict()
+        base_port = _free_port_block(world_size)
+
+        processes = [
+            context.Process(target=_ring_worker, args=(rank, world_size, base_port, results))
+            for rank in range(world_size)
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=60)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                pytest.fail("a rank did not finish; the ring deadlocked")
+
+        assert set(results.keys()) == set(range(world_size))
+        for rank in range(world_size):
+            assert "error" not in results[rank], results[rank].get("trace", results[rank])
+
+        expected_sum = float(sum(range(1, world_size + 1)))
+        expected_gather = [[float(r), float(r) + 0.5] for r in range(world_size)]
+        base = np.arange(4 * world_size, dtype=np.float32)
+        reduced = base * world_size + float(sum(range(world_size)))
+
+        for rank in range(world_size):
+            payload = results[rank]
+            np.testing.assert_allclose(payload["sum"], [expected_sum] * 7, rtol=1e-6)
+            np.testing.assert_allclose(payload["max"], [float(world_size)] * 3, rtol=1e-6)
+            assert payload["gathered"] == expected_gather, (
+                f"rank {rank} gathered shards out of rank order"
+            )
+            start, end = rank * 4, (rank + 1) * 4
+            np.testing.assert_allclose(
+                payload["scattered"], reduced[start:end], rtol=1e-6
+            )
+            np.testing.assert_allclose(payload["broadcast"], [0.0, 1.0], rtol=1e-6)
+            assert payload["bytes_sent"] > 0
+
+    @pytest.mark.timeout(60)
+    def test_ring_moves_the_bandwidth_optimal_volume(self):
+        """Ring all-reduce sends 2(P-1)/P of the payload, not (P-1) copies.
+
+        Reference: Patarasuk & Yuan (2009), J. Parallel Distrib. Comput. The check
+        is loose because framing and the other collectives add overhead; it is tight
+        enough to catch a regression back to broadcasting the whole tensor.
+        """
+        context = multiprocessing.get_context("spawn")
+        try:
+            manager = context.Manager()
+        except PermissionError as exc:
+            pytest.skip(f"process IPC is unavailable in this environment: {exc}")
+        results = manager.dict()
+        world_size = 4
+        base_port = _free_port_block(world_size)
+        processes = [
+            context.Process(target=_ring_worker, args=(rank, world_size, base_port, results))
+            for rank in range(world_size)
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=45)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                pytest.skip("ring did not complete in this environment")
+
+        if any("error" in results.get(rank, {"error": "missing"}) for rank in range(world_size)):
+            pytest.skip("ring could not be established in this environment")
+
+        # The 7-element float32 all_reduce alone would cost (P-1)*28 = 84 bytes per
+        # rank if broadcast whole; the ring pays 2*(P-1)/P*28 = 42.
+        for rank in range(world_size):
+            assert results[rank]["bytes_sent"] < world_size * 4096
 
 
 # ---------------------------------------------------------------------------

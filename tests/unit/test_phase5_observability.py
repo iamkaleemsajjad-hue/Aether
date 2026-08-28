@@ -201,16 +201,27 @@ class TestOTLPExporter:
         assert config["protocol"] == "http/json"
 
     def test_export_to_http_endpoint(self):
+        """The stub collector decompresses, as a real OTLP receiver does.
+
+        The exporter gzips by default and sets ``Content-Encoding: gzip``. Reading
+        the body without honouring that header is what a broken receiver does, so
+        the test does the decoding and asserts the header was actually set.
+        """
+        import gzip
         from http.server import BaseHTTPRequestHandler, HTTPServer
         import threading
 
         from aether.observability.otel import AetherTracer, OTLPExporter
 
         received: list[bytes] = []
+        encodings: list[str] = []
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
-                received.append(self.rfile.read(int(self.headers["Content-Length"])))
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                encoding = self.headers.get("Content-Encoding", "")
+                encodings.append(encoding)
+                received.append(gzip.decompress(body) if encoding == "gzip" else body)
                 self.send_response(200)
                 self.end_headers()
 
@@ -227,6 +238,7 @@ class TestOTLPExporter:
                 f"http://127.0.0.1:{server.server_port}/v1/traces"
             ).export_to_endpoint(tracer)
             assert status == 200
+            assert encodings == ["gzip"]
             assert received and b"resourceSpans" in received[0]
         finally:
             server.shutdown()

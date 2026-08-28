@@ -1214,6 +1214,110 @@ def version() -> None:
     console.print(f"Aether Runtime {AETHER_VERSION}")
 
 
+_LEVEL_STYLE: dict[str, tuple[str, str]] = {
+    "parity_verified": ("✅", "green"),
+    "runs": ("🟡", "yellow"),
+    "known_incorrect": ("🔬", "red"),
+    "unsupported": ("❌", "dim"),
+}
+
+
+@cli.command("models")
+@click.option("--counts", "counts_only", is_flag=True, help="Print only the family counts.")
+@click.option("--level", "level_filter", default=None, help="Filter by support level.")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+def models(counts_only: bool, level_filter: str | None, as_json: bool) -> None:
+    """Show the graded model-family support matrix.
+
+    The numbers printed here are the same ones published in README.md and
+    SUPPORTED_MODELS.md: all three read one registry, so a documented count can
+    never drift away from what the compiler actually implements.
+    """
+    from aether.core.model_families import (
+        MODEL_FAMILIES,
+        SupportLevel,
+        family_counts,
+        support_summary,
+    )
+
+    counts = family_counts()
+    if level_filter is not None:
+        try:
+            wanted = SupportLevel(level_filter)
+        except ValueError:
+            valid = ", ".join(level.value for level in SupportLevel)
+            raise click.BadParameter(f"unknown level {level_filter!r}; expected one of: {valid}") from None
+        rows = [family for family in MODEL_FAMILIES if family.level is wanted]
+    else:
+        rows = list(MODEL_FAMILIES)
+
+    if as_json:
+        payload: dict[str, Any] = {"counts": counts, "summary": support_summary()}
+        if not counts_only:
+            payload["families"] = [
+                {
+                    "key": family.key,
+                    "name": family.name,
+                    "kind": family.kind.value,
+                    "level": family.level.value,
+                    "representative_models": list(family.representative_models),
+                    "numerics": family.numerics,
+                    "detection_keys": list(family.detection_keys),
+                    "aether_family": family.aether_family,
+                    "note": family.note,
+                }
+                for family in rows
+            ]
+        console.print_json(json.dumps(payload))
+        return
+
+    console.print(f"[bold]Aether model-family support[/bold] — {AETHER_VERSION}\n")
+    summary = Table(show_header=True, header_style="bold")
+    summary.add_column("Level")
+    summary.add_column("Families", justify="right")
+    summary.add_column("Guarantee")
+    summary.add_row("✅ parity_verified", str(counts["parity_verified"]),
+                    "logits match the reference (~1e-6), prefill and decode")
+    summary.add_row("🟡 runs", str(counts["runs"]),
+                    "executes with round-trip tests, no per-logit gate")
+    summary.add_row("🔬 known_incorrect", str(counts["known_incorrect"]),
+                    "executes with measured divergence — do not rely on output")
+    summary.add_row("❌ unsupported", str(counts["unsupported"]),
+                    "refused at compile time rather than emitting a wrong artifact")
+    summary.add_row("[bold]executable[/bold]", f"[bold]{counts['executable']}[/bold]",
+                    "parity_verified + runs + known_incorrect")
+    console.print(summary)
+    console.print(
+        f"\n{counts['total']} architecture families · "
+        f"{counts['detection_keys']} detected name / class spellings · "
+        f"{counts['decoder']} decoder, {counts['encoder']} encoder, "
+        f"{counts['encoder_decoder']} encoder-decoder, "
+        f"{counts['ssm_hybrid']} SSM/hybrid, {counts['multimodal']} multimodal\n"
+    )
+    if counts_only:
+        return
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("")
+    table.add_column("Family")
+    table.add_column("Kind")
+    table.add_column("Representative models")
+    table.add_column("Distinguishing contract")
+    for family in rows:
+        mark, style = _LEVEL_STYLE.get(family.level.value, ("?", "white"))
+        detail = family.numerics if family.level.value == "parity_verified" else (
+            family.note or family.numerics
+        )
+        table.add_row(
+            mark,
+            f"[{style}]{_display_text(family.name)}[/{style}]",
+            family.kind.value,
+            _display_text(", ".join(family.representative_models[:3])),
+            _display_text(detail),
+        )
+    console.print(table)
+
+
 @cli.command("eval")
 @click.argument("model")
 @click.option("--domain", default="general", help="Evaluation domain.")
@@ -2245,6 +2349,143 @@ def inspect_aeg(ctx: click.Context, aeg_path: str, as_json: bool) -> None:
         console.print(f"  {f}")
     if len(files) > 20:
         console.print(f"  [dim]... and {len(files) - 20} more[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# aether sign / aether verify — C2PA Content Credentials
+# ---------------------------------------------------------------------------
+
+def _load_trust_anchors(paths: tuple[str, ...]) -> list[bytes]:
+    """Read DER or PEM trust anchors from disk."""
+    anchors: list[bytes] = []
+    for entry in paths:
+        raw = Path(entry).read_bytes()
+        if b"-----BEGIN CERTIFICATE-----" in raw:
+            import base64
+
+            for block in raw.split(b"-----BEGIN CERTIFICATE-----")[1:]:
+                body = block.split(b"-----END CERTIFICATE-----")[0]
+                anchors.append(base64.b64decode(b"".join(body.split())))
+        else:
+            anchors.append(raw)
+    return anchors
+
+
+@cli.command("sign")
+@click.argument("aeg_path", type=click.Path(exists=True, file_okay=False))
+@click.option("--key", "key_path", type=click.Path(), default=None,
+              help="Ed25519 signing seed (32 raw bytes or hex). Generated on first use.")
+@click.option("--cert", "cert_paths", multiple=True, type=click.Path(exists=True),
+              help="DER/PEM certificate chain, leaf first. Self-signed if omitted.")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def sign_aeg(aeg_path: str, key_path: str | None, cert_paths: tuple[str, ...], as_json: bool) -> None:
+    """Sign an AEG package with C2PA Content Credentials.
+
+    Writes a JUMBF manifest store to provenance/c2pa.manifest containing a
+    deterministic-CBOR claim, a collection hard binding over every file in the
+    package, and a detached COSE_Sign1 claim signature.
+    """
+    from aether.provenance.manifest import attach_c2pa_manifest
+
+    chain = _load_trust_anchors(cert_paths) if cert_paths else None
+    try:
+        store_path, manifest = attach_c2pa_manifest(
+            aeg_path, key_path=key_path, certificate_chain=chain
+        )
+    except Exception as exc:  # noqa: BLE001 - surface the reason, not a traceback
+        console.print(f"[red]Signing failed: {exc}[/red]")
+        raise SystemExit(1) from exc
+
+    payload = {
+        "manifest_store": str(store_path),
+        "manifest_label": manifest.c2pa_manifest_label,
+        "signature_algorithm": manifest.c2pa_signature_algorithm,
+        "signer": manifest.c2pa_signer,
+        "files_bound": manifest.c2pa_files_bound,
+        "self_signed": not cert_paths,
+    }
+    if as_json:
+        console.print(RichJSON(json.dumps(payload, indent=2)))
+        return
+    console.print(f"[green]Signed[/green] {aeg_path}")
+    table = Table(show_header=False)
+    table.add_column("Field", style="cyan")
+    table.add_column("Value")
+    for key, value in payload.items():
+        table.add_row(key, _display_text(str(value)))
+    console.print(table)
+    if not cert_paths:
+        console.print(
+            "[yellow]Self-signed:[/yellow] this signature proves the artifact is "
+            "unmodified. It does not establish who produced it — pass --cert with a "
+            "chain from a real CA for that."
+        )
+
+
+
+@cli.command("verify")
+@click.argument("aeg_path", type=click.Path(exists=True, file_okay=False))
+@click.option("--trust-anchor", "anchor_paths", multiple=True, type=click.Path(exists=True),
+              help="DER/PEM trust anchor. Without one, identity is reported as unestablished.")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def verify_aeg(aeg_path: str, anchor_paths: tuple[str, ...], as_json: bool) -> None:
+    """Verify an AEG package's C2PA Content Credentials.
+
+    Checks four things independently: the manifest structure, the COSE_Sign1
+    claim signature, every assertion hash referenced by the claim, and the hard
+    binding against the files on disk. Exits non-zero if integrity fails.
+    """
+    from aether.provenance.manifest import verify_c2pa_manifest
+
+    anchors = _load_trust_anchors(anchor_paths) if anchor_paths else None
+    result = verify_c2pa_manifest(aeg_path, trust_anchors=anchors)
+    if as_json:
+        console.print(RichJSON(json.dumps(result.to_dict(), indent=2)))
+        raise SystemExit(0 if result.integrity_valid else 1)
+
+    checks = [
+        ("manifest present", result.manifest_present),
+        ("structure valid", result.structure_valid),
+        ("claim signature valid", result.claim_signature_valid),
+        ("assertion hashes valid", result.assertions_valid),
+        ("file binding valid", result.binding_valid),
+    ]
+    table = Table(title=f"C2PA verification — {aeg_path}")
+    table.add_column("Check", style="cyan")
+    table.add_column("Result")
+    for name, passed in checks:
+        table.add_row(name, "[green]pass[/green]" if passed else "[red]FAIL[/red]")
+    console.print(table)
+
+    if result.signature is not None and result.signature.certificate is not None:
+        certificate = result.signature.certificate
+        console.print(f"Algorithm: {result.signature.algorithm_name}")
+        console.print(f"Signer:    {_display_text(certificate.subject)}")
+        console.print(f"Validity:  {certificate.not_before} -> {certificate.not_after}")
+    console.print(f"Files bound: {result.files_bound}")
+    for label, entries in (
+        ("changed", result.changed_files),
+        ("missing", result.missing_files),
+    ):
+        if entries:
+            console.print(f"[red]{label}:[/red] {', '.join(entries[:10])}")
+    if result.extra_files:
+        console.print(
+            f"[dim]not covered by the binding ({len(result.extra_files)}): "
+            f"{', '.join(result.extra_files[:5])}[/dim]"
+        )
+    for error in result.errors:
+        console.print(f"[red]*[/red] {_display_text(error)}")
+
+    if result.integrity_valid:
+        console.print("\n[green]Integrity verified.[/green]")
+        if result.trusted:
+            console.print(f"[green]Trusted:[/green] {result.trust_reason}")
+        else:
+            console.print(f"[yellow]Identity not established:[/yellow] {result.trust_reason}")
+    else:
+        console.print("\n[red]Integrity check FAILED.[/red]")
+    raise SystemExit(0 if result.integrity_valid else 1)
 
 
 # ---------------------------------------------------------------------------

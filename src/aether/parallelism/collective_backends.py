@@ -4,15 +4,23 @@ Aether Runtime — Collective Communication Backend Abstraction
 Provides a clear type hierarchy that honestly labels what each collective
 implementation can and cannot do on the current host:
 
-  SocketCollectiveBackend     — CPU reference via stdlib sockets (always works)
-  NCCLCollectiveBackend       — NVIDIA NCCL (requires CUDA multi-GPU)
-  RCCLCollectiveBackend       — AMD RCCL (requires ROCm multi-GPU)
+  SocketCollectiveBackend     — CPU multi-process ring over TCP (always works)
+  P2PCollectiveBackend        — single-process multi-GPU over peer-to-peer copies,
+                                with no NCCL and no torch.distributed
+  NCCLCollectiveBackend       — NVIDIA NCCL (multi-process / multi-node CUDA)
+  RCCLCollectiveBackend       — AMD RCCL (multi-process / multi-node ROCm)
   PlaceholderCollectiveBackend— Fail-closed stub for unimplemented backends
+
+Which one is NCCL-free, precisely: the socket ring (CPU) and the P2P backend
+(single-process multi-GPU). Multi-process or multi-node GPU collectives require a
+vendor library, and asking for one on a host without it raises rather than
+silently degrading.
 
 Usage:
     from aether.parallelism.collective_backends import get_collective_backend
-    backend = get_collective_backend("socket")   # always safe
-    backend = get_collective_backend("nccl")     # raises if CUDA unavailable
+    backend = get_collective_backend("socket")            # always safe
+    backend = get_collective_backend("p2p")               # local multi-GPU, no NCCL
+    backend = get_collective_backend("nccl")              # raises if CUDA unavailable
 """
 
 from __future__ import annotations
@@ -64,10 +72,12 @@ class CollectiveBackend(ABC):
 
 
 class SocketCollectiveBackend(CollectiveBackend):
-    """CPU reference collective using stdlib sockets.
+    """CPU multi-process ring collective over stdlib sockets.
 
-    Always available. Suitable for single-machine multi-process testing.
-    NOT suitable for production multi-GPU inference due to bandwidth constraints.
+    Always available, and the ring math is bandwidth-optimal: each rank moves
+    2*(P-1)/P of the payload. It is limited by TCP, not by the algorithm, so it is
+    the right choice for CPU multi-process execution and the wrong one for GPUs —
+    use P2PCollectiveBackend (single process) or NCCL/RCCL (multi-process) there.
     """
 
     mode = "cpu_socket_mp"
@@ -261,6 +271,98 @@ class RCCLCollectiveBackend(CollectiveBackend):
         dist.barrier()
 
 
+class P2PCollectiveBackend(CollectiveBackend):
+    """Single-process multi-GPU collectives over peer-to-peer device copies.
+
+    This is the NCCL-free GPU path.  It works inside one process across all local
+    accelerators, using device-to-device tensor copies scheduled by
+    :mod:`aether.parallelism.p2p_ring`, which selects one-shot, two-shot or ring
+    from the measured link latency and bandwidth.
+
+    It is production-capable for its scope and only for its scope: one process, one
+    node.  Multi-process or multi-node GPU collectives need NCCL or RCCL, and this
+    backend says so rather than pretending otherwise.
+
+    Unlike the socket and NCCL backends, its operations take a *list* of per-device
+    tensors rather than one tensor, because in a single process all shards are
+    addressable at once — that is exactly what makes the NCCL-free schedule
+    possible.
+    """
+
+    mode = "p2p_multi_gpu_single_process"
+    production_capable = True
+
+    def __init__(self, devices: list[str] | None = None) -> None:
+        self.devices = list(devices or [])
+        self._collective: Any = None
+
+    def initialize(self, rank: int, world_size: int, **kwargs: Any) -> None:
+        devices = kwargs.get("devices") or self.devices
+        if not devices:
+            devices = [f"cuda:{index}" for index in range(world_size)]
+        if len(devices) != world_size:
+            raise CollectiveBackendError(
+                f"P2P backend needs one device per rank: got {len(devices)} devices "
+                f"for world_size {world_size}"
+            )
+        try:
+            from aether.parallelism.p2p_ring import P2PRingCollective
+        except ImportError as exc:
+            raise CollectiveBackendError(
+                "P2P collectives require PyTorch for device tensors"
+            ) from exc
+        self.devices = list(devices)
+        self._collective = P2PRingCollective(self.devices)
+        logger.info(
+            "P2PCollectiveBackend initialized",
+            devices=self.devices,
+            world_size=world_size,
+        )
+
+    def shutdown(self) -> None:
+        self._collective = None
+
+    def _require(self) -> Any:
+        if self._collective is None:
+            raise CollectiveBackendError(
+                "P2P backend not initialized; call initialize() first"
+            )
+        return self._collective
+
+    def all_reduce(self, data: Any, op: str = "sum") -> Any:
+        """All-reduce a list of per-device tensors."""
+        return self._require().all_reduce(data, op=op)
+
+    def all_gather(self, data: Any, dim: int = -1) -> Any:
+        """All-gather a list of per-device tensors, concatenated in device order."""
+        return self._require().all_gather(data, dim=dim)
+
+    def reduce_to_root(self, data: Any, op: str = "sum", root: int = 0) -> Any:
+        """Tree-reduce onto one device — the shape tensor-parallel decode needs."""
+        return self._require().reduce_to_root(data, op=op, root=root)
+
+    def broadcast(self, data: Any, src: int = 0) -> Any:
+        """Replicate ``data[src]`` to every device."""
+        collective = self._require()
+        source = data[src] if isinstance(data, (list, tuple)) else data
+        return [
+            source.to(device) if source.device != device else source.clone()
+            for device in collective.devices
+        ]
+
+    def barrier(self) -> None:
+        """Wait for every device's queued work.
+
+        In one process the ranks are not independent schedulers, so there is no
+        rendezvous to perform — the meaningful synchronization is the device one.
+        """
+        collective = self._require()
+        collective._synchronize()
+
+    def stats(self) -> dict[str, Any]:
+        return self._require().stats()
+
+
 class PlaceholderCollectiveBackend(CollectiveBackend):
     """Fail-closed stub for unimplemented or unsupported backends.
 
@@ -299,6 +401,7 @@ class PlaceholderCollectiveBackend(CollectiveBackend):
 
 _REGISTRY: dict[str, type[CollectiveBackend]] = {
     "socket": SocketCollectiveBackend,
+    "p2p": P2PCollectiveBackend,
     "nccl": NCCLCollectiveBackend,
     "rccl": RCCLCollectiveBackend,
     "rocm": RCCLCollectiveBackend,
@@ -309,7 +412,7 @@ def get_collective_backend(name: str, **kwargs: Any) -> CollectiveBackend:
     """Return the collective backend for the given name.
 
     Args:
-        name: One of "socket", "nccl", "rccl", "rocm".
+        name: One of "socket", "p2p", "nccl", "rccl", "rocm".
         **kwargs: Passed to the backend constructor (e.g. master_addr, master_port).
 
     Returns:
@@ -325,7 +428,8 @@ def get_collective_backend(name: str, **kwargs: Any) -> CollectiveBackend:
             f"Unknown collective backend: {name!r}. "
             f"Available: {sorted(_REGISTRY.keys())}"
         )
-    backend = cls(**{k: v for k, v in kwargs.items() if k in ("master_addr", "master_port", "name", "reason")})
+    accepted = ("master_addr", "master_port", "name", "reason", "devices")
+    backend = cls(**{k: v for k, v in kwargs.items() if k in accepted})
     logger.debug("Collective backend created", backend=name, mode=backend.mode, production=backend.production_capable)
     return backend
 
@@ -334,6 +438,7 @@ __all__ = [
     "CollectiveBackend",
     "CollectiveBackendError",
     "NCCLCollectiveBackend",
+    "P2PCollectiveBackend",
     "PlaceholderCollectiveBackend",
     "RCCLCollectiveBackend",
     "SocketCollectiveBackend",

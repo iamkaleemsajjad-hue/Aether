@@ -1,46 +1,69 @@
 """
-Aether Runtime — Complete Distributed Execution Engine.
+Aether Runtime — Distributed Execution Engine.
 
-Implements real multi-process distributed inference using Python's
-multiprocessing + socket-based collective operations. This provides:
+Multi-process distributed inference over Python's multiprocessing and socket-based
+collectives:
 
   - Tensor Parallelism (TP): Split attention heads and FFN dimensions
   - Pipeline Parallelism (PP): Split transformer layers across processes
   - Data Parallelism (DP): Replicate model, split batch
   - Expert Parallelism (EP): Distribute MoE experts across nodes
-  - NCCL-compatible collective operations (all-reduce, all-gather, etc.)
+  - Ring collectives — all-reduce, all-gather, reduce-scatter, broadcast, barrier
   - Fault tolerance with automatic worker restart
   - Disaggregated prefill/decode (separate prefill and decode pools)
   - KV cache transfer between prefill and decode workers
   - Session migration during worker failures
 
+Which collective runs where
+---------------------------
+Aether has three collective paths, and conflating them is how "multi-GPU
+ring-allreduce without NCCL" becomes an overclaim.  Precisely:
+
+``SocketCollective`` (this module)
+    Ring collectives over TCP, for **CPU** multi-process execution.  No NCCL, no
+    ``torch.distributed``, no GPU.  Verified across real processes up to
+    ``world_size=8`` in ``tests/unit/test_distributed_complete.py``.
+
+:mod:`aether.parallelism.p2p_ring`
+    Ring collectives over **CUDA/ROCm peer-to-peer device copies**, for
+    single-process multi-GPU execution.  Also NCCL-free, and this is the path the
+    tensor-parallel executor uses.
+
+``NCCLCollectiveBackend`` / ``RCCLCollectiveBackend``
+    Vendor collectives via ``torch.distributed``, for **multi-process multi-GPU**
+    and multi-node.  This path *does* require NCCL or RCCL; Aether does not
+    reimplement inter-node GPU transport, and requesting it on a host without it
+    fails closed rather than silently degrading.
+
+Every collective here fails closed.  A ring that loses a peer raises
+:class:`CollectiveError` rather than returning an approximation — the earlier
+implementation multiplied local chunks by ``world_size`` on socket failure, which
+returned a fabricated result indistinguishable from a correct one.
+
 Research basis:
+  - Ring all-reduce: Patarasuk & Yuan, J. Parallel Distrib. Comput. 69(2), 2009
   - Megatron-LM tensor parallelism (Shoeybi et al., 2019)
   - Pipeline parallelism (Huang et al., GPipe 2019)
   - vLLM disaggregated prefill/decode (2024)
   - NIXL network interconnect for KV transfer (2025)
-  - SwarmKV multi-agent KV coordination (2026)
 """
 
 from __future__ import annotations
 
 import json
-import multiprocessing
-import os
 import queue
 import socket
 import struct
 import threading
 import time
-import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
 
 import numpy as np
 
-from aether.utils.logging import get_logger
 from aether.parallelism.sharding import balanced_partition
+from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -108,16 +131,69 @@ class CollectiveMessage:
         )
 
 
-class SocketCollective:
+class CollectiveError(RuntimeError):
+    """Raised when a collective cannot be completed.
+
+    Collectives fail closed.  A ring all-reduce that loses a peer has *no* valid
+    result, and returning an approximation would corrupt every logit downstream
+    while looking like success.  The previous implementation multiplied its local
+    chunks by ``world_size`` when the socket exchange failed, which produced a
+    plausible number with no relationship to the other ranks' data; that path is
+    gone.
     """
-    Real socket-based collective communication backend.
 
-    Implements ring-allreduce for efficient bandwidth utilization —
-    the same algorithm used by NCCL for GPU collectives.
 
-    Algorithm: Ring All-Reduce (Baidu, 2017)
-    - Reduces communication volume from O(N*D) to O(2D) per rank
-    - N = number of workers, D = tensor size
+def _reduce_into(target: np.ndarray, incoming: np.ndarray, op: str) -> None:
+    """Apply one reduction step in place."""
+    if op in ("sum", "avg"):
+        target += incoming
+    elif op == "max":
+        np.maximum(target, incoming, out=target)
+    elif op == "min":
+        np.minimum(target, incoming, out=target)
+    elif op == "prod":
+        target *= incoming
+    else:
+        raise CollectiveError(f"unsupported reduction {op!r}")
+
+
+def _accumulation_dtype(dtype: np.dtype) -> np.dtype:
+    """Choose the dtype a ring reduction accumulates in.
+
+    Half precision accumulates in float32 and is cast back at the end.  Summing
+    ``world_size`` float16 partials in float16 loses low-order bits at every hop,
+    and the error grows with the ring length — the same reason NCCL offers
+    higher-precision accumulation.  Every other dtype reduces in itself, so
+    integer collectives stay exact.
+    """
+    if dtype == np.float16:
+        return np.dtype(np.float32)
+    return dtype
+
+
+class SocketCollective:
+    """Ring collectives over TCP, for CPU multi-process execution.
+
+    Implements the bandwidth-optimal ring algorithm (Patarasuk & Yuan 2009): an
+    all-reduce is a ring reduce-scatter followed by a ring all-gather, so each rank
+    sends and receives ``2·(P−1)/P·D`` bytes instead of the ``(P−1)·D`` a
+    gather-to-root would move.
+
+    Three properties this implementation holds and its predecessor did not:
+
+    * **Connections are persistent.** One socket to the successor and one from the
+      predecessor, established once at :meth:`initialize`. Opening a fresh TCP
+      connection per chunk per step — with a handshake and slow-start each time —
+      made the "optimal" algorithm slower than sending the whole tensor once.
+    * **Messages are matched.** Each rank reads only from its predecessor's
+      socket, so a step cannot consume a message another rank happened to send
+      first. Accepting from a listening socket per receive gave no such guarantee.
+    * **It fails closed.** Any transport error raises :class:`CollectiveError`.
+
+    Ranks exchange concurrently: at each step a rank sends to its successor while
+    receiving from its predecessor. That has to overlap — a payload larger than the
+    socket buffers would otherwise deadlock the whole ring with every rank blocked
+    in ``sendall`` and nobody reading.
     """
 
     def __init__(
@@ -128,6 +204,10 @@ class SocketCollective:
         master_port: int = 29500,
         timeout: float = 30.0,
     ) -> None:
+        if world_size < 1:
+            raise ValueError(f"world_size must be >= 1, got {world_size}")
+        if not 0 <= rank < world_size:
+            raise ValueError(f"rank {rank} out of range for world_size {world_size}")
         self.rank = rank
         self.world_size = world_size
         self.master_addr = master_addr
@@ -138,238 +218,349 @@ class SocketCollective:
         self._recv_rank = (rank - 1) % world_size
         self._sockets: dict[int, socket.socket] = {}
         self._server: socket.socket | None = None
+        self._send_sock: socket.socket | None = None
+        self._recv_sock: socket.socket | None = None
+        self._pool: Any = None
+        self._bytes_sent = 0
+        self._bytes_received = 0
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
+    @property
+    def is_ring_connected(self) -> bool:
+        """Whether the ring is established and collectives can actually run."""
+        return self._connected and (
+            self.world_size == 1
+            or (self._send_sock is not None and self._recv_sock is not None)
+        )
 
     def initialize(self) -> None:
-        """Initialize the socket communication group."""
+        """Bind, then form the ring by connecting to the successor.
+
+        Connecting and accepting happen concurrently. A ring where every rank
+        connects before any rank accepts cannot form: rank 0's connect has nowhere
+        to land until rank 1 is already accepting.
+        """
         if self.world_size == 1:
             self._connected = True
             return
 
-        # Start listening server for incoming connections
+        from concurrent.futures import ThreadPoolExecutor
+
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        port = self.master_port + self.rank
-        self._server.bind(("0.0.0.0", port))
-        self._server.listen(self.world_size)
+        listen_port = self.master_port + self.rank
+        try:
+            self._server.bind(("0.0.0.0", listen_port))
+        except OSError as exc:
+            raise CollectiveError(
+                f"rank {self.rank} could not bind port {listen_port}: {exc}"
+            ) from exc
+        self._server.listen(8)
         self._server.settimeout(self.timeout)
 
-        self._connected = True
-        logger.info(f"SocketCollective rank {self.rank} initialized on port {port}")
-
-    def _read_exact(self, sock: socket.socket, num_bytes: int) -> bytes:
-        """Read exactly num_bytes from a socket."""
-        buf = bytearray()
-        while len(buf) < num_bytes:
-            chunk = sock.recv(min(num_bytes - len(buf), 65536))
-            if not chunk:
-                raise ConnectionError("Socket closed prematurely")
-            buf.extend(chunk)
-        return bytes(buf)
-
-    def _send_tensor(self, tensor: np.ndarray, dst_rank: int, op_tag: str = "send") -> None:
-        """Send a tensor to a specific rank."""
-        if dst_rank == self.rank:
-            return
-        data = np.ascontiguousarray(tensor).tobytes()
-        msg = CollectiveMessage(
-            op=op_tag,
-            rank=self.rank,
-            world_size=self.world_size,
-            data=data,
-            dtype=str(tensor.dtype),
-            shape=list(tensor.shape),
-            dst=dst_rank,
-        )
-        raw = msg.to_bytes()
-        dst_port = self.master_port + dst_rank
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aether-ring")
+        connect_future = self._pool.submit(self._connect_to_successor)
         try:
-            sock.connect((self.master_addr, dst_port))
-            sock.sendall(struct.pack(">I", len(raw)) + raw)
-        finally:
-            sock.close()
-
-    def _recv_tensor(self) -> tuple[np.ndarray, int, str]:
-        """Receive a tensor on the listening socket. Returns (tensor, src_rank, op)."""
-        if self._server is None:
-            raise RuntimeError("Socket server not initialized")
-        client, _ = self._server.accept()
+            client, _ = self._server.accept()
+        except (OSError, socket.timeout) as exc:
+            connect_future.cancel()
+            self.shutdown()
+            raise CollectiveError(
+                f"rank {self.rank} timed out waiting for rank {self._recv_rank} "
+                f"to join the ring"
+            ) from exc
         client.settimeout(self.timeout)
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._recv_sock = client
         try:
-            hdr = self._read_exact(client, 4)
-            length = struct.unpack(">I", hdr)[0]
-            raw = self._read_exact(client, length)
-            msg = CollectiveMessage.from_bytes(raw)
-            arr = np.frombuffer(msg.data, dtype=np.dtype(msg.dtype)).reshape(msg.shape)
-            return arr.copy(), msg.rank, msg.op
-        finally:
-            client.close()
+            self._send_sock = connect_future.result(timeout=self.timeout)
+        except Exception as exc:  # noqa: BLE001 - normalized below
+            self.shutdown()
+            raise CollectiveError(
+                f"rank {self.rank} could not connect to rank {self._send_rank}: {exc}"
+            ) from exc
+        self._connected = True
+        logger.info(
+            "ring established: rank %d listens on %d, sends to rank %d",
+            self.rank, listen_port, self._send_rank,
+        )
 
-    def all_reduce(self, tensor: np.ndarray, op: str = "sum") -> np.ndarray:
-        """
-        True Ring All-Reduce implementation (Baidu / NCCL ring algorithm).
-
-        For world_size == 1, returns the tensor unchanged.
-        For multiple workers, executes Ring Reduce-Scatter followed by Ring All-Gather
-        over connected worker sockets, reducing communication to O(2 * (N-1)/N * D).
-        """
-        if self.world_size == 1 or not self._connected:
-            return tensor.copy()
-
-        orig_shape = tensor.shape
-        orig_dtype = tensor.dtype
-        flat = np.ascontiguousarray(tensor, dtype=np.float32).ravel()
-        total_len = flat.size
-
-        # Pad to be divisible by world_size if needed
-        pad_len = (self.world_size - (total_len % self.world_size)) % self.world_size
-        if pad_len > 0:
-            flat = np.pad(flat, (0, pad_len), mode="constant", constant_values=0.0)
-
-        chunk_size = flat.size // self.world_size
-        chunks = [flat[i * chunk_size : (i + 1) * chunk_size].copy() for i in range(self.world_size)]
-
-        # If running in multi-process group with socket server active
-        if self._server is not None:
+    def _connect_to_successor(self) -> socket.socket:
+        """Dial the successor, retrying until it is listening."""
+        target_port = self.master_port + self._send_rank
+        deadline = time.monotonic() + self.timeout
+        last: OSError | None = None
+        while time.monotonic() < deadline:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
             try:
-                # 1. Ring Reduce-Scatter phase (world_size - 1 steps)
-                for step in range(self.world_size - 1):
-                    send_idx = (self.rank - step) % self.world_size
-                    recv_idx = (self.rank - step - 1) % self.world_size
-
-                    # Send chunk send_idx to (rank + 1) % W
-                    self._send_tensor(chunks[send_idx], self._send_rank, op_tag="reduce_scatter")
-                    # Receive chunk recv_idx from (rank - 1) % W
-                    recv_chunk, src, _ = self._recv_tensor()
-
-                    # In-place reduction
-                    if op == "sum" or op == "avg":
-                        chunks[recv_idx] += recv_chunk
-                    elif op == "max":
-                        chunks[recv_idx] = np.maximum(chunks[recv_idx], recv_chunk)
-                    elif op == "min":
-                        chunks[recv_idx] = np.minimum(chunks[recv_idx], recv_chunk)
-
-                # 2. Ring All-Gather phase (world_size - 1 steps)
-                for step in range(self.world_size - 1):
-                    send_idx = (self.rank - step + 1) % self.world_size
-                    recv_idx = (self.rank - step) % self.world_size
-
-                    self._send_tensor(chunks[send_idx], self._send_rank, op_tag="all_gather")
-                    recv_chunk, src, _ = self._recv_tensor()
-                    chunks[recv_idx] = recv_chunk
-
-            except (socket.timeout, ConnectionError, OSError) as exc:
-                logger.debug(f"Direct socket ring exchange not active ({exc}); computing rank reduce")
-                # Fallback for single-rank execution of multi-process structure
-                if op == "sum":
-                    chunks = [c * self.world_size for c in chunks]
-        else:
-            if op == "sum":
-                chunks = [c * self.world_size for c in chunks]
-
-        # Assemble reduced chunks
-        result_flat = np.concatenate(chunks)
-        if pad_len > 0:
-            result_flat = result_flat[:total_len]
-
-        if op == "avg":
-            result_flat /= float(self.world_size)
-
-        return result_flat.reshape(orig_shape).astype(orig_dtype)
-
-    def all_gather(self, tensor: np.ndarray, axis: int = 0) -> np.ndarray:
-        """
-        Ring All-Gather across all ranks.
-        Each rank distributes its shard along `axis` so all ranks receive all shards.
-        """
-        if self.world_size == 1 or not self._connected:
-            return tensor.copy()
-
-        shards = [None] * self.world_size
-        shards[self.rank] = tensor.copy()
-
-        if self._server is not None:
-            try:
-                # Ring circulation of shards (world_size - 1 steps)
-                curr_shard = tensor.copy()
-                for step in range(self.world_size - 1):
-                    send_rank_idx = (self.rank - step) % self.world_size
-                    recv_rank_idx = (self.rank - step - 1) % self.world_size
-
-                    self._send_tensor(shards[send_rank_idx], self._send_rank, op_tag="all_gather")
-                    recv_chunk, src, _ = self._recv_tensor()
-                    shards[recv_rank_idx] = recv_chunk
-            except (socket.timeout, ConnectionError, OSError):
-                # If standalone, replicate local tensor
-                shards = [tensor.copy() for _ in range(self.world_size)]
-
-        return np.concatenate([s if s is not None else tensor for s in shards], axis=axis)
-
-    def reduce_scatter(self, tensor: np.ndarray, axis: int = 0) -> np.ndarray:
-        """
-        Reduce and scatter tensor shards along `axis`.
-        Each rank receives its dedicated reduced shard.
-        """
-        if self.world_size == 1 or not self._connected:
-            return tensor.copy()
-
-        start, end = balanced_partition(tensor.shape[axis], self.world_size)[self.rank]
-        slices = [slice(None)] * tensor.ndim
-        slices[axis] = slice(start, end)
-        return tensor[tuple(slices)].copy()
-
-    def broadcast(self, tensor: np.ndarray, src: int = 0) -> np.ndarray:
-        """
-        Broadcast tensor from source rank to all other ranks.
-        """
-        if self.world_size == 1 or not self._connected:
-            return tensor.copy()
-
-        if self._server is not None:
-            try:
-                if self.rank == src:
-                    for dst in range(self.world_size):
-                        if dst != self.rank:
-                            self._send_tensor(tensor, dst, op_tag="broadcast")
-                    return tensor.copy()
-                else:
-                    recv_arr, src_id, _ = self._recv_tensor()
-                    return recv_arr.astype(tensor.dtype)
-            except (socket.timeout, ConnectionError, OSError):
-                pass
-        return tensor.copy()
-
-    def barrier(self) -> None:
-        """
-        Barrier synchronization across all ranks.
-        """
-        if self.world_size <= 1 or not self._connected:
-            return
-        if self._server is not None:
-            try:
-                token = np.array([1], dtype=np.int32)
-                if self.rank == 0:
-                    for dst in range(1, self.world_size):
-                        self._send_tensor(token, dst, op_tag="barrier")
-                else:
-                    self._recv_tensor()
-            except (socket.timeout, ConnectionError, OSError):
-                pass
+                sock.connect((self.master_addr, target_port))
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                return sock
+            except OSError as exc:
+                last = exc
+                sock.close()
+                time.sleep(0.02)
+        raise CollectiveError(
+            f"rank {self.rank} could not reach rank {self._send_rank} on port "
+            f"{target_port}: {last}"
+        )
 
     def shutdown(self) -> None:
-        """Close all connections."""
-        if self._server:
-            try:
-                self._server.close()
-            except Exception:  # noqa: BLE001
-                pass
+        """Close all connections and release the thread used for overlap."""
+        for sock in (self._send_sock, self._recv_sock, self._server):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
         for sock in self._sockets.values():
             try:
                 sock.close()
-            except Exception:  # noqa: BLE001
+            except OSError:
                 pass
+        self._sockets.clear()
+        self._send_sock = self._recv_sock = self._server = None
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
+            self._pool = None
+        self._connected = False
+
+    # ── framed transport ──────────────────────────────────────────────────────
+
+    def _read_exact(self, sock: socket.socket, num_bytes: int) -> bytes:
+        """Read exactly ``num_bytes``; a short read is a failure, not a result."""
+        buffer = bytearray()
+        view = memoryview(bytearray(num_bytes))
+        received = 0
+        while received < num_bytes:
+            try:
+                count = sock.recv_into(view[received:], num_bytes - received)
+            except (OSError, socket.timeout) as exc:
+                raise CollectiveError(f"ring read failed after {received} bytes: {exc}") from exc
+            if not count:
+                raise CollectiveError(
+                    f"peer closed the ring after {received} of {num_bytes} bytes"
+                )
+            received += count
+        del buffer
+        self._bytes_received += num_bytes
+        return bytes(view)
+
+    def _exchange(self, payload: bytes) -> bytes:
+        """Send ``payload`` to the successor while receiving from the predecessor.
+
+        The send runs on the helper thread so both directions are in flight at
+        once. Doing them in sequence deadlocks as soon as a payload exceeds the
+        kernel socket buffers, which for real activations it always does.
+        """
+        if self._send_sock is None or self._recv_sock is None or self._pool is None:
+            raise CollectiveError(
+                "ring is not connected; call initialize() before a collective"
+            )
+        frame = struct.pack(">Q", len(payload)) + payload
+
+        def _send() -> None:
+            try:
+                self._send_sock.sendall(frame)  # type: ignore[union-attr]
+            except (OSError, socket.timeout) as exc:
+                raise CollectiveError(f"ring send failed: {exc}") from exc
+
+        future = self._pool.submit(_send)
+        try:
+            header = self._read_exact(self._recv_sock, 8)
+            length = int(struct.unpack(">Q", header)[0])
+            body = self._read_exact(self._recv_sock, length)
+        finally:
+            # Surface a send failure even when the read already raised, so a
+            # half-broken ring is not reported as a read-only problem.
+            future.result(timeout=self.timeout)
+        self._bytes_sent += len(frame)
+        return body
+
+    # ── collectives ───────────────────────────────────────────────────────────
+
+    def _chunk(self, flat: np.ndarray) -> tuple[list[np.ndarray], int]:
+        """Split a flat buffer into ``world_size`` equal chunks, zero-padded."""
+        total = flat.size
+        pad = (self.world_size - (total % self.world_size)) % self.world_size
+        if pad:
+            flat = np.concatenate([flat, np.zeros(pad, dtype=flat.dtype)])
+        width = flat.size // self.world_size
+        return [flat[i * width:(i + 1) * width].copy() for i in range(self.world_size)], pad
+
+    def all_reduce(self, tensor: np.ndarray, op: str = "sum") -> np.ndarray:
+        """Ring all-reduce: reduce-scatter followed by all-gather.
+
+        Communication volume is ``2*(P-1)/P*D`` bytes per rank, against ``(P-1)*D``
+        for a gather-to-root, and the reduction runs in a fixed ring order so the
+        result is reproducible run to run.
+
+        Raises:
+            CollectiveError: If the ring is not connected or a peer fails. There is
+                no approximate answer to return.
+        """
+        if self.world_size == 1:
+            return tensor.copy()
+        if not self.is_ring_connected:
+            raise CollectiveError(
+                f"all_reduce needs a connected ring of {self.world_size} ranks; "
+                f"rank {self.rank} is not connected. Every rank must construct a "
+                "SocketCollective and call initialize()."
+            )
+        original_shape, original_dtype = tensor.shape, tensor.dtype
+        work_dtype = _accumulation_dtype(original_dtype)
+        chunks, pad = self._chunk(
+            np.ascontiguousarray(tensor, dtype=work_dtype).ravel()
+        )
+
+        # Phase 1 - reduce-scatter. After P-1 steps chunk[(rank+1) % P] holds the
+        # fully reduced values for that slice.
+        for step in range(self.world_size - 1):
+            send_index = (self.rank - step) % self.world_size
+            recv_index = (self.rank - step - 1) % self.world_size
+            incoming = self._exchange(chunks[send_index].tobytes())
+            received = np.frombuffer(incoming, dtype=work_dtype)
+            if received.size != chunks[recv_index].size:
+                raise CollectiveError(
+                    f"rank {self.rank} received {received.size} elements at "
+                    f"reduce-scatter step {step}, expected {chunks[recv_index].size}"
+                )
+            _reduce_into(chunks[recv_index], received, op)
+
+        # Phase 2 - all-gather. Circulate the reduced chunks until every rank
+        # holds all of them.
+        for step in range(self.world_size - 1):
+            send_index = (self.rank - step + 1) % self.world_size
+            recv_index = (self.rank - step) % self.world_size
+            incoming = self._exchange(chunks[send_index].tobytes())
+            received = np.frombuffer(incoming, dtype=work_dtype)
+            if received.size != chunks[recv_index].size:
+                raise CollectiveError(
+                    f"rank {self.rank} received {received.size} elements at "
+                    f"all-gather step {step}, expected {chunks[recv_index].size}"
+                )
+            chunks[recv_index] = received.copy()
+
+        flat = np.concatenate(chunks)
+        if pad:
+            flat = flat[:flat.size - pad]
+        if op == "avg":
+            flat = flat / np.array(self.world_size, dtype=work_dtype)
+        return flat.reshape(original_shape).astype(original_dtype, copy=False)
+
+    def reduce_scatter(self, tensor: np.ndarray, axis: int = 0, op: str = "sum") -> np.ndarray:
+        """Ring reduce-scatter: reduce across ranks, keep only this rank's shard.
+
+        This *reduces*. The previous implementation returned a local slice with no
+        communication at all, which is a scatter of un-reduced data - a silently
+        wrong answer wherever a row-parallel layer depended on it.
+        """
+        if self.world_size == 1:
+            return tensor.copy()
+        if not self.is_ring_connected:
+            raise CollectiveError(
+                f"reduce_scatter needs a connected ring of {self.world_size} ranks; "
+                f"rank {self.rank} is not connected"
+            )
+        reduced = self.all_reduce(tensor, op=op)
+        start, end = balanced_partition(reduced.shape[axis], self.world_size)[self.rank]
+        slices: list[Any] = [slice(None)] * reduced.ndim
+        slices[axis] = slice(start, end)
+        return reduced[tuple(slices)].copy()
+
+    def all_gather(self, tensor: np.ndarray, axis: int = 0) -> np.ndarray:
+        """Ring all-gather: every rank ends with every rank's shard, in rank order.
+
+        Shard order is by rank, always. A gather whose order depends on arrival time
+        concatenates activations differently on different ranks, which is a
+        correctness bug that only appears under load.
+        """
+        if self.world_size == 1:
+            return tensor.copy()
+        if not self.is_ring_connected:
+            raise CollectiveError(
+                f"all_gather needs a connected ring of {self.world_size} ranks; "
+                f"rank {self.rank} is not connected"
+            )
+        contiguous = np.ascontiguousarray(tensor)
+        shards: list[np.ndarray | None] = [None] * self.world_size
+        shards[self.rank] = contiguous.copy()
+        payload = contiguous.tobytes()
+        for step in range(self.world_size - 1):
+            incoming = self._exchange(payload)
+            # The buffer arriving at step s originated (s+1) hops upstream.
+            source = (self.rank - step - 1) % self.world_size
+            shards[source] = (
+                np.frombuffer(incoming, dtype=contiguous.dtype)
+                .reshape(contiguous.shape)
+                .copy()
+            )
+            payload = incoming
+        if any(shard is None for shard in shards):
+            raise CollectiveError("all_gather did not receive every rank's shard")
+        return np.concatenate([shard for shard in shards if shard is not None], axis=axis)
+
+    def broadcast(self, tensor: np.ndarray, src: int = 0) -> np.ndarray:
+        """Broadcast from ``src`` by passing the buffer once around the ring.
+
+        Each rank forwards what it received, so the payload crosses each link
+        exactly once instead of leaving one sender's link as a shared bottleneck.
+        """
+        if self.world_size == 1:
+            return tensor.copy()
+        if not 0 <= src < self.world_size:
+            raise CollectiveError(f"broadcast src {src} out of range")
+        if not self.is_ring_connected:
+            raise CollectiveError(
+                f"broadcast needs a connected ring of {self.world_size} ranks; "
+                f"rank {self.rank} is not connected"
+            )
+        contiguous = np.ascontiguousarray(tensor)
+        payload = contiguous.tobytes()
+        result = contiguous.copy()
+        for step in range(self.world_size - 1):
+            incoming = self._exchange(payload)
+            # A rank adopts the value once the wavefront from src reaches it.
+            if (self.rank - src) % self.world_size == step + 1:
+                result = (
+                    np.frombuffer(incoming, dtype=contiguous.dtype)
+                    .reshape(contiguous.shape)
+                    .copy()
+                )
+            payload = incoming
+        return result
+
+    def barrier(self) -> None:
+        """Two-phase ring barrier: no rank proceeds until every rank arrived.
+
+        Both phases are required. One pass around the ring proves only that every
+        rank *sent*; the return trip is what proves every rank also received, which
+        is the guarantee a barrier exists to give.
+        """
+        if self.world_size == 1:
+            return
+        if not self.is_ring_connected:
+            raise CollectiveError(
+                f"barrier needs a connected ring of {self.world_size} ranks; "
+                f"rank {self.rank} is not connected"
+            )
+        token = np.array([self.rank], dtype=np.int32).tobytes()
+        for _ in range(2 * (self.world_size - 1)):
+            token = self._exchange(token)
+
+    def stats(self) -> dict[str, Any]:
+        """Bytes moved, for checking the ring's 2(P-1)/P scaling in a benchmark."""
+        return {
+            "rank": self.rank,
+            "world_size": self.world_size,
+            "connected": self.is_ring_connected,
+            "bytes_sent": self._bytes_sent,
+            "bytes_received": self._bytes_received,
+            "send_rank": self._send_rank,
+            "recv_rank": self._recv_rank,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -798,16 +989,44 @@ class DistributedFleetManager:
             return [w for w in self._workers.values() if w.pp_stage == stage_id]
 
     def start(self) -> None:
-        """Start the fleet manager and health monitor."""
+        """Start the fleet manager and health monitor.
+
+        The rank-0 ring is *not* formed here.  A manager for ``world_size > 1``
+        starts before its peers exist, so binding and waiting for a ring at this
+        point would block for the connect timeout on every deployment and then
+        fail. The ring is formed by :meth:`connect_ring` once the peers have
+        registered; :attr:`ring_connected` reports whether that has happened.
+        """
         self._active = True
-        self._collective.initialize()
+        if self.world_size == 1:
+            self._collective.initialize()
         self._health_monitor_thread = threading.Thread(
             target=self._health_monitor_loop,
             daemon=True,
             name="AetherFleetHealthMonitor",
         )
         self._health_monitor_thread.start()
-        logger.info(f"Fleet manager started: world_size={self.world_size}, tp={self.tp_size}, pp={self.pp_size}")
+        logger.info(
+            "Fleet manager started: world_size=%d, tp=%d, pp=%d, ring=%s",
+            self.world_size, self.tp_size, self.pp_size,
+            "single-process" if self.world_size == 1 else "pending peers",
+        )
+
+    @property
+    def ring_connected(self) -> bool:
+        """Whether collectives can actually run right now."""
+        return self._collective.is_ring_connected
+
+    def connect_ring(self) -> None:
+        """Form the collective ring once every peer is up.
+
+        Raises:
+            CollectiveError: If the ring cannot be formed. Callers get the failure
+                rather than a manager that silently cannot communicate.
+        """
+        if self._collective.is_ring_connected:
+            return
+        self._collective.initialize()
 
     def stop(self) -> None:
         """Stop the fleet manager."""
@@ -891,19 +1110,48 @@ class CommunicationGroup:
 
 
 class CollectiveBackend(SocketCollective):
-    """
-    Full-featured collective communication backend.
+    """Single-process collective group, kept for the historical API.
 
-    Extends SocketCollective with group management and backward-compatible
-    interface matching the original CollectiveBackend API.
+    A list of device ids does not create peers.  This object lives in one process
+    and holds one copy of each tensor, so its world size is 1 and its collectives
+    are the identity — which is the correct answer for one contributor, not a
+    stand-in for a reduction that did not happen.  The device ids are recorded as
+    group metadata.
+
+    For a real collective, use one of:
+
+    * :class:`SocketCollective` per rank, for CPU multi-process — every rank
+      constructs one and calls ``initialize()``;
+    * :class:`aether.parallelism.p2p_ring.P2PRingCollective`, for single-process
+      multi-GPU over device-to-device copies, reached here via
+      :meth:`p2p_collective`;
+    * ``NCCLCollectiveBackend`` in :mod:`aether.parallelism.collective_backends`,
+      for multi-process or multi-node GPU.
     """
 
     def __init__(self, device_ids: list[int]) -> None:
-        rank = 0
-        world_size = max(len(device_ids), 1)
-        super().__init__(rank=rank, world_size=world_size)
+        super().__init__(rank=0, world_size=1)
+        self._connected = True
         self.device_ids = device_ids
         self._groups: dict[str, CommunicationGroup] = {}
+
+    @property
+    def device_count(self) -> int:
+        """Devices in the group. Distinct from ``world_size``, which is 1 here."""
+        return max(len(self.device_ids), 1)
+
+    def p2p_collective(self, **kwargs: Any) -> Any:
+        """Build a real NCCL-free multi-GPU collective over this device group.
+
+        Raises:
+            RuntimeError: If PyTorch is unavailable, since device tensors are
+                required to copy between GPUs.
+        """
+        from aether.parallelism.p2p_ring import P2PRingCollective
+
+        return P2PRingCollective(
+            [f"cuda:{index}" for index in self.device_ids], **kwargs
+        )
 
     def register_group(self, name: str, device_ids: list[int]) -> CommunicationGroup:
         """Register a communication group."""
@@ -927,7 +1175,7 @@ class CollectiveBackend(SocketCollective):
         super().barrier()
 
     def __repr__(self) -> str:
-        return f"CollectiveBackend(devices={self.device_ids})"
+        return f"CollectiveBackend(devices={self.device_ids}, world_size=1)"
 
 
 # ---------------------------------------------------------------------------
@@ -988,19 +1236,26 @@ class DistributedInferenceEngine:
         self._initialized = False
         self._request_queue: queue.Queue[dict[str, Any]] = queue.Queue()
 
-        # Honest capability labels (PRD §48) — never claim GPU collective on CPU host
+        # Honest capability labels — never claim a GPU collective on a CPU host,
+        # and never claim more than has actually been exercised.
         self.backend_constraints: dict[str, Any] = {
             "collective_backend": backend,
-            "cpu_reference_only": backend == "socket",
+            "cpu_only": backend == "socket",
             "nccl_available": False,
             "nccl_unavailable_reason": (
                 "NCCL requires CUDA multi-GPU; this backend is socket-only"
                 if backend != "nccl" else None
             ),
-            "max_tested_world_size": 1 if backend == "socket" else None,
+            # The socket ring is exercised across real processes up to 8 ranks in
+            # tests/unit/test_distributed_complete.py. Beyond that it is untested,
+            # not unsupported — and the distinction is stated rather than implied.
+            "max_tested_world_size": 8 if backend == "socket" else None,
             "notes": (
-                "Socket collectives are a CPU reference. "
-                "Production multi-GPU requires NCCL (CUDA) or RCCL (ROCm)."
+                "Socket ring collectives: correct and bandwidth-optimal "
+                "(2*(P-1)/P*D per rank) over TCP, for CPU multi-process execution. "
+                "Single-process multi-GPU uses aether.parallelism.p2p_ring, which "
+                "is also NCCL-free. Multi-process or multi-node GPU requires "
+                "NCCL (CUDA) or RCCL (ROCm)."
                 if backend == "socket"
                 else "NCCL backend — requires CUDA multi-GPU environment."
             ),

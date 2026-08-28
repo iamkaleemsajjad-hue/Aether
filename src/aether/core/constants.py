@@ -288,6 +288,9 @@ ARCHITECTURE_BY_MODEL_PREFIX: dict[str, str] = {
     "mistral": "mistral_family",
     "phi": "phi_family",
     "falcon": "falcon_family",
+    # Falcon's pre-rename RefinedWeb releases publish ``RefinedWebModel`` /
+    # ``RWForCausalLM`` rather than any name containing "falcon".
+    "refinedweb": "falcon_family",
     "whisper": "whisper_family",
     "vit": "vision_family",
     "llava": "vision_family",
@@ -410,19 +413,10 @@ ARCHITECTURE_BY_MODEL_PREFIX: dict[str, str] = {
     "pegasus": "encoder_decoder_family",
     "marian": "encoder_decoder_family",
     "xlnet": "bert_family",
-    # Hybrid SSM / state space extensions
-    "mamba2": "hybrid_ssm_family",
-    "zamba": "hybrid_ssm_family",
-    "zamba2": "hybrid_ssm_family",
-    "hymba": "hybrid_ssm_family",
-    "falcon_h1": "hybrid_ssm_family",
-    "plamo": "hybrid_ssm_family",
     # Additional instruction-tuned families
     "openhermes": "generic_decoder_family",
     "capybara": "generic_decoder_family",
     "starling": "generic_decoder_family",
-    "nous": "generic_decoder_family",
-    "nous_hermes": "generic_decoder_family",
     # Additional code model families (2025)
     "yi_coder": "generic_decoder_family",
     "qwen_coder": "generic_decoder_family",

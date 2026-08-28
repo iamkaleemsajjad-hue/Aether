@@ -169,7 +169,7 @@ pip install "aether-runtime[distributed]"
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `grpcio` | ≥ 1.66.0 | Custom ring-allreduce collectives (no NCCL required) |
+| `grpcio` | ≥ 1.66.0 | gRPC inference service. Collectives do **not** use it: the CPU ring uses stdlib sockets and the multi-GPU path uses peer-to-peer device copies (`aether.parallelism.p2p_ring`) |
 | `protobuf` | ≥ 5.28.3 | gRPC message serialization |
 
 ---

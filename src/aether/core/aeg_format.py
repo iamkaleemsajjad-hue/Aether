@@ -89,7 +89,13 @@ class ProvenanceInfo:
     """Hash of the full transformation chain."""
 
     c2pa_binding: str = ""
-    """C2PA manifest URI for content authenticity."""
+    """The ``urn:c2pa:<uuid>`` label of this artifact's signed C2PA manifest.
+
+    Empty when the artifact has not been signed. It is a manifest label, not a
+    resolvable URL: the manifest store itself lives at
+    ``provenance/c2pa.manifest`` inside the package. See
+    :mod:`aether.provenance.c2pa`.
+    """
 
     watermark_enabled: bool = False
     """Whether the AEG carries an output watermark."""

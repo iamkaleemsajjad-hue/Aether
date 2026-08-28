@@ -93,11 +93,15 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
             [round(value, 6) for value in self.shard_fractions],
         )
 
-        # ── Hardware topology + collective strategy ────────────────────────
-        # Detect NVLink / PCIe / XGMI interconnects and log the recommended
-        # AllReduce algorithm.  This is informational at init; the actual
-        # collectives use torch.distributed or explicit device copies.
-        # Reference: Megatron-LM §3.3 (Shoeybi et al. 2019, arXiv:1909.08053).
+        # ── Hardware topology + NCCL-free collective ───────────────────────────
+        # Detect NVLink / PCIe / XGMI interconnects, then build the peer-to-peer
+        # collective the row-parallel reduction uses.  There is no NCCL and no
+        # torch.distributed on this path: the reduction is device-to-device tensor
+        # copies scheduled by aether.parallelism.p2p_ring, which picks its
+        # algorithm from the measured link parameters.
+        # Reference: Megatron-LM §3.3 (Shoeybi et al. 2019, arXiv:1909.08053);
+        # Patarasuk & Yuan 2009 for the bandwidth bound.
+        self._collective = None
         try:
             from aether.parallelism.hardware_topology import detect_hardware_topology
             _device_strs = [str(d) for d in devices]
@@ -116,6 +120,19 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
             )
         except Exception:  # noqa: BLE001 — topology is advisory, never fatal
             self._topology = None
+        try:
+            from aether.parallelism.p2p_ring import P2PRingCollective
+
+            self._collective = P2PRingCollective(
+                [str(device) for device in self.devices], torch_module=torch
+            )
+        except Exception as exc:  # noqa: BLE001 — fall back to sequential copies
+            logger.warning(
+                "peer-to-peer collective unavailable (%s); row-parallel reductions "
+                "will accumulate sequentially on %s",
+                exc,
+                self.device,
+            )
 
         source_weights = cpu_engine.weights
         # Keep only scalar graph metadata after sharding. Holding the CPU
@@ -508,12 +525,48 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         return self._gather(values)
 
     def _parallel_column_linear(self, x: Any, weights: list[Any], bias: Any | None) -> Any:
-        result = self.torch.zeros((*x.shape[:-1], int(weights[0].shape[0])), device=self.device, dtype=x.dtype)
+        """Row-parallel GEMM in Megatron terms: shard the input, reduce the output.
+
+        Each device holds a slice of the input features and produces a *partial*
+        output for the full feature range; the layer's real output is the sum over
+        devices.  Only the primary device consumes it, so this is a reduce-to-root
+        rather than an all-reduce — replicating the result to every device would be
+        work nothing reads.
+
+        The reduction goes through :mod:`aether.parallelism.p2p_ring`, which folds
+        the partials with a binary tree in ``ceil(log2 P)`` rounds of device copies.
+        Accumulating into device 0 one partial at a time is ``P-1`` dependent copies
+        queued on a single link. No NCCL is involved on this path.
+        """
+        partials: list[Any] = []
+        offset = 0
         for index, weight in enumerate(weights):
-            start = sum(int(item.shape[1]) for item in weights[:index])
-            local = self._linear(x[..., start:start + int(weight.shape[1])].to(self.devices[index]), weight)
-            result = result + local.to(self.device)
+            width = int(weight.shape[1])
+            local_x = x[..., offset:offset + width].to(self.devices[index])
+            partials.append(self._linear(local_x, weight))
+            offset += width
+        if self._collective is not None and len(partials) > 1:
+            try:
+                result = self._collective.reduce_to_root(partials, "sum", root=0)
+                result = result.to(self.device)
+            except Exception as exc:  # noqa: BLE001 — never fail a forward pass here
+                logger.debug("p2p reduce_to_root fell back to sequential sum: %s", exc)
+                result = self._sequential_sum(partials)
+        else:
+            result = self._sequential_sum(partials)
         return result if bias is None else result + bias
+
+    def _sequential_sum(self, partials: list[Any]) -> Any:
+        """Fold partials into the primary device in a fixed order.
+
+        The order is fixed so the sum is reproducible: floating-point addition is
+        not associative, and a reduction ordered by completion would give different
+        logits on different runs.
+        """
+        total = partials[0].to(self.device)
+        for partial in partials[1:]:
+            total = total + partial.to(self.device)
+        return total
 
     def _moe_ffn(self, hidden: Any, layer: dict[str, Any]) -> Any:
         if layer["router"] is None or not layer["experts"]:

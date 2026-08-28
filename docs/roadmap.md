@@ -114,7 +114,7 @@ This roadmap tracks implementation gates per release phase. A feature is complet
 ### Remaining Implementation Items
 - [x] GGUF Q2_K / Q4_K / Q5_K / Q6_K / Q8_K dequantization -- IMPLEMENTED (K-quant dispatch in gguf_loader.py)
 - [ ] NCCL/RCCL collective backend (replaces SocketCollective for GPU clusters)
-- [ ] OpenTelemetry SDK full integration (distributed traces across workers)
+- [x] OpenTelemetry SDK bridge (`aether.observability.otel_sdk`, extra `[otel]`); OTLP conformance pinned by tests
 - [ ] SDK type stubs (`.pyi` files for all public APIs)
 - [ ] Docker multi-stage images (CPU / CUDA / ROCm variants)
 - [ ] CI/CD pipeline: GitHub Actions matrix (Linux × Python 3.10–3.12 × CPU/CUDA)
