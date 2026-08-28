@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 import numpy as np
+from aether.runtime.stopping import stop_token_set
 
 
 @dataclass
@@ -170,13 +171,17 @@ class Mamba2ExecutionEngine:
     def generate_iter(self, prompt_ids: np.ndarray, max_tokens: int = 16, temperature: float = 0.0,
                       eos_token_id: int | None = None, cache: Mamba2Cache | None = None,
                       cache_callback: Any | None = None, **_: Any) -> Iterator[int]:
+        # Normalized once per request: a checkpoint may declare several stop
+        # ids (an instruct model's turn delimiter is often not its eos_token),
+        # and every engine must agree on what stopping means.
+        stops = stop_token_set(eos_token_id)
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         logits, cache = self.forward(np.asarray(prompt_ids, dtype=np.int64), cache)
         for _ in range(int(max_tokens)):
             token = int(np.argmax(logits[-1]) if temperature <= 0 else np.random.default_rng().choice(logits.shape[-1], p=self._probabilities(logits[-1], temperature)))
             yield token
-            if eos_token_id is not None and token == int(eos_token_id):
+            if token in stops:
                 break
             logits, cache = self.forward(np.asarray([token], dtype=np.int64), cache)
         if cache_callback is not None:

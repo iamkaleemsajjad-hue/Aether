@@ -1071,6 +1071,25 @@ class ModelArchitecture:
     rope_theta: float = 10000.0
     """RoPE theta base frequency."""
 
+    rope_scaling: dict[str, Any] | None = None
+    """The checkpoint's ``rope_scaling`` mapping, verbatim.
+
+    Every long-context model ships a rotary *frequency transform* here — linear,
+    dynamic NTK, YaRN, LongRoPE or the Llama-3.1 piecewise form. The transform is
+    part of the model: evaluating a scaled checkpoint with unscaled frequencies
+    rotates every query and key by the wrong angle, which degrades attention
+    progressively along the sequence rather than failing. Carried as the raw mapping
+    so the artifact stays JSON and a scheme added later needs no format change.
+    """
+
+    original_context_length: int | None = None
+    """Context length the checkpoint was pretrained at, when it differs.
+
+    A top-level config field for the Phi family. LongRoPE needs it twice: to choose
+    between the short and long factor tables, and to set the attention temperature
+    from its ratio to :attr:`context_length`.
+    """
+
     is_moe: bool = False
     """Whether this is a Mixture-of-Experts model."""
 
@@ -1316,7 +1335,7 @@ class ModelArchitecture:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
-        return {
+        payload: dict[str, Any] = {
             "family": self.family,
             "params_billion": self.params_billion,
             "layers": self.layers,
@@ -1382,6 +1401,19 @@ class ModelArchitecture:
             "gelu_approximate": self.gelu_approximate,
             "moe_renormalize_topk": self.moe_renormalize_topk,
         }
+        # Additive fields are emitted only when the model actually declares them.
+        #
+        # The manifest hash is computed over this mapping, so emitting a new key
+        # unconditionally changes the serialization of *every* previously compiled
+        # artifact and makes it fail its own integrity check. Omitting unset fields
+        # keeps a legacy manifest byte-identical while still recording the transform
+        # for models that carry one — which is what lets the format grow without a
+        # version bump or a migration.
+        if self.rope_scaling:
+            payload["rope_scaling"] = dict(self.rope_scaling)
+        if self.original_context_length is not None:
+            payload["original_context_length"] = self.original_context_length
+        return payload
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> ModelArchitecture:
@@ -1403,6 +1435,12 @@ class ModelArchitecture:
             vocab_size=data.get("vocab_size", 32000),
             norm_eps=data.get("norm_eps", 1e-5),
             rope_theta=data.get("rope_theta", 10000.0),
+            rope_scaling=(
+                dict(data["rope_scaling"])
+                if isinstance(data.get("rope_scaling"), dict) and data["rope_scaling"]
+                else None
+            ),
+            original_context_length=data.get("original_context_length"),
             is_moe=data.get("is_moe", False),
             is_encoder=data.get("is_encoder", False),
             is_encoder_decoder=data.get("is_encoder_decoder", False),

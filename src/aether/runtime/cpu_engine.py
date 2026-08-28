@@ -28,6 +28,7 @@ import numpy as np
 from aether.kernels.native_cpu import NativeCPUKernels, get_native_kernels
 from aether.runtime.positional import alibi_slopes
 from aether.utils.logging import get_logger
+from aether.runtime.stopping import stop_token_set
 
 logger = get_logger(__name__)
 
@@ -221,6 +222,16 @@ class ModelWeights:
     rope_interleaved: bool = False
     #: Separate RoPE base used by sliding-window layers.
     rope_local_theta: float | None = None
+    #: The model's declared ``rope_scaling`` mapping, verbatim.  Kept as the raw
+    #: mapping rather than a parsed object so the AEG contract stays JSON, and so a
+    #: scheme added later needs no format change.  ``None`` means the standard
+    #: unscaled frequencies.  See :mod:`aether.runtime.rope_scaling`.
+    rope_scaling: dict[str, Any] | None = None
+    #: Context length the checkpoint was *pretrained* at, when it differs from
+    #: ``context_length``.  A top-level config field for the Phi family, and
+    #: LongRoPE needs it both to choose its factor table and to set its attention
+    #: temperature.
+    original_context_length: int | None = None
     #: ``pre`` | ``post`` | ``sandwich`` block normalization placement.
     norm_placement: str = "pre"
     #: ``head`` | ``full`` scope of the Q/K normalization weights.
@@ -565,13 +576,37 @@ class CPUExecutionEngine:
         The table covers ``rotary_dim / 2`` frequencies, which equals the full
         half-head width unless the architecture rotates only a prefix of each
         head (GPT-NeoX, GPT-J, StableLM, Phi).
+
+        The frequencies come from :mod:`aether.runtime.rope_scaling`, so this
+        reference executor applies the checkpoint's declared rotary transform
+        (linear, dynamic NTK, YaRN, LongRoPE or the Llama-3.1 piecewise form) rather
+        than the unscaled formula.  A model that declares no scaling gets exactly
+        the standard frequencies, so nothing changes for it.  Any temperature
+        correction the scheme carries is folded into the tables, matching the
+        reference implementation, because it scales the *rotated* query and key and
+        is therefore not interchangeable with the softmax scale.
         """
-        half = self._rotary_dim // 2
-        inv_freq = 1.0 / (
-            theta ** (np.arange(0, half, dtype=np.float64) * 2.0 / self._rotary_dim)
+        from aether.runtime.rope_scaling import (
+            parse_rope_scaling,
+            scaled_inverse_frequencies,
+        )
+
+        declared_context = int(getattr(self.weights, "context_length", 0) or 0) or None
+        spec = parse_rope_scaling(
+            getattr(self.weights, "rope_scaling", None),
+            context_length=declared_context,
+            original_context_length=getattr(
+                self.weights, "original_context_length", None
+            ),
+        )
+        inv_freq, attention = scaled_inverse_frequencies(
+            theta, self._rotary_dim, spec, sequence_length=int(max_positions)
         )
         angles = np.arange(max_positions, dtype=np.float64)[:, None] * inv_freq[None, :]
-        return np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
+        cos, sin = np.cos(angles), np.sin(angles)
+        if attention != 1.0:
+            cos, sin = cos * attention, sin * attention
+        return cos.astype(np.float32), sin.astype(np.float32)
 
     def _apply_rope(
         self, x: np.ndarray, position_offset: int, *, local: bool = False
@@ -1674,6 +1709,10 @@ class CPUExecutionEngine:
         response.  ``cache_callback`` receives the final cache after normal
         completion and is intentionally not called when generation raises.
         """
+        # Normalized once per request: a checkpoint may declare several stop
+        # ids (an instruct model's turn delimiter is often not its eos_token),
+        # and every engine must agree on what stopping means.
+        stops = stop_token_set(eos_token_id)
         ids = np.ascontiguousarray(prompt_ids, dtype=np.int64).reshape(-1)
         rng = np.random.default_rng(seed)
         if cache is None:
@@ -1730,7 +1769,7 @@ class CPUExecutionEngine:
                         context_tokens.append(next_token)
                         self._speculative_stats["draft_tokens"] += 1
                         self._speculative_stats["accepted_tokens"] += int(int(proposal) == target_token)
-                        if eos_token_id is not None and next_token == eos_token_id:
+                        if next_token in stops:
                             generated_count = max_tokens
                             break
                         logits, cache = self.forward(
@@ -1765,7 +1804,7 @@ class CPUExecutionEngine:
             context_tokens.append(next_token)
             if grammar_session is not None and getattr(grammar_session, "is_accepting", lambda: False)():
                 break
-            if eos_token_id is not None and next_token == eos_token_id:
+            if next_token in stops:
                 break
             logits, cache = self.forward(
                 np.array([next_token], dtype=np.int64), cache, ttt_slots=ttt_slots, adapter_id=adapter_id

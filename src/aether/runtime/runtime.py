@@ -612,20 +612,35 @@ class Runtime:
             return backend
 
     def _resolve_aeg_path(self, model_id: str) -> str | None:
-        """Find the AEG package path for a model, downloading/compile if needed."""
-        from aether.utils.file_io import aether_cache_dir
+        """Find the cached AEG package for a model reference.
+
+        Resolution order, most explicit first:
+
+        1. an explicit path the caller gave (a directory holding a ``manifest.json``);
+        2. the canonical cache path from :func:`aeg_cache_candidates`, which is the
+           *same* function the compiler writes through — so a model compiled by ID is
+           discoverable by that ID, which is the invariant this method exists to
+           uphold;
+        3. earlier cache layouts, so upgrading Aether never orphans an artifact a
+           user already has on disk.
+
+        A candidate must contain a ``manifest.json`` to count. Accepting a bare
+        directory, as this once did, meant a partially written or unrelated directory
+        resolved here and then failed further downstream with an error that pointed
+        at execution rather than at the artifact.
+        """
+        from aether.utils.file_io import aeg_cache_candidates
 
         path_candidate = Path(model_id)
-        if path_candidate.exists() and (path_candidate / "manifest.json").exists():
+        if path_candidate.is_dir() and (path_candidate / "manifest.json").is_file():
             return str(path_candidate.resolve())
 
-        cache_root = aether_cache_dir(self.config.model_cache_dir)
-        aeg_path = cache_root / "models" / safe_model_id_path(model_id)
-        if aeg_path.exists():
-            return str(aeg_path)
-        # Check local compiled path
+        for candidate in aeg_cache_candidates(model_id, self.config.model_cache_dir):
+            if (candidate / "manifest.json").is_file():
+                return str(candidate)
+
         local = resolve_model_path(model_id, self.config.model_cache_dir)
-        if local and (local / "manifest.json").exists():
+        if local and (local / "manifest.json").is_file():
             return str(local)
         return None
 
@@ -642,12 +657,10 @@ class Runtime:
         logger.info(f"Pulling and compiling model {model_id}")
         from aether import Compiler
         compiler = Compiler()
-        aeg = compiler.compile(
-            model_id,
-            output_path=self._resolve_aeg_path(model_id)
-            or aether_cache_dir(self.config.model_cache_dir) / "models" / safe_model_id_path(model_id),
-        )
-        aeg.save()
+        # No explicit output path: the compiler derives the canonical cache path
+        # from the same naming contract this class resolves through, so passing one
+        # here could only reintroduce a divergence between writer and reader.
+        compiler.compile(model_id)
 
     def list(self) -> list[str]:
         """Return a list of model IDs with cached AEG artifacts."""
@@ -655,9 +668,18 @@ class Runtime:
 
         cache_root = aether_cache_dir(self.config.model_cache_dir)
         model_dir = cache_root / "models"
-        if not model_dir.exists():
+        if not model_dir.is_dir():
             return []
-        return sorted(d.name for d in model_dir.iterdir() if (d / "manifest.json").exists())
+        # Directory names are returned as-is rather than de-mangled back to a
+        # Hugging Face ID: ``--`` stands in for ``/``, but a repo name may itself
+        # contain ``--``, so reversing it is ambiguous. Every name returned here is
+        # accepted by :meth:`_resolve_aeg_path`, which is the property that matters —
+        # output of ``aether list`` can be fed straight back to info/graph/run.
+        return sorted(
+            entry.name
+            for entry in model_dir.iterdir()
+            if (entry / "manifest.json").is_file()
+        )
 
     def info(self, model_id: str) -> dict[str, Any]:
         """Return metadata and precision info for a compiled model."""

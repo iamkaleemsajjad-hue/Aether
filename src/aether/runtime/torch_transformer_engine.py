@@ -12,6 +12,7 @@ from typing import Any, Iterator
 import numpy as np
 
 from aether.runtime.torch_engine import _resolve_device
+from aether.runtime.stopping import stop_token_set
 
 
 class TorchEncoderAEGEngine:
@@ -273,6 +274,10 @@ class TorchSeq2SeqAEGEngine:
         return logits.float().cpu().numpy(), None
 
     def generate(self, prompt_ids: Any, max_tokens: int = 16, temperature: float = 0.0, top_k: int = 0, top_p: float = 1.0, eos_token_id: int | None = None, grammar_session: Any | None = None, **_: Any) -> list[int]:
+        # Normalized once per request: a checkpoint may declare several stop
+        # ids (an instruct model's turn delimiter is often not its eos_token),
+        # and every engine must agree on what stopping means.
+        stops = stop_token_set(eos_token_id)
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         prompt = self.torch.as_tensor(np.asarray(prompt_ids, dtype=np.int64).reshape(-1), device=self.device)
@@ -304,7 +309,7 @@ class TorchSeq2SeqAEGEngine:
                 decoder_ids.append(token)
                 if grammar_session is not None and getattr(grammar_session, "is_accepting", lambda: False)():
                     break
-                if eos_token_id is not None and token == int(eos_token_id):
+                if token in stops:
                     break
             return generated
 

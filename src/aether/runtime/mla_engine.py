@@ -15,6 +15,7 @@ from typing import Any, Iterator
 import numpy as np
 
 from aether.attention.mla import MLAConfig, MLAAttention
+from aether.runtime.stopping import stop_token_set
 
 
 @dataclass
@@ -176,6 +177,10 @@ class MLAExecutionEngine:
         top_k: int = 0, top_p: float = 1.0, eos_token_id: int | None = None,
         cache: MLACache | None = None, cache_callback: Any | None = None, **_: Any,
     ) -> Iterator[int]:
+        # Normalized once per request: a checkpoint may declare several stop
+        # ids (an instruct model's turn delimiter is often not its eos_token),
+        # and every engine must agree on what stopping means.
+        stops = stop_token_set(eos_token_id)
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         prompt = np.asarray(prompt_ids, dtype=np.int64).reshape(-1)
@@ -189,7 +194,7 @@ class MLAExecutionEngine:
         for _ in range(int(max_tokens)):
             token = self._sample(next_logits, temperature, top_k, top_p)
             yield token
-            if eos_token_id is not None and token == int(eos_token_id):
+            if token in stops:
                 break
             _, cache = self.forward(np.asarray([token], dtype=np.int64), cache)
             next_logits = cache.last_logits

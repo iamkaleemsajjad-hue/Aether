@@ -64,6 +64,32 @@ KNOWN_MODEL_SPECS: dict[str, dict[str, Any]] = {
 }
 
 
+def _rope_scaling_config(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the checkpoint's ``rope_scaling`` mapping, or ``None`` if unscaled.
+
+    Validated at compile time so an unreproducible scheme is a compile error rather
+    than a silent quality regression at inference. Both the historical ``type`` key
+    and the current ``rope_type`` are accepted, since checkpoints in the wild use
+    each.
+    """
+    from aether.runtime.rope_scaling import SUPPORTED_ROPE_SCALING
+
+    value = config.get("rope_scaling")
+    if not isinstance(value, dict) or not value:
+        return None
+    declared = str(
+        value.get("rope_type", value.get("type", "default")) or "default"
+    ).strip().lower()
+    if declared not in SUPPORTED_ROPE_SCALING:
+        raise ValueError(
+            f"checkpoint declares rope_scaling type {declared!r}, which Aether "
+            "cannot reproduce. Compiling it would produce an artifact that runs "
+            "with the wrong rotary geometry. Supported schemes: "
+            f"{sorted(SUPPORTED_ROPE_SCALING)}"
+        )
+    return dict(value)
+
+
 class ArchitectureDetector:
     """Detects model architecture from name, metadata, or weight inspection.
 
@@ -837,6 +863,20 @@ class ArchitectureDetector:
             vocab_size=vocab_size,
             norm_eps=norm_eps,
             rope_theta=rope_theta,
+            # The rotary frequency transform is part of the model.  Captured
+            # verbatim and validated rather than interpreted here: a scheme this
+            # runtime cannot reproduce must fail the compile, because executing a
+            # scaled checkpoint with unscaled frequencies rotates every query and
+            # key by the wrong angle and degrades output without any error.
+            rope_scaling=_rope_scaling_config(config),
+            # Distinct from context_length: the length the checkpoint was
+            # *pretrained* at.  Phi-3/3.5 declare it at the top level of the config
+            # and LongRoPE needs it to pick its factor table and its temperature.
+            original_context_length=(
+                int(config["original_max_position_embeddings"])
+                if config.get("original_max_position_embeddings") is not None
+                else None
+            ),
             qk_norm=qk_norm,
             parallel_residual=parallel_residual,
             intermediate_size=intermediate_size,

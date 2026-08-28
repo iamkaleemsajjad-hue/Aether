@@ -17,6 +17,7 @@ import numpy as np
 
 from aether.runtime.cpu_engine import CPUExecutionEngine, KVCache, LayerWeights, ModelWeights
 from aether.runtime.mamba_engine import MambaCache, MambaExecutionEngine, MambaLayerWeights, MambaModelWeights
+from aether.runtime.stopping import stop_token_set
 
 
 @dataclass
@@ -268,6 +269,10 @@ class HybridExecutionEngine:
         seed: int | None = None, cache: HybridCache | None = None,
         cache_callback: Any | None = None, **_: Any,
     ) -> Iterator[int]:
+        # Normalized once per request: a checkpoint may declare several stop
+        # ids (an instruct model's turn delimiter is often not its eos_token),
+        # and every engine must agree on what stopping means.
+        stops = stop_token_set(eos_token_id)
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         prompt = np.asarray(prompt_ids, dtype=np.int64).reshape(-1)
@@ -282,7 +287,7 @@ class HybridExecutionEngine:
         for _ in range(int(max_tokens)):
             token = self._sample(next_logits, temperature, top_k, top_p, rng)
             yield token
-            if eos_token_id is not None and token == int(eos_token_id):
+            if token in stops:
                 break
             _, cache = self.forward(np.asarray([token], dtype=np.int64), cache)
             next_logits = cache.last_logits

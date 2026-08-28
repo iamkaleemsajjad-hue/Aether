@@ -28,6 +28,20 @@ from aether.core.hash_utils import compute_file_hash
 from aether.runtime.aeg_loader import load_engine_from_path, package_is_runnable
 
 
+def _stop_ids(tokenizer: Any) -> Any:
+    """Every stop id the checkpoint declares, falling back to the canonical one.
+
+    ``eos_token_ids`` is the merged set from ``generation_config.json`` and the
+    tokenizer; a tokenizer predating it still exposes ``eos_token_id``. Passing the
+    full set is what lets an instruction-tuned model stop on its turn delimiter
+    rather than running to ``max_tokens``.
+    """
+    ids = getattr(tokenizer, "eos_token_ids", None)
+    if ids:
+        return tuple(ids)
+    return getattr(tokenizer, "eos_token_id", None)
+
+
 class PackagedTokenizer:
     """Adapter around a serialized Hugging Face ``tokenizer.json``."""
 
@@ -58,6 +72,49 @@ class PackagedTokenizer:
         self.pad_token_id = self._special_id(config.get("pad_token"), special.get("pad_token"))
         self.bos_token_id = self._special_id(config.get("bos_token"), special.get("bos_token"))
         self.chat_template = config.get("chat_template")
+        self.eos_token_ids = self._stop_token_ids(tokenizer_path, config, special)
+
+    def _stop_token_ids(
+        self, tokenizer_path: Path, config: dict[str, Any], special: dict[str, Any]
+    ) -> tuple[int, ...]:
+        """Every token id that should end generation, not just the canonical one.
+
+        Instruction-tuned models routinely stop on a turn delimiter that is *not*
+        the tokenizer's ``eos_token``.  Phi-3.5-mini is the clear case: its
+        ``tokenizer_config.eos_token`` is ``<|endoftext|>``, but a chat turn ends
+        with ``<|end|>``, and its ``generation_config.eos_token_id`` lists both.
+        Honouring only the tokenizer's single id means never stopping — generation
+        runs to ``max_tokens`` and the tail degenerates, which looks like a model
+        quality problem and is not one.
+
+        Sources are merged, in order of authority:
+
+        1. ``generation_config.json`` — where the checkpoint states its real stop
+           ids, as a scalar or a list.
+        2. the tokenizer's own ``eos_token``.
+        3. ``special_tokens_map.json``'s ``eos_token``.
+
+        Duplicates are dropped and order is preserved so the first entry stays the
+        canonical id for callers that want a single value.
+        """
+        collected: list[int] = []
+
+        def add(value: Any) -> None:
+            if isinstance(value, bool) or not isinstance(value, int):
+                return
+            if value >= 0 and value not in collected:
+                collected.append(int(value))
+
+        generation = self._read_json(tokenizer_path.with_name("generation_config.json"))
+        declared = generation.get("eos_token_id")
+        if isinstance(declared, (list, tuple)):
+            for item in declared:
+                add(item)
+        else:
+            add(declared)
+        add(self.eos_token_id)
+        add(self._special_id(special.get("eos_token"), config.get("eos_token")))
+        return tuple(collected)
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
@@ -510,7 +567,7 @@ class NativeCPUBackend(Backend):
                     temperature=request.temperature,
                     top_k=request.top_k,
                     top_p=request.top_p,
-                    eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+                    eos_token_id=_stop_ids(handle.tokenizer),
                     grammar_session=request.extra.get("grammar_session"),
                     cache=cache,
                     ttt_slots=ttt_slots,
@@ -524,7 +581,7 @@ class NativeCPUBackend(Backend):
                     temperature=request.temperature,
                     top_k=request.top_k,
                     top_p=request.top_p,
-                    eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+                    eos_token_id=_stop_ids(handle.tokenizer),
                     ttt_slots=ttt_slots,
                     peagle_engine=request.extra.get("peagle_engine"),
                 )
@@ -543,7 +600,7 @@ class NativeCPUBackend(Backend):
                 temperature=request.temperature,
                 top_k=request.top_k,
                 top_p=request.top_p,
-                eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+                eos_token_id=_stop_ids(handle.tokenizer),
                 grammar_session=request.extra.get("grammar_session"),
                 cache=cache,
             )
@@ -630,7 +687,7 @@ class NativeCPUBackend(Backend):
             temperature=request.temperature,
             top_k=request.top_k,
             top_p=request.top_p,
-            eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+            eos_token_id=_stop_ids(handle.tokenizer),
             grammar_session=request.extra.get("grammar_session"),
             cache=cache,
             cache_callback=remember,

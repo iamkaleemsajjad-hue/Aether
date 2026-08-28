@@ -1065,6 +1065,11 @@ def _execution_numerics(architecture: dict[str, Any]) -> dict[str, Any]:
         "rope_partial_dim": int(partial) if partial else None,
         "rope_interleaved": bool(architecture.get("rope_interleaved", False)),
         "rope_local_theta": number("rope_local_theta"),
+        "rope_scaling": _rope_scaling_mapping(architecture),
+        "original_context_length": (
+            int(architecture["original_context_length"])
+            if architecture.get("original_context_length") else None
+        ),
         "norm_placement": placement,
         "qk_norm_scope": scope,
         "no_rope_layers": index_list("no_rope_layers"),
@@ -1075,6 +1080,31 @@ def _execution_numerics(architecture: dict[str, Any]) -> dict[str, Any]:
             if architecture.get("context_length") else None
         ),
     }
+
+
+def _rope_scaling_mapping(architecture: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the manifest's ``rope_scaling`` mapping, or ``None`` if unscaled.
+
+    Validated here rather than at first use: a manifest naming a scheme this
+    runtime cannot reproduce must fail the load with a clear message, because the
+    alternative is executing the model with the wrong rotary geometry and returning
+    fluent-looking but degraded text.  An artifact compiled before this field
+    existed simply omits it and keeps the standard frequencies.
+    """
+    from aether.runtime.rope_scaling import SUPPORTED_ROPE_SCALING
+
+    value = architecture.get("rope_scaling")
+    if not isinstance(value, dict) or not value:
+        return None
+    declared = str(value.get("rope_type", value.get("type", "default")) or "default").lower()
+    if declared not in SUPPORTED_ROPE_SCALING:
+        raise AEGLoadError(
+            f"AEG declares rope_scaling type {declared!r}, which this runtime "
+            "cannot reproduce. Refusing to execute with unscaled rotary "
+            "frequencies, which would silently degrade output quality. Supported: "
+            f"{sorted(SUPPORTED_ROPE_SCALING)}"
+        )
+    return dict(value)
 
 
 def _architecture_dict(package: Any) -> dict[str, Any]:

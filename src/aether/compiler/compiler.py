@@ -785,6 +785,7 @@ class Compiler:
                 config,
                 output_path,
                 start_time,
+                source_model_id=model,
             )
         except Exception as exc:
             shutil.rmtree(pass_artifact_dir, ignore_errors=True)
@@ -979,15 +980,26 @@ class Compiler:
         config: CompilerConfig,
         output_path: str | Path | None,
         start_time: datetime.datetime,
+        source_model_id: str | None = None,
     ) -> AEGPackage:
-        """Run Stage 4: create and save the AEG package."""
+        """Run Stage 4: create and save the AEG package.
+
+        ``source_model_id`` is the reference the caller actually passed — a Hugging
+        Face ID or a local directory. The cache path is derived from it through the
+        shared naming contract so that the runtime, which resolves from the same
+        function, looks exactly where this writes. ``model_id`` is the normalized
+        form recorded inside the manifest and is deliberately not used for the path.
+        """
         from aether.core.aeg_ir import AEGIRModule
 
         if output_path is None:
-            from aether.utils.file_io import aether_cache_dir
+            # The cache path comes from the single shared naming contract, so the
+            # runtime looks in exactly the place the compiler writes.  Deriving it
+            # separately here is what previously made a compiled model
+            # undiscoverable by the ID it was compiled from.
+            from aether.utils.file_io import aeg_cache_path
 
-            cache_root = aether_cache_dir(config.cache_dir)
-            output_path = cache_root / "models" / f"{model_id}.aeg"
+            output_path = aeg_cache_path(source_model_id or model_id, config.cache_dir)
         else:
             output_path = Path(output_path)
 

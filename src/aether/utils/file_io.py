@@ -180,6 +180,77 @@ def safe_model_id_path(model_id: str) -> str:
     return safe
 
 
+#: Separator standing in for ``/`` in a cached artifact's directory name.  Chosen
+#: because it is what compiled artifacts on disk already use, so adopting it as the
+#: canonical form makes every previously compiled package discoverable without a
+#: recompile.
+_MODEL_ID_SEPARATOR = "--"
+
+#: Suffix marking a directory as an AEG package.  An AEG *is* a directory — a
+#: manifest plus weight, graph and metadata subtrees — so the suffix is a naming
+#: convention, not a file extension.
+AEG_SUFFIX = ".aeg"
+
+
+def aeg_artifact_name(model_id: str) -> str:
+    """Return the canonical cache directory name for ``model_id``.
+
+    One definition, used by the compiler when it writes and by the runtime when it
+    looks up. Having two conventions in two modules is what made a compiled model
+    undiscoverable by the ID it was compiled from: the writer produced
+    ``microsoft--Phi-3.5-mini-instruct.aeg`` while the reader looked for
+    ``microsoft_Phi-3.5-mini-instruct``, so no Hugging Face ID containing ``/``
+    could ever resolve.
+
+    Only characters that are unsafe in a path component are substituted. Dots and
+    single dashes are left alone, because they are ordinary in Hugging Face repo
+    names (``Phi-3.5-mini-instruct``) and mangling them would make the name harder
+    to recognize for no benefit.
+    """
+    name = str(model_id).strip()
+    for unsafe, replacement in (
+        ("/", _MODEL_ID_SEPARATOR),
+        ("\\", _MODEL_ID_SEPARATOR),
+        (":", "_"),
+        (" ", "_"),
+    ):
+        name = name.replace(unsafe, replacement)
+    # A leading dot would hide the directory; a trailing one is invalid on Windows.
+    name = name.strip(".")
+    if not name:
+        name = "unnamed_model"
+    return f"{name}{AEG_SUFFIX}"
+
+
+def aeg_cache_path(model_id: str, cache_dir: str | Path | None = None) -> Path:
+    """Return the canonical cache path an AEG for ``model_id`` is written to."""
+    return aether_cache_dir(cache_dir) / "models" / aeg_artifact_name(model_id)
+
+
+def aeg_cache_candidates(
+    model_id: str, cache_dir: str | Path | None = None
+) -> list[Path]:
+    """Every cache path that could hold this model's AEG, most canonical first.
+
+    The canonical name comes first; the remaining entries are layouts written by
+    earlier versions. Accepting them means upgrading Aether never orphans an
+    artifact a user already has on disk, and the ordering means a freshly compiled
+    package always wins over a stale one.
+    """
+    models = aether_cache_dir(cache_dir) / "models"
+    canonical = aeg_artifact_name(model_id)
+    legacy = {
+        # The reader's old convention: underscores, no suffix.
+        safe_model_id_path(model_id),
+        # ...and the same with a suffix.
+        f"{safe_model_id_path(model_id)}{AEG_SUFFIX}",
+        # The writer's old convention without the suffix.
+        canonical[: -len(AEG_SUFFIX)],
+    }
+    ordered = [canonical] + sorted(name for name in legacy if name != canonical)
+    return [models / name for name in ordered]
+
+
 def glob_models(cache_dir: str | Path | None = None) -> list[Path]:
     """Find all AEG packages in the Aether cache.
 

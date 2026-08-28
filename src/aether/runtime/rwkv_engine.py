@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 import numpy as np
+from aether.runtime.stopping import stop_token_set
 
 
 @dataclass
@@ -155,6 +156,10 @@ class RWKVExecutionEngine:
     def generate_iter(self, prompt_ids: np.ndarray, max_tokens: int = 16, temperature: float = 0.0,
                       eos_token_id: int | None = None, cache: RWKVCache | None = None,
                       cache_callback: Any | None = None, **_: Any) -> Iterator[int]:
+        # Normalized once per request: a checkpoint may declare several stop
+        # ids (an instruct model's turn delimiter is often not its eos_token),
+        # and every engine must agree on what stopping means.
+        stops = stop_token_set(eos_token_id)
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         logits, cache = self.forward(np.asarray(prompt_ids, dtype=np.int64), cache)
@@ -166,7 +171,7 @@ class RWKVExecutionEngine:
                 values -= values.max(); probs = np.exp(values); probs /= probs.sum()
                 token = int(np.random.default_rng().choice(values.size, p=probs))
             yield token
-            if eos_token_id is not None and token == int(eos_token_id):
+            if token in stops:
                 break
             logits, cache = self.forward(np.asarray([token]), cache)
         if cache_callback is not None:

@@ -30,6 +30,20 @@ from aether.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _stop_ids(tokenizer: Any) -> Any:
+    """Every stop id the checkpoint declares, falling back to the canonical one.
+
+    ``eos_token_ids`` is the merged set from ``generation_config.json`` and the
+    tokenizer; a tokenizer predating it still exposes ``eos_token_id``. Passing the
+    full set is what lets an instruction-tuned model stop on its turn delimiter
+    rather than running to ``max_tokens``.
+    """
+    ids = getattr(tokenizer, "eos_token_ids", None)
+    if ids:
+        return tuple(ids)
+    return getattr(tokenizer, "eos_token_id", None)
+
+
 def _release_host_weights_enabled() -> bool:
     """Whether to reclaim host weights after an accelerator load.
 
@@ -711,7 +725,7 @@ class TorchBackend(Backend):
                         temperature=request.temperature,
                         top_k=request.top_k,
                         top_p=request.top_p,
-                        eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+                        eos_token_id=_stop_ids(handle.tokenizer),
                         grammar_session=request.extra.get("grammar_session"),
                         cache=cache,
                         ttt_slots=ttt_slots,
@@ -725,7 +739,7 @@ class TorchBackend(Backend):
                         temperature=request.temperature,
                         top_k=request.top_k,
                         top_p=request.top_p,
-                        eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+                        eos_token_id=_stop_ids(handle.tokenizer),
                         grammar_session=request.extra.get("grammar_session"),
                         ttt_slots=ttt_slots,
                         adapter_id=adapter_id,
@@ -1170,7 +1184,7 @@ class TorchBackend(Backend):
                 temperature=request.temperature,
                 top_k=request.top_k,
                 top_p=request.top_p,
-                eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+                eos_token_id=_stop_ids(handle.tokenizer),
                 grammar_session=request.extra.get("grammar_session"),
                 cache=cache,
                 cache_callback=remember,

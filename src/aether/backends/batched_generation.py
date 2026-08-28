@@ -39,6 +39,20 @@ logger = get_logger(__name__)
 _PROMOTABLE_ENGINE = "CPUExecutionEngine"
 
 
+def _stop_ids(tokenizer: Any) -> Any:
+    """Every stop id the checkpoint declares, falling back to the canonical one.
+
+    ``eos_token_ids`` is the merged set from ``generation_config.json`` and the
+    tokenizer; a tokenizer predating it still exposes ``eos_token_id``. Passing the
+    full set is what lets an instruction-tuned model stop on its turn delimiter
+    rather than running to ``max_tokens``.
+    """
+    ids = getattr(tokenizer, "eos_token_ids", None)
+    if ids:
+        return tuple(ids)
+    return getattr(tokenizer, "eos_token_id", None)
+
+
 def engine_can_batch(engine: Any, batch_size: int) -> bool:
     """Whether ``engine`` advertises real batched execution at this width."""
     supports = getattr(engine, "supports_batch", None)
@@ -190,7 +204,7 @@ def generate_batch(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
-        eos_token_id=getattr(handle.tokenizer, "eos_token_id", None),
+        eos_token_id=_stop_ids(handle.tokenizer),
     )
     elapsed = time.perf_counter() - start
     if len(rows) != len(requests):

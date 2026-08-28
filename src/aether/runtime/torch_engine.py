@@ -27,6 +27,11 @@ from aether.runtime.batch import (
     pack_left_padded,
 )
 from aether.runtime.positional import alibi_slopes
+from aether.runtime.stopping import stop_token_set
+from aether.runtime.rope_scaling import (
+    parse_rope_scaling,
+    scaled_inverse_frequencies,
+)
 
 
 def _resolve_device(torch: Any, spec: Any) -> Any:
@@ -86,6 +91,11 @@ EXECUTION_NUMERICS_FIELDS: tuple[str, ...] = (
     "rope_partial_dim",
     "rope_interleaved",
     "rope_local_theta",
+    # The rotary frequency transform is part of the model, not a runtime option:
+    # executing a scaled checkpoint with unscaled frequencies is a silent,
+    # model-wide numerical error.  It must survive any rebuilt weight container.
+    "rope_scaling",
+    "original_context_length",
     "norm_placement",
     "qk_norm_scope",
     "no_rope_layers",
@@ -321,6 +331,28 @@ class TorchAEGEngine:
             if local_theta and float(local_theta) != self.rope_theta
             else None
         )
+        # ── Rotary frequency transform ─────────────────────────────────────
+        # Parsed once here, never per token.  ``None`` means the checkpoint
+        # declares no scaling and the standard frequencies apply, which is the
+        # majority of models and costs nothing.
+        declared_context = int(getattr(weights, "context_length", 0) or 0) or None
+        self.rope_scaling_spec = parse_rope_scaling(
+            getattr(weights, "rope_scaling", None),
+            context_length=declared_context,
+            original_context_length=getattr(weights, "original_context_length", None),
+        )
+        #: Multiplier YaRN and LongRoPE apply to the rotary tables.  Folded into
+        #: cos/sin exactly as the reference does, rather than into the softmax
+        #: scale: it multiplies the *rotated* query and key, so the two are not
+        #: interchangeable.
+        self.rope_attention_scaling = 1.0
+        #: ``inv_freq`` the cached tables were built from.  Two schemes are
+        #: length-dependent — ``dynamic`` rescales the base and ``longrope``
+        #: switches factor tables — so a request that crosses their boundary needs
+        #: new tables even when the cached ones are tall enough.  Comparing the
+        #: frequencies themselves catches every scheme without special cases, and
+        #: costs a few dozen float operations per growth check.
+        self._rope_inv_freq: np.ndarray | None = None
         declared_scale = getattr(weights, "attention_scale", None)
         self.base_attention_scale = (
             float(declared_scale)
@@ -543,9 +575,27 @@ class TorchAEGEngine:
         as well without the runaway.
         """
         device = device or self.device
+        inverse, attention = scaled_inverse_frequencies(
+            self.rope_theta,
+            self.rotary_dim,
+            self.rope_scaling_spec,
+            sequence_length=int(required),
+        )
         current = 0 if self._cos is None else int(self._cos.shape[0])
-        if self._cos is not None and current >= required and self._cos.device == device:
+        unchanged = (
+            self._rope_inv_freq is not None
+            and self._rope_inv_freq.shape == inverse.shape
+            and np.array_equal(self._rope_inv_freq, inverse)
+        )
+        if (
+            self._cos is not None
+            and current >= required
+            and self._cos.device == device
+            and unchanged
+        ):
             return
+        self._rope_inv_freq = inverse
+        self.rope_attention_scaling = float(attention)
         capacity = min(
             max(int(required) + self._ROPE_HEADROOM, self._ROPE_HEADROOM),
             self.max_positions,
@@ -576,14 +626,21 @@ class TorchAEGEngine:
         expansion once, at table-build time, removes several tensor operations
         per layer per token, which is the dominant cost of small-model decode.
         """
-        half = self.rotary_dim // 2
-        positions = self.torch.arange(required, device=device, dtype=self.torch.float32)[:, None]
-        exponent = self.torch.arange(half, device=device, dtype=self.torch.float32) * (
-            2.0 / self.rotary_dim
+        inverse, attention = scaled_inverse_frequencies(
+            theta, self.rotary_dim, self.rope_scaling_spec, sequence_length=int(required)
         )
-        inv_freq = theta ** (-exponent)
+        positions = self.torch.arange(required, device=device, dtype=self.torch.float32)[:, None]
+        inv_freq = self.torch.as_tensor(
+            inverse, device=device, dtype=self.torch.float32
+        )
         angles = positions * inv_freq[None, :]
         cos, sin = self.torch.cos(angles), self.torch.sin(angles)
+        if attention != 1.0:
+            # YaRN's temperature correction, applied to the tables exactly as the
+            # reference applies it.  It scales the rotated Q and K, so folding it
+            # into the softmax scale instead would change the result by its square.
+            cos = cos * attention
+            sin = sin * attention
         if self.rope_interleaved:
             # Adjacent-channel pairing (GPT-J, Cohere, GLM-4): frequency i covers
             # channels 2i and 2i+1.
@@ -1444,7 +1501,7 @@ class TorchAEGEngine:
         describes exactly the tokens that were yielded.
         """
         token_device = self._sample_device(next_logits, temperature, top_k, top_p)
-        stop = None if eos_token_id is None else int(eos_token_id)
+        stops = stop_token_set(eos_token_id)
         for _ in range(int(max_tokens)):
             checkpoint = int(cache.length)
             _, cache = self._forward_device(
@@ -1455,7 +1512,7 @@ class TorchAEGEngine:
             # residual device time rather than the whole step.
             token = int(token_device.item())
             yield token
-            if stop is not None and token == stop:
+            if token in stops:
                 cache.length = checkpoint
                 break
             token_device = following
@@ -1478,6 +1535,7 @@ class TorchAEGEngine:
         sample-then-advance ordering and forgoes the lookahead above.
         """
         torch = self.torch
+        stops = stop_token_set(eos_token_id)
         for _ in range(int(max_tokens)):
             mask = grammar_session.get_token_mask()
             if len(mask) * 8 < int(next_logits.numel()):
@@ -1503,7 +1561,7 @@ class TorchAEGEngine:
             yield token
             if getattr(grammar_session, "is_accepting", lambda: False)():
                 break
-            if eos_token_id is not None and token == int(eos_token_id):
+            if token in stops:
                 break
             _, cache = self._forward_device(
                 torch.tensor([token], dtype=torch.long, device=self.device),
@@ -1768,7 +1826,7 @@ class TorchAEGEngine:
         )
         outputs: list[list[int]] = [[] for _ in range(batch)]
         finished = [False] * batch
-        stop = None if eos_token_id is None else int(eos_token_id)
+        stops = stop_token_set(eos_token_id)
         tokens = self._sample_device(cache.last_logits, temperature, top_k, top_p)
         for _ in range(int(max_tokens)):
             # Queue the next step before reading this one back, for the reason
@@ -1788,7 +1846,7 @@ class TorchAEGEngine:
                     continue
                 token = int(row_tokens[index])
                 outputs[index].append(token)
-                if stop is not None and token == stop:
+                if token in stops:
                     finished[index] = True
             if all(finished):
                 break
@@ -2081,6 +2139,10 @@ class TorchHybridAEGEngine:
                       top_k: int = 0, top_p: float = 1.0, eos_token_id: int | None = None,
                       cache: TorchHybridCache | None = None, cache_callback: Any | None = None,
                       grammar_session: Any | None = None, **_: Any) -> Iterator[int]:
+        # Normalized once per request: a checkpoint may declare several stop
+        # ids (an instruct model's turn delimiter is often not its eos_token),
+        # and every engine must agree on what stopping means.
+        stops = stop_token_set(eos_token_id)
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         prompt = np.asarray(prompt_ids, dtype=np.int64).reshape(-1)
@@ -2111,7 +2173,7 @@ class TorchHybridAEGEngine:
             yield token
             if grammar_session is not None and getattr(grammar_session, "is_accepting", lambda: False)():
                 break
-            if eos_token_id is not None and token == int(eos_token_id):
+            if token in stops:
                 break
             _, cache = self.forward(np.asarray([token], dtype=np.int64), cache)
             next_logits = cache.last_logits
