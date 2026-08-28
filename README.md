@@ -9,6 +9,129 @@ Aether is an open-source AI model compiler and inference runtime. It ingests any
 
 ---
 
+## Benchmark Results — Aether vs HuggingFace Transformers
+
+> Measured on **2x Tesla T4 (14.6 GiB each)** · BF16 · Kaggle · Aether Runtime v1.2.8 · Transformers v5.0.0
+> Full report: [`benchmark/results/BENCHMARK_RESULTS.md`](benchmark/results/BENCHMARK_RESULTS.md)
+
+### Mean Speedup per Model
+
+![Overview Speedup](benchmark/results/overview_speedup.png)
+
+| Model | Best Speedup | Mean Speedup | Worst Cell |
+|-------|-------------|--------------|-----------|
+| SmolLM2-135M-Instruct | **1.93x** (P256/B1) | **1.80x** | 1.56x (P1024/B4) |
+| Qwen3-0.6B | **2.14x** (P32/B1) | **1.57x** | 1.16x (P1024/B4) |
+| GPTNeo350M-Instruct-SFT | **1.83x** (P32/B1) | **1.37x** | 0.93x (P1024/B4) |
+
+> **26 of 27 cells**: Aether faster by >5% &nbsp;|&nbsp; **1 cell**: Transformers faster (GPTNeo P1024/B4, full-MHA KV pressure)
+
+---
+
+### SmolLM2-135M-Instruct
+
+#### Throughput (tok/s) — Bar Chart
+
+![SmolLM2 Throughput Bar](benchmark/results/smollm2_135m_instruct_throughput_bar.png)
+
+#### Throughput vs Prompt Length — Line Chart
+
+![SmolLM2 Throughput Line](benchmark/results/smollm2_135m_instruct_throughput_line.png)
+
+#### Speedup Heatmap (Aether / Transformers)
+
+![SmolLM2 Speedup Heatmap](benchmark/results/smollm2_135m_instruct_speedup_heatmap.png)
+
+#### Latency (s) — Bar Chart
+
+![SmolLM2 Latency Bar](benchmark/results/smollm2_135m_instruct_latency_bar.png)
+
+#### Throughput Table
+
+| Prompt | Batch | Aether tok/s | HF tok/s | Speedup |
+|--------|-------|-------------|---------|---------|
+| 32 | 1 | **46.06** | 23.95 | 1.92x |
+| 32 | 2 | **87.50** | 49.37 | 1.77x |
+| 32 | 4 | **172.41** | 95.03 | 1.81x |
+| 256 | 1 | **45.80** | 23.71 | 1.93x |
+| 256 | 2 | **85.56** | 47.50 | 1.80x |
+| 256 | 4 | **157.56** | 89.14 | 1.77x |
+| 1024 | 1 | **41.50** | 21.96 | 1.89x |
+| 1024 | 2 | **75.61** | 43.36 | 1.74x |
+| 1024 | 4 | **129.43** | 82.71 | 1.56x |
+
+---
+
+### Qwen3-0.6B
+
+#### Throughput (tok/s) — Bar Chart
+
+![Qwen3 Throughput Bar](benchmark/results/qwen3_0.6b_throughput_bar.png)
+
+#### Throughput vs Prompt Length — Line Chart
+
+![Qwen3 Throughput Line](benchmark/results/qwen3_0.6b_throughput_line.png)
+
+#### Speedup Heatmap (Aether / Transformers)
+
+![Qwen3 Speedup Heatmap](benchmark/results/qwen3_0.6b_speedup_heatmap.png)
+
+#### Latency (s) — Bar Chart
+
+![Qwen3 Latency Bar](benchmark/results/qwen3_0.6b_latency_bar.png)
+
+#### Throughput Table
+
+| Prompt | Batch | Aether tok/s | HF tok/s | Speedup |
+|--------|-------|-------------|---------|---------|
+| 32 | 1 | **41.96** | 19.56 | 2.14x |
+| 32 | 2 | **42.78** | 33.88 | 1.26x |
+| 32 | 4 | **81.40** | 65.40 | 1.24x |
+| 256 | 1 | **40.24** | 19.60 | 2.05x |
+| 256 | 2 | **37.73** | 31.35 | 1.20x |
+| 256 | 4 | **66.04** | 54.69 | 1.21x |
+| 1024 | 1 | **35.71** | 18.44 | 1.94x |
+| 1024 | 2 | **27.38** | 23.11 | 1.18x |
+| 1024 | 4 | **39.81** | 34.39 | 1.16x |
+
+---
+
+### GPTNeo350M-Instruct-SFT
+
+#### Throughput (tok/s) — Bar Chart
+
+![GPTNeo Throughput Bar](benchmark/results/gptneo350m_instruct_sft_throughput_bar.png)
+
+#### Throughput vs Prompt Length — Line Chart
+
+![GPTNeo Throughput Line](benchmark/results/gptneo350m_instruct_sft_throughput_line.png)
+
+#### Speedup Heatmap (Aether / Transformers)
+
+![GPTNeo Speedup Heatmap](benchmark/results/gptneo350m_instruct_sft_speedup_heatmap.png)
+
+#### Latency (s) — Bar Chart
+
+![GPTNeo Latency Bar](benchmark/results/gptneo350m_instruct_sft_latency_bar.png)
+
+#### Throughput Table
+
+| Prompt | Batch | Aether tok/s | HF tok/s | Speedup |
+|--------|-------|-------------|---------|---------|
+| 32 | 1 | **71.67** | 39.14 | 1.83x |
+| 32 | 2 | **64.57** | 47.37 | 1.36x |
+| 32 | 4 | **123.11** | 93.42 | 1.32x |
+| 256 | 1 | **63.14** | 39.34 | 1.61x |
+| 256 | 2 | **57.40** | 45.53 | 1.26x |
+| 256 | 4 | **99.94** | 85.60 | 1.17x |
+| 1024 | 1 | **54.41** | 36.94 | 1.47x |
+| 1024 | 2 | **41.35** | 39.08 | 1.06x |
+| 1024 | 4 | 60.38 | **65.21** | 0.93x |
+
+> **Note (P1024/B4):** Only cell where Transformers wins. Full MHA (no GQA) causes KV-cache memory spill at large batch x long context. Targeted for v1.3.
+
+---
+
 ## Core Principles
 
 | Principle | Implementation |
