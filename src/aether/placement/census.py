@@ -376,6 +376,27 @@ def _registry_prior(name: str, kind: str) -> tuple[float, float]:
     return _UNKNOWN_ACCEL_BANDWIDTH_BPS, _UNKNOWN_ACCEL_FLOPS
 
 
+def _device_barrier(torch: Any, device: Any) -> "Any | None":
+    """Return a callable that waits for ``device`` to finish, or ``None`` for a CPU.
+
+    Every asynchronous backend publishes a ``synchronize`` under its own namespace, so
+    the barrier is looked up by device type rather than enumerated. ``None`` means the
+    device is synchronous (a CPU) or the backend exposes no barrier — in either case a
+    timed measurement of queued work would be meaningless, and the caller keeps its
+    prior instead.
+    """
+    kind = getattr(device, "type", "cpu")
+    if kind == "cpu":
+        return None
+    if kind == "cuda":
+        return lambda: torch.cuda.synchronize(device)
+    namespace = getattr(torch, kind, None)
+    synchronize = getattr(namespace, "synchronize", None)
+    if synchronize is None:
+        return None
+    return lambda: synchronize()
+
+
 def measure_bandwidth_bps(device_id: str, *, payload_bytes: int = _BANDWIDTH_PROBE_BYTES) -> float:
     """Time a large on-device copy to get effective memory bandwidth.
 
@@ -386,10 +407,16 @@ def measure_bandwidth_bps(device_id: str, *, payload_bytes: int = _BANDWIDTH_PRO
     keeps its prior rather than trusting a failed measurement.
     """
     try:
+        import time as _time
+
         import torch
 
         device = torch.device(device_id)
-        if device.type not in ("cuda", "mps"):
+        # Any backend that can hold a tensor and be told to finish can be measured.
+        # Naming the accelerators that *can* be probed rather than the ones that cannot
+        # is what keeps a new backend from silently falling onto a registry prior.
+        barrier = _device_barrier(torch, device)
+        if barrier is None:
             return 0.0
         count = payload_bytes // 4
         source = torch.empty(count, dtype=torch.float32, device=device)
@@ -397,6 +424,8 @@ def measure_bandwidth_bps(device_id: str, *, payload_bytes: int = _BANDWIDTH_PRO
         for _ in range(2):  # warm up allocator and clocks
             target.copy_(source)
         if device.type == "cuda":
+            # CUDA events time the copy on the device itself, which excludes the host
+            # cost of issuing it — the tighter measurement where it is available.
             torch.cuda.synchronize(device)
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
@@ -407,13 +436,11 @@ def measure_bandwidth_bps(device_id: str, *, payload_bytes: int = _BANDWIDTH_PRO
             torch.cuda.synchronize(device)
             elapsed = start.elapsed_time(end) / 1000.0 / 5
         else:
-            import time as _time
-
-            torch.mps.synchronize()
+            barrier()
             begin = _time.perf_counter()
             for _ in range(5):
                 target.copy_(source)
-            torch.mps.synchronize()
+            barrier()
             elapsed = (_time.perf_counter() - begin) / 5
         del source, target
         if elapsed <= 0:
@@ -461,12 +488,9 @@ def measure_dispatch_seconds(
 
         device = torch.device(device_id)
         tensor = torch.ones(16, dtype=torch.float32, device=device)
-        synchronize = None
-        if device.type == "cuda":
-            def synchronize() -> None:
-                torch.cuda.synchronize(device)
-        elif device.type == "mps":
-            synchronize = torch.mps.synchronize
+        # One lookup for every asynchronous backend; ``None`` on a CPU, where the work
+        # is already complete when the call returns.
+        synchronize = _device_barrier(torch, device)
 
         def one_pass() -> float:
             start = _time.perf_counter()

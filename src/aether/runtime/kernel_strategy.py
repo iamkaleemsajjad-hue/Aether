@@ -373,14 +373,27 @@ class StrategyCalibrator:
         """The class of hardware, not the individual card.
 
         A strategy that wins on one Ampere card wins on another, so the calibration is
-        keyed by architecture where the backend exposes one and by device type
-        otherwise. This is what lets a fleet share a calibration instead of measuring
-        per host, and it contains no vendor branch: the capability string comes from
-        whatever backend is present.
+        keyed by *architecture* where the backend exposes one and by device type
+        otherwise.  That is what lets a fleet share one calibration instead of measuring
+        per host.
+
+        The vendor is part of the key rather than assumed from the device type.  PyTorch
+        exposes AMD GPUs through ``torch.cuda``, so keying on ``device.type`` alone would
+        label an MI300X ``cuda-sm…`` and could give two different vendors' architectures
+        the same key.  ROCm reports a GCN architecture name, so that is what is used
+        there; CUDA reports a compute capability; every other backend contributes its own
+        type.  No branch here asserts what a device *is capable of* — only what it calls
+        itself.
         """
         kind = getattr(self.device, "type", str(self.device))
         try:
             if kind == "cuda":
+                if getattr(self.torch.version, "hip", None):
+                    properties = self.torch.cuda.get_device_properties(self.device)
+                    arch = str(
+                        getattr(properties, "gcnArchName", "") or ""
+                    ).split(":")[0].strip()
+                    return f"rocm-{arch}" if arch else "rocm"
                 major, minor = self.torch.cuda.get_device_capability(self.device)
                 return f"cuda-sm{major}{minor}"
             if kind in ("xpu", "mps", "cpu"):
@@ -460,16 +473,23 @@ class StrategyCalibrator:
 
         Without this a launch-only measurement would rank the candidates by how
         cheaply they *enqueue*, which is the opposite of the question being asked.
+
+        The barrier is looked up by device type rather than enumerated per vendor, so a
+        backend Aether has not seen before is still measured correctly instead of having
+        its launch cost mistaken for its execution cost.
         """
         torch = self.torch
         kind = getattr(self.device, "type", "cpu")
+        if kind == "cpu":
+            return
         try:
             if kind == "cuda":
                 torch.cuda.synchronize(self.device)
-            elif kind == "mps":
-                torch.mps.synchronize()
-            elif kind == "xpu":
-                torch.xpu.synchronize()
+                return
+            namespace = getattr(torch, kind, None)
+            synchronize = getattr(namespace, "synchronize", None)
+            if synchronize is not None:
+                synchronize()
         except Exception:  # noqa: BLE001 - a backend without a barrier needs none
             pass
 

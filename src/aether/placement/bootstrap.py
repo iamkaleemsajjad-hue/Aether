@@ -157,6 +157,10 @@ def reset_peak_stats(device_ids: "tuple[str, ...] | list[str]") -> None:
         try:
             if device_id.startswith("cuda"):
                 torch.cuda.reset_peak_memory_stats(device_id)
+            elif device_id.startswith("xpu") and hasattr(
+                getattr(torch, "xpu", None), "reset_peak_memory_stats"
+            ):
+                torch.xpu.reset_peak_memory_stats(device_id)
             elif device_id == "mps" and hasattr(torch.mps, "reset_peak_memory_stats"):
                 torch.mps.reset_peak_memory_stats()
         except Exception as exc:  # noqa: BLE001 - a missing counter is not fatal
@@ -169,6 +173,11 @@ def read_memory(device_id: str) -> MemoryReading | None:
     Returns ``None`` when the device has no readable counters — a CPU, or a backend
     without allocator statistics — because a fabricated zero would be folded into σ as
     if it were a measurement.
+
+    Each backend is asked for the counters *it* publishes rather than being assumed to
+    have CUDA's set.  A backend that publishes none defers the bootstrap, which is the
+    honest outcome: an unmeasured device keeps its documented prior instead of being
+    credited with a fabricated measurement.
     """
     try:
         import torch
@@ -184,6 +193,23 @@ def read_memory(device_id: str) -> MemoryReading | None:
                 reserved_bytes=int(torch.cuda.memory_reserved(index)),
                 driver_used_bytes=int(total) - int(free),
                 total_bytes=int(total),
+            )
+        if device_id.startswith("xpu"):
+            xpu = getattr(torch, "xpu", None)
+            peak = getattr(xpu, "max_memory_allocated", None)
+            reserved = getattr(xpu, "memory_reserved", None)
+            if peak is None:
+                return None
+            allocated = int(peak(device_id))
+            held = int(reserved(device_id)) if reserved is not None else allocated
+            # Intel's runtime publishes no driver-wide total, so the non-framework term
+            # is unknown rather than zero; reporting `driver_used == reserved` makes
+            # `non_framework_bytes` zero, which the caller reads as "not measured".
+            return MemoryReading(
+                device_id=device_id,
+                peak_allocated_bytes=allocated,
+                reserved_bytes=held,
+                driver_used_bytes=held,
             )
         if device_id == "mps":
             current = getattr(torch.mps, "current_allocated_memory", None)

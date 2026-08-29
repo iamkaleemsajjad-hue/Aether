@@ -20,6 +20,10 @@ from typing import Any, Iterator
 
 import numpy as np
 
+from aether.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
 from aether.runtime.batch import (
     DEFAULT_PAD_TOKEN_ID,
     BatchLayout,
@@ -247,7 +251,7 @@ class TorchAEGEngine:
         elif self.device.type == "cuda":
             self.compute_dtype = torch.float16
         else:
-            self.compute_dtype = torch.float32
+            self.compute_dtype = self._probe_compute_dtype(torch, self.device)
         self.source_engine = cpu_engine
         self.weights = cpu_engine.weights
         #: Set once ``release_host_weights`` has dropped the bulk host arrays, so
@@ -728,6 +732,50 @@ class TorchAEGEngine:
             x.float().pow(2).mean(dim=-1, keepdim=True) + self.norm_eps
         ).to(dtype=x.dtype)
         return x * rms * weight
+
+    #: Half-precision verdict per device type, so the probe below runs once per
+    #: process rather than once per loaded model.
+    _HALF_PRECISION_SUPPORT: "dict[str, Any]" = {}
+
+    @classmethod
+    def _probe_compute_dtype(cls, torch: Any, device: Any) -> Any:
+        """Choose residency precision for a non-CUDA device by *asking* the device.
+
+        A CPU stays at FP32 — half precision there is emulated and slower.  Every other
+        accelerator is a question rather than an assumption: Metal, XPU, and backends
+        Aether has not seen all support half precision to differing degrees, and
+        hard-coding FP32 for "not CUDA" leaves an Apple or Intel GPU running at a
+        fraction of its rate for no reason other than the branch it failed.
+
+        So a tiny matmul is run in FP16 and checked against the FP32 result.  Half
+        precision is adopted only if the backend both executes it and agrees — the same
+        measure-then-select discipline the decode kernel strategy uses, and the reason
+        this cannot regress a device where FP16 is unimplemented or wrong.
+
+        The tolerance is loose because FP16 accumulation genuinely differs from FP32;
+        what is being detected is a backend that silently produces garbage or refuses,
+        not the last bit of a rounding difference.
+        """
+        kind = getattr(device, "type", "cpu")
+        cached = cls._HALF_PRECISION_SUPPORT.get(kind)
+        if cached is not None:
+            return cached
+        if kind == "cpu":
+            cls._HALF_PRECISION_SUPPORT[kind] = torch.float32
+            return torch.float32
+        verdict = torch.float32
+        try:
+            left = torch.ones((8, 8), dtype=torch.float32, device=device)
+            right = torch.full((8, 8), 0.5, dtype=torch.float32, device=device)
+            reference = left @ right
+            produced = (left.half() @ right.half()).float()
+            if torch.allclose(produced, reference, rtol=5e-2, atol=5e-2):
+                verdict = torch.float16
+        except Exception as exc:  # noqa: BLE001 - an unsupported dtype is an answer
+            logger.debug("half precision unavailable on %s (%s); using fp32", kind, exc)
+        cls._HALF_PRECISION_SUPPORT[kind] = verdict
+        logger.debug("residency precision for %s: %s", kind, verdict)
+        return verdict
 
     def _matmul(self, x: Any, weight: Any, bias: Any | None = None) -> Any:
         """Apply a projection whose orientation was settled at load time.

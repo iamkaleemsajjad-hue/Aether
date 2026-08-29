@@ -176,6 +176,11 @@ class DecodeProfile:
 def _synchronizer(engine: Any) -> "Callable[[], None]":
     """A barrier for the engine's device, or a no-op where none is needed.
 
+    Looked up by device type rather than enumerated per vendor: every asynchronous
+    backend publishes ``synchronize`` under its own namespace, so a backend Aether has
+    not seen before still gets a correct barrier instead of silently reporting launch
+    time as if it were execution time.
+
     Under a profiler the barrier is required for the numbers to mean anything; it is
     also why a profiled step is slower than an unprofiled one, and why the *shares*
     rather than the absolute times are the figure to read.
@@ -187,11 +192,11 @@ def _synchronizer(engine: Any) -> "Callable[[], None]":
         return lambda: None
     if kind == "cuda":
         return lambda: torch.cuda.synchronize(device)
-    if kind == "mps":
-        return torch.mps.synchronize
-    if kind == "xpu":
-        return lambda: torch.xpu.synchronize()
-    return lambda: None
+    namespace = getattr(torch, kind, None)
+    synchronize = getattr(namespace, "synchronize", None)
+    if synchronize is None:
+        return lambda: None
+    return lambda: synchronize()
 
 
 # ── drivers ───────────────────────────────────────────────────────────────────
