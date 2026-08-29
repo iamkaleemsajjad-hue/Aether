@@ -21,6 +21,7 @@ the architecture can be exercised on a host with no artifacts present.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import platform
 import sys
@@ -28,7 +29,44 @@ import time
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+def require_installed_aether() -> None:
+    """Fail with a diagnosis instead of a misleading ``ModuleNotFoundError``.
+
+    This script deliberately does **not** prepend ``src`` to ``sys.path``.  An
+    installed distribution has to be importable on its own; repairing the path here
+    would hide a broken install and would only work for callers who happened to run
+    this file.
+
+    The failure worth naming is the implicit namespace package.  If a *directory*
+    called ``aether`` sits on ``sys.path`` — most easily by cloning the repository
+    into a directory of that name next to an entry like ``/kaggle/working`` — and the
+    real distribution is not importable, then ``import aether`` quietly succeeds as an
+    empty namespace package with ``__file__ is None``, and the first submodule import
+    fails pointing at the submodule rather than at the cause.  Worse, that empty module
+    is now cached in ``sys.modules``, so a later ``sys.path`` fix cannot undo it.
+    """
+    spec = importlib.util.find_spec("aether")
+    if spec is None:
+        raise SystemExit(
+            "aether is not importable. Install it first:  pip install -e .\n"
+            "(from a notebook, restart the kernel after installing: a .pth file is "
+            "only read when an interpreter starts.)"
+        )
+    if spec.origin is None or spec.submodule_search_locations is None:
+        found = list(spec.submodule_search_locations or [])
+        raise SystemExit(
+            "aether resolved to an implicit namespace package, not the installed "
+            f"distribution.\n  found: {found}\n"
+            "A directory named 'aether' on sys.path is shadowing it, and the real "
+            "package is not importable.\n"
+            "Fix: install the distribution (pip install -e .) and, in a notebook, "
+            "restart the kernel afterwards; or clone into a directory that is not "
+            "named 'aether'."
+        )
+
+
+require_installed_aether()
 
 #: Geometries covering the shape classes the supported families fall into.  Named for
 #: the property being exercised, not for a vendor's model, because the point is the

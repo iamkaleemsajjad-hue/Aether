@@ -278,38 +278,29 @@ collective = "aether.parallelism.distributed:CollectiveBackend"
 [project.entry-points."aether.eval"]
 evaluators = "aether.observability.evaluators:EVALUATOR_REGISTRY"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/aether"]
-include = [
-    "/src/aether",
-]
+# ── Packaging ─────────────────────────────────────────────────────────────────
+# The build backend is setuptools (see [build-system]).  Everything about the
+# layout is declared explicitly rather than inferred, because the failure mode of
+# inference is silent: a stray directory becomes an implicit namespace package,
+# `aether.__file__` is None, and every submodule import fails with a
+# ModuleNotFoundError that points nowhere near the real cause.
+#
+# `package-dir` states the src layout instead of letting it be derived from
+# `where`.  `include` pins discovery to this project's own package tree, so a
+# sibling directory under src/ can never be packaged by accident.  `namespaces =
+# false` requires a real __init__.py for every discovered package, which is the
+# direct guard against the implicit-namespace-package class of bug.
+[tool.setuptools]
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["aether*"]
+namespaces = false
 
 # PEP 561: include py.typed marker and .pyi stubs in the wheel
 [tool.setuptools.package-data]
 aether = ["py.typed", "*.pyi"]
-
-[tool.hatch.build.targets.sdist]
-include = [
-    "/src",
-    "/tests",
-    "/docs",
-    "/examples",
-    "/benchmarks",
-    "/scripts",
-    "/research",
-    "/README.md",
-    "/LICENSE",
-    "/CONTRIBUTING.md",
-    "/CHANGELOG.md",
-    "/Makefile",
-]
-
-[tool.hatch.version]
-source = "vcs"
-fallback-version = "1.2.8a0"
 
 [tool.ruff]
 target-version = "py310"
