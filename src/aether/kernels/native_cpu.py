@@ -28,6 +28,7 @@ import sysconfig
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -94,6 +95,69 @@ class CompilerToolchain:
 
 def _is_macos() -> bool:
     return sysconfig.get_platform().startswith("macosx")
+
+
+def _open_shared_library(
+    path: Path, toolchain: "CompilerToolchain | None" = None
+) -> ctypes.CDLL:
+    """Load a compiled kernel library, resolving its transitive dependencies.
+
+    A MinGW build of the kernel source imports ``libgomp-1.dll`` for the OpenMP
+    pragmas, and that DLL lives beside the compiler rather than on the interpreter's
+    ``PATH`` — which is precisely how Aether ends up compiling a library it cannot
+    load and silently dropping to the numpy reference path.
+
+    Two search strategies are tried because they cover disjoint cases, and the order
+    matters:
+
+    1. ctypes' default Windows mode, which is ``LOAD_WITH_ALTERED_SEARCH_PATH |
+       LOAD_LIBRARY_SEARCH_DEFAULT_DIRS``.  Only this mode consults the directories
+       registered by :func:`os.add_dll_directory`, so it is the one that can find the
+       toolchain's own runtime DLLs.
+    2. ``winmode=0``, which asks for the legacy search order and therefore *does*
+       consult ``PATH``.  It is the fallback for a host whose dependencies are on
+       ``PATH`` but outside any directory we can name.
+
+    Passing ``winmode=0`` alone — as this loader used to — opts out of
+    ``LOAD_LIBRARY_SEARCH_*`` entirely and thus discards every added directory,
+    which made the ``add_dll_directory`` calls dead code.
+
+    Raises:
+        OSError: When no strategy could load the library. The first error is
+            re-raised, because it is the one describing the intended path.
+    """
+    if os.name != "nt":
+        return ctypes.CDLL(str(path))
+
+    search: list[Path] = [path.parent]
+    if toolchain is not None and toolchain.executable:
+        # The compiler's bin directory is where libgomp/libstdc++ ship.
+        binary_dir = Path(toolchain.executable).parent
+        if binary_dir.is_dir():
+            search.append(binary_dir)
+
+    handles: list[Any] = []
+    for directory in search:
+        try:
+            handles.append(os.add_dll_directory(str(directory)))
+        except (AttributeError, OSError):  # pragma: no cover - platform dependent
+            continue
+    try:
+        first_error: OSError | None = None
+        for keywords in ({}, {"winmode": 0}):
+            try:
+                return ctypes.CDLL(str(path), **keywords)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        assert first_error is not None
+        raise first_error
+    finally:
+        for handle in handles:
+            try:
+                handle.close()
+            except OSError:  # pragma: no cover - close is best effort
+                pass
 
 
 #: Compilers tried in order of preference, with their flags.
@@ -196,8 +260,32 @@ def detect_toolchain() -> CompilerToolchain | None:
 
 
 def _verify_toolchain(toolchain: CompilerToolchain) -> bool:
-    """Compile a trivial translation unit to confirm the toolchain works."""
-    probe = 'extern "C" int aether_probe(void) { return 42; }\n'
+    """Compile a trivial translation unit *and load it* to confirm the toolchain works.
+
+    Loading is the part that matters.  A compiler can succeed and still emit a
+    library this process cannot open — the MinGW OpenMP runtime is the common case —
+    and a check that stops at ``output.exists()`` accepts that toolchain, then fails
+    at the real load with the numpy fallback as the only visible symptom.  Verifying
+    the load here means an unloadable configuration is rejected while the candidate
+    list still has alternatives left to try.
+
+    The probe mirrors the real build: when ``-fopenmp`` is requested it contains an
+    OpenMP pragma, so the probe imports the same runtime the kernels will.  Without
+    that, the probe links against nothing and proves nothing about the case that
+    actually breaks.
+    """
+    uses_openmp = any("openmp" in flag or flag == "/openmp" for flag in toolchain.base_flags)
+    loop = "    for (int i = 0; i < 4; ++i) total += i;\n"
+    body = ("    #pragma omp parallel for\n" + loop) if uses_openmp else loop
+    probe = (
+        'extern "C" {export} int aether_probe(void) {{\n'
+        "    int total = 0;\n{body}"
+        "    return total + 36;\n"
+        "}}\n"
+    ).format(
+        export="__declspec(dllexport)" if os.name == "nt" else "",
+        body=body,
+    )
     with tempfile.TemporaryDirectory() as tmp:
         source = Path(tmp) / "probe.cpp"
         source.write_text(probe, encoding="utf-8")
@@ -212,7 +300,41 @@ def _verify_toolchain(toolchain: CompilerToolchain) -> bool:
             )
         except (OSError, subprocess.SubprocessError):
             return False
-        return result.returncode == 0 and output.exists()
+        if result.returncode != 0 or not output.exists():
+            return False
+        library: Any = None
+        try:
+            library = _open_shared_library(output, toolchain)
+            probe_symbol = library.aether_probe
+            probe_symbol.restype = ctypes.c_int
+            if probe_symbol() != 42:
+                return False
+        except (OSError, AttributeError) as exc:
+            logger.debug(
+                "toolchain %s compiles but its output does not load (%s)",
+                toolchain.executable, exc,
+            )
+            return False
+        finally:
+            # Windows keeps a compiled probe mapped until its handle is released,
+            # and the TemporaryDirectory teardown would then fail to remove it.
+            _release_library(library)
+        return True
+
+
+def _release_library(library: Any) -> None:
+    """Drop a ctypes handle so the file it maps can be deleted.
+
+    Only meaningful on Windows, where an open mapping keeps the file locked. A
+    failure to unload is not actionable — the temporary directory cleanup is
+    best-effort either way — so this never raises.
+    """
+    if library is None or os.name != "nt":
+        return
+    try:
+        ctypes.windll.kernel32.FreeLibrary(ctypes.c_void_p(library._handle))
+    except Exception:  # noqa: BLE001 - unloading is best effort
+        pass
 
 
 # ── Kernel source ─────────────────────────────────────────────────────────────
@@ -896,35 +1018,7 @@ class NativeCPUKernels:
             return False
 
         try:
-            # On Windows, ctypes.CDLL may fail with "Could not find module" if
-            # the DLL has transitive dependencies (OpenMP runtime: vcomp.dll or
-            # libgomp.dll) not on the DLL search path.  Python 3.8+ exposes
-            # os.add_dll_directory() for exactly this purpose.  We also pass
-            # winmode=0 to force the standard Windows DLL search order instead
-            # of ctypes' custom restricted loader.
-            _dll_dirs: list = []
-            try:
-                if hasattr(os, "add_dll_directory"):
-                    _dll_dirs.append(os.add_dll_directory(str(library.parent)))
-                    # Also add the toolchain's bin directory (where libgomp.dll lives).
-                    if self.toolchain is not None and self.toolchain.executable:
-                        tc_bin = Path(self.toolchain.executable).parent
-                        if tc_bin.is_dir():
-                            _dll_dirs.append(os.add_dll_directory(str(tc_bin)))
-            except (AttributeError, OSError):
-                pass
-            try:
-                import platform as _platform
-                if _platform.system() == "Windows":
-                    self._lib = ctypes.CDLL(str(library), winmode=0)
-                else:
-                    self._lib = ctypes.CDLL(str(library))
-            finally:
-                for _d in _dll_dirs:
-                    try:
-                        _d.close()
-                    except Exception:  # noqa: BLE001
-                        pass
+            self._lib = _open_shared_library(library, self.toolchain)
         except OSError as exc:
             self._build_error = f"could not load {library}: {exc}"
             logger.warning("Failed to load native kernels: %s", exc)
@@ -956,26 +1050,10 @@ class NativeCPUKernels:
                 self._build_error = f"native kernel library hash mismatch for {path}"
                 return False
         try:
-            # Apply the same Windows-safe DLL loading used in ensure_compiled():
-            # add_dll_directory lets the loader find OpenMP/MSVCRT dependencies.
-            _dll_dirs2: list = []
-            try:
-                if hasattr(os, "add_dll_directory"):
-                    _dll_dirs2.append(os.add_dll_directory(str(path.parent)))
-            except (AttributeError, OSError):
-                pass
-            try:
-                import platform as _platform2
-                if _platform2.system() == "Windows":
-                    library = ctypes.CDLL(str(path), winmode=0)
-                else:
-                    library = ctypes.CDLL(str(path))
-            finally:
-                for _d in _dll_dirs2:
-                    try:
-                        _d.close()
-                    except Exception:  # noqa: BLE001
-                        pass
+            # A packaged library is loaded through the same dependency-resolving
+            # path as a locally compiled one: an AEG built on a MinGW host carries
+            # the same OpenMP import.
+            library = _open_shared_library(path, self.toolchain)
             previous = self._lib
             self._lib = library
             try:

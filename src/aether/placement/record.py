@@ -199,6 +199,23 @@ def render_record(decision: "PlannerDecision") -> str:
             f"(<<1 means the fabric can carry it)"
         )
 
+    # ── the constants that shaped the space ───────────────────────────────────
+    # Both of these were weak points in the original design: one was an underived
+    # constant, the other a value whose key could silently be wrong. Printing the
+    # derivation is what makes either falsifiable in the field.
+    if decision.homogeneity is not None:
+        lines.append(_wrap("LAW I      ", decision.homogeneity.explain(), indent=11))
+        bound = decision.homogeneity
+        lines.append(
+            f"           tested {bound.ratio:.2f}x aggregate/candidate throughput "
+            f"({'admitted' if bound.admitted else 'rejected'}: "
+            f"{'+'.join(bound.group) or 'none'} + {bound.candidate})"
+        )
+    if decision.dispatch_sensitivity is not None:
+        lines.append(_wrap("DISPATCH   ", decision.dispatch_sensitivity.explain(), indent=11))
+    if decision.bootstrap is not None:
+        lines.append(_wrap("BOOTSTRAP  ", decision.bootstrap.summary(), indent=11))
+
     lines.append("LADDER")
     for rung in decision.ladder:
         lines.append(f"           {rung}")

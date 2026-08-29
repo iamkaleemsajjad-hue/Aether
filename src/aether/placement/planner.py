@@ -22,7 +22,10 @@ order. The feedback loop exists to tighten the *next* prediction.
 
 from __future__ import annotations
 
+import math
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +40,7 @@ from aether.placement.cost import (
     tp_comm_seconds,
     tp_prefill_comm_ratio,
 )
+from aether.placement.homogeneity import HomogeneityBound, HomogeneityLaw
 from aether.placement.ledger import CalibrationLedger, LedgerEntry
 from aether.placement.memory import (
     KAPPA_DEFAULT,
@@ -60,6 +64,7 @@ logger = get_logger(__name__)
 
 __all__ = [
     "PlacementInfeasible",
+    "DispatchSensitivity",
     "PlanEvaluation",
     "PlannerDecision",
     "ExecutionPlanner",
@@ -68,12 +73,37 @@ __all__ = [
 _UNCALIBRATED_LATENCY_SIGMA = 0.25
 """Relative latency uncertainty before any measurement exists."""
 
+_MEASURED_LATENCY_SIGMA_FLOOR = 0.02
+"""Smallest relative uncertainty a *measured* history may claim.
+
+Mirrors the feasibility lane's margin floor and for the same reason: several readings
+that agreed exactly prove nothing has varied yet, not that nothing can.  Without it a
+handful of repeatable runs would drive the error bar to zero, and every tie would then
+resolve on a difference the planner cannot actually resolve."""
+
 _PER_DEVICE_LATENCY_SIGMA = 0.05
 """Extra relative uncertainty per additional device: each one adds an interaction
 the cost model does not measure directly."""
 
 _HOST_LINK_BPS = 6e9
 """Conservative host-to-device streaming bandwidth for offload plans."""
+
+_DISPATCH_SEARCH_SPAN = 10.0
+"""How far either way the dispatch-sensitivity search looks, as a factor.
+
+An order of magnitude brackets the real range: capturing CUDA graphs moves the host
+cost per operation from tens of microseconds to a couple, and no plausible mis-keying
+moves it further than that.  A decision that survives the whole span cannot be an
+artefact of the ledger key."""
+
+_DISPATCH_BISECTIONS = 12
+"""Bisection steps per direction. Twelve resolves the factor to better than 0.1%."""
+
+_DISPATCH_RIVALS = 3
+"""Alternatives re-costed during the sensitivity search, strongest first.
+
+The flip, if there is one, is to a plan that was already close; re-costing the whole
+feasible set would multiply the planning cost for candidates that cannot win."""
 
 
 class PlacementInfeasible(RuntimeError):
@@ -190,6 +220,95 @@ class PlanEvaluation:
         }
 
 
+@dataclass(frozen=True)
+class DispatchSensitivity:
+    """How far ``t_dispatch`` would have to move before the decision changes.
+
+    The dispatch roof is a property of the runtime build rather than the hardware, and
+    it moves whenever the decode path is fused or captured.  The design named a
+    mis-keyed dispatch cost as the failure mode to watch, because an inflated roof does
+    not merely mispredict a latency — it makes every wider plan look worse, so the
+    planner *systematically* refuses to shard models it should.
+
+    A silent systematic bias is unacceptable; a *quantified* one is a line in a report.
+    This bisects the factor on ``t_dispatch`` at which the ranking flips, so the record
+    can state both the margin and the alternative it would produce.  A planner that
+    says "TP wins below 9 µs/op and I measured 56" cannot mislead an operator the way a
+    planner that only reports its own answer can.
+    """
+
+    current_seconds: float
+    """Dispatch cost in force, per graph operation."""
+
+    flip_factor: float = 0.0
+    """Multiplier at which the selected plan loses. Zero means no flip was found."""
+
+    flip_seconds: float = 0.0
+    """The dispatch cost that flip corresponds to."""
+
+    alternative: str = ""
+    """Label of the plan that would win instead."""
+
+    measured: bool = False
+    """Whether the current cost is a probe or the documented prior."""
+
+    decisive: bool = False
+    """Whether the dispatch roof is what binds the selected plan."""
+
+    rivals_tested: int = 0
+    """Structurally different feasible plans re-costed during the search.
+
+    Zero means nothing could have flipped — there was no alternative — which is a
+    different statement from "the answer survived the search", and the record must not
+    conflate them."""
+
+    @property
+    def robust(self) -> bool:
+        """True when no reachable dispatch cost changes the answer.
+
+        "Reachable" is the search window: an order of magnitude either way, which is
+        wider than the gap between an eager loop and a captured graph.  A decision that
+        survives all of it cannot be an artefact of a wrong key.
+        """
+        return self.rivals_tested > 0 and self.flip_factor <= 0.0
+
+    def explain(self) -> str:
+        source = "measured" if self.measured else "prior, not yet measured"
+        current = f"t_dispatch {self.current_seconds * 1e6:.1f} us/op ({source})"
+        if self.rivals_tested <= 0:
+            return (
+                f"{current}; no structurally different plan was feasible, so the "
+                "dispatch cost could not have changed the placement"
+            )
+        if self.robust:
+            return (
+                f"{current}; the decision is unchanged across a 10x move either way, "
+                "so a mis-keyed dispatch cost could not have produced it"
+            )
+        direction = "below" if self.flip_factor < 1.0 else "above"
+        return (
+            f"{current}; {self.alternative} would win {direction} "
+            f"{self.flip_seconds * 1e6:.1f} us/op ({self.flip_factor:.2f}x). "
+            + (
+                "Capturing CUDA graphs or fusing the decode path reaches that."
+                if self.flip_factor < 1.0
+                else "Verify the ledger key before trusting this margin."
+            )
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "current_us_per_op": round(self.current_seconds * 1e6, 3),
+            "measured": self.measured,
+            "decisive": self.decisive,
+            "robust": self.robust,
+            "rivals_tested": self.rivals_tested,
+            "flip_factor": round(self.flip_factor, 4),
+            "flip_us_per_op": round(self.flip_seconds * 1e6, 3),
+            "alternative": self.alternative,
+        }
+
+
 @dataclass
 class PlannerDecision:
     """The planner's output: a choice, the evidence, and the reasoning."""
@@ -204,6 +323,14 @@ class PlannerDecision:
     ladder: tuple[str, ...] = ()
     planning_seconds: float = 0.0
     calibrated: bool = False
+    homogeneity: HomogeneityBound | None = None
+    """Law I's binding decision, with the arithmetic that produced its tolerance."""
+
+    dispatch_sensitivity: "DispatchSensitivity | None" = None
+    """How far the dispatch cost would have to move to change this decision."""
+
+    bootstrap: Any = None
+    """The cold-start calibration pass, once one has run. ``None`` before that."""
 
     @property
     def plan(self) -> ExecutionPlan:
@@ -234,6 +361,11 @@ class PlannerDecision:
             "ladder": list(self.ladder),
             "calibrated": self.calibrated,
             "planning_ms": round(self.planning_seconds * 1e3, 3),
+            "homogeneity": self.homogeneity.to_dict() if self.homogeneity else None,
+            "dispatch_sensitivity": (
+                self.dispatch_sensitivity.to_dict() if self.dispatch_sensitivity else None
+            ),
+            "bootstrap": self.bootstrap.to_dict() if self.bootstrap is not None else None,
             "model": self.profile.to_dict(),
             "workload": self.workload.to_dict(),
             "hardware": self.census.to_dict(),
@@ -252,7 +384,10 @@ class ExecutionPlanner:
         ledger: Calibration store. A default, on-disk one is used when omitted.
         kappa: Device-memory ceiling fraction — the only percentage in the design.
         z: One-sided quantile for the transient-peak margin.
-        tolerance: Law I's throughput ratio bound for a tensor-parallel group.
+        tolerance: Pin Law I's throughput-ratio bound instead of deriving it. Left at
+            the default the bound is computed from the shard granularity and the
+            planner's own error bar; see :mod:`aether.placement.homogeneity`. Pass a
+            value only to reproduce an old decision or to bisect a suspected bug.
     """
 
     def __init__(
@@ -265,11 +400,14 @@ class ExecutionPlanner:
         z: float = Z_DEFAULT,
         tolerance: float = THETA_TOLERANCE,
         probe_bandwidth: bool = True,
+        probe_dispatch: bool = True,
     ) -> None:
         self.profile = profile
         self.ledger = ledger if ledger is not None else CalibrationLedger()
         self.census = census if census is not None else take_census(
-            ledger=self.ledger, probe_bandwidth=probe_bandwidth
+            ledger=self.ledger,
+            probe_bandwidth=probe_bandwidth,
+            probe_dispatch=probe_dispatch,
         )
         self.kappa = kappa
         self.z = z
@@ -285,6 +423,52 @@ class ExecutionPlanner:
                 device.signature, self.census.backend_build
             )
         return self._entries[device.device_id]
+
+    def latency_sigma(self, devices: int, device_ids: "tuple[str, ...]" = ()) -> float:
+        """Relative uncertainty on a latency prediction for a plan this wide.
+
+        Measured where the ledger has timing evidence, structural where it does not,
+        plus a term per additional device because each one adds an interaction the cost
+        model does not observe directly.  Exposed as one method so the σ-gated tie-break
+        and Law I's derivation cannot drift apart: both are statements about the same
+        error bar, and two copies of it would eventually disagree.
+
+        Evidence is selected on the *sample count*, never on ``σ > 0``. A device whose
+        predictions have been exact has a σ of zero and the best evidence there is;
+        reading that as "unmeasured" would leave the planner permanently uncertain about
+        its most reliable hardware. A measured σ is floored instead, because several
+        identical readings prove nothing has varied yet rather than that nothing can.
+        """
+        ids = device_ids or tuple(device.device_id for device in self.census.devices[:1])
+        entries = [self.entry_for(self.census.by_id(device_id)) for device_id in ids]
+        measured = [entry.latency_sigma for entry in entries if entry.has_latency_evidence]
+        if measured:
+            base = max(sum(measured) / len(measured), _MEASURED_LATENCY_SIGMA_FLOOR)
+        else:
+            base = _UNCALIBRATED_LATENCY_SIGMA
+        return base + _PER_DEVICE_LATENCY_SIGMA * max(0, devices - 1)
+
+    def homogeneity_law(self, workload: WorkloadEnvelope) -> HomogeneityLaw:
+        """Law I for this workload, with its tolerance derived rather than set.
+
+        See :mod:`aether.placement.homogeneity`: the largest admissible throughput
+        ratio inside a tensor-parallel group is the wider of the throughput-measurement
+        noise floor and the ratio at which whole-head shard rounding breaks the
+        planner's own error bar — overridden by a measured crossover once the ledger has
+        bracketed one.
+
+        A ``tolerance`` other than the default pins the bound instead of deriving it, so
+        an operator can reproduce an old decision or bisect a suspected planner bug. The
+        record labels a pinned bound as such.
+        """
+        return HomogeneityLaw(
+            profile=self.profile,
+            census=self.census,
+            workload=workload,
+            entry_for=self.entry_for,
+            latency_sigma=lambda devices: self.latency_sigma(devices),
+            override=None if self.tolerance == THETA_TOLERANCE else self.tolerance,
+        )
 
     def theta(self, workload: WorkloadEnvelope) -> dict[str, float]:
         """Relative capability per device, on the roof the workload actually hits.
@@ -559,13 +743,9 @@ class ExecutionPlanner:
         # ── prediction uncertainty ─────────────────────────────────────────────
         # Measured where evidence exists, structural where it does not. Each extra
         # device adds an interaction the cost model does not observe directly, so the
-        # σ-gated tie-break naturally demands more evidence from wider plans.
-        entries = [self.entry_for(self.census.by_id(d)) for d in plan.device_ids]
-        measured = [e.latency_sigma for e in entries if e.latency_sigma > 0]
-        base = (
-            sum(measured) / len(measured) if measured else _UNCALIBRATED_LATENCY_SIGMA
-        )
-        latency_sigma = base + _PER_DEVICE_LATENCY_SIGMA * max(0, plan.num_devices - 1)
+        # σ-gated tie-break naturally demands more evidence from wider plans. Law I
+        # derives its tolerance from the same number.
+        latency_sigma = self.latency_sigma(plan.num_devices, plan.device_ids)
 
         # ── blended per-token time ─────────────────────────────────────────────
         fraction = workload.effective_prefill_fraction
@@ -590,6 +770,18 @@ class ExecutionPlanner:
                 f"dispatch-bound: host op cost exceeds the next roof by {ratio:.1f}x. "
                 "CUDA-graph capture or operator fusion is the fix, not more devices."
             )
+            lead_dispatch = self.entry_for(lead)
+            if not lead_dispatch.dispatch_measured:
+                # The one case where a wrong ledger key changes the answer rather than
+                # only the number: the roof that decides is the one that was never
+                # measured. Saying so is what stops the prior passing for evidence.
+                flags.append(
+                    "the deciding dispatch roof uses the "
+                    f"{lead_dispatch.dispatch_seconds * 1e6:.0f} us/op prior, not a "
+                    f"measurement, for backend {self.census.backend_build}. Run a "
+                    "census with probe_dispatch enabled before treating this verdict "
+                    "as calibrated."
+                )
         if plan.max_tp_degree > 1 and comm_ratio > 0.5:
             flags.append(
                 f"tensor-parallel prefill communication is {comm_ratio:.2f}x its compute "
@@ -654,8 +846,10 @@ class ExecutionPlanner:
         workload = workload or WorkloadEnvelope()
         theta = self.theta(workload)
         caps = self.weight_caps()
+        law = self.homogeneity_law(workload)
         candidates = enumerate_plans(
-            self.profile, self.census, theta=theta, caps=caps, tolerance=self.tolerance
+            self.profile, self.census, theta=theta, caps=caps,
+            tolerance=self.tolerance, admits=law,
         )
         evaluations = [self.evaluate(plan, workload) for plan in candidates]
         feasible = [evaluation for evaluation in evaluations if evaluation.feasible]
@@ -720,6 +914,8 @@ class ExecutionPlanner:
             ladder=ladder,
             planning_seconds=time.perf_counter() - started,
             calibrated=all(budget.calibrated for budget in selected.budgets),
+            homogeneity=law.binding_bound(),
+            dispatch_sensitivity=self._dispatch_sensitivity(selected, feasible, workload),
         )
         logger.info(
             "placement: %s selected for %s (%d feasible of %d plans, %.2f ms)",
@@ -727,6 +923,107 @@ class ExecutionPlanner:
             len(feasible), len(evaluations), decision.planning_seconds * 1e3,
         )
         return decision
+
+    # ── dispatch sensitivity ──────────────────────────────────────────────────
+
+    @contextmanager
+    def _dispatch_scale(self, factor: float) -> "Iterator[None]":
+        """Temporarily scale every device's dispatch cost.
+
+        The cached entries are copies the planner owns, so scaling them is local and
+        reversible — no ledger write, no effect on any other planner.
+        """
+        for device in self.census.devices:  # populate the cache before mutating it
+            self.entry_for(device)
+        original = {key: entry.dispatch_seconds for key, entry in self._entries.items()}
+        try:
+            for key, entry in self._entries.items():
+                entry.dispatch_seconds = original[key] * factor
+            yield
+        finally:
+            for key, entry in self._entries.items():
+                entry.dispatch_seconds = original[key]
+
+    def _dispatch_sensitivity(
+        self,
+        selected: PlanEvaluation,
+        feasible: "list[PlanEvaluation]",
+        workload: WorkloadEnvelope,
+    ) -> DispatchSensitivity:
+        """Find the dispatch cost at which this decision would change.
+
+        Bisected rather than solved, because the objective is a max of three roofs plus
+        a communication term and is therefore piecewise — but it is monotone in
+        ``t_dispatch``, which is all bisection needs.  Only the strongest few
+        alternatives are re-costed, so the whole search stays inside the planning budget.
+        """
+        lead = self.census.by_id(selected.plan.device_ids[0])
+        entry = self.entry_for(lead)
+        current = float(entry.dispatch_seconds)
+        base = DispatchSensitivity(
+            current_seconds=current,
+            measured=bool(entry.dispatch_measured),
+            decisive=selected.binding_roof == "dispatch",
+        )
+        rivals = sorted(
+            (
+                evaluation for evaluation in feasible
+                # Structurally different plans only. A rival that differs from the
+                # selection by a shard policy or a layer ordering is the same placement
+                # wearing another label, and a "flip" to it at 1.00x says nothing about
+                # whether the dispatch cost was keyed correctly.
+                if evaluation.plan.num_devices != selected.plan.num_devices
+                or evaluation.plan.kind is not selected.plan.kind
+            ),
+            key=lambda evaluation: evaluation.objective(workload),
+        )[:_DISPATCH_RIVALS]
+        if not rivals or current <= 0:
+            return base
+
+        plans = [selected.plan] + [rival.plan for rival in rivals]
+        selected_label = selected.plan.label
+        base = DispatchSensitivity(
+            current_seconds=current, measured=base.measured,
+            decisive=base.decisive, rivals_tested=len(rivals),
+        )
+
+        def winner(factor: float) -> str:
+            with self._dispatch_scale(factor):
+                evaluations = [self.evaluate(plan, workload) for plan in plans]
+                feasible_now = [e for e in evaluations if e.feasible] or evaluations
+                return min(
+                    feasible_now, key=lambda e: e.objective(workload)
+                ).plan.label
+
+        def bisect(near: float, far: float) -> float:
+            """Factor closest to 1.0 at which the winner is no longer the selection."""
+            for _ in range(_DISPATCH_BISECTIONS):
+                middle = (near * far) ** 0.5  # geometric: the quantity is a ratio
+                if winner(middle) == selected_label:
+                    near = middle
+                else:
+                    far = middle
+            return far
+
+        flips: list[tuple[float, str]] = []
+        for far in (1.0 / _DISPATCH_SEARCH_SPAN, _DISPATCH_SEARCH_SPAN):
+            label = winner(far)
+            if label != selected_label:
+                factor = bisect(1.0, far)
+                flips.append((factor, winner(factor)))
+        if not flips:
+            return base
+
+        factor, alternative = min(flips, key=lambda item: abs(math.log(item[0])))
+        return DispatchSensitivity(
+            current_seconds=current,
+            flip_factor=factor,
+            flip_seconds=current * factor,
+            alternative=alternative,
+            measured=base.measured,
+            decisive=base.decisive,
+            rivals_tested=len(rivals),
+        )
 
     def _reason(
         self,
@@ -887,6 +1184,61 @@ class ExecutionPlanner:
 
     # ── feedback ──────────────────────────────────────────────────────────────
 
+    def needs_bootstrap(self, decision: PlannerDecision) -> bool:
+        """Whether this decision rests on priors that one measurement would replace.
+
+        True when any device in the selected plan has no residual history.  That is the
+        cold-start case the design named: the margin is a documented prior rather than a
+        measured σ, and the honest fix is one forward pass, not a wider default.
+        """
+        return any(not budget.calibrated for budget in decision.selected.budgets)
+
+    def calibrate(
+        self,
+        decision: PlannerDecision,
+        forward: "Callable[[int, int], Any]",
+        *,
+        tokens: int = 0,
+        batch: int = 0,
+        force: bool = False,
+    ) -> Any:
+        """Run the cold-start bootstrap and fold it into the ledger.
+
+        One forward pass at the workload ceiling replaces the conservative prior with a
+        measurement, which is the difference between a margin that is *defensible* and
+        one that is merely *safe*.  The pass is skipped when the devices are already
+        calibrated, because re-measuring what is known costs a load-time pass for
+        nothing.
+
+        Args:
+            decision: The plan that was selected and is now resident.
+            forward: ``forward(batch, tokens)`` runs exactly one pass. The caller owns
+                it because only the caller can drive its engine.
+            tokens: Sequence length. Defaults to the workload's target context — the
+                widest step the plan must survive.
+            batch: Batch. Defaults to the workload's target batch.
+            force: Measure even when the ledger already has evidence.
+
+        Returns:
+            A :class:`~aether.placement.bootstrap.BootstrapResult`, also attached to
+            ``decision.bootstrap`` so the record can report it. Never raises for an
+            allocation failure: an OOM during the pass is recorded as evidence that the
+            prediction was low.
+        """
+        from aether.placement.bootstrap import BootstrapResult, bootstrap
+
+        if not force and not self.needs_bootstrap(decision):
+            result = BootstrapResult(skipped="every device already has residual history")
+        else:
+            result = bootstrap(
+                decision, forward, self.ledger, tokens=tokens, batch=batch
+            )
+            # The cache holds pre-bootstrap copies; the next plan must read the new σ.
+            self._entries.clear()
+        decision.bootstrap = result
+        logger.info("placement bootstrap: %s", result.summary())
+        return result
+
     def observe(
         self,
         decision: PlannerDecision,
@@ -918,7 +1270,50 @@ class ExecutionPlanner:
                 r_fixed_bytes=(observed_r_fixed_bytes or {}).get(budget.device_id),
                 fragmentation=(observed_fragmentation or {}).get(budget.device_id),
             )
+        self._observe_homogeneity(decision, observed_decode_seconds)
         self._entries.clear()
+
+    def _observe_homogeneity(
+        self, decision: PlannerDecision, observed_decode_seconds: float
+    ) -> None:
+        """Record whether a heterogeneous TP group met its water-filled prediction.
+
+        This is what makes Law I's tolerance a *measurement* of this machine rather than
+        a derivation about it.  Only heterogeneous groups carry information — a group of
+        identical devices has a ratio of 1.0 and cannot bracket a crossover — so a
+        homogeneous run is correctly ignored rather than recorded as evidence for a
+        tolerance it does not test.
+        """
+        if observed_decode_seconds <= 0:
+            return
+        predicted = decision.selected.decode_seconds
+        if predicted <= 0:
+            return
+        theta = self.theta(decision.workload)
+        for stage in decision.plan.stages:
+            if stage.tp_degree < 2:
+                continue
+            speeds = [max(theta.get(device_id, 0.0), 0.0) for device_id in stage.devices]
+            if min(speeds) <= 0:
+                continue
+            # The law's own metric: the aggregate of everything *except* the slowest
+            # member, over the slowest member. That is the ratio Law I tested when it
+            # admitted that device, so an observation recorded on any other scale would
+            # be compared against a limit it does not describe.
+            slowest = min(speeds)
+            ratio = (sum(speeds) - slowest) / slowest
+            if ratio <= 1.0 + 1e-9:
+                # A group of identical devices sits at the metric's floor and cannot
+                # bracket a crossover, so recording it would add noise, not evidence.
+                continue
+            lead = self.census.by_id(stage.devices[0])
+            self.ledger.observe_tp_group(
+                lead.signature,
+                self.census.backend_build,
+                theta_ratio=ratio,
+                predicted_seconds=predicted,
+                observed_seconds=observed_decode_seconds,
+            )
 
     def __repr__(self) -> str:
         return (

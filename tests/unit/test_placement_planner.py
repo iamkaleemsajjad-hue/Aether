@@ -1066,3 +1066,639 @@ def test_the_record_names_every_device_and_its_memory(mid_model, tmp_path) -> No
     hardware = [line for line in decision.render().splitlines() if line.startswith("hardware")][0]
     assert "Tesla T4" in hardware and "T4-24" in hardware
     assert "14." in hardware and "21." in hardware, "each device's memory must be shown"
+
+
+# ── Law I: a derived tolerance, not a constant ─────────────────────────────────
+#
+# These pin the three properties that make the homogeneity tolerance defensible:
+# it is computed from the shard granularity and the planner's own error bar, it
+# tightens as calibration accumulates, and a measurement overrides the derivation.
+
+
+def law_for(profile, devices, links, workload, tmp_path, **kwargs):
+    """Build the derived Law I predicate the planner would use."""
+    machine = census(devices, links)
+    store = ledger_for(tmp_path, ops=profile.ops_per_token, signatures=T4_SIGNATURES, **kwargs)
+    planner = ExecutionPlanner(profile, machine, store, probe_bandwidth=False)
+    return planner, planner.homogeneity_law(workload), machine
+
+
+def test_law_one_tolerance_is_derived_from_heads_and_sigma(small_model, workload, tmp_path) -> None:
+    """H*sigma - 1, with the noise floor as a lower bound. No constant anywhere."""
+    planner, law, machine = law_for(
+        small_model, [device(0), device(1)], [link("cuda:0", "cuda:1")], workload, tmp_path
+    )
+    theta = planner.theta(workload)
+    bound = law.bound((machine.devices[0],), machine.devices[1], theta)
+    sigma = planner.latency_sigma(2)
+    assert bound.heads == small_model.num_heads
+    assert bound.sigma == pytest.approx(sigma)
+    assert bound.noise_floor == pytest.approx(1.0 + sigma)
+    assert bound.granularity_limit == pytest.approx(small_model.num_heads * sigma - 1.0)
+    assert bound.limit == pytest.approx(max(bound.noise_floor, bound.granularity_limit))
+    assert bound.source in ("granularity", "noise")
+
+
+def test_the_uncalibrated_floor_lands_on_the_constant_the_design_guessed(
+    small_model, workload, tmp_path
+) -> None:
+    """1 + sigma with no evidence is 1.3 - the placeholder, now with a reason."""
+    from aether.placement.homogeneity import TOLERANCE_PRIOR
+
+    planner, law, machine = law_for(
+        small_model, [device(0), device(1)], [link("cuda:0", "cuda:1")], workload, tmp_path
+    )
+    bound = law.bound((machine.devices[0],), machine.devices[1], planner.theta(workload))
+    assert bound.noise_floor == pytest.approx(TOLERANCE_PRIOR, abs=1e-9)
+
+
+def test_identical_devices_are_always_admitted(small_model, workload, tmp_path) -> None:
+    """A ratio of 1.0 must never be refused: the group would be refusing itself."""
+    planner, law, machine = law_for(
+        small_model, [device(0), device(1)], [link("cuda:0", "cuda:1")], workload, tmp_path
+    )
+    theta = planner.theta(workload)
+    bound = law.bound((machine.devices[0],), machine.devices[1], theta)
+    assert bound.ratio == pytest.approx(1.0, abs=1e-6)
+    assert bound.admitted
+    assert bound.limit > 1.0, "a bound of exactly 1.0 would reject any real pair"
+
+
+def test_a_near_identical_pair_is_admitted_where_a_hard_1_0_would_refuse_it(
+    mid_model, workload, tmp_path
+) -> None:
+    """320 vs 300 GB/s is a 7% mismatch and the design's Scenario 4 shards it."""
+    decision = plan_for(
+        mid_model,
+        [device(0), device(1, name="Tesla T4-24", total=23_000_000_000, bandwidth=300e9)],
+        [link("cuda:0", "cuda:1")],
+        workload, tmp_path,
+    )
+    assert decision.plan.stages[0].tp_degree == 2
+    assert decision.homogeneity is not None
+    assert decision.homogeneity.admitted
+
+
+def test_the_tolerance_tightens_as_calibration_accumulates(small_model, workload, tmp_path) -> None:
+    """Evidence narrows the bound. An uncalibrated host must be the permissive one."""
+    machine = census([device(0), device(1)], [link("cuda:0", "cuda:1")])
+    loose = ledger_for(tmp_path / "loose", ops=small_model.ops_per_token, signatures=T4_SIGNATURES)
+    tight = ledger_for(tmp_path / "tight", ops=small_model.ops_per_token, signatures=T4_SIGNATURES)
+    for signature in T4_SIGNATURES:
+        for _ in range(12):
+            # A perfectly predictable device: sigma collapses toward zero.
+            tight.observe_execution(
+                signature, "test-backend",
+                predicted_transient_bytes=1 << 30, observed_peak_bytes=1 << 30,
+                predicted_seconds=0.02, observed_seconds=0.02,
+                r_fixed_bytes=1 << 29,
+            )
+    bounds = []
+    for store in (loose, tight):
+        planner = ExecutionPlanner(small_model, machine, store, probe_bandwidth=False)
+        law = planner.homogeneity_law(workload)
+        bounds.append(
+            law.bound((machine.devices[0],), machine.devices[1], planner.theta(workload))
+        )
+    assert bounds[1].sigma < bounds[0].sigma, "calibration must shrink the error bar"
+    assert bounds[1].limit < bounds[0].limit, "and shrinking it must tighten Law I"
+
+
+def test_a_measured_crossover_overrides_the_derivation(small_model, workload, tmp_path) -> None:
+    """The design asked for a measured ratio. When one exists it wins outright."""
+    machine = census([device(0), device(1)], [link("cuda:0", "cuda:1")])
+    store = ledger_for(tmp_path, ops=small_model.ops_per_token, signatures=T4_SIGNATURES)
+    signature = machine.devices[0].signature
+    # A group at 1.5x met its prediction; one at 4.0x missed it by more than sigma.
+    store.observe_tp_group(
+        signature, "test-backend",
+        theta_ratio=1.5, predicted_seconds=0.020, observed_seconds=0.020,
+    )
+    store.observe_tp_group(
+        signature, "test-backend",
+        theta_ratio=4.0, predicted_seconds=0.020, observed_seconds=0.060,
+    )
+    planner = ExecutionPlanner(small_model, machine, store, probe_bandwidth=False)
+    law = planner.homogeneity_law(workload)
+    bound = law.bound((machine.devices[0],), machine.devices[1], planner.theta(workload))
+    assert bound.source == "measured"
+    assert bound.samples == 2
+    # The crossover is bracketed by the two observations, geometrically centred.
+    assert 1.5 < bound.limit < 4.0
+    assert bound.limit == pytest.approx(math.sqrt(1.5 * 4.0))
+
+
+def test_a_group_that_met_its_prediction_is_never_refused_afterwards(
+    small_model, workload, tmp_path
+) -> None:
+    """Refusing a ratio we have watched succeed would contradict our own evidence."""
+    machine = census([device(0), device(1)], [link("cuda:0", "cuda:1")])
+    store = ledger_for(tmp_path, ops=small_model.ops_per_token, signatures=T4_SIGNATURES)
+    store.observe_tp_group(
+        machine.devices[0].signature, "test-backend",
+        theta_ratio=9.0, predicted_seconds=0.020, observed_seconds=0.020,
+    )
+    planner = ExecutionPlanner(small_model, machine, store, probe_bandwidth=False)
+    law = planner.homogeneity_law(workload)
+    bound = law.bound((machine.devices[0],), machine.devices[1], planner.theta(workload))
+    assert bound.limit >= 9.0
+    assert bound.source == "measured"
+
+
+def test_law_one_still_keeps_a_cpu_out_of_a_tensor_parallel_group(
+    small_model, workload, tmp_path
+) -> None:
+    """The exclusion must survive the rewrite, and follow from arithmetic not a name."""
+    planner, law, machine = law_for(
+        small_model, [device(0), host_cpu()], [], workload, tmp_path
+    )
+    theta = planner.theta(workload)
+    bound = law.bound((machine.by_id("cuda:0"),), machine.by_id("cpu"), theta)
+    assert not bound.admitted
+    assert bound.ratio > bound.limit
+
+
+def test_law_one_is_structural_and_never_deletes_the_only_feasible_plan(
+    mid_model, tmp_path
+) -> None:
+    """A value test inside a hard constraint would empty the fallback ladder.
+
+    This is the failure the separation exists to prevent: a model too large for one
+    device needs its sharded plan *generated* even when widening is a poor trade.
+    """
+    tight = WorkloadEnvelope(
+        batch_floor=1, batch_target=1, context_floor=512, context_target=2048,
+        generate_floor=64, generate_target=256,
+    )
+    decision = plan_for(
+        mid_model,
+        [device(0, total=T4_TOTAL), device(1, total=T4_TOTAL, bandwidth=300e9)],
+        [link("cuda:0", "cuda:1")],
+        tight, tmp_path,
+    )
+    assert decision.plan.num_devices == 2, "the model does not fit on one T4"
+    assert decision.homogeneity is not None
+    assert decision.homogeneity.admitted
+
+
+def test_the_value_test_is_reported_but_does_not_prune(small_model, workload, tmp_path) -> None:
+    """On a dispatch-bound small model one more rank never pays, and the record says so."""
+    planner, law, machine = law_for(
+        small_model, [device(0), device(1)], [link("cuda:0", "cuda:1")], workload, tmp_path
+    )
+    bound = law.bound((machine.devices[0],), machine.devices[1], planner.theta(workload))
+    assert bound.value_computed
+    assert not bound.worth_it, "widening cannot pay on a 0.6B model over PCIe"
+    assert bound.admitted, "but the plan is still generated"
+    assert "never pays" in bound.explain()
+
+
+def test_the_record_shows_law_one_with_its_derivation(small_model, workload, tmp_path) -> None:
+    decision = plan_for(
+        small_model, [device(0), device(1)], [link("cuda:0", "cuda:1")], workload, tmp_path
+    )
+    record = decision.render()
+    assert "LAW I" in record
+    assert "sigma" in record
+    assert "aggregate/candidate throughput" in record
+
+
+def test_capability_groups_still_accepts_a_plain_ratio() -> None:
+    """The context-free API must keep working for tests and inspection tools."""
+    fast, slow = device(0, bandwidth=900e9), device(1, bandwidth=200e9)
+    theta = {"cuda:0": 1.0, "cuda:1": 200 / 900}
+    assert len(capability_groups((fast, slow), theta=theta, tolerance=1.3)) == 2
+    assert len(capability_groups((fast, slow), theta=theta, tolerance=8.0)) == 1
+
+
+def test_an_explicit_tolerance_pins_the_bound_and_is_labelled_as_pinned(
+    small_model, workload, tmp_path
+) -> None:
+    """An operator may reproduce an old decision, but never disguise it as derived."""
+    machine = census([device(0), device(1)], [link("cuda:0", "cuda:1")])
+    store = ledger_for(tmp_path, ops=small_model.ops_per_token, signatures=T4_SIGNATURES)
+    planner = ExecutionPlanner(
+        small_model, machine, store, probe_bandwidth=False, tolerance=1.02
+    )
+    law = planner.homogeneity_law(workload)
+    bound = law.bound((machine.devices[0],), machine.devices[1], planner.theta(workload))
+    assert bound.limit == pytest.approx(1.02)
+    assert bound.source == "override"
+    assert "pinned by the caller" in bound.explain()
+
+
+
+# ── t_dispatch: keyed, verified, and quantified ────────────────────────────────
+#
+# The design named a mis-keyed dispatch cost as the failure mode to watch, because an
+# inflated dispatch roof does not merely mispredict a latency - it makes every wider
+# plan look worse, so the planner systematically refuses to shard. Three defences are
+# pinned here: a key wide enough to separate runtimes, a probe that overrules a stale
+# value, and a reported margin so the bias cannot be silent.
+
+
+def test_the_backend_key_separates_every_layer_that_moves_dispatch_cost() -> None:
+    from aether.placement.census import _backend_build, _execution_mode
+
+    key = _backend_build()
+    assert "py" in key, "the interpreter issues the operations"
+    assert "aether" in key, "Aether's own decode loop is the host-side cost"
+    assert _execution_mode() in key, "graph capture moves the cost without a version"
+
+
+def test_graph_capture_changes_the_key_so_it_cannot_reuse_an_eager_measurement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aether.placement.census import _backend_build
+
+    eager = _backend_build()
+    monkeypatch.setenv("AETHER_CUDA_GRAPHS", "1")
+    captured = _backend_build()
+    assert eager != captured, "an eager dispatch cost must not be read as a captured one"
+
+
+def test_a_stale_dispatch_cost_is_replaced_rather_than_trusted(tmp_path: Path) -> None:
+    """The guard for the named failure mode: verify, do not trust."""
+    from aether.placement.ledger import DISPATCH_STALE_RATIO
+
+    store = CalibrationLedger(tmp_path / "cal.json", autosave=False)
+    store.record_dispatch("cuda:T4:14GiB", "build-a", 56e-6, measured=True)
+    fresh = 56e-6 / (DISPATCH_STALE_RATIO * 2)
+    value, replaced = store.reconcile_dispatch("cuda:T4:14GiB", "build-a", fresh)
+    assert replaced, "a 4x divergence is evidence the stored value is not this runtime"
+    assert value == pytest.approx(fresh)
+    assert store.get("cuda:T4:14GiB", "build-a").dispatch_seconds == pytest.approx(fresh)
+
+
+def test_probe_noise_does_not_thrash_the_stored_dispatch_cost(tmp_path: Path) -> None:
+    """Within the staleness ratio the stored measurement stands: no oscillation."""
+    store = CalibrationLedger(tmp_path / "cal.json", autosave=False)
+    store.record_dispatch("cuda:T4:14GiB", "build-a", 56e-6, measured=True)
+    value, replaced = store.reconcile_dispatch("cuda:T4:14GiB", "build-a", 62e-6)
+    assert not replaced
+    assert value == pytest.approx(56e-6)
+
+
+def test_a_prior_never_overwrites_a_measurement(tmp_path: Path) -> None:
+    store = CalibrationLedger(tmp_path / "cal.json", autosave=False)
+    store.record_dispatch("cuda:T4:14GiB", "build-a", 56e-6, measured=True)
+    store.record_dispatch("cuda:T4:14GiB", "build-a", 25e-6, measured=False)
+    entry = store.get("cuda:T4:14GiB", "build-a")
+    assert entry.dispatch_seconds == pytest.approx(56e-6)
+    assert entry.dispatch_measured
+
+
+def test_an_unmeasured_dispatch_cost_is_flagged_when_it_decides(
+    small_model, workload, tmp_path
+) -> None:
+    """A prior may not pass for evidence in the one place it changes the answer."""
+    machine = census([device(0), device(1)], [link("cuda:0", "cuda:1")])
+    bare = CalibrationLedger(tmp_path / "bare.json", autosave=False)
+    planner = ExecutionPlanner(small_model, machine, bare, probe_bandwidth=False)
+    decision = planner.plan(workload)
+    assert decision.selected.binding_roof == "dispatch"
+    assert any("prior, not a measurement" in flag for flag in decision.flags)
+
+
+def test_a_measured_dispatch_cost_is_not_flagged(small_model, workload, tmp_path) -> None:
+    decision = plan_for(
+        small_model, [device(0), device(1)], [link("cuda:0", "cuda:1")], workload, tmp_path
+    )
+    assert not any("prior, not a measurement" in flag for flag in decision.flags)
+    assert decision.dispatch_sensitivity is not None
+    assert decision.dispatch_sensitivity.measured
+
+
+def test_the_dispatch_margin_is_quantified_so_the_bias_cannot_be_silent(
+    mid_model, workload, tmp_path
+) -> None:
+    """A planner that reports where its answer flips cannot mislead by being wrong."""
+    machine = census(
+        [device(0), device(1)], [link("cuda:0", "cuda:1", kind="NVLINK", bandwidth=300e9,
+                                     latency=1.5e-6)],
+    )
+    store = ledger_for(tmp_path, dispatch_ms=60.0, ops=mid_model.ops_per_token,
+                       signatures=T4_SIGNATURES)
+    planner = ExecutionPlanner(mid_model, machine, store, probe_bandwidth=False)
+    decision = planner.plan(workload)
+    sensitivity = decision.dispatch_sensitivity
+    assert sensitivity is not None
+    assert sensitivity.current_seconds > 0
+    text = sensitivity.explain()
+    assert "t_dispatch" in text and "us/op" in text
+    if not sensitivity.robust:
+        # A flip was found: it must name the plan and a cost on the right side of now.
+        assert sensitivity.alternative
+        assert sensitivity.flip_seconds > 0
+        assert sensitivity.flip_seconds == pytest.approx(
+            sensitivity.current_seconds * sensitivity.flip_factor
+        )
+    else:
+        assert "unchanged across a 10x move" in text
+
+
+def test_no_alternative_is_reported_as_such_and_not_as_robustness(
+    small_model, workload, tmp_path
+) -> None:
+    """"Nothing could flip" and "the answer survived the search" are different claims."""
+    decision = plan_for(small_model, [device(0)], [], workload, tmp_path)
+    sensitivity = decision.dispatch_sensitivity
+    assert sensitivity is not None
+    structural = [
+        c for c in decision.feasible_candidates
+        if c.plan.num_devices != decision.plan.num_devices
+        or c.plan.kind is not decision.plan.kind
+    ]
+    if not structural:
+        assert sensitivity.rivals_tested == 0
+        assert not sensitivity.robust
+        assert "no structurally different plan was feasible" in sensitivity.explain()
+
+
+
+def test_the_record_reports_the_dispatch_sensitivity(small_model, workload, tmp_path) -> None:
+    decision = plan_for(
+        small_model, [device(0), device(1)], [link("cuda:0", "cuda:1")], workload, tmp_path
+    )
+    assert "DISPATCH" in decision.render()
+
+
+def test_dispatch_sensitivity_leaves_the_ledger_untouched(small_model, workload, tmp_path) -> None:
+    """The search scales cached copies, never the stored calibration."""
+    machine = census([device(0), device(1)], [link("cuda:0", "cuda:1")])
+    store = ledger_for(tmp_path, ops=small_model.ops_per_token, signatures=T4_SIGNATURES)
+    before = store.get(machine.devices[0].signature, "test-backend").dispatch_seconds
+    ExecutionPlanner(small_model, machine, store, probe_bandwidth=False).plan(workload)
+    after = store.get(machine.devices[0].signature, "test-backend").dispatch_seconds
+    assert after == pytest.approx(before)
+
+
+def test_the_dispatch_probe_is_reproducible_enough_not_to_trip_its_own_guard() -> None:
+    """A probe that cannot reproduce itself would flag every load as stale."""
+    from aether.placement.census import measure_dispatch_seconds
+    from aether.placement.ledger import DISPATCH_STALE_RATIO
+
+    first = measure_dispatch_seconds("cpu")
+    second = measure_dispatch_seconds("cpu")
+    if first <= 0 or second <= 0:
+        pytest.skip("no framework available to probe host dispatch cost")
+    spread = max(first / second, second / first)
+    assert spread < DISPATCH_STALE_RATIO, (
+        f"consecutive probes differ by {spread:.2f}x, which would thrash the ledger"
+    )
+
+
+# ── the cold-start bootstrap ───────────────────────────────────────────────────
+#
+# The design specified one cheap measurement to seed sigma - allocate the weights, run
+# one forward pass at the workload ceiling, read the peak, discard - and it was designed
+# but not wired. These pin that it now runs, that it is one pass at the ceiling, that an
+# OOM during it is recorded as evidence rather than raised, and that it actually narrows
+# the next plan's margin.
+
+
+def _fake_readings(monkeypatch, peak_bytes: int, *, reserved: float = 1.1,
+                   non_framework: int = 512 << 20):
+    """Stand in for the allocator counters so the pass needs no accelerator."""
+    from aether.placement import bootstrap as boot
+
+    def read_memory(device_id: str):
+        return boot.MemoryReading(
+            device_id=device_id,
+            peak_allocated_bytes=peak_bytes,
+            reserved_bytes=int(peak_bytes * reserved),
+            driver_used_bytes=int(peak_bytes * reserved) + non_framework,
+            total_bytes=T4_TOTAL,
+        )
+
+    monkeypatch.setattr(boot, "read_memory", read_memory)
+    monkeypatch.setattr(boot, "reset_peak_stats", lambda ids: None)
+
+
+def test_the_bootstrap_is_needed_on_a_fresh_install(small_model, workload, tmp_path) -> None:
+    machine = census([device(0)], [])
+    store = CalibrationLedger(tmp_path / "cal.json", autosave=False)
+    planner = ExecutionPlanner(small_model, machine, store, probe_bandwidth=False)
+    decision = planner.plan(workload)
+    assert planner.needs_bootstrap(decision), "no residual history means a prior is in use"
+    assert not decision.calibrated
+
+
+def test_one_forward_pass_at_the_ceiling_replaces_the_prior_with_a_measurement(
+    small_model, workload, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    machine = census([device(0)], [])
+    store = CalibrationLedger(tmp_path / "cal.json", autosave=False)
+    planner = ExecutionPlanner(small_model, machine, store, probe_bandwidth=False)
+    decision = planner.plan(workload)
+    _fake_readings(monkeypatch, peak_bytes=900 << 20)
+
+    seen: list[tuple[int, int]] = []
+
+    def forward(batch: int, tokens: int):
+        seen.append((batch, tokens))
+        return None
+
+    result = planner.calibrate(decision, forward)
+    assert result.ran and result.calibrated
+    assert seen == [(workload.batch_target, workload.context_target)], (
+        "exactly one pass, at the workload ceiling"
+    )
+    entry = store.get(machine.devices[0].signature, machine.backend_build)
+    assert entry.residual_samples == 1
+    assert entry.r_fixed_bytes > 0, "the unmodellable term must now be measured"
+    assert decision.bootstrap is result
+
+
+def test_the_bootstrap_narrows_the_next_plan(small_model, workload, tmp_path,
+                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole point: the margin comes from evidence on the second load, not a prior."""
+    machine = census([device(0)], [])
+    store = CalibrationLedger(tmp_path / "cal.json", autosave=False)
+    planner = ExecutionPlanner(small_model, machine, store, probe_bandwidth=False)
+    first = planner.plan(workload)
+    prior_margin = first.selected.budgets[0].transient_margin_bytes
+
+    _fake_readings(monkeypatch, peak_bytes=first.selected.budgets[0].predicted_peak_bytes)
+    for _ in range(6):
+        planner.calibrate(planner.plan(workload), lambda batch, tokens: None, force=True)
+
+    later = planner.plan(workload)
+    assert later.selected.budgets[0].transient_margin_bytes < prior_margin, (
+        "a measured sigma must be tighter than the uncalibrated prior"
+    )
+    assert later.calibrated
+    assert not planner.needs_bootstrap(later)
+
+
+def test_a_calibrated_host_skips_the_pass(small_model, workload, tmp_path,
+                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    machine = census([device(0)], [])
+    store = CalibrationLedger(tmp_path / "cal.json", autosave=False)
+    planner = ExecutionPlanner(small_model, machine, store, probe_bandwidth=False)
+    decision = planner.plan(workload)
+    _fake_readings(monkeypatch, peak_bytes=decision.selected.budgets[0].predicted_peak_bytes)
+    for _ in range(6):
+        planner.calibrate(planner.plan(workload), lambda batch, tokens: None, force=True)
+
+    calls: list[int] = []
+    result = planner.calibrate(
+        planner.plan(workload), lambda batch, tokens: calls.append(1)
+    )
+    assert not calls, "re-measuring what is known costs a load-time pass for nothing"
+    assert result.skipped
+
+
+def test_an_oom_during_the_bootstrap_is_evidence_not_a_crash(
+    small_model, workload, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pass exists to protect the process; killing it would defeat the purpose."""
+    machine = census([device(0)], [])
+    store = CalibrationLedger(tmp_path / "cal.json", autosave=False)
+    planner = ExecutionPlanner(small_model, machine, store, probe_bandwidth=False)
+    decision = planner.plan(workload)
+    _fake_readings(monkeypatch, peak_bytes=1 << 20)
+
+    def forward(batch: int, tokens: int):
+        raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+
+    result = planner.calibrate(decision, forward)
+    assert result.ran and result.oom
+    assert not result.calibrated, "an incomplete pass is not a clean calibration"
+    entry = store.get(machine.devices[0].signature, machine.backend_build)
+    # The requirement is known to exceed the safe capacity, so the recorded residual
+    # must push the next prediction up rather than down.
+    assert entry.residual_mean > 0
+    assert "at least" in " ".join(result.notes)
+
+
+def test_an_unrelated_bootstrap_failure_keeps_the_priors(
+    small_model, workload, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    machine = census([device(0)], [])
+    store = CalibrationLedger(tmp_path / "cal.json", autosave=False)
+    planner = ExecutionPlanner(small_model, machine, store, probe_bandwidth=False)
+    decision = planner.plan(workload)
+    _fake_readings(monkeypatch, peak_bytes=1 << 20)
+
+    def forward(batch: int, tokens: int):
+        raise ValueError("token ids out of range")
+
+    result = planner.calibrate(decision, forward)
+    assert not result.ran and not result.oom
+    assert store.get(machine.devices[0].signature, machine.backend_build).residual_samples == 0
+
+
+def test_a_backend_without_allocator_counters_skips_rather_than_guesses(
+    small_model, workload, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fabricated zero would be folded into sigma as if it were a measurement."""
+    from aether.placement import bootstrap as boot
+
+    machine = census([device(0)], [])
+    store = CalibrationLedger(tmp_path / "cal.json", autosave=False)
+    planner = ExecutionPlanner(small_model, machine, store, probe_bandwidth=False)
+    decision = planner.plan(workload)
+    monkeypatch.setattr(boot, "read_memory", lambda device_id: None)
+    monkeypatch.setattr(boot, "reset_peak_stats", lambda ids: None)
+    result = planner.calibrate(decision, lambda batch, tokens: None)
+    assert result.skipped
+    assert store.get(machine.devices[0].signature, machine.backend_build).residual_samples == 0
+
+
+def test_the_record_reports_the_bootstrap(small_model, workload, tmp_path,
+                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    machine = census([device(0)], [])
+    store = CalibrationLedger(tmp_path / "cal.json", autosave=False)
+    planner = ExecutionPlanner(small_model, machine, store, probe_bandwidth=False)
+    decision = planner.plan(workload)
+    _fake_readings(monkeypatch, peak_bytes=900 << 20)
+    planner.calibrate(decision, lambda batch, tokens: None)
+    record = decision.render()
+    assert "BOOTSTRAP" in record
+    assert "bootstrap measured peak" in record
+
+
+def test_a_heterogeneous_group_observation_brackets_the_crossover(
+    mid_model, workload, tmp_path
+) -> None:
+    """The feedback path that turns Law I's derivation into a measurement."""
+    machine = census(
+        [device(0), device(1, name="Tesla T4-24", total=23_000_000_000, bandwidth=300e9)],
+        [link("cuda:0", "cuda:1")],
+    )
+    store = ledger_for(tmp_path, ops=mid_model.ops_per_token, signatures=T4_SIGNATURES)
+    planner = ExecutionPlanner(mid_model, machine, store, probe_bandwidth=False)
+    decision = planner.plan(workload)
+    assert decision.plan.max_tp_degree == 2, "the scenario must shard to mean anything"
+    planner.observe(
+        decision,
+        observed_peak_bytes={
+            b.device_id: b.predicted_peak_bytes for b in decision.selected.budgets
+        },
+        observed_decode_seconds=decision.selected.decode_seconds * 4,
+    )
+    entry = store.get(machine.devices[0].signature, machine.backend_build)
+    assert entry.tp_samples == 1
+    assert entry.tp_ratio_bad_min > 0, "a group that missed its prediction bounds the crossover"
+
+
+def test_a_homogeneous_run_is_not_recorded_as_crossover_evidence(
+    mid_model, workload, tmp_path
+) -> None:
+    """A ratio of 1.0 cannot bracket anything, so recording it would be noise."""
+    machine = census([device(0), device(1)], [link("cuda:0", "cuda:1")])
+    store = ledger_for(tmp_path, ops=mid_model.ops_per_token, signatures=T4_SIGNATURES)
+    planner = ExecutionPlanner(mid_model, machine, store, probe_bandwidth=False)
+    decision = planner.plan(workload)
+    planner.observe(
+        decision,
+        observed_peak_bytes={
+            b.device_id: b.predicted_peak_bytes for b in decision.selected.budgets
+        },
+        observed_decode_seconds=decision.selected.decode_seconds * 4,
+    )
+    assert store.get(machine.devices[0].signature, machine.backend_build).tp_samples == 0
+
+
+def test_an_older_ledger_still_loads_and_keeps_its_evidence(tmp_path: Path) -> None:
+    """New calibration fields must not invalidate a host's accumulated history.
+
+    Bumping the ledger version to add a field would discard every measurement on every
+    machine that upgrades — which would reset exactly the σ this work exists to sharpen.
+    """
+    from aether.placement.ledger import LEDGER_VERSION
+
+    legacy = {
+        "version": LEDGER_VERSION,
+        "bandwidth": {"cuda:T4:14GiB": 3.1e11},
+        "entries": {
+            "cuda:T4:14GiB|old-build": {
+                "key": "cuda:T4:14GiB|old-build",
+                "r_fixed_bytes": 640 << 20,
+                "fragmentation": 1.08,
+                "dispatch_seconds": 5.6e-05,
+                "residual_samples": 9,
+                "residual_mean": 1.0e07,
+                "residual_m2": 2.0e14,
+                "runs": 9,
+            }
+        },
+    }
+    path = tmp_path / "cal.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    entry = CalibrationLedger(path, autosave=False).get("cuda:T4:14GiB", "old-build")
+    assert entry.residual_samples == 9, "history must survive the upgrade"
+    assert entry.residual_sigma > 0
+    assert entry.tp_samples == 0, "the new fields default rather than break the load"
+    assert entry.tp_crossover_ratio == 0.0
+    assert entry.dispatch_measured is False, (
+        "a value stored before provenance was tracked is not evidence of a measurement"
+    )
+
+
+
+
+
+
+

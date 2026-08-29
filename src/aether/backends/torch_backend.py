@@ -83,6 +83,7 @@ class TorchBackend(Backend):
         self._allow_remote_code = False
         # Placement state, populated once per model load by the execution planner.
         self._placement: Any = None
+        self._placement_planner: Any = None
         self._placement_devices: list[str] | None = None
         self._placement_forced = False
         self._placement_failed = False
@@ -182,6 +183,7 @@ class TorchBackend(Backend):
                     )
             planner = ExecutionPlanner(profile, census, ledger)
             decision = planner.plan(self._placement_workload())
+            self._placement_planner = planner
         except Exception as exc:  # noqa: BLE001 - planning must never block a load
             from aether.placement.planner import PlacementInfeasible
 
@@ -217,12 +219,14 @@ class TorchBackend(Backend):
 
         ``AETHER_FORCE_TENSOR_PARALLEL=1`` still overrides the planner, and the
         override is recorded rather than hidden.
+
+        The plan is taken even on a single accelerator, where there is nothing to
+        shard: it still reports the context ceiling, and it is the object the
+        cold-start bootstrap calibrates against.
         """
         accelerators = [device for device in self._devices if device != "cpu"]
-        if len(accelerators) < 2:
-            return False
         force = os.environ.get("AETHER_FORCE_TENSOR_PARALLEL", "").strip().lower()
-        if force in {"1", "true", "yes"}:
+        if force in {"1", "true", "yes"} and len(accelerators) >= 2:
             logger.info(
                 "tensor-parallel execution forced by AETHER_FORCE_TENSOR_PARALLEL "
                 "across %d devices; the planner's own choice was not used",
@@ -231,8 +235,12 @@ class TorchBackend(Backend):
             self._placement_forced = True
             return True
 
+        # Planned even on a single accelerator. There is no sharding decision to make
+        # there, but the plan still reports the context ceiling and, more importantly,
+        # it is what lets the first forward pass calibrate the memory margin — a
+        # one-device host needs a measured sigma exactly as much as a two-device one.
         decision = self.placement_decision(engine)
-        if decision is None:
+        if decision is None or len(accelerators) < 2:
             # No plan means no evidence for widening. One device runs any model the
             # host could load, so that is the safe answer.
             return False
@@ -244,6 +252,59 @@ class TorchBackend(Backend):
     def placement_devices(self) -> list[str] | None:
         """The devices the planner actually selected, when it selected a subset."""
         return getattr(self, "_placement_devices", None)
+
+    def bootstrap_placement(self, engine: Any) -> Any:
+        """Turn the first execution into the planner's calibration event.
+
+        The feasibility lane's margin is ``z·σ_T``, and σ_T comes from recorded
+        prediction error.  On a fresh install there is none, so the planner falls back
+        to a conservative prior — which is the thing the whole design exists to avoid.
+        One forward pass at the workload ceiling replaces it with a measurement, and it
+        is the *only* pass needed: one profile run for the chosen plan, not one per
+        candidate.
+
+        Called after the device engine exists, because that is the first moment the
+        weights are resident and a peak reading means anything.  Deliberately
+        non-fatal: a failed or skipped bootstrap leaves the prior in place and the model
+        still runs.
+
+        Set ``AETHER_PLAN_BOOTSTRAP=0`` to skip it — the record then says the margin is
+        uncalibrated rather than pretending otherwise.
+        """
+        enabled = os.environ.get("AETHER_PLAN_BOOTSTRAP", "1").strip().lower()
+        if enabled in {"0", "false", "no", "off"}:
+            return None
+        decision = getattr(self, "_placement", None)
+        planner = getattr(self, "_placement_planner", None)
+        if decision is None or planner is None:
+            return None
+        if not planner.needs_bootstrap(decision):
+            return None
+        forward = getattr(engine, "forward", None)
+        if not callable(forward):
+            return None
+
+        def one_pass(batch: int, tokens: int) -> Any:
+            import numpy as np
+
+            # A prefill at the ceiling is the widest step the plan will ever take, so
+            # it is the step whose peak the margin has to cover. Token *values* are
+            # irrelevant to the footprint; only the shape is. Zeros are used because
+            # every vocabulary contains index 0.
+            ids = np.zeros(max(1, int(tokens)), dtype=np.int64)
+            return forward(ids)
+
+        try:
+            result = planner.calibrate(decision, one_pass)
+        except Exception as exc:  # noqa: BLE001 - calibration must never block a load
+            logger.warning("placement bootstrap unavailable (%s); keeping priors", exc)
+            return None
+        if result.calibrated:
+            logger.info(
+                "placement calibrated from one forward pass; the next plan's memory "
+                "margin comes from measurement rather than a prior"
+            )
+        return result
 
     @staticmethod
     def _estimated_weight_bytes(engine: Any) -> int:
@@ -552,6 +613,10 @@ class TorchBackend(Backend):
                                 "materializing the device copy.",
                                 freed / 1024**3,
                             )
+                    # The weights are now resident, which is the first moment a peak
+                    # memory reading means anything. One pass at the workload ceiling
+                    # turns the planner's conservative prior into a measurement.
+                    self.bootstrap_placement(engine)
                 tokenizer_root = root / "tokenizer"
                 if tokenizer_root.exists():
                     # The tokenizer is part of the authenticated AEG.  Do

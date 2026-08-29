@@ -157,6 +157,94 @@ class TestShardingPolicy:
         monkeypatch.setenv("AETHER_PLAN_INTENT", "fastest-possible")
         assert TorchBackend()._placement_workload().intent.value == "balanced"
 
+    def test_a_single_accelerator_is_still_planned_so_it_can_calibrate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One device has no sharding decision, but it still needs a measured sigma."""
+        backend = TorchBackend()
+        backend._devices = ["cuda:0"]
+        planned: list[int] = []
+
+        def decision(self_, engine):
+            planned.append(1)
+            return TestShardingPolicy._decision(["cuda:0"], 1)
+
+        monkeypatch.setattr(TorchBackend, "placement_decision", decision)
+        assert backend._should_shard(_engine()) is False
+        assert planned, "the plan is what the cold-start bootstrap calibrates against"
+
+
+class TestBootstrapWiring:
+    """The cold-start measurement must be reachable from a real model load.
+
+    It was specified in the design and left unwired: the first run used a conservative
+    prior and only calibrated from whatever telemetry a caller happened to feed back.
+    These pin that the backend now drives it, and that it stays non-fatal.
+    """
+
+    @staticmethod
+    def _prepared(*, needs: bool = True):
+        backend = TorchBackend()
+        backend._devices = ["cuda:0"]
+        backend._placement = SimpleNamespace(bootstrap=None)
+        calls: dict[str, object] = {}
+
+        class Planner:
+            def needs_bootstrap(self, decision: object) -> bool:
+                return needs
+
+            def calibrate(self, decision: object, forward: object, **kwargs: object) -> object:
+                calls["forward"] = forward
+                calls["result"] = SimpleNamespace(calibrated=True)
+                return calls["result"]
+
+        backend._placement_planner = Planner()
+        return backend, calls
+
+    def test_the_backend_runs_the_bootstrap_once_the_weights_are_resident(self) -> None:
+        backend, calls = self._prepared()
+        seen: list[object] = []
+        result = backend.bootstrap_placement(
+            SimpleNamespace(forward=lambda ids: seen.append(ids))
+        )
+        assert result is calls["result"]
+        # The callable handed to the planner must drive exactly one pass, shaped to the
+        # workload ceiling — that shape is what the memory margin has to cover.
+        calls["forward"](1, 128)
+        assert len(seen) == 1
+        assert seen[0].shape == (128,)
+
+    def test_a_calibrated_host_does_no_work(self) -> None:
+        backend, calls = self._prepared(needs=False)
+        assert backend.bootstrap_placement(SimpleNamespace(forward=lambda ids: None)) is None
+        assert "forward" not in calls
+
+    def test_it_can_be_switched_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AETHER_PLAN_BOOTSTRAP", "0")
+        backend, calls = self._prepared()
+        assert backend.bootstrap_placement(SimpleNamespace(forward=lambda ids: None)) is None
+        assert "forward" not in calls
+
+    def test_a_failure_never_blocks_a_load(self) -> None:
+        backend = TorchBackend()
+        backend._devices = ["cuda:0"]
+        backend._placement = SimpleNamespace(bootstrap=None)
+
+        class Planner:
+            def needs_bootstrap(self, decision: object) -> bool:
+                return True
+
+            def calibrate(self, decision: object, forward: object, **kwargs: object) -> object:
+                raise RuntimeError("driver fell over")
+
+        backend._placement_planner = Planner()
+        assert backend.bootstrap_placement(SimpleNamespace(forward=lambda ids: None)) is None
+
+    def test_no_plan_means_no_bootstrap(self) -> None:
+        backend = TorchBackend()
+        backend._placement = None
+        assert backend.bootstrap_placement(SimpleNamespace(forward=lambda ids: None)) is None
+
 
 class TestDeviceResolution:
     """An index-less accelerator device breaks every device-equality cache."""

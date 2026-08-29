@@ -5,10 +5,13 @@ filters, and that is what keeps the space small enough to enumerate exhaustively
 under a millisecond on the device counts a single node actually has:
 
 **Law I — homogeneity.**  A tensor-parallel group may only contain devices whose
-throughput on the binding roof lies within :data:`THETA_TOLERANCE`.  A TP group
-synchronises twice per layer, so its stage time is the max over members: the slowest
-device sets the pace on every one of L layers.  CPUs never join a TP group, and
-neither do an A100 and a T4.
+throughput on the binding roof lies within a tolerance that is *derived*, not chosen:
+:class:`~aether.placement.homogeneity.HomogeneityLaw` computes it from the shard
+granularity and the planner's own error bar, and a measured crossover overrides it.  A
+TP group synchronises twice per layer, so its stage time is the max over members: the
+slowest device sets the pace on every one of L layers.  CPUs never join a TP group, and
+neither do an A100 and a T4 — but both of those follow from the arithmetic rather than
+from a constant.
 
 **Law II — fabric alignment.**  A tensor-parallel group may not span a fabric class.
 Classes come from the interconnect graph, so this adapts to any topology instead of
@@ -26,11 +29,13 @@ deterministic, explainable, and free of a solver dependency.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 from aether.placement.census import DeviceCapability, DeviceCensus
+from aether.placement.homogeneity import TOLERANCE_PRIOR
 from aether.placement.model_profile import ModelProfile
 from aether.placement.waterfill import (
     WaterfillInfeasible,
@@ -51,15 +56,28 @@ __all__ = [
     "enumerate_plans",
 ]
 
-THETA_TOLERANCE = 1.3
-"""Largest throughput ratio permitted inside one tensor-parallel group.
+THETA_TOLERANCE = TOLERANCE_PRIOR
+"""Fallback throughput ratio for a tensor-parallel group, for context-free callers.
 
-An admitted placeholder: it is the one constant in the design without a derivation,
-and it should be replaced by the measured ratio at which a TP group's real time
-exceeds the water-filled prediction by more than σ."""
+Law I's real tolerance is **derived**, not chosen: see
+:class:`~aether.placement.homogeneity.HomogeneityLaw`, which computes the largest
+admissible ratio from the shard granularity and the planner's own error bar, and lets a
+measured crossover override it.  The planner always passes that law, so this constant
+only applies to a caller that has no model, fabric or workload to derive from — and its
+value is where the derived bound sits with no calibration at all, rather than a guess."""
 
 MAX_ENUMERATED_PLANS = 512
 """Hard bound on generated plans, so an unusual topology cannot stall a model load."""
+
+AdmissionRule = Callable[
+    ["tuple[DeviceCapability, ...]", DeviceCapability, "dict[str, float]"], bool
+]
+"""Law I as a predicate: may this group take this device into one TP stage?
+
+Given the group so far as well as the candidate, so the bound can tighten as the group
+grows — the fifth device has to justify itself against a stronger group than the second.
+:class:`~aether.placement.homogeneity.HomogeneityLaw` is the implementation the planner
+supplies."""
 
 
 class Parallelism(str, Enum):
@@ -212,15 +230,29 @@ def capability_groups(
     *,
     theta: "dict[str, float]",
     tolerance: float = THETA_TOLERANCE,
+    admits: "AdmissionRule | None" = None,
 ) -> list[tuple[DeviceCapability, ...]]:
     """Partition devices into groups a tensor-parallel split may use.
 
     Law II first — devices are bucketed by fabric class — then Law I within each
     bucket, by walking the devices in descending throughput and starting a new group
-    whenever the ratio to the group's fastest member exceeds ``tolerance``.
+    whenever the current group cannot admit the next device.
 
-    Groups are returned in descending order of aggregate throughput, which is also
-    the order a pipeline should visit them under a latency objective.
+    Args:
+        devices: The candidate devices.
+        theta: Relative throughput on the binding roof, per device id.
+        tolerance: Fixed ratio bound, applied against the group's *fastest* member.
+            Used only when ``admits`` is absent.
+        admits: The admission predicate — normally a
+            :class:`~aether.placement.homogeneity.HomogeneityLaw`, which derives the
+            bound from the marginal value of the candidate instead of comparing
+            against a constant.  Given both the group so far and the candidate, so it
+            can tighten as the group grows: the fifth device has to justify itself
+            against a stronger group than the second did.
+
+    Returns:
+        Groups in descending order of aggregate throughput, which is also the order a
+        pipeline should visit them under a latency objective.
     """
     if tolerance < 1.0:
         raise ValueError("tolerance must be >= 1.0")
@@ -228,21 +260,30 @@ def capability_groups(
     for device in devices:
         by_fabric.setdefault(device.fabric_class, []).append(device)
 
+    def group_admits(
+        current: "list[DeviceCapability]", device: DeviceCapability
+    ) -> bool:
+        speed = theta.get(device.device_id, 0.0)
+        if speed <= 0:
+            return False
+        if admits is not None:
+            return bool(admits(tuple(current), device, theta))
+        fastest = theta.get(current[0].device_id, 0.0)
+        return fastest / speed <= tolerance
+
     groups: list[tuple[DeviceCapability, ...]] = []
     for fabric in sorted(by_fabric):
         ordered = sorted(by_fabric[fabric], key=lambda d: -theta.get(d.device_id, 0.0))
         current: list[DeviceCapability] = []
         for device in ordered:
-            speed = theta.get(device.device_id, 0.0)
             if not current:
                 current = [device]
                 continue
-            fastest = theta.get(current[0].device_id, 0.0)
-            if speed <= 0 or fastest / speed > tolerance:
+            if group_admits(current, device):
+                current.append(device)
+            else:
                 groups.append(tuple(current))
                 current = [device]
-            else:
-                current.append(device)
         if current:
             groups.append(tuple(current))
     groups.sort(key=lambda group: -sum(theta.get(d.device_id, 0.0) for d in group))
@@ -399,6 +440,7 @@ def enumerate_plans(
     caps: "dict[str, float]",
     include_offload: bool = True,
     tolerance: float = THETA_TOLERANCE,
+    admits: "AdmissionRule | None" = None,
     max_plans: int = MAX_ENUMERATED_PLANS,
 ) -> list[ExecutionPlan]:
     """Generate every structurally admissible plan for this model and machine.
@@ -415,6 +457,8 @@ def enumerate_plans(
             feasible and always slow, so they lose on cost unless nothing else
             survives — the fallback ladder emerges from ranking rather than from a
             special case.
+        tolerance: Law I's fixed ratio bound, used only when ``admits`` is absent.
+        admits: Law I as a derived predicate; see :func:`capability_groups`.
 
     Returns:
         Plans in generation order: narrower and simpler first. Never empty — a host
@@ -456,7 +500,9 @@ def enumerate_plans(
         plans.append(plan)
 
     for subset in _candidate_device_sets(accelerators, theta):
-        groups = capability_groups(subset, theta=theta, tolerance=tolerance)
+        groups = capability_groups(
+            subset, theta=theta, tolerance=tolerance, admits=admits
+        )
         if not groups:
             continue
 

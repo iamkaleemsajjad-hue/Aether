@@ -28,6 +28,8 @@ References:
 
 from __future__ import annotations
 
+import contextlib
+import os
 import platform
 from dataclasses import dataclass
 from typing import Any
@@ -41,6 +43,8 @@ __all__ = [
     "DeviceCapability",
     "FabricLink",
     "DeviceCensus",
+    "measure_bandwidth_bps",
+    "measure_dispatch_seconds",
     "take_census",
 ]
 
@@ -49,6 +53,21 @@ FABRIC_BANDWIDTH_RATIO = 4.0
 
 _BANDWIDTH_PROBE_BYTES = 64 << 20
 """Payload for the device-to-device copy that measures effective bandwidth."""
+
+_DISPATCH_PROBE_OPS = 400
+"""Operations timed per dispatch-probe pass.
+
+Large enough that the perf_counter resolution is negligible against the total, small
+enough that the whole probe costs well under 100 ms on any host."""
+
+_DISPATCH_PROBE_PASSES = 12
+"""Upper bound on probe passes. Convergence normally stops it after three or four."""
+
+_DISPATCH_PROBE_SETTLED = 1.25
+"""Pass-to-pass agreement that counts as converged.
+
+Comfortably inside the staleness ratio, so a converged probe cannot trip the staleness
+check against the value a converged probe stored a moment earlier."""
 
 # Conservative sustained-throughput priors, used only until a measurement exists.
 # CPUs are deliberately pessimistic: a CPU that turns out to be faster than this
@@ -227,12 +246,54 @@ class DeviceCensus:
 
 # ── detection ─────────────────────────────────────────────────────────────────
 
+def _execution_mode() -> str:
+    """The host-side execution shape, which is half of what sets ``t_dispatch``.
+
+    A framework version alone does not identify the dispatch cost.  Capturing a CUDA
+    graph or compiling the decode path collapses hundreds of launches into one, moving
+    the cost by an order of magnitude without moving any version string — and a
+    dispatch cost attributed to the wrong mode makes the planner refuse to shard
+    models it should.  So the mode is part of the key, and the key is checked against a
+    probe (see :meth:`~aether.placement.ledger.CalibrationLedger.reconcile_dispatch`)
+    rather than trusted.
+    """
+    modes: list[str] = []
+    for variable, token in (
+        ("AETHER_CUDA_GRAPHS", "graph"),
+        ("AETHER_TORCH_COMPILE", "compile"),
+    ):
+        value = os.environ.get(variable, "").strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            modes.append(token)
+    try:
+        import torch
+
+        # A live capture or a compiled callable is authoritative over the request.
+        if getattr(torch.cuda, "is_current_stream_capturing", None) is not None:
+            with contextlib.suppress(Exception):
+                if torch.cuda.is_current_stream_capturing():
+                    modes.append("capturing")
+        threads = int(torch.get_num_threads())
+        if threads > 0:
+            modes.append(f"t{threads}")
+    except Exception:  # noqa: BLE001 - a torch-free install has no mode to report
+        pass
+    return "+".join(modes) if modes else "eager"
+
+
 def _backend_build() -> str:
     """Identity of the runtime whose dispatch cost we are calibrating.
 
-    Keyed on the framework version and Python version because ``t_dispatch`` is a
-    property of the host-side stack, not of the accelerator.  Mis-keying it is the
-    failure mode that would make the planner refuse to shard models it should.
+    ``t_dispatch`` is a property of the host-side stack, not of the accelerator, so
+    the key carries every layer of that stack that can move it: the interpreter, the
+    framework and its CUDA build, Aether's own version — the decode loop that issues
+    the operations is Aether code — and the execution mode.
+
+    Mis-keying is the failure mode the design flagged as the one to watch, because an
+    inflated dispatch roof does not merely mispredict a time: it makes every wider plan
+    look worse, so the planner refuses to shard models it should.  Widening the key
+    narrows the chance of a collision; it cannot eliminate it, which is why the value
+    is also verified against a fresh probe before it is used.
     """
     parts = [f"py{platform.python_version()}"]
     try:
@@ -242,8 +303,18 @@ def _backend_build() -> str:
         cuda_version = getattr(torch.version, "cuda", None)
         if cuda_version:
             parts.append(f"cu{cuda_version}")
+        hip_version = getattr(torch.version, "hip", None)
+        if hip_version:
+            parts.append(f"hip{hip_version}")
     except Exception:  # noqa: BLE001 - a torch-free install is a valid backend
         parts.append("numpy")
+    try:
+        from aether.core.constants import AETHER_VERSION
+
+        parts.append(f"aether{AETHER_VERSION}")
+    except Exception:  # noqa: BLE001 - version metadata is advisory
+        pass
+    parts.append(_execution_mode())
     return "|".join(parts)
 
 
@@ -353,6 +424,79 @@ def measure_bandwidth_bps(device_id: str, *, payload_bytes: int = _BANDWIDTH_PRO
         return 0.0
 
 
+def measure_dispatch_seconds(
+    device_id: str, *, operations: int = _DISPATCH_PROBE_OPS
+) -> float:
+    """Time the host cost of issuing one graph operation on this device.
+
+    The dispatch roof is ``n_ops · t_dispatch``, and ``t_dispatch`` is *host-side
+    issue* cost: the Python call, the framework's dispatcher, the kernel launch.  So
+    the probe measures exactly that and nothing else — a stream of tiny operations
+    timed on the **host clock with no synchronisation inside the loop**, so the queue
+    never drains and the wall time is the issue cost rather than the device time.
+
+    Synchronising per operation would measure launch latency plus device execution plus
+    a round trip, which is a different and much larger quantity; using it as
+    ``t_dispatch`` would inflate the dispatch roof and make the planner refuse to shard
+    bandwidth-bound models.  One synchronise happens after the timed region, purely so
+    the probe does not leave work queued behind it.
+
+    The measurement is taken to *convergence* rather than for a fixed number of passes.
+    That matters more than it looks: a cold process pays dispatcher and autograd
+    initialisation on its first few hundred calls, so a fixed-count probe reports a
+    number the same machine will not reproduce a second later — and a value that does
+    not reproduce would trip the staleness check on the next load and thrash the stored
+    calibration.  Passes therefore continue until two consecutive ones agree, and the
+    minimum is kept because the fastest pass is the one least polluted by the OS
+    scheduler.
+
+    Returns:
+        Seconds per operation, or ``0.0`` when the probe cannot run — in which case the
+        caller keeps its prior and says so, rather than trusting a failed measurement.
+    """
+    try:
+        import time as _time
+
+        import torch
+
+        device = torch.device(device_id)
+        tensor = torch.ones(16, dtype=torch.float32, device=device)
+        synchronize = None
+        if device.type == "cuda":
+            def synchronize() -> None:
+                torch.cuda.synchronize(device)
+        elif device.type == "mps":
+            synchronize = torch.mps.synchronize
+
+        def one_pass() -> float:
+            start = _time.perf_counter()
+            for _ in range(operations):
+                tensor.add_(1.0)
+            elapsed = _time.perf_counter() - start
+            if synchronize is not None:
+                synchronize()
+            return elapsed / operations if elapsed > 0 else 0.0
+
+        best = 0.0
+        previous = 0.0
+        settled = 0
+        for _ in range(_DISPATCH_PROBE_PASSES):
+            per_op = one_pass()
+            if per_op <= 0:
+                continue
+            best = per_op if best == 0.0 else min(best, per_op)
+            if previous > 0:
+                spread = max(per_op / previous, previous / per_op)
+                settled = settled + 1 if spread <= _DISPATCH_PROBE_SETTLED else 0
+                if settled >= 2:
+                    break
+            previous = per_op
+        return best
+    except Exception as exc:  # noqa: BLE001 - probing must never block planning
+        logger.debug("dispatch probe on %s failed: %s", device_id, exc)
+        return 0.0
+
+
 def _detect_links(device_ids: list[str]) -> tuple[FabricLink, ...]:
     """Build the interconnect edge list from the existing topology detector."""
     if len(device_ids) < 2:
@@ -433,6 +577,7 @@ def take_census(
     device_ids: list[str] | None = None,
     ledger: Any | None = None,
     probe_bandwidth: bool = True,
+    probe_dispatch: bool = True,
 ) -> DeviceCensus:
     """Measure this host and return the planner's hardware input.
 
@@ -444,6 +589,11 @@ def take_census(
             runs once per machine rather than once per model load.
         probe_bandwidth: Time an on-device copy to get sustained bandwidth. Costs
             roughly 20 ms per device and replaces a registry prior with a fact.
+        probe_dispatch: Time a stream of trivial operations to get the host cost per
+            graph op, and reconcile it against whatever the ledger holds for this
+            backend build. Costs a few tens of milliseconds per device and is the
+            check that catches a mis-keyed or stale dispatch cost — the failure mode
+            that silently stops the planner sharding models it should.
 
     Returns:
         A :class:`DeviceCensus`. Always succeeds: a host with no accelerator
@@ -451,6 +601,7 @@ def take_census(
     """
     devices: list[DeviceCapability] = []
     discovered: list[tuple[str, str, str, int, int, int, bool, bool]] = []
+    backend_build = _backend_build()
 
     try:
         import torch
@@ -513,13 +664,13 @@ def take_census(
         measured: list[str] = []
 
         entry = None
+        signature = DeviceCapability(
+            device_id=identifier, kind=kind, name=name,
+            total_bytes=total, free_bytes=free, external_bytes=external,
+            bandwidth_bps=bandwidth, flops=flops,
+        ).signature
         if ledger is not None:
-            probe = DeviceCapability(
-                device_id=identifier, kind=kind, name=name,
-                total_bytes=total, free_bytes=free, external_bytes=external,
-                bandwidth_bps=bandwidth, flops=flops,
-            )
-            entry = ledger.get(probe.signature)
+            entry = ledger.get(signature, backend_build)
             if entry is not None:
                 if entry.measured_bandwidth_bps > 0:
                     bandwidth = entry.measured_bandwidth_bps
@@ -541,12 +692,25 @@ def take_census(
                 achieved_bandwidth = 1.0
                 measured.append("bandwidth")
                 if ledger is not None:
-                    signature = DeviceCapability(
-                        device_id=identifier, kind=kind, name=name,
-                        total_bytes=total, free_bytes=free, external_bytes=external,
-                        bandwidth_bps=bandwidth, flops=flops,
-                    ).signature
                     ledger.record_bandwidth(signature, observed)
+
+        # ── dispatch cost ────────────────────────────────────────────────────
+        # Probed on every census rather than cached-and-trusted, because the stored
+        # value is keyed by a *description* of the runtime and a description can be
+        # wrong. Reconciling a fresh measurement against the ledger turns a silent
+        # systematic bias into a logged replacement.
+        if probe_dispatch and ledger is not None:
+            probed = measure_dispatch_seconds(identifier)
+            if probed > 0:
+                in_force, replaced = ledger.reconcile_dispatch(
+                    signature, backend_build, probed
+                )
+                if in_force > 0:
+                    measured.append("dispatch")
+                if replaced:
+                    measured.append("dispatch_refreshed")
+        elif ledger is not None and entry is not None and entry.dispatch_measured:
+            measured.append("dispatch")
 
         devices.append(DeviceCapability(
             device_id=identifier, kind=kind, name=name,
@@ -562,7 +726,7 @@ def take_census(
         devices=tuple(devices),
         links=links,
         host_bytes=_host_bytes(),
-        backend_build=_backend_build(),
+        backend_build=backend_build,
     )
     logger.info(
         "device census: %d devices, %d fabric class(es), backend %s",

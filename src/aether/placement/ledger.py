@@ -24,6 +24,11 @@ how a memory model becomes a fudge factor:
     of the feasibility lane's one-sided margin, and it is the reason the margin
     shrinks as evidence accumulates instead of staying at a hand-set reserve.
 
+``Law I crossover``
+    The throughput ratio at which a heterogeneous tensor-parallel group stops meeting
+    its water-filled prediction.  Bracketed from both sides across runs, so the
+    homogeneity tolerance becomes a measurement of this machine rather than a constant.
+
 Statistics use Welford's online algorithm so the ledger stores three numbers per
 entry rather than a growing sample list, and remains numerically stable over
 thousands of runs.
@@ -48,7 +53,7 @@ from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-__all__ = ["LEDGER_VERSION", "LedgerEntry", "CalibrationLedger"]
+__all__ = ["LEDGER_VERSION", "DISPATCH_STALE_RATIO", "LedgerEntry", "CalibrationLedger"]
 
 LEDGER_VERSION = "aether_placement_ledger/1"
 
@@ -70,7 +75,31 @@ _CALIBRATED_MARGIN_FLOOR = 0.02
 Several identical readings prove that nothing has varied *yet*, not that nothing can.
 Without a floor, a handful of repeatable runs would drive the safety margin to zero
 and the first unusual allocation would kill the process."""
-"""With no residual history, σ is taken as this fraction of the predicted peak."""
+
+_UNCALIBRATED_LATENCY_FRACTION = 0.25
+"""Relative latency uncertainty before any timing evidence exists.
+
+Shared with the planner's σ-gated tie-break so that Law I's derivation, the plan
+ranking and the TP-crossover test all speak about the same error bar."""
+
+_LATENCY_SIGMA_FLOOR = 0.02
+"""Smallest relative latency σ a measured history may claim.
+
+The same floor, for the same reason, as :data:`_CALIBRATED_MARGIN_FLOOR`: identical
+readings prove nothing has varied yet, not that nothing can.  Without it a perfectly
+repeatable device would judge every TP group against a zero-width band and record a
+crossover on the first microsecond of noise."""
+
+DISPATCH_STALE_RATIO = 2.0
+"""Divergence at which a stored dispatch cost is treated as mis-keyed.
+
+``t_dispatch`` is a property of the runtime build, and the key cannot capture every
+change to it — a fused decode path or a captured CUDA graph moves the number without
+moving a version string.  A fresh probe that disagrees by this factor is therefore
+taken as proof that the stored value belongs to a different runtime, and it is
+replaced rather than trusted.  Two-fold is chosen because it is well outside probe
+noise (a few percent) and well inside the order-of-magnitude change that graph capture
+produces, so the check fires on real staleness and not on jitter."""
 
 
 def _expandable_segments_enabled() -> bool:
@@ -107,6 +136,25 @@ class LedgerEntry:
     latency_mean: float = 0.0
     latency_m2: float = 0.0
 
+    # Law I's measured crossover, bracketed from both sides. A heterogeneous
+    # tensor-parallel group either meets its water-filled prediction or it does not,
+    # and the ratio at which that flips is the tolerance the design asked for.
+    tp_ratio_ok_max: float = 0.0
+    """Widest θ ratio whose measured group time matched the prediction within σ."""
+
+    tp_ratio_bad_min: float = 0.0
+    """Narrowest θ ratio whose measured group time exceeded the prediction by > σ."""
+
+    tp_samples: int = 0
+
+    dispatch_measured: bool = False
+    """True when ``dispatch_seconds`` came from a probe rather than the prior.
+
+    The dispatch roof is a property of the runtime build, so a stale or mis-keyed
+    value systematically distorts every sharding verdict. Recording whether the number
+    was measured is what lets the planner say so instead of presenting a prior as a
+    fact."""
+
     runs: int = 0
     last_seen: float = field(default_factory=time.time)
     notes: dict[str, Any] = field(default_factory=dict)
@@ -127,17 +175,87 @@ class LedgerEntry:
         """Relative standard deviation of the latency prediction error.
 
         Dimensionless, so one number covers every model on this device. It is the
-        width used by the σ-gated tie-break: a wider plan must beat a narrower one by
-        more than this, or the planner is chasing its own noise.
+        width used by the σ-gated tie-break and by Law I's derivation: a wider plan
+        must beat a narrower one by more than this, or the planner is chasing its own
+        noise.
+
+        Returns the raw statistic, which is ``0.0`` both when there is no evidence and
+        when every reading agreed exactly.  Those are different states — see
+        :attr:`has_latency_evidence` — and a caller that conflates them will treat a
+        perfectly predictable device as an unmeasured one.
         """
         if self.latency_samples < 2:
             return 0.0
         return math.sqrt(max(0.0, self.latency_m2 / (self.latency_samples - 1)))
 
     @property
+    def has_latency_evidence(self) -> bool:
+        """Whether enough timings exist to prefer the measurement over the prior.
+
+        Separate from ``latency_sigma > 0`` on purpose: a device that predicted itself
+        exactly twelve times has a σ of zero *and* the strongest possible evidence, and
+        reading that as "unmeasured" would keep the planner permanently uncertain about
+        its most reliable hardware.
+        """
+        return self.latency_samples >= 2
+
+    @property
     def is_calibrated(self) -> bool:
         """Whether this entry has enough evidence to narrow the safety margin."""
         return self.residual_samples >= 5 and self.r_fixed_bytes > 0
+
+    @property
+    def tp_crossover_ratio(self) -> float:
+        """Measured Law I tolerance: the θ ratio at which a TP group breaks.
+
+        The two accumulators bracket the crossover from below and above, so the
+        estimate is the geometric mean of the bracket — geometric because the quantity
+        is a ratio, and the midpoint of a ratio interval is its geometric centre.
+
+        Returns ``0.0`` when there is no upper bracket, which means "no crossover has
+        been observed yet"; the caller must then keep its analytic bound rather than
+        read zero as a refusal to shard.
+        """
+        if self.tp_ratio_bad_min <= 0:
+            return 0.0
+        if self.tp_ratio_ok_max <= 0 or self.tp_ratio_ok_max >= self.tp_ratio_bad_min:
+            # No usable lower bracket: the known-bad ratio is the only evidence, and a
+            # bound *at* it is the conservative reading.
+            return self.tp_ratio_bad_min
+        return math.sqrt(self.tp_ratio_ok_max * self.tp_ratio_bad_min)
+
+    def observe_tp_group(
+        self, theta_ratio: float, predicted_seconds: float, observed_seconds: float
+    ) -> None:
+        """Record whether a heterogeneous TP group met its water-filled prediction.
+
+        A group whose measured time exceeds the prediction by more than the entry's own
+        relative σ has broken the water-filling assumption, and its θ ratio bounds the
+        crossover from above.  One that met the prediction bounds it from below.  This
+        is the measurement the design named as the replacement for a guessed tolerance,
+        and it uses the σ already being tracked rather than a new threshold.
+        """
+        if theta_ratio < 1.0 or predicted_seconds <= 0 or observed_seconds <= 0:
+            return
+        # The comparison band is the entry's own relative σ, so the crossover is defined
+        # against the planner's real error bar rather than a new threshold. Before any
+        # timing history exists there is nothing to compare against, so the documented
+        # uncalibrated fraction stands in; once history exists it is floored for the same
+        # reason the memory margin is — readings that agreed exactly prove nothing has
+        # varied yet, not that nothing can.
+        if self.has_latency_evidence:
+            sigma = max(self.latency_sigma, _LATENCY_SIGMA_FLOOR)
+        else:
+            sigma = _UNCALIBRATED_LATENCY_FRACTION
+        overshoot = (observed_seconds - predicted_seconds) / predicted_seconds
+        self.tp_samples += 1
+        if overshoot > sigma:
+            self.tp_ratio_bad_min = (
+                theta_ratio if self.tp_ratio_bad_min <= 0
+                else min(self.tp_ratio_bad_min, theta_ratio)
+            )
+        else:
+            self.tp_ratio_ok_max = max(self.tp_ratio_ok_max, theta_ratio)
 
     def observe_residual(self, predicted_bytes: int, observed_bytes: int) -> None:
         """Fold one prediction error into the running statistics (Welford)."""
@@ -186,6 +304,10 @@ class LedgerEntry:
             "latency_samples": self.latency_samples,
             "latency_mean": self.latency_mean,
             "latency_m2": self.latency_m2,
+            "tp_ratio_ok_max": self.tp_ratio_ok_max,
+            "tp_ratio_bad_min": self.tp_ratio_bad_min,
+            "tp_samples": self.tp_samples,
+            "dispatch_measured": self.dispatch_measured,
             "runs": self.runs,
             "last_seen": self.last_seen,
             "notes": dict(self.notes),
@@ -206,6 +328,10 @@ class LedgerEntry:
             latency_samples=int(data.get("latency_samples", 0) or 0),
             latency_mean=float(data.get("latency_mean", 0.0) or 0.0),
             latency_m2=float(data.get("latency_m2", 0.0) or 0.0),
+            tp_ratio_ok_max=float(data.get("tp_ratio_ok_max", 0.0) or 0.0),
+            tp_ratio_bad_min=float(data.get("tp_ratio_bad_min", 0.0) or 0.0),
+            tp_samples=int(data.get("tp_samples", 0) or 0),
+            dispatch_measured=bool(data.get("dispatch_measured", False)),
             runs=int(data.get("runs", 0) or 0),
             last_seen=float(data.get("last_seen", 0.0) or 0.0),
             notes=dict(data.get("notes", {}) or {}),
@@ -351,17 +477,107 @@ class CalibrationLedger:
         if self.autosave:
             self.save()
 
-    def record_dispatch(self, signature: str, backend_build: str, seconds_per_op: float) -> None:
-        """Cache the measured host cost per graph operation for this backend."""
+    def record_dispatch(
+        self,
+        signature: str,
+        backend_build: str,
+        seconds_per_op: float,
+        *,
+        measured: bool = True,
+    ) -> None:
+        """Cache the host cost per graph operation for this backend.
+
+        Args:
+            signature: Device signature.
+            backend_build: Runtime identity — the key that makes this cost meaningful.
+            seconds_per_op: The cost.
+            measured: Whether the value came from a probe. A measured value replaces a
+                stored one; a *prior* never overwrites a measurement, because a
+                documented default must not silently displace evidence.
+        """
         if seconds_per_op <= 0:
             return
         with self._lock:
             entry = self._mutable(f"{signature}|{backend_build}")
+            if entry.dispatch_measured and not measured:
+                return
             entry.dispatch_seconds = float(seconds_per_op)
+            entry.dispatch_measured = bool(measured)
             entry.last_seen = time.time()
             self._dirty = True
         if self.autosave:
             self.save()
+
+    def reconcile_dispatch(
+        self, signature: str, backend_build: str, probed_seconds: float
+    ) -> tuple[float, bool]:
+        """Check a fresh dispatch probe against the stored value and keep the truth.
+
+        This is the guard for the design's named failure mode.  ``t_dispatch`` belongs
+        to the runtime build, and the key — Python, framework, CUDA, Aether version,
+        execution mode — cannot capture every change to it.  If a stored value is ever
+        wrong the planner does not merely mispredict: it systematically refuses to
+        shard models it should, because an inflated dispatch roof makes every wider
+        plan look worse.  So the value is *verified* rather than trusted, and a probe
+        that disagrees by :data:`DISPATCH_STALE_RATIO` replaces it.
+
+        Returns:
+            ``(seconds_per_op, replaced)`` — the value now in force, and whether the
+            stored one was discarded as stale.
+        """
+        if probed_seconds <= 0:
+            return 0.0, False
+        key = f"{signature}|{backend_build}"
+        with self._lock:
+            existing = self._entries.get(key)
+            stored = existing.dispatch_seconds if existing is not None else 0.0
+            was_measured = bool(existing.dispatch_measured) if existing is not None else False
+        replaced = False
+        if stored > 0 and was_measured:
+            ratio = max(stored / probed_seconds, probed_seconds / stored)
+            if ratio >= DISPATCH_STALE_RATIO:
+                replaced = True
+                logger.warning(
+                    "dispatch cost for %s under %s was %.1f us/op but probes at "
+                    "%.1f us/op (%.1fx); the stored value belongs to a different "
+                    "runtime and is being replaced. A stale dispatch roof makes the "
+                    "planner refuse to shard models it should.",
+                    signature, backend_build, stored * 1e6, probed_seconds * 1e6, ratio,
+                )
+            else:
+                return stored, False
+        self.record_dispatch(signature, backend_build, probed_seconds, measured=True)
+        return probed_seconds, replaced
+
+    def observe_tp_group(
+        self,
+        signature: str,
+        backend_build: str,
+        *,
+        theta_ratio: float,
+        predicted_seconds: float,
+        observed_seconds: float,
+    ) -> None:
+        """Fold one heterogeneous tensor-parallel group's realised time into Law I.
+
+        Over runs this brackets the crossover ratio from both sides, which is what
+        turns Law I's tolerance from a derivation into a measurement.
+        """
+        if theta_ratio < 1.0 or predicted_seconds <= 0 or observed_seconds <= 0:
+            return
+        with self._lock:
+            entry = self._mutable(f"{signature}|{backend_build}")
+            entry.observe_tp_group(theta_ratio, predicted_seconds, observed_seconds)
+            entry.last_seen = time.time()
+            self._dirty = True
+            crossover = entry.tp_crossover_ratio
+            samples = entry.tp_samples
+        if self.autosave:
+            self.save()
+        logger.debug(
+            "Law I crossover for %s: %.2fx from %d group observation(s)",
+            signature, crossover, samples,
+        )
 
     def observe_execution(
         self,
@@ -400,6 +616,7 @@ class CalibrationLedger:
                 entry.achieved_flops = achieved_flops
             if dispatch_seconds is not None and dispatch_seconds > 0:
                 entry.dispatch_seconds = dispatch_seconds
+                entry.dispatch_measured = True
             entry.runs += 1
             entry.last_seen = time.time()
             self._dirty = True

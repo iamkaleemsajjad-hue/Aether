@@ -2509,7 +2509,8 @@ def verify_aeg(aeg_path: str, anchor_paths: tuple[str, ...], as_json: bool) -> N
               help="Device-memory ceiling fraction. The only percentage in the model.")
 @click.option("--z", "z_value", type=click.FloatRange(0.0, 6.0), default=None,
               help="One-sided quantile for the transient-peak margin. 3.0 for serving.")
-@click.option("--no-probe", is_flag=True, help="Skip the bandwidth micro-benchmark.")
+@click.option("--no-probe", is_flag=True,
+              help="Skip the bandwidth and dispatch micro-benchmarks and use priors.")
 @click.option("--json", "as_json", is_flag=True, help="Emit the full decision as JSON.")
 def plan_cmd(
     aeg_path: str, batch: int, context: int, generate: int,
@@ -2552,7 +2553,7 @@ def plan_cmd(
     ledger = CalibrationLedger()
     census = take_census(
         device_ids=[item.strip() for item in devices.split(",") if item.strip()] if devices else None,
-        ledger=ledger, probe_bandwidth=not no_probe,
+        ledger=ledger, probe_bandwidth=not no_probe, probe_dispatch=not no_probe,
     )
     planner = ExecutionPlanner(
         profile, census, ledger,

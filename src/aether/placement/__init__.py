@@ -27,9 +27,11 @@ Module map
 :mod:`~aether.placement.workload`       the workload envelope and the planning intent
 :mod:`~aether.placement.memory`         safe capacity, the residual, ``tokens_max``
 :mod:`~aether.placement.cost`           the three-roof kernel and communication terms
+:mod:`~aether.placement.homogeneity`    Law I's tolerance, derived and then measured
 :mod:`~aether.placement.waterfill`      capped water-filling and greedy fill
 :mod:`~aether.placement.plans`          plan representation and law-pruned enumeration
 :mod:`~aether.placement.planner`        the planner: filter, rank, select, explain
+:mod:`~aether.placement.bootstrap`      the cold-start measurement that seeds σ
 :mod:`~aether.placement.record`         the human-readable decision record
 
 Design notes live in ``docs/architecture-execution-planner.html``.
@@ -37,17 +39,21 @@ Design notes live in ``docs/architecture-execution-planner.html``.
 
 from __future__ import annotations
 
+from aether.placement.bootstrap import BootstrapResult, MemoryReading
 from aether.placement.census import (
     DeviceCapability,
     DeviceCensus,
     FabricLink,
+    measure_dispatch_seconds,
     take_census,
 )
 from aether.placement.cost import RoofBreakdown, StageCost, decode_cost, prefill_cost
+from aether.placement.homogeneity import HomogeneityBound, HomogeneityLaw
 from aether.placement.ledger import CalibrationLedger, LedgerEntry
 from aether.placement.memory import MemoryBudget, safe_capacity
 from aether.placement.model_profile import ModelProfile
 from aether.placement.planner import (
+    DispatchSensitivity,
     ExecutionPlanner,
     PlacementInfeasible,
     PlanEvaluation,
@@ -59,15 +65,20 @@ from aether.placement.waterfill import greedy_fill, water_fill
 from aether.placement.workload import Intent, WorkloadEnvelope
 
 __all__ = [
+    "BootstrapResult",
     "CalibrationLedger",
     "DeviceCapability",
     "DeviceCensus",
+    "DispatchSensitivity",
     "ExecutionPlan",
     "ExecutionPlanner",
     "FabricLink",
+    "HomogeneityBound",
+    "HomogeneityLaw",
     "Intent",
     "LedgerEntry",
     "MemoryBudget",
+    "MemoryReading",
     "ModelProfile",
     "Parallelism",
     "PlacementInfeasible",
@@ -80,6 +91,7 @@ __all__ = [
     "decode_cost",
     "enumerate_plans",
     "greedy_fill",
+    "measure_dispatch_seconds",
     "prefill_cost",
     "render_record",
     "safe_capacity",

@@ -316,11 +316,20 @@ graphs, don't add GPUs.*
 **Two structural laws prune the search** before any ranking happens, which is why
 planning takes under a millisecond for 8 devices instead of Gurobi-hours:
 
-- **Homogeneity** — a TP group's devices must be within `1.3×` throughput of each other.
-  A TP group is a barrier twice per layer, so the slowest member sets the pace on every
-  layer. CPUs and mismatched GPUs never join one.
+- **Homogeneity** — a TP group's devices must be within a *derived* throughput ratio of
+  each other: `max(1 + sigma, heads*sigma - 1)`, the wider of the throughput-measurement
+  noise floor and the ratio at which rounding a shard to a whole attention head breaks
+  the planner's own error bar. A TP group is a barrier twice per layer, so the slowest
+  member sets the pace on every layer. The bound *tightens as calibration accumulates*,
+  and a measured crossover — recorded whenever a heterogeneous group misses its
+  water-filled prediction — overrides the derivation outright. CPUs and mismatched GPUs
+  never join one, by arithmetic rather than by name.
 - **Fabric alignment** — a TP group may not cross a fabric class. Heterogeneity is
   expressed *across* pipeline stages, where each runs at its own pace.
+
+Both laws are *structural*: they ask whether a group can be balanced, never whether
+widening is worthwhile. That question belongs to the ranking lane, and keeping it there is
+what stops the generator from deleting the only plan a too-large model has.
 
 **Asymmetric splits are water-filling, and the objective is phase-dependent.** For a
 16 GB + 24 GB pair holding a 21 GiB model, the capacity-optimal split is **33.8 / 66.2**
@@ -343,6 +352,22 @@ Nothing is reactive: there is no OOM-and-retry path. An impossible workload is r
 before the load with the arithmetic and the fixes that would change the answer. Telemetry
 feeds a calibration ledger keyed by device signature *and* backend build, so the next
 prediction is tighter — never the current placement.
+
+**The first run calibrates itself.** With no ledger entry there is no measured `sigma`, so
+the planner runs one forward pass at the workload ceiling after the weights are resident,
+reads peak allocated and `cuda_used - torch_reserved`, and folds both in — one profile run
+for the *chosen* plan, not one per candidate. An allocation failure during that pass is
+recorded as evidence the prediction was low rather than raised, because the pass exists to
+protect the process. Set `AETHER_PLAN_BOOTSTRAP=0` to skip it; the record then says the
+margin is uncalibrated instead of pretending otherwise.
+
+**`t_dispatch` is verified, not trusted.** It belongs to the runtime build, so its ledger
+key carries the interpreter, the framework and its CUDA build, Aether's own version and the
+execution mode — and because no key can capture every change, a fresh probe reconciles
+against the stored value on every census and replaces it when they diverge by 2×. The
+record also prints the dispatch cost at which the verdict would flip (*"PP=2 would win
+above 44.1 us/op"*), so a mis-keyed value cannot bias the answer silently even if it slips
+past both defences.
 
 Full design, including the fourteen stress-tested scenarios and what would falsify it:
 [`docs/architecture-execution-planner.html`](docs/architecture-execution-planner.html).
