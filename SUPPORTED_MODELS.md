@@ -221,9 +221,29 @@ for positions the request can never reach.
 
 ## A note on multi-GPU
 
-Tensor-parallel sharding is a **memory-capacity** mechanism, not a throughput
-boost for small models. Splitting a model that already fits on one accelerator
-adds a cross-device copy to every layer and makes decode *slower*. Aether
-therefore auto-shards only when the model does not fit on the smallest device;
-otherwise it runs single-device. Force sharding for benchmarking with
-`AETHER_FORCE_TENSOR_PARALLEL=1`.
+Sharding is decided by a **planner**, not a threshold. Aether measures the machine,
+reads the model's exact tensor geometry from the AEG, enumerates every structurally
+admissible placement, filters them by a conservative memory residual, and ranks the
+survivors on a three-roof cost model — compute, memory bandwidth, and host dispatch.
+
+Three consequences worth knowing:
+
+* **Tensor parallelism is not automatically a speed-up.** For small models decode is
+  *dispatch*-bound, not bandwidth-bound, and TP roughly doubles the host op count. The
+  planner predicts that and keeps such models on one device.
+* **It is a speed-up when the bandwidth roof binds and the fabric is fast.** A 34B model
+  on two NVLink A100s runs ~1.97× faster sharded and holds ~4.6× the KV cache. The same
+  question on two PCIe T4s with a 0.6B model answers the opposite way — one formula, both
+  answers.
+* **Capacity is reported, not discovered.** Every plan carries `tokens_max`, so the batch
+  and context ceiling is known at load time instead of arriving as an OOM.
+
+Inspect the decision for any artifact and any workload:
+
+```bash
+aether plan model.aeg --batch 4 --context 8192 --intent balanced
+```
+
+`AETHER_FORCE_TENSOR_PARALLEL=1` still overrides the planner, and the override is
+recorded in the decision rather than hidden. Design:
+[`docs/architecture-execution-planner.html`](docs/architecture-execution-planner.html).

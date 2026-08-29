@@ -60,62 +60,102 @@ class TestWeightEstimate:
 
 
 class TestShardingPolicy:
+    """The policy now comes from :mod:`aether.placement`, not a fixed multiplier.
+
+    These tests exercise the backend's *use* of the planner — the override, the
+    single-device short circuit, the subset selection, and the fail-safe when
+    planning is impossible. The planner's own decisions are pinned by
+    ``tests/unit/test_placement_planner.py``, which does not need a GPU either.
+    """
+
+    @staticmethod
+    def _decision(devices: list[str], tp_degree: int) -> SimpleNamespace:
+        """A stand-in for a PlannerDecision, carrying only what the backend reads."""
+        return SimpleNamespace(
+            plan=SimpleNamespace(
+                device_ids=tuple(devices),
+                max_tp_degree=tp_degree,
+                label=f"TP={tp_degree}" if tp_degree > 1 else f"1x {devices[0]}",
+            ),
+            render=lambda: "AETHER EXECUTION PLAN\nDECISION test",
+        )
+
     def test_single_accelerator_never_shards(self) -> None:
         backend = TorchBackend()
         backend._devices = ["cuda:0"]
         assert backend._should_shard(_engine()) is False
 
-    def test_heterogeneous_cpu_mesh_is_never_automatic(self) -> None:
-        # A CPU shard inside a GPU decode is slower than either device alone.
-        backend = TorchBackend()
-        backend._devices = ["cuda:0", "cpu"]
-        assert backend._should_shard(_engine()) is False
-
-    def test_model_that_fits_stays_on_one_device(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_plan_that_stays_on_one_device_does_not_shard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         backend = TorchBackend()
         backend._devices = ["cuda:0", "cuda:1"]
         monkeypatch.setattr(
-            TorchBackend, "_smallest_free_accelerator_bytes",
-            lambda self, devices: 16 * 1024**3,
-        )
-        monkeypatch.setattr(
-            TorchBackend, "_estimated_weight_bytes",
-            staticmethod(lambda engine: 1 * 1024**3),
+            TorchBackend, "placement_decision",
+            lambda backend, engine: self._decision(["cuda:0"], 1),
         )
         assert backend._should_shard(_engine()) is False
 
-    def test_model_that_does_not_fit_is_sharded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_tensor_parallel_plan_shards(self, monkeypatch: pytest.MonkeyPatch) -> None:
         backend = TorchBackend()
         backend._devices = ["cuda:0", "cuda:1"]
         monkeypatch.setattr(
-            TorchBackend, "_smallest_free_accelerator_bytes",
-            lambda self, devices: 16 * 1024**3,
-        )
-        monkeypatch.setattr(
-            TorchBackend, "_estimated_weight_bytes",
-            staticmethod(lambda engine: 30 * 1024**3),
+            TorchBackend, "placement_decision",
+            lambda backend, engine: self._decision(["cuda:0", "cuda:1"], 2),
         )
         assert backend._should_shard(_engine()) is True
+
+    def test_the_planner_may_select_a_subset_of_visible_devices(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A weak or badly-connected accelerator earns its place; it is not assumed."""
+        backend = TorchBackend()
+        backend._devices = ["cuda:0", "cuda:1", "cuda:2"]
+        monkeypatch.setattr(
+            TorchBackend, "placement_decision",
+            lambda backend, engine: self._decision(["cuda:1", "cuda:2"], 2),
+        )
+        assert backend._should_shard(_engine()) is True
+        assert backend.placement_devices() == ["cuda:1", "cuda:2"]
 
     def test_operator_can_force_sharding(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("AETHER_FORCE_TENSOR_PARALLEL", "1")
         backend = TorchBackend()
         backend._devices = ["cuda:0", "cuda:1"]
         assert backend._should_shard(_engine()) is True
+        assert backend._placement_forced is True
 
-    def test_a_failed_capacity_probe_prefers_single_device(
+    def test_a_failed_plan_prefers_single_device(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Probing must never block a load; the single-device path runs anything
-        # the host could load at all.
+        # Planning must never block a load. With no plan there is no evidence for
+        # widening, and one device runs anything the host could load at all.
         backend = TorchBackend()
         backend._devices = ["cuda:0", "cuda:1"]
-
-        def explode(self: object, devices: list[str]) -> int:
-            raise RuntimeError("no NVML")
-
-        monkeypatch.setattr(TorchBackend, "_smallest_free_accelerator_bytes", explode)
+        monkeypatch.setattr(
+            TorchBackend, "placement_decision", lambda backend, engine: None
+        )
         assert backend._should_shard(_engine()) is False
+
+    def test_the_workload_envelope_is_configurable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AETHER_PLAN_BATCH", "8")
+        monkeypatch.setenv("AETHER_PLAN_CONTEXT", "16384")
+        monkeypatch.setenv("AETHER_PLAN_INTENT", "throughput")
+        envelope = TorchBackend()._placement_workload()
+        assert envelope.batch_target == 8
+        assert envelope.context_target == 16384
+        assert envelope.intent.value == "throughput"
+        # The floor stays modest: planning against an optimistic guess is how a
+        # runtime OOMs on the first large request.
+        assert envelope.batch_floor == 1
+
+    def test_an_unknown_intent_falls_back_to_balanced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AETHER_PLAN_INTENT", "fastest-possible")
+        assert TorchBackend()._placement_workload().intent.value == "balanced"
 
 
 class TestDeviceResolution:

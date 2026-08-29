@@ -255,22 +255,110 @@ print(f"Throughput: {result.metrics['throughput_tps']:.1f} tok/s")
 
 ---
 
-## Multi-GPU Execution (VRAM-Weighted Tensor Parallel)
+## Multi-GPU Execution (Hardware-Aware Placement Planner)
 
-When multiple GPUs are present, Aether automatically distributes the model across all of them using **VRAM-weighted capacity partitioning**. Each GPU holds a fraction of every projection layer proportional to its available VRAM — not a simple equal split.
+When more than one device is present, Aether does not assume it should use them. It
+**plans**: it measures the machine, reads the model's exact tensor geometry out of the
+AEG, and judges every structurally admissible placement on two separate axes.
+
+```bash
+aether plan model.aeg --batch 4 --context 8192 --intent balanced
+```
+
+```
+FEASIBILITY  binding device     1x cuda:0      TP=2/cap      PP=2/bal
+  C_safe           GiB           12.96         12.96         12.96
+  static S         GiB           15.51          7.88          7.88
+  transient T      GiB            0.51          0.44          0.44
+  margin z*sigma    GiB           0.17          0.15          0.15
+  KV budget K      GiB           -3.23          4.49          4.49
+  tokens_max                          0        74,724        74,724
+  verdict                    INFEASIBLE      feasible      feasible
+
+PERFORMANCE  decode/token     1x cuda:0      TP=2/cap      PP=2/bal
+  bandwidth roof    ms           51.20         25.60         51.20
+  dispatch roof     ms           27.16         59.75         27.16
+  predicted TPOT    ms           51.20         61.16         51.22
+  binding roof                bandwidth      dispatch     bandwidth
+```
+
+**Feasibility is a residual, not a comparison.** KV cache is the elastic term, so it is
+what is *left over*:
+
+```
+C_safe(d) = min(free(d) - external(d), total(d)*kappa) - R_fixed(d)
+K(d)      = C_safe(d) - static(d) - (transient(d) + z*sigma(d))
+tokens_max = min_d floor(K(d) / kv_per_token(d))
+```
+
+That turns "does it fit" into a capacity, which is what lets Aether answer *"batch size
+just changed"* without replanning and report the context ceiling at load time instead of
+discovering it as an OOM. `kappa` is the only percentage in the model, and its job is to
+absorb driver growth — not to test fit. `R_fixed` (CUDA context, cuBLAS workspace,
+collective buffers) is **measured**, not modelled, and `sigma` is the standard deviation
+of this device's own past prediction errors, so **the safety margin shrinks as evidence
+accumulates.**
+
+**Performance is three roofs, not two.** A Python-dispatched runtime has a ceiling the
+roofline model does not contain, and for small-model decode it is the binding one:
+
+```
+t_stage = max( FLOPs/(theta_flops*u) , bytes/theta_bw , n_ops*t_dispatch )
+```
+
+Aether measures Qwen3-0.6B at 41.96 tok/s on one T4 — 23.8 ms/token. The two-roof model
+predicts 3.75 ms and therefore *recommends sharding*. The model was never near its
+bandwidth roof, and TP roughly doubles the host op count: predicted 53 ms, measured ~2×
+slower. The third roof is what makes the planner get this right, and it also produces the
+useful advice — *dispatch-bound at 23.8 ms against a 3.8 ms bandwidth roof; capture CUDA
+graphs, don't add GPUs.*
+
+**Two structural laws prune the search** before any ranking happens, which is why
+planning takes under a millisecond for 8 devices instead of Gurobi-hours:
+
+- **Homogeneity** — a TP group's devices must be within `1.3×` throughput of each other.
+  A TP group is a barrier twice per layer, so the slowest member sets the pace on every
+  layer. CPUs and mismatched GPUs never join one.
+- **Fabric alignment** — a TP group may not cross a fabric class. Heterogeneity is
+  expressed *across* pipeline stages, where each runs at its own pace.
+
+**Asymmetric splits are water-filling, and the objective is phase-dependent.** For a
+16 GB + 24 GB pair holding a 21 GiB model, the capacity-optimal split is **33.8 / 66.2**
+— which holds 74,724 KV tokens against 30,425 for a naive 50/50. Not 50/50, not
+memory-proportional, not bandwidth-proportional: the constrained optimum.
+
+| Sizing | Objective | Rule |
+|--------|-----------|------|
+| TP shard fractions | `min max t_i` | water-fill ∝ θ, capped |
+| PP layers, throughput | `min max t_i` | water-fill ∝ θ, capped |
+| **PP layers, latency** | **`min Σ t_i`** | **greedy — fastest device first** |
+
+**A tie goes to fewer devices.** A wider plan is accepted only when its predicted gain
+exceeds the planner's own error bar, which makes "use the minimum hardware necessary" a
+consequence of the cost model rather than a preference. The same 34B model on two NVLink
+A100s is selected as `TP=2` (1.97× faster, 4.6× the KV) under a graph-captured runtime and
+`1× cuda:0` under an eager one — one formula, opposite answers, both correct.
+
+Nothing is reactive: there is no OOM-and-retry path. An impossible workload is refused
+before the load with the arithmetic and the fixes that would change the answer. Telemetry
+feeds a calibration ledger keyed by device signature *and* backend build, so the next
+prediction is tighter — never the current placement.
+
+Full design, including the fourteen stress-tested scenarios and what would falsify it:
+[`docs/architecture-execution-planner.html`](docs/architecture-execution-planner.html).
+Implementation: [`src/aether/placement/`](src/aether/placement/).
 
 ```python
-from aether.parallelism.planner import ParallelismPlanner
-from aether.parallelism.sharding import DeviceCapacity
+from aether.placement import ExecutionPlanner, Intent, WorkloadEnvelope
+from aether.placement.model_profile import profile_from_manifest
 
-# VRAM-weighted heterogeneous sharding plan
-planner = ParallelismPlanner(architecture)
-plan = planner.plan_for_devices([
-    DeviceCapacity(device_id="cuda:0", compute_units=1.0, memory_bytes=24 * 1024**3),  # 24 GB
-    DeviceCapacity(device_id="cuda:1", compute_units=0.5, memory_bytes=12 * 1024**3),  # 12 GB
-])
-# cuda:0 holds ~67% of weights, cuda:1 holds ~33%
-print(plan.weight_fractions)   # {"cuda:0": 0.667, "cuda:1": 0.333}
+planner = ExecutionPlanner(profile_from_manifest(manifest))
+decision = planner.plan(WorkloadEnvelope(
+    batch_target=4, context_target=8192, generate_target=512, intent=Intent.BALANCED,
+))
+print(decision.render())                    # the full derivation
+print(decision.selected.tokens_max)         # capacity, not a boolean
+print(decision.plan.device_ids)             # which devices, and why
 ```
 
 The compiler embeds sharding plans for 1–8 GPUs in every AEG artifact (Pass 6: Parallelism Discovery). At runtime the distributed engine reads the matching plan and reduces with Aether's own collectives.
@@ -561,6 +649,7 @@ RustSDKGenerator().write('./sdk/rust/src/')           # aether_client.rs
 | `aether eval <path.aeg>` | Run eval gate CI check |
 | `aether hardware` | Show hardware profile |
 | `aether models` | Show the graded model-family support matrix |
+| `aether plan <path.aeg>` | Show the hardware-aware placement decision and its derivation |
 | `aether hub push <path.aeg>` | Push to Aether Hub CDN |
 | `aether hub pull <model-id>` | Pull from Aether Hub CDN |
 | `aether sdk generate` | Generate TypeScript/Go/Rust SDKs |

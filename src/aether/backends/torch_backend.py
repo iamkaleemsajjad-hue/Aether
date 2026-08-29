@@ -81,6 +81,11 @@ class TorchBackend(Backend):
         self._devices: list[str] = ["cpu"]
         self._runtime_family: str = "cpu"
         self._allow_remote_code = False
+        # Placement state, populated once per model load by the execution planner.
+        self._placement: Any = None
+        self._placement_devices: list[str] | None = None
+        self._placement_forced = False
+        self._placement_failed = False
         self._try_detect_device()
 
     def _try_detect_device(self) -> None:
@@ -107,57 +112,138 @@ class TorchBackend(Backend):
             self._devices = ["cpu"]
             self._runtime_family = "cpu"
 
+    def _placement_workload(self) -> Any:
+        """Build the workload envelope the planner will size against.
+
+        The backend does not know the request mix at load time, so the envelope is
+        configurable and its defaults are deliberately modest: a floor that any
+        deployment can meet and a target drawn from the artifact's own declared
+        context. Planning against an optimistic guess is how a runtime OOMs on the
+        first large request.
+        """
+        from aether.placement import Intent, WorkloadEnvelope
+
+        def value(name: str, default: int) -> int:
+            try:
+                return max(1, int(os.environ.get(name, "") or default))
+            except ValueError:
+                return default
+
+        batch = value("AETHER_PLAN_BATCH", 1)
+        context = value("AETHER_PLAN_CONTEXT", 2048)
+        generate = value("AETHER_PLAN_GENERATE", 256)
+        requested = str(os.environ.get("AETHER_PLAN_INTENT", "") or "balanced").lower()
+        try:
+            intent = Intent(requested)
+        except ValueError:
+            logger.warning("unknown AETHER_PLAN_INTENT %r; using balanced", requested)
+            intent = Intent.BALANCED
+        return WorkloadEnvelope(
+            batch_floor=1, batch_target=batch,
+            context_floor=min(512, context), context_target=context,
+            generate_floor=min(64, generate), generate_target=generate,
+            intent=intent,
+        )
+
+    def placement_decision(self, engine: Any) -> Any:
+        """Plan where this engine should execute, or ``None`` if planning failed.
+
+        The decision is cached: a model is planned once per load, and the record is
+        available afterwards for ``aether inspect`` and for the manifest.
+        """
+        if getattr(self, "_placement", None) is not None:
+            return self._placement
+        try:
+            from aether.placement import CalibrationLedger, ExecutionPlanner, take_census
+            from aether.placement.model_profile import profile_from_engine
+
+            ledger = CalibrationLedger()
+            census = take_census(ledger=ledger)
+            profile = profile_from_engine(
+                engine,
+                model_id=str(getattr(engine, "model_id", "") or "aeg"),
+                weight_dtype_bytes=2.0,
+            )
+            # Cross-check the profile against an independent sum of the same tensors.
+            # A large divergence means the profile was built from the wrong shapes,
+            # and a memory model fed the wrong weight bytes is worse than no model.
+            independent = self._estimated_weight_bytes(engine)
+            if independent > 0 and profile.weight_bytes > 0:
+                ratio = profile.weight_bytes / independent
+                if not 0.9 <= ratio <= 1.1:
+                    logger.warning(
+                        "placement profile reports %.2f GiB of weights but a direct "
+                        "tensor sum gives %.2f GiB (ratio %.2f); the smallest device "
+                        "has %.2f GiB free. Planning on the direct sum.",
+                        profile.weight_bytes / 1024 ** 3, independent / 1024 ** 3, ratio,
+                        self._smallest_free_accelerator_bytes(
+                            [d for d in self._devices if d != "cpu"]
+                        ) / 1024 ** 3,
+                    )
+            planner = ExecutionPlanner(profile, census, ledger)
+            decision = planner.plan(self._placement_workload())
+        except Exception as exc:  # noqa: BLE001 - planning must never block a load
+            from aether.placement.planner import PlacementInfeasible
+
+            if isinstance(exc, PlacementInfeasible):
+                # A refusal is information, not a crash: log the arithmetic and let
+                # the caller proceed on one device, where it will fail loudly and
+                # locally rather than silently mis-placing the model.
+                logger.error("placement refused: %s", exc)
+                for remedy in exc.detail.get("remedies", [])[:3]:
+                    logger.error("  remedy: %s", remedy)
+            else:
+                logger.warning("placement planning unavailable (%s); using one device", exc)
+            self._placement = None
+            self._placement_failed = True
+            return None
+        self._placement = decision
+        logger.info("placement: %s", decision.render().splitlines()[-1].strip())
+        logger.debug("placement record:\n%s", decision.render())
+        return decision
+
     def _should_shard(self, engine: Any) -> bool:
-        """Decide whether a dense decoder should be tensor-parallel sharded.
+        """Decide whether this model should be tensor-parallel sharded.
 
-        Tensor parallelism is a memory-capacity tool, not a throughput tool for
-        small models: every layer copies activations between devices, and for a
-        model that already fits on one GPU those copies serialize the decode
-        pipeline and make it *slower* than single-device execution.  A 350M
-        model split across two GPUs is the pathological case — it runs at about
-        half the single-device rate.
+        The decision comes from :mod:`aether.placement`, which compares every
+        structurally admissible plan on two axes — a conservative memory residual and
+        a three-roof cost model — and picks the narrowest plan whose predicted
+        advantage clears its own error bar.
 
-        So sharding is selected only when at least one of these holds:
+        This replaces a fixed ``weight_bytes × 2 > free`` rule that had no notion of
+        batch size, context length, activation peak, allocator fragmentation, host
+        dispatch cost or interconnect bandwidth, and therefore recommended sharding
+        exactly the small models that get slower when split.
 
-        * there are ``≥2`` accelerators AND the model's resident size does not
-          comfortably fit in the smallest device's free memory (the genuine
-          capacity case), or
-        * the operator explicitly requested it via
-          ``AETHER_FORCE_TENSOR_PARALLEL=1`` (benchmarking / correctness runs).
-
-        Otherwise a single device is used.  A heterogeneous mesh that includes
-        CPU is never auto-sharded: mixing a CPU shard into a GPU decode is far
-        slower than either alone and must be opted into explicitly.
+        ``AETHER_FORCE_TENSOR_PARALLEL=1`` still overrides the planner, and the
+        override is recorded rather than hidden.
         """
         accelerators = [device for device in self._devices if device != "cpu"]
         if len(accelerators) < 2:
             return False
         force = os.environ.get("AETHER_FORCE_TENSOR_PARALLEL", "").strip().lower()
         if force in {"1", "true", "yes"}:
-            return True
-        if len(accelerators) != len(self._devices):
-            # Heterogeneous CPU+GPU mesh: never automatic.
-            return False
-        try:
-            required = self._estimated_weight_bytes(engine)
-            headroom = self._smallest_free_accelerator_bytes(accelerators)
-        except Exception:  # noqa: BLE001 — capacity probing must never block a load
-            # If the probe fails, prefer the safe fast path: a single device
-            # runs any model that the host could load in the first place.
-            return False
-        if required <= 0 or headroom <= 0:
-            return False
-        # Require the whole model plus a working margin for activations and the
-        # KV cache (2x) to fit before choosing single-device execution.
-        fits_on_one = required * 2.0 <= headroom
-        if not fits_on_one:
             logger.info(
-                "Model needs ~%.1f GiB but the smallest device has ~%.1f GiB free; "
-                "activating tensor-parallel execution.",
-                required / 1024**3,
-                headroom / 1024**3,
+                "tensor-parallel execution forced by AETHER_FORCE_TENSOR_PARALLEL "
+                "across %d devices; the planner's own choice was not used",
+                len(accelerators),
             )
-        return not fits_on_one
+            self._placement_forced = True
+            return True
+
+        decision = self.placement_decision(engine)
+        if decision is None:
+            # No plan means no evidence for widening. One device runs any model the
+            # host could load, so that is the safe answer.
+            return False
+        chosen = [d for d in decision.plan.device_ids if d != "cpu"]
+        if len(chosen) > 1:
+            self._placement_devices = chosen
+        return decision.plan.max_tp_degree > 1
+
+    def placement_devices(self) -> list[str] | None:
+        """The devices the planner actually selected, when it selected a subset."""
+        return getattr(self, "_placement_devices", None)
 
     @staticmethod
     def _estimated_weight_bytes(engine: Any) -> int:
@@ -423,12 +509,16 @@ class TorchBackend(Backend):
                     _TP_ELIGIBLE_ENGINES = {"CPUExecutionEngine"}
                     if engine_kind in _TP_ELIGIBLE_ENGINES and self._should_shard(engine):
                         from aether.runtime.torch_tensor_parallel import TorchTensorParallelAEGEngine
+                        # The planner may select a *subset* of the visible devices —
+                        # a weak or badly-connected accelerator earns its place only
+                        # when the cost model says it helps.
+                        mesh = self.placement_devices() or self._devices
                         logger.info(
-                            "Activating tensor-parallel execution across %d GPUs: %s",
-                            len(self._devices),
-                            self._devices,
+                            "Activating tensor-parallel execution across %d of %d "
+                            "device(s): %s",
+                            len(mesh), len(self._devices), mesh,
                         )
-                        engine = TorchTensorParallelAEGEngine(engine, self._devices)
+                        engine = TorchTensorParallelAEGEngine(engine, mesh)
                     elif engine_kind == "EncoderExecutionEngine":
                         engine = TorchEncoderAEGEngine(engine, self._device, self._devices)
                     elif engine_kind == "Seq2SeqExecutionEngine":

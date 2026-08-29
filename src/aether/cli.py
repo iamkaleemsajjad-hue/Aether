@@ -2489,8 +2489,100 @@ def verify_aeg(aeg_path: str, anchor_paths: tuple[str, ...], as_json: bool) -> N
 
 
 # ---------------------------------------------------------------------------
-# aether benchmark — real measured performance (PRD §36)
+# aether plan — hardware-aware placement decision
 # ---------------------------------------------------------------------------
+
+@cli.command("plan")
+@click.argument("aeg_path", type=click.Path(exists=True))
+@click.option("--batch", type=click.IntRange(1), default=1, help="Target batch size.")
+@click.option("--context", type=click.IntRange(1), default=2048, help="Target prompt length.")
+@click.option("--generate", type=click.IntRange(1), default=256, help="Target output length.")
+@click.option("--batch-floor", type=click.IntRange(1), default=None,
+              help="Batch that must work or the plan is infeasible. Defaults to 1.")
+@click.option("--context-floor", type=click.IntRange(1), default=None,
+              help="Prompt length that must work. Defaults to min(512, --context).")
+@click.option("--intent", type=click.Choice(["balanced", "latency", "throughput", "capacity"]),
+              default="balanced", help="What to optimise among feasible plans.")
+@click.option("--devices", default=None,
+              help="Comma-separated device list to consider, e.g. 'cuda:0,cuda:1'.")
+@click.option("--kappa", type=click.FloatRange(0.1, 1.0), default=None,
+              help="Device-memory ceiling fraction. The only percentage in the model.")
+@click.option("--z", "z_value", type=click.FloatRange(0.0, 6.0), default=None,
+              help="One-sided quantile for the transient-peak margin. 3.0 for serving.")
+@click.option("--no-probe", is_flag=True, help="Skip the bandwidth micro-benchmark.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the full decision as JSON.")
+def plan_cmd(
+    aeg_path: str, batch: int, context: int, generate: int,
+    batch_floor: int | None, context_floor: int | None, intent: str,
+    devices: str | None, kappa: float | None, z_value: float | None,
+    no_probe: bool, as_json: bool,
+) -> None:
+    """Show where Aether would run this model, and why.
+
+    Reads the artifact's manifest — no weights are loaded — measures this machine,
+    enumerates every structurally admissible placement, filters by a conservative
+    memory residual, ranks the survivors by a three-roof cost model, and prints the
+    derivation. Exits non-zero when no plan is feasible, with the arithmetic and the
+    changes that would make it feasible.
+    """
+    from aether.placement import (
+        CalibrationLedger, ExecutionPlanner, Intent, WorkloadEnvelope, take_census,
+    )
+    from aether.placement.memory import KAPPA_DEFAULT, Z_DEFAULT
+    from aether.placement.model_profile import profile_from_manifest
+    from aether.placement.planner import PlacementInfeasible
+
+    manifest_path = Path(aeg_path)
+    if manifest_path.is_dir():
+        manifest_path = manifest_path / "manifest.json"
+    if not manifest_path.is_file():
+        raise click.ClickException(f"no AEG manifest at {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        profile = profile_from_manifest(manifest)
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(f"could not read {manifest_path}: {exc}") from exc
+
+    envelope = WorkloadEnvelope(
+        batch_floor=batch_floor or 1, batch_target=batch,
+        context_floor=context_floor or min(512, context), context_target=context,
+        generate_floor=min(64, generate), generate_target=generate,
+        intent=Intent(intent),
+    )
+    ledger = CalibrationLedger()
+    census = take_census(
+        device_ids=[item.strip() for item in devices.split(",") if item.strip()] if devices else None,
+        ledger=ledger, probe_bandwidth=not no_probe,
+    )
+    planner = ExecutionPlanner(
+        profile, census, ledger,
+        kappa=KAPPA_DEFAULT if kappa is None else kappa,
+        z=Z_DEFAULT if z_value is None else z_value,
+    )
+    try:
+        decision = planner.plan(envelope)
+    except PlacementInfeasible as exc:
+        if as_json:
+            # Raw, unwrapped JSON: a --json flag exists to be piped, and Rich's
+            # pretty-printer inserts soft wraps that break json.loads downstream.
+            click.echo(json.dumps(
+                {"feasible": False, "error": str(exc), **exc.detail},
+                indent=2, default=str,
+            ))
+        else:
+            console.print(f"[red]{_display_text(str(exc))}[/red]\n")
+            console.print("[bold]What would make this feasible[/bold]")
+            for remedy in exc.detail.get("remedies", []):
+                console.print(f"  - {_display_text(remedy)}")
+        raise SystemExit(2) from None
+
+    if as_json:
+        click.echo(json.dumps(decision.to_dict(), indent=2, default=str))
+        return
+    # The record is fixed-width by construction; Rich would re-wrap the columns.
+    click.echo(_display_text(decision.render()))
+
+
 
 @cli.command("benchmark")
 @click.argument("model")

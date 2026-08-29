@@ -178,3 +178,73 @@ def test_slo_profile_add_persists_profile(tmp_path) -> None:
     assert '"max_ttft_ms": 200.0' in result.output
     assert '"max_tbt_ms": 50.0' in result.output
     assert (tmp_path / "slo_profiles.json").is_file()
+
+
+def _placement_manifest(root, **overrides) -> None:
+    """Write the minimum AEG manifest ``aether plan`` needs: an architecture."""
+    architecture = {
+        "family": "qwen_family", "params_billion": 0.0, "layers": 28,
+        "hidden_size": 1024, "num_attention_heads": 16, "num_kv_heads": 8,
+        "head_dim": 128, "context_length": 32768, "vocab_size": 151936,
+        "intermediate_size": 3072, "qk_norm": True, "ffn_type": "SwiGLU",
+        "norm_type": "RMSNorm", "position_type": "RoPE",
+    }
+    architecture.update(overrides)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "manifest.json").write_text(
+        json.dumps({"model_id": "planner-fixture", "architecture": architecture}),
+        encoding="utf-8",
+    )
+
+
+def test_plan_prints_the_decision_record(tmp_path) -> None:
+    """``aether plan`` must answer from the manifest alone — no weights loaded."""
+    package = tmp_path / "fixture.aeg"
+    _placement_manifest(package)
+    result = CliRunner().invoke(
+        cli,
+        ["plan", str(package), "--context", "256", "--generate", "32", "--no-probe"],
+    )
+    # Either a plan or a documented refusal; both are valid on an arbitrary host.
+    assert result.exit_code in (0, 2), result.output
+    if result.exit_code == 0:
+        for section in ("AETHER EXECUTION PLAN", "FEASIBILITY", "DECISION", "LADDER"):
+            assert section in result.output
+    else:
+        assert "no feasible placement" in result.output
+        assert "What would make this feasible" in result.output
+
+
+def test_plan_emits_machine_readable_json(tmp_path) -> None:
+    package = tmp_path / "fixture.aeg"
+    _placement_manifest(package)
+    result = CliRunner().invoke(
+        cli, ["plan", str(package), "--context", "256", "--json", "--no-probe"]
+    )
+    assert result.exit_code in (0, 2), result.output
+    payload = json.loads(result.output)
+    if result.exit_code == 0:
+        assert payload["selected"]["plan"]["devices"]
+        assert payload["model"]["kv_bytes_per_token"] > 0
+    else:
+        assert payload["feasible"] is False
+        assert payload["remedies"]
+
+
+def test_plan_rejects_a_path_without_a_manifest(tmp_path) -> None:
+    empty = tmp_path / "empty.aeg"
+    empty.mkdir()
+    result = CliRunner().invoke(cli, ["plan", str(empty), "--no-probe"])
+    assert result.exit_code != 0
+    assert "manifest" in result.output.lower()
+
+
+def test_plan_intent_is_accepted_and_validated(tmp_path) -> None:
+    package = tmp_path / "fixture.aeg"
+    _placement_manifest(package)
+    good = CliRunner().invoke(
+        cli, ["plan", str(package), "--intent", "capacity", "--context", "256", "--no-probe"]
+    )
+    assert good.exit_code in (0, 2), good.output
+    bad = CliRunner().invoke(cli, ["plan", str(package), "--intent", "nonsense", "--no-probe"])
+    assert bad.exit_code != 0

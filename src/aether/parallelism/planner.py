@@ -8,7 +8,7 @@ the disaggregated scheduler.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from aether.core.constants import (
@@ -19,8 +19,8 @@ from aether.core.constants import (
 )
 from aether.core.exceptions import ParallelismError
 from aether.core.types import ModelArchitecture, ShardingPlan
-from aether.parallelism.mesh import DeviceMesh
-from aether.parallelism.sharding import DeviceCapacity, capacity_weighted_partition
+from aether.parallelism.sharding import DeviceCapacity
+from aether.placement.waterfill import WaterfillInfeasible, water_fill
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -133,10 +133,19 @@ class ParallelismPlanner:
     ) -> HeterogeneousShardingPlan:
         """Build a capacity-weighted, single-copy plan for any device mix.
 
-        ``compute_units`` determines the work share; ``memory_bytes`` is a
-        hard placement constraint when known.  The resulting ranges describe
-        model weights, while activations are transient collective buffers and
-        are not counted as extra model replicas.
+        The split is capped water-filling
+        (:func:`aether.placement.waterfill.water_fill`): distribute in proportion to
+        throughput, pin any device that would exceed its memory, redistribute the
+        remainder, repeat.  That is the min-max optimum under a linear resource with
+        per-device caps, and it is the reason an asymmetric pair gets an asymmetric
+        split instead of an error.
+
+        The previous behaviour split purely by ``compute_units`` and then *raised* if
+        a shard exceeded 90% of a device — so the very case this method exists for,
+        a 16 GB device beside a 24 GB one, failed rather than repartitioning.
+
+        Raises:
+            ParallelismError: Only when the devices cannot hold the model at all.
         """
         if not devices:
             raise ParallelismError("at least one execution device is required")
@@ -146,34 +155,52 @@ class ParallelismPlanner:
             1,
             int(self.architecture.params_billion * 1_000_000_000 * precision_bits / 8.0),
         )
-        ranges = capacity_weighted_partition(
-            total_bytes, [device.compute_units for device in devices]
-        )
+        # A device with no declared memory is treated as unbounded rather than as
+        # zero: an unknown capacity must not silently exclude a device.
+        caps = [
+            float(device.memory_bytes * 0.90) if device.memory_bytes else float("inf")
+            for device in devices
+        ]
+        throughputs = [max(device.compute_units, 1e-9) for device in devices]
+        try:
+            weights = water_fill(float(total_bytes), throughputs, caps)
+        except WaterfillInfeasible as exc:
+            raise ParallelismError(
+                f"the given devices cannot hold {total_bytes} bytes of weights: {exc}"
+            ) from exc
+
+        boundaries: list[tuple[int, int]] = []
+        cursor = 0
+        for index, weight in enumerate(weights):
+            end = total_bytes if index == len(weights) - 1 else cursor + int(total_bytes * weight)
+            boundaries.append((cursor, end))
+            cursor = end
         weight_ranges = {
-            device.device_id: value for device, value in zip(devices, ranges)
+            device.device_id: value
+            for device, value in zip(devices, boundaries, strict=False)
         }
         fractions = {
             device.device_id: (end - start) / total_bytes
-            for device, (start, end) in zip(devices, ranges)
+            for device, (start, end) in zip(devices, boundaries, strict=False)
         }
-        for device, (start, end) in zip(devices, ranges):
-            assigned = end - start
-            if device.memory_bytes and assigned > int(device.memory_bytes * 0.90):
-                raise ParallelismError(
-                    f"device {device.device_id!r} cannot hold its model shard: "
-                    f"{assigned} > 90% of {device.memory_bytes} bytes"
-                )
         activation_bytes = int(
             self.architecture.hidden_size * max(1, self.architecture.layers) * precision_bits / 8.0
         )
         participants = len(devices)
-        all_reduce_bytes = int(activation_bytes * 2.0 * (participants - 1) / participants)
-        work_time = max(
-            fractions[device.device_id] / device.compute_units for device in devices
+        all_reduce_bytes = (
+            int(activation_bytes * 2.0 * (participants - 1) / participants)
+            if participants > 1 else 0
         )
-        communication_time = max(
-            all_reduce_bytes / (device.bandwidth_gbps * 1_000_000_000)
+        work_time = max(
+            fractions[device.device_id] / max(device.compute_units, 1e-9)
             for device in devices
+        )
+        communication_time = (
+            max(
+                all_reduce_bytes / (device.bandwidth_gbps * 1_000_000_000)
+                for device in devices
+            )
+            if participants > 1 else 0.0
         )
         return HeterogeneousShardingPlan(
             phase=phase,
