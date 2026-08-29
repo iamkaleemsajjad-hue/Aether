@@ -285,6 +285,17 @@ class TorchAEGEngine:
             if self.weights.position_embedding is not None else None
         )
         self.layers = [self._convert_layer(layer) for layer in self.weights.layers]
+        # ── Decode kernel strategy ─────────────────────────────────────────
+        # The projection formulation is measured per (device class, phase, row
+        # count, dtype) and cached; until a measurement exists this is exactly
+        # ``F.linear``, so an uncalibrated device is unchanged.  Constructed here
+        # but never *run* here: calibration happens on the first pass of each
+        # shape class, so a load that never decodes pays nothing.
+        self._reference_projection = self._reference_projection_factory(torch)
+        self._projection = self._reference_projection
+        self._projection_choice: Any = None
+        self._projection_rows: int = -1
+        self._strategies = self._build_strategy_calibrator()
         self._cos: Any | None = None
         self._sin: Any | None = None
         self._local_cos: Any | None = None
@@ -726,8 +737,146 @@ class TorchAEGEngine:
         loop it is several Python operations per projection per layer, repeated
         for every token — enough to matter on a small model where each kernel is
         only microseconds of real work.
+
+        ``self._projection`` is the *measured* formulation for this pass's shape
+        class; see :mod:`aether.runtime.kernel_strategy`.  It is
+        ``F.linear`` until a calibration says otherwise, so an uncalibrated device
+        behaves exactly as it did before the mechanism existed.
         """
-        return self.torch.nn.functional.linear(x, weight, bias)
+        return self._projection(x, weight, bias)
+
+    @staticmethod
+    def _reference_projection_factory(torch: Any) -> Any:
+        """The always-correct projection, bound once so the hot path has no branch."""
+        linear = torch.nn.functional.linear
+
+        def apply(x: Any, weight: Any, bias: Any | None = None) -> Any:
+            return linear(x, weight, bias)
+
+        return apply
+
+    def _build_strategy_calibrator(self) -> Any:
+        """Construct the projection-strategy calibrator, or ``None`` if unavailable.
+
+        Never raises and never measures: an environment without the calibration module,
+        without a writable store, or with calibration switched off simply keeps the
+        reference kernel. Sharing the placement ledger means the strategy winners live
+        beside the placement calibration, under one key per device and backend build.
+        """
+        try:
+            from aether.runtime.kernel_strategy import (
+                calibration_enabled,
+                projection_strategies,
+            )
+
+            if not calibration_enabled():
+                return None
+            store = signature = backend_build = None
+            try:
+                from aether.placement.census import DeviceCapability, _backend_build
+                from aether.placement.ledger import CalibrationLedger
+
+                store = CalibrationLedger()
+                backend_build = _backend_build()
+                signature = DeviceCapability(
+                    device_id=str(self.device), kind=self.device.type,
+                    name=self._device_name(), total_bytes=0, free_bytes=0,
+                    external_bytes=0, bandwidth_bps=0.0, flops=0.0,
+                ).signature
+            except Exception as exc:  # noqa: BLE001 - in-memory calibration is valid
+                logger.debug("decode strategy calibration will not persist: %s", exc)
+                store = None
+            return projection_strategies(
+                self.torch, self.device, store=store,
+                signature=signature or "", backend_build=backend_build or "",
+            )
+        except Exception as exc:  # noqa: BLE001 - the reference kernel always works
+            logger.debug("decode strategy calibration unavailable: %s", exc)
+            return None
+
+    def _device_name(self) -> str:
+        """A stable name for the device class, for the calibration key."""
+        try:
+            if self.device.type == "cuda":
+                return str(self.torch.cuda.get_device_name(self.device))
+        except Exception:  # noqa: BLE001 - naming is advisory
+            pass
+        return self.device.type
+
+    def _projection_probe_shape(self) -> "tuple[Any, Any | None] | None":
+        """The largest projection in the first layer, as the class representative.
+
+        Calibrating every ``(K, N)`` a model contains would run a probe per weight;
+        the flat-GEMM effect is dominated by the row count with only a weak dependence
+        on the weight's magnitude, so one representative per layer stack is the right
+        granularity.  The *largest* weight is chosen because it is the one whose kernel
+        selection actually moves the step time.
+        """
+        if not self.layers:
+            return None
+        best: Any = None
+        for name in (
+            "down_proj", "gate_up_weight", "up_proj", "gate_proj",
+            "qkv_weight", "o_proj", "q_proj",
+        ):
+            weight = self.layers[0].get(name)
+            if weight is None:
+                continue
+            if best is None or int(weight.numel()) > int(best.numel()):
+                best = weight
+        return None if best is None else (best, None)
+
+    def _resolve_projection(self, rows: int, phase: str) -> None:
+        """Select the projection formulation for this pass, measuring at most once.
+
+        Called once per forward pass rather than once per projection: every layer in a
+        pass shares the same row count, which is the dimension the choice turns on. The
+        calibrator memoises per shape class, so this is a dictionary lookup after the
+        first pass of each class and performs no measurement on the hot path.
+        """
+        calibrator = self._strategies
+        if calibrator is None:
+            return
+        probe_shape = self._projection_probe_shape()
+        if probe_shape is None:
+            return
+        weight, bias = probe_shape
+        torch = self.torch
+
+        def probe() -> "tuple[Any, Any, Any | None]":
+            # The real weight, not a copy: it measures the layout that will actually
+            # be used and costs no extra device memory at a moment when the model is
+            # already resident.
+            activation = torch.zeros(
+                (int(rows), int(weight.shape[1])),
+                dtype=weight.dtype, device=weight.device,
+            )
+            return activation, weight, bias
+
+        try:
+            choice = calibrator.choose(
+                phase=phase, rows=int(rows),
+                in_features=int(weight.shape[1]), out_features=int(weight.shape[0]),
+                dtype=weight.dtype, probe=probe,
+            )
+        except Exception as exc:  # noqa: BLE001 - never let selection break a pass
+            logger.debug("projection strategy selection failed: %s", exc)
+            return
+        self._projection_choice = choice
+        self._projection = (
+            calibrator.strategy(choice)
+            if choice.name != "linear"
+            else self._reference_projection
+        )
+
+    def projection_report(self) -> dict[str, Any]:
+        """Which projection formulation is in force, and how it was chosen."""
+        if self._strategies is None:
+            return {"enabled": False, "reason": "calibration unavailable"}
+        report = self._strategies.report()
+        if self._projection_choice is not None:
+            report["active"] = self._projection_choice.to_dict()
+        return report
 
     def _linear(self, x: Any, weight: Any, bias: Any | None = None) -> Any:
         if weight.ndim != 2:
@@ -915,6 +1064,32 @@ class TorchAEGEngine:
             # is vacuous.  Dropping it lets SDPA keep its fused path instead of
             # falling back to the math backend for an all-true mask — material
             # for GPT-Neo and Gemma, where half or more of the layers are local.
+            local = False
+            window_size = None
+        if local and query_length == 1 and live is None:
+            # A one-token step against a sliding window admits a *contiguous
+            # suffix* of the cache, so the constraint can be satisfied by slicing
+            # the keys instead of masking them.  Two things follow, and both are
+            # what makes local-attention families scale with batch:
+            #
+            #   * the mask disappears, so SDPA keeps its fused kernel instead of
+            #     falling back to the math backend, which materializes the whole
+            #     (batch, heads, 1, key) score tensor and expands grouped KV
+            #     heads to full width;
+            #   * attention reads ``window`` keys per step instead of ``key``,
+            #     which at a 1024-token context with a 256-token window is four
+            #     times less traffic on every local layer.
+            #
+            # Restricted to an unpadded batch on purpose: with ragged rows each
+            # row's window starts at a different slot, so one slice cannot express
+            # it and the mask remains the correct answer.
+            span = int(window_size)
+            if key_length > span:
+                start = key_length - span
+                k = k[:, start:] if batched else k[start:]
+                v = v[:, start:] if batched else v[start:]
+                key_positions = key_positions[..., start:]
+                key_length = span
             local = False
             window_size = None
         scale = self.base_attention_scale if scale is None else float(scale)
@@ -1165,6 +1340,14 @@ class TorchAEGEngine:
         post_norm = self.norm_placement == "post"
         parallel = self.parallel_residual
         residual_scale = self.residual_scale
+        # One strategy resolution per pass, not per projection: every layer shares this
+        # pass's row count, which is the dimension the choice turns on. Memoised inside
+        # the calibrator, so this is a dictionary lookup after the first pass of each
+        # shape class and never a measurement on the hot path.
+        rows = int(ids.numel())
+        if rows != self._projection_rows:
+            self._projection_rows = rows
+            self._resolve_projection(rows, "prefill" if seq_len > 1 else "decode")
         # The rotation factors depend only on the positions and the rotary base,
         # so gather them once per step instead of twice per layer.
         rope_global = self._rope_slice(positions, local=False) if self.uses_rope else None

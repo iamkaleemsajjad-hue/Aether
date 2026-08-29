@@ -549,6 +549,34 @@ class CalibrationLedger:
         self.record_dispatch(signature, backend_build, probed_seconds, measured=True)
         return probed_seconds, replaced
 
+    def record_notes(
+        self, signature: str, backend_build: str, notes: "dict[str, Any]"
+    ) -> None:
+        """Merge free-form calibration into an entry, one namespace at a time.
+
+        Used by calibrations that belong to the same (device, backend) key but are not
+        part of the placement schema — the decode kernel-strategy winners in
+        :mod:`aether.runtime.kernel_strategy` are the first. Nested dictionaries are
+        merged rather than replaced, so two namespaces, or two shape classes inside
+        one namespace, cannot overwrite each other's measurements.
+        """
+        if not notes:
+            return
+        with self._lock:
+            entry = self._mutable(f"{signature}|{backend_build}")
+            for namespace, value in notes.items():
+                existing = entry.notes.get(namespace)
+                if isinstance(existing, dict) and isinstance(value, dict):
+                    merged = dict(existing)
+                    merged.update(value)
+                    entry.notes[namespace] = merged
+                else:
+                    entry.notes[namespace] = value
+            entry.last_seen = time.time()
+            self._dirty = True
+        if self.autosave:
+            self.save()
+
     def observe_tp_group(
         self,
         signature: str,
