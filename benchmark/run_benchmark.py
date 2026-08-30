@@ -317,7 +317,7 @@ def run_multigpu(config: BenchmarkConfig) -> dict[str, Any] | None:
     """Mode 5: how each runtime uses more than one accelerator.
 
     Aether shards a dense decoder only when the model does not fit on the
-    smallest visible device, so for these three models the default on a
+    smallest visible device, so for these models the default on a
     multi-GPU host is single-device execution.  Both the default and the forced
     sharded path are measured, and each is labelled, because comparing a sharded
     Aether against a single-device Transformers would not be a same-hardware

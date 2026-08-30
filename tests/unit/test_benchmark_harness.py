@@ -93,15 +93,22 @@ def test_unsupported_configurations_are_recorded_not_silently_skipped() -> None:
 
 
 def test_charter_models_are_fixed() -> None:
-    """The three benchmark models are part of the definition, not a default."""
+    """The benchmark models are part of the definition, not a default.
+
+    Pinned here so adding or substituting a model has to be a deliberate edit in two
+    places: results from two different model sets are not comparable, and the set was
+    chosen for a specific hardware budget.
+    """
     from benchmark.config import MODELS, is_charter_model
 
     assert MODELS == (
         "HuggingFaceTB/SmolLM2-135M-Instruct",
         "Qwen/Qwen3-0.6B",
         "SummerSigh/GPTNeo350M-Instruct-SFT",
+        "microsoft/Phi-3.5-mini-instruct",
     )
     assert is_charter_model(MODELS[0])
+    assert is_charter_model("microsoft/Phi-3.5-mini-instruct")
     assert not is_charter_model("./some/local/checkpoint")
 
 

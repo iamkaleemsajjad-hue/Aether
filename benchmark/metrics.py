@@ -67,6 +67,9 @@ def summarize(samples: list[float]) -> dict[str, Any]:
         "p50": percentile(0.50),
         "p90": percentile(0.90),
         "p95": percentile(0.95) if n >= 3 else None,
+        # A nearest-rank p99 over a handful of samples is just the maximum, so it
+        # is only reported once there are enough samples for the two to differ.
+        "p99": percentile(0.99) if n >= 10 else None,
         "coefficient_of_variation": (
             statistics.stdev(ordered) / statistics.fmean(ordered)
             if n > 1 and statistics.fmean(ordered) > 0 else 0.0

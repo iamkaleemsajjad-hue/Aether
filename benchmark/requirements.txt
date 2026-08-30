@@ -11,3 +11,20 @@ psutil>=5.9.0            # process RSS, CPU utilization, core counts
 nvidia-ml-py>=12.535.0   # NVML: GPU utilization, power, temperature, clocks
 matplotlib>=3.7.0        # charts; the benchmark degrades gracefully without it
 huggingface-hub>=0.27.0  # model download and revision resolution
+
+# ── Multi-engine suite (benchmark/suite, entry point: python benchmark.py) ────
+# The measurement dependencies above cover it. The competing engines are all
+# optional and deliberately not pinned here: the suite reports an engine that is
+# absent as NOT_INSTALLED rather than pulling it in, because installing a serving
+# engine changes the environment every other engine is then measured in.
+#
+# Install only what the host can genuinely run:
+#   pip install "optimum[onnxruntime]"        # ONNX Runtime  (CPU or GPU build)
+#   pip install "optimum[openvino]"           # OpenVINO      (Intel CPU / iGPU)
+#   pip install llama-cpp-python              # llama.cpp     (needs a GGUF)
+#   pip install vllm                          # vLLM          (NVIDIA only)
+#   pip install "sglang[all]"                 # SGLang        (NVIDIA only)
+#   pip install tensorrt-llm                   # TensorRT-LLM  (NVIDIA only)
+#   pip install deepspeed                      # DeepSpeed     (NVIDIA only)
+#   pip install exllamav2                      # ExLlamaV2     (needs EXL2 weights)
+#   pip install mlc-llm-nightly                # MLC LLM       (needs a compiled model)

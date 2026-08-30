@@ -1,0 +1,238 @@
+"""vLLM: an LLM serving engine with a paged KV cache and a continuous scheduler.
+
+vLLM is not primarily a compiler; it is a serving system. Its throughput comes
+from PagedAttention, a continuous batching scheduler, and CUDA-graph capture of
+the decode step. That makes it the field's strongest opponent at large batch and a
+different kind of system from the ones whose advantage is a build phase, so the
+report classifies it accordingly rather than lumping it in with the compilers.
+
+It is measured through the offline ``LLM`` API - the same engine and scheduler the
+server uses, with the HTTP layer removed so no network time is attributed to
+inference.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from typing import Any
+
+from benchmark.backends import (
+    GenerationOutcome,
+    LoadOutcome,
+    UnsupportedConfiguration,
+    set_seed,
+)
+from benchmark.suite.engines import base
+
+SPEC = base.EngineSpec(
+    key="vllm",
+    display="vLLM",
+    taxonomy=(base.SERVING_ENGINE, base.RUNTIME, base.EXECUTION_ENGINE),
+    summary=(
+        "Optimized LLM serving engine: paged KV cache, continuous batching "
+        "scheduler, fused kernels, and CUDA-graph capture of the decode step. "
+        "Measured through its offline LLM API so no HTTP time is included."
+    ),
+    package="vllm",
+    requires=("torch", "vllm"),
+    has_build_phase=True,
+    artifact_persistence=base.ARTIFACT_DISK_CACHE,
+    requires_cuda=True,
+    ttft_method="single_token_call",
+    notes=(
+        "Engine start-up includes CUDA-graph capture and, on recent versions, a "
+        "torch.compile pass whose output is cached under the vLLM cache directory. "
+        "That start-up cost is timed as this engine's build phase; it is a "
+        "machine-local cache, not a portable artifact.",
+        "vLLM pre-allocates a large fraction of device memory for its KV pool by "
+        "design, so its peak-memory row reflects a reservation policy rather than "
+        "the working set of one request. gpu_memory_utilization is recorded with "
+        "the result.",
+        "Prompts are submitted as one batch of independent requests, which is what "
+        "the scheduler is built for; the batch-1 rows submit exactly one.",
+    ),
+)
+
+#: Fraction of device memory vLLM may reserve for weights plus its KV pool.
+#: Deliberately below 1.0 so a second engine's leftovers or another tenant on a
+#: shared host cannot turn this into an allocation failure. Recorded in the result.
+GPU_MEMORY_UTILIZATION = 0.85
+
+
+_DTYPE = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}
+
+
+class Engine(base.BackendAdapterMixin):
+    """Drive vLLM's offline engine under the suite's fixed generation settings."""
+
+    spec = SPEC
+    name = SPEC.key
+
+    def __init__(
+        self,
+        device: str = "cuda",
+        gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION,
+        max_model_len: int | None = None,
+        **_: Any,
+    ) -> None:
+        self.device = device
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_model_len = max_model_len
+        self._llm: Any = None
+        self._tokenizer: Any = None
+        self._precision: str | None = None
+        self._startup_s: float = 0.0
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "backend": self.name,
+            "engine_key": SPEC.key,
+            "taxonomy": list(SPEC.taxonomy),
+            "device": self.device,
+            "precision": self._precision,
+            "gpu_memory_utilization": self.gpu_memory_utilization,
+            "max_model_len": self.max_model_len,
+            "engine_startup_s": self._startup_s,
+            "generation": "vllm.LLM.generate with SamplingParams (offline engine)",
+            "representation": "published checkpoint, loaded at the benchmark precision",
+            "quantized": False,
+            "ttft_method": SPEC.ttft_method,
+            "version": base.package_version("vllm"),
+        }
+
+    def load(self, model_id: str, precision: str) -> LoadOutcome:
+        from vllm import LLM
+
+        if precision not in _DTYPE:
+            raise UnsupportedConfiguration(f"unknown precision {precision!r}")
+        self._precision = precision
+        # vLLM logs at INFO by default and the volume distorts a terminal summary;
+        # quieting it does not change execution.
+        os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+
+        start = time.perf_counter()
+        try:
+            kwargs: dict[str, Any] = {
+                "model": model_id,
+                "dtype": _DTYPE[precision],
+                "gpu_memory_utilization": self.gpu_memory_utilization,
+                "trust_remote_code": False,
+                "seed": 0,
+            }
+            if self.max_model_len:
+                kwargs["max_model_len"] = self.max_model_len
+            self._llm = LLM(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            raise UnsupportedConfiguration(
+                f"vLLM could not start for {model_id}: {type(exc).__name__}: {exc}"[:400]
+            ) from exc
+        self._startup_s = time.perf_counter() - start
+        self._tokenizer = self._llm.get_tokenizer()
+        return LoadOutcome(
+            download_s=None,
+            # Engine start-up subsumes weight loading, KV-pool sizing and graph
+            # capture. vLLM does not separate them, so the whole cost is reported
+            # under the build column and labelled, rather than split by guesswork.
+            prepare_s=None,
+            load_s=self._startup_s,
+            total_s=self._startup_s,
+            notes={
+                "engine_startup_s": self._startup_s,
+                "gpu_memory_utilization": self.gpu_memory_utilization,
+                "vllm_version": base.package_version("vllm"),
+                "startup_includes": "weight load, KV pool allocation, graph capture",
+            },
+        )
+
+    def tokenizer(self) -> Any:
+        return self._tokenizer
+
+    def _params(self, max_new_tokens: int, temperature: float, top_p: float, top_k: int) -> Any:
+        from vllm import SamplingParams
+
+        return SamplingParams(
+            temperature=temperature,
+            top_p=top_p if temperature > 0.0 else 1.0,
+            top_k=top_k if (temperature > 0.0 and top_k > 0) else -1,
+            max_tokens=max_new_tokens,
+            min_tokens=max_new_tokens,
+            # Every engine in the suite is asked for exactly max_new_tokens of work,
+            # so an early stop cannot make one row look faster by doing less.
+            ignore_eos=True,
+            seed=None,
+        )
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        seed: int,
+        batch_size: int = 1,
+    ) -> GenerationOutcome:
+        set_seed(seed)
+        params = self._params(max_new_tokens, temperature, top_p, top_k)
+        outputs = self._llm.generate([prompt] * batch_size, params, use_tqdm=False)
+        if len(outputs) != batch_size:
+            raise UnsupportedConfiguration(
+                f"vLLM returned {len(outputs)} rows for batch {batch_size}"
+            )
+        first = outputs[0].outputs[0]
+        ids = [int(value) for value in first.token_ids]
+        return GenerationOutcome(
+            text=first.text,
+            token_ids=ids,
+            prompt_tokens=len(outputs[0].prompt_token_ids or []),
+            completion_tokens=len(ids),
+            backend_metrics={
+                "batch_size": batch_size,
+                "returned_rows": len(outputs),
+                "engine": "vllm",
+                "row_completion_tokens": [
+                    len(item.outputs[0].token_ids) for item in outputs
+                ],
+                "finish_reasons": sorted({item.outputs[0].finish_reason for item in outputs}),
+            },
+        )
+
+    def generate_mixed(self, prompts: list[str], *, max_new_tokens: int,
+                       temperature: float, top_p: float, top_k: int) -> Any:
+        """One scheduled pass over prompts of differing length.
+
+        This is the case vLLM's scheduler exists for: rows are not padded to a
+        common width, they are packed into pages, so the pad overhead a padded
+        batch pays is not paid here. The report notes that difference next to the
+        numbers rather than pretending the two mechanisms are the same.
+        """
+        from benchmark.backends import MixedBatchOutcome
+
+        params = self._params(max_new_tokens, temperature, top_p, top_k)
+        outputs = self._llm.generate(list(prompts), params, use_tqdm=False)
+        return MixedBatchOutcome(
+            texts=[item.outputs[0].text for item in outputs],
+            row_prompt_tokens=[len(item.prompt_token_ids or []) for item in outputs],
+            row_completion_tokens=[len(item.outputs[0].token_ids) for item in outputs],
+            backend_metrics={"engine": "vllm", "scheduling": "paged, no row padding"},
+        )
+
+    def unload(self) -> None:
+        self._llm = None
+        self._tokenizer = None
+        super().unload()
+
+
+def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Availability:
+    return base.generic_probe(SPEC, hardware)
+
+
+def build(hardware: Any, model_id: str, precision: str, options: Any) -> Engine:
+    return Engine(
+        device="cuda",
+        gpu_memory_utilization=getattr(options, "vllm_gpu_utilization", None)
+        or GPU_MEMORY_UTILIZATION,
+        max_model_len=getattr(options, "vllm_max_model_len", None),
+    )

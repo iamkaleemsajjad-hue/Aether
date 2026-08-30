@@ -1,6 +1,6 @@
 """Benchmark configuration — every knob lives here, nothing is hard-coded elsewhere.
 
-The three models under test are fixed by the benchmark's charter.  Everything
+The models under test are fixed by the benchmark's charter.  Everything
 else (prompt lengths, batch sizes, precision, repetitions, seed) is configurable
 from the command line so that no experiment requires editing source.
 """
@@ -11,12 +11,18 @@ import argparse
 import json
 from dataclasses import asdict, dataclass, field
 
-#: The models this benchmark is defined over.  Both backends load the same
+#: The models this benchmark is defined over.  Every engine loads the same
 #: repository at the same revision; see ``resolve_revision`` in system_info.
+#: The list is fixed by the benchmark's charter and by the hardware budget it
+#: was chosen for — a 135M, a 0.6B, a 350M and a 3.8B checkpoint, which is the
+#: largest that fits one 15 GiB accelerator at 16-bit weights alongside a KV
+#: cache.  Adding to it or substituting into it invalidates cross-run
+#: comparison, so it is changed only by amending this tuple deliberately.
 MODELS: tuple[str, ...] = (
     "HuggingFaceTB/SmolLM2-135M-Instruct",
     "Qwen/Qwen3-0.6B",
     "SummerSigh/GPTNeo350M-Instruct-SFT",
+    "microsoft/Phi-3.5-mini-instruct",
 )
 
 #: Prompt sizes in *tokens*, measured with each model's own tokenizer rather
@@ -91,7 +97,7 @@ def parse_args(argv: list[str] | None = None) -> BenchmarkConfig:
         help="Which experiment to run. Each mode is independent; 'all' runs them in sequence.",
     )
     parser.add_argument("--models", type=_str_list, default=None,
-                        help="Subset of the three benchmark models (default: all).")
+                        help="Subset of the benchmark models (default: all).")
     parser.add_argument("--prompt-tokens", type=_int_list, default=None,
                         help="Prompt lengths in tokens, e.g. '32,256,1024'.")
     parser.add_argument("--batch-sizes", type=_int_list, default=None,
@@ -142,7 +148,7 @@ def parse_args(argv: list[str] | None = None) -> BenchmarkConfig:
             setattr(config, name, value)
     if args.no_multi_gpu:
         config.multi_gpu = False
-    # The charter fixes the three benchmark models.  A filesystem path is also
+    # The charter fixes the benchmark model list.  A filesystem path is also
     # accepted so the harness itself can be validated offline — that is a
     # pipeline check, not a benchmark result, and the runner labels it as such.
     from pathlib import Path
@@ -153,7 +159,7 @@ def parse_args(argv: list[str] | None = None) -> BenchmarkConfig:
     ]
     if unknown:
         raise SystemExit(
-            "--models accepts the three benchmark models or an existing local "
+            "--models accepts the benchmark models or an existing local "
             f"checkpoint directory; got {unknown}"
         )
     bad = set(config.precisions) - set(PRECISIONS)
@@ -163,5 +169,5 @@ def parse_args(argv: list[str] | None = None) -> BenchmarkConfig:
 
 
 def is_charter_model(name: str) -> bool:
-    """Whether a model entry is one of the three the benchmark is defined over."""
+    """Whether a model entry is one of the models the benchmark is defined over."""
     return name in MODELS

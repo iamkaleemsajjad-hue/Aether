@@ -1,5 +1,16 @@
 # Aether Runtime vs Hugging Face Transformers — Benchmark
 
+> **Two benchmarks live here.** This document describes the controlled two-runtime
+> A/B (`python benchmark/run_benchmark.py`), which measures Aether against
+> Transformers in one process with execution order alternated per cell. The
+> multi-engine competition — Aether against thirteen inference stacks, with
+> per-engine process isolation, engine taxonomy, batch scaling to 16, win/loss
+> matrices and the compile-once probe — is `python benchmark.py`; see
+> [`suite/README.md`](suite/README.md) and, for a step-by-step notebook runbook,
+> [`docs/benchmark-kaggle.md`](../docs/benchmark-kaggle.md). Both read the same
+> locked model list from `config.py` and take their measurements with the same
+> primitives in `runner.py`, so their numbers are directly comparable.
+
 A neutral, reproducible comparison of two **runtimes** executing the **same model
 architectures and the same weights**.
 
@@ -11,14 +22,16 @@ fail are recorded rather than worked around.
 
 ## Models
 
-Fixed by the benchmark's charter — three decoder families with deliberately
-different structure:
+Fixed by the benchmark's charter — four decoder families with deliberately
+different structure, and a size range that spans two orders of magnitude while
+still fitting one 15 GiB accelerator at 16-bit weights:
 
 | Model | Params | Layers | Positional scheme |
 |-------|-------:|-------:|-------------------|
 | `HuggingFaceTB/SmolLM2-135M-Instruct` | 135M | 30 | RoPE |
 | `Qwen/Qwen3-0.6B` | 0.6B | 28 | RoPE + per-head Q/K norm |
 | `SummerSigh/GPTNeo350M-Instruct-SFT` | 350M | 24 | learned absolute (no RoPE) |
+| `microsoft/Phi-3.5-mini-instruct` | 3.8B | 32 | LongRoPE, fused QKV, SwiGLU |
 
 They are downloaded automatically from the Hub. Nothing is fetched by hand, and
 both backends load the same repository at the same revision — which the report

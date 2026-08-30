@@ -162,6 +162,15 @@ qwen*/
 benchmark/results/*
 !benchmark/results/.gitkeep
 
+# Multi-engine suite outputs (python benchmark.py). Same reasoning: the raw
+# records, figures and report belong to one host at one moment, and the compiled
+# artifacts under artifacts/ are build products measured in gigabytes. Committing a
+# result set is a deliberate act - copy it somewhere tracked and say which host it
+# came from.
+benchmark_results/
+bench_out*/
+benchmark_results_*/
+
 # Internal product requirements and publishing guides
 PRD.md
 PRD_v2.md

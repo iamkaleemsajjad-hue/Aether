@@ -43,7 +43,7 @@ a different model — it is a different way of running the same one.
 | | Transformers | Aether |
 |---|---|---|
 | Source | checkpoint on disk / Hub | compiled `.aeg` artifact |
-| Weight format | as published (BF16 for all three benchmark models) | quantized blob, default residency **BF16** **[source: `compiler.py`, `default_precision="BF16"`]** |
+| Weight format | as published (BF16 for every benchmark model) | quantized blob, default residency **BF16** **[source: `compiler.py`, `default_precision="BF16"`]** |
 | Tokenizer | loaded from the repo | **embedded in the artifact** **[source: `aeg_format.py`, `tokenizer/` subtree]** |
 | Integrity | none by default | every payload hashed and verified on load **[source: `AEGPackage.verify_integrity`]** |
 | Self-contained | no | yes — the original checkpoint can be deleted **[measured]** |
@@ -73,7 +73,7 @@ assuming.
 | MLA (DeepSeek) | `TorchMLAAEGEngine` |
 | Mamba / Mamba-2 / RWKV | `TorchMambaAEGEngine`, `TorchMamba2AEGEngine`, `TorchRWKVAEGEngine` |
 
-All three benchmark models take `TorchAEGEngine`.
+Every benchmark model takes `TorchAEGEngine`.
 
 ---
 
