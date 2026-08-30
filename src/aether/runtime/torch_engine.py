@@ -226,6 +226,37 @@ class TorchAEGEngine:
     #: Ceiling used when the artifact declares no context length.
     _DEFAULT_MAX_POSITIONS = 1 << 20
 
+    # ── Inherited runtime state ───────────────────────────────────────────────
+    #
+    # Declared on the class, not only assigned in ``__init__``, because
+    # ``TorchTensorParallelAEGEngine`` deliberately does *not* call
+    # ``super().__init__`` — it would upload the unsharded weights to one device
+    # before splitting them.  Every attribute the parent assigns only in its
+    # constructor is therefore absent on that subclass, and an inherited method
+    # that reads one raises ``AttributeError`` at load time.  That is not a
+    # hypothetical: ``release_host_weights`` reads ``host_weights_released`` and
+    # crashed a tensor-parallel load, and each attribute added to the parent since
+    # then silently widened the gap.
+    #
+    # Class-level defaults close the class of bug rather than one instance of it.
+    # A subclass that skips the constructor inherits values that are correct for
+    # "nothing has happened yet", and instance assignment still shadows them for
+    # the normal path, so behaviour there is unchanged.
+
+    #: Set once ``release_host_weights`` has dropped the bulk host arrays.
+    host_weights_released = False
+
+    #: Persisted optimizer plans this accelerator path does not implement.
+    _ignored_optimized_plans: "dict[str, Any] | frozenset[str] | tuple[str, ...]" = ()
+
+    #: Decode projection strategy. ``None`` means "not resolved yet"; the
+    #: accessors below fall back to the reference kernel, which is always correct.
+    _projection: "Any | None" = None
+    _reference_projection: "Any | None" = None
+    _projection_choice: "Any | None" = None
+    _projection_rows: int = -1
+    _strategies: "Any | None" = None
+
     def __init__(self, cpu_engine: Any, device: str) -> None:
         try:
             import torch
@@ -790,8 +821,16 @@ class TorchAEGEngine:
         class; see :mod:`aether.runtime.kernel_strategy`.  It is
         ``F.linear`` until a calibration says otherwise, so an uncalibrated device
         behaves exactly as it did before the mechanism existed.
+
+        ``None`` means a subclass never ran the parent constructor — the
+        tensor-parallel executor is the case — and the reference kernel is used
+        directly.  Reading the attribute rather than requiring it is what keeps a
+        subclass from having to know that this optimisation exists at all.
         """
-        return self._projection(x, weight, bias)
+        projection = self._projection
+        if projection is None:
+            return self.torch.nn.functional.linear(x, weight, bias)
+        return projection(x, weight, bias)
 
     @staticmethod
     def _reference_projection_factory(torch: Any) -> Any:
@@ -1831,15 +1870,25 @@ class TorchAEGEngine:
         is what makes :meth:`release_host_weights` safe to call unconditionally —
         where the two alias, there is nothing duplicated to free, and dropping the
         reference would leave the executor pointing at storage nothing owns.
+
+        A *sharded* executor holds a list of per-device slices rather than one
+        tensor. A slice is always a copy, so it can never alias, and asking it for a
+        data pointer would raise instead of answering. The shape of the attribute is
+        therefore inspected rather than assumed.
         """
         source = getattr(self.weights, "embedding", None)
         if source is None or not isinstance(source, np.ndarray):
+            return False
+        resident = getattr(self, "embedding", None)
+        pointer = getattr(resident, "data_ptr", None)
+        if not callable(pointer):
+            # A sequence of shards, or no resident embedding at all: nothing aliases.
             return False
         try:
             host_pointer = source.__array_interface__["data"][0]
         except (AttributeError, KeyError, TypeError):
             return False
-        return int(self.embedding.data_ptr()) == int(host_pointer)
+        return int(pointer()) == int(host_pointer)
 
     def release_host_weights(self) -> int:
         """Free host-resident weight matrices once the device owns its own copy.

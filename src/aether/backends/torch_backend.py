@@ -779,7 +779,7 @@ class TorchBackend(Backend):
     def _generate_from_compiled_aeg(self, handle: CompiledAEGHandle, request: GenerationRequest) -> GenerationResult:
         if handle.engine is not None and handle.tokenizer is not None:
             text = self._request_text(request, handle.tokenizer)
-            encoded = handle.tokenizer(text, return_tensors="np")
+            encoded = self._encode_prompt(text, request, handle.tokenizer)
             prompt_ids = encoded["input_ids"][0]
             start = time.perf_counter()
             execution_engine, reweight_metrics = self._engine_for_task_weights(
@@ -1033,14 +1033,40 @@ class TorchBackend(Backend):
                 break
         return full_text[:first_cutoff], token_count, True
 
+    #: Request key that turns a bare ``prompt`` into a templated chat turn.
+    #: Absent means "raw completion", which is what a completion API must stay.
+    CHAT_TEMPLATE_KEY = "apply_chat_template"
+
+    @staticmethod
+    def _declares_chat_template(tokenizer: Any) -> bool:
+        """Whether this checkpoint was trained to see a turn-delimited prompt.
+
+        The artifact answers this itself: an instruction-tuned checkpoint packages a
+        ``chat_template``, a base checkpoint does not. That is a far better signal than
+        a model-name heuristic, and it is the only one that generalises to every family
+        Aether supports — including families it has not seen.
+        """
+        if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+            return False
+        return getattr(tokenizer, "chat_template", None) is not None
+
     def _request_text(self, request: GenerationRequest, tokenizer: Any | None = None) -> str:
-        """Return the text represented by a generation request."""
+        """Return the text represented by a generation request.
+
+        Chat messages are always rendered through the checkpoint's own template when it
+        has one.  A bare ``prompt`` is rendered through it only when the caller asks,
+        via ``extra[CHAT_TEMPLATE_KEY]``.
+
+        That asymmetry is deliberate and it is the difference between a coherent answer
+        and fluent nonsense.  An instruction-tuned model given ``"Introduce yourself!"``
+        with no turn delimiters does not answer the question — it *continues the string*,
+        which is what it was trained to do with untemplated text.  But silently
+        templating every completion request would be equally wrong: a completion API has
+        to send exactly the bytes it was given, and a base model has no template to
+        apply.  So the interactive surfaces opt in and the completion API does not.
+        """
         if request.messages is not None:
-            if (
-                tokenizer is not None
-                and hasattr(tokenizer, "apply_chat_template")
-                and getattr(tokenizer, "chat_template", None) is not None
-            ):
+            if self._declares_chat_template(tokenizer):
                 return str(
                     tokenizer.apply_chat_template(
                         request.messages,
@@ -1052,7 +1078,41 @@ class TorchBackend(Backend):
                 f"{message.get('role', 'user')}: {message.get('content', '')}"
                 for message in request.messages
             ) + "\nassistant:"
-        return request.prompt or ""
+        prompt = request.prompt or ""
+        if request.extra.get(self.CHAT_TEMPLATE_KEY) and self._declares_chat_template(
+            tokenizer
+        ):
+            return str(
+                tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            )
+        return prompt
+
+    def _encode_prompt(
+        self, text: str, request: GenerationRequest, tokenizer: Any
+    ) -> Any:
+        """Tokenize prompt text, adding special tokens only when nothing else did.
+
+        A rendered chat template already contains the checkpoint's opening token, so
+        letting the tokenizer add its own produces a duplicated BOS.  That is not
+        cosmetic: a doubled BOS shifts every position by one relative to training and
+        measurably degrades the answer, and it is silent — the only symptom is a worse
+        model.  So the two are made mutually exclusive rather than both left on.
+        """
+        templated = bool(
+            request.messages is not None
+            or request.extra.get(self.CHAT_TEMPLATE_KEY)
+        ) and self._declares_chat_template(tokenizer)
+        if templated:
+            try:
+                return tokenizer(text, return_tensors="np", add_special_tokens=False)
+            except TypeError:
+                # A tokenizer that does not accept the flag never added one either.
+                return tokenizer(text, return_tensors="np")
+        return tokenizer(text, return_tensors="np")
 
     def _begin_ttt(
         self,
@@ -1295,7 +1355,7 @@ class TorchBackend(Backend):
         import numpy as np
 
         text = self._request_text(request, handle.tokenizer)
-        encoded = handle.tokenizer(text, return_tensors="np")
+        encoded = self._encode_prompt(text, request, handle.tokenizer)
         prompt_ids = np.asarray(encoded["input_ids"][0], dtype=np.int64)
         execution_engine, _reweight_metrics = self._engine_for_task_weights(
             handle, request.extra.get("task_weights")

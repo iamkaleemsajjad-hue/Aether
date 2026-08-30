@@ -266,6 +266,14 @@ def pull(ctx: click.Context, model: str, compile_local: bool) -> None:
 @click.option("--temperature", default=0.7, help="Sampling temperature.")
 @click.option("--top-p", default=0.9, help="Top-p sampling parameter.")
 @click.option("--stream", is_flag=True, help="Stream output.")
+@click.option(
+    "--raw",
+    is_flag=True,
+    help=(
+        "Send the prompt verbatim instead of as a chat turn. Use for base models, "
+        "or to measure raw continuation."
+    ),
+)
 @click.option("--non-interactive", is_flag=True, help="Run in non-interactive mode.")
 @click.pass_context
 def run(
@@ -276,9 +284,17 @@ def run(
     temperature: float,
     top_p: float,
     stream: bool,
+    raw: bool,
     non_interactive: bool,
 ) -> None:
-    """Run a model and generate text."""
+    """Run a model and generate text.
+
+    A prompt typed here is a *question*, so it is delivered the way the checkpoint
+    was trained to receive one: instruction-tuned artifacts package a chat template,
+    and the prompt is rendered through it. Without that an instruction-tuned model
+    does not answer — it continues the string, fluently and irrelevantly. Base models
+    declare no template and are unaffected. ``--raw`` opts out.
+    """
     rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
     with console.status(f"[bold green]Loading {model}..."):
         rt._load_model(model)  # noqa: SLF001
@@ -293,6 +309,7 @@ def run(
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            apply_chat_template=not raw,
         )
     console.print(f"[bold]Response:[/bold] {_display_text(response.text)}")
     console.print(f"[dim]Tokens: {response.usage}[/dim]")
