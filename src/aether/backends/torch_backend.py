@@ -781,6 +781,7 @@ class TorchBackend(Backend):
         if handle.engine is not None and handle.tokenizer is not None:
             text = self._request_text(request, handle.tokenizer)
             encoded = self._encode_prompt(text, request, handle.tokenizer)
+            self._augment_stops(request, handle.tokenizer)
             prompt_ids = encoded["input_ids"][0]
             start = time.perf_counter()
             execution_engine, reweight_metrics = self._engine_for_task_weights(
@@ -1053,6 +1054,10 @@ class TorchBackend(Backend):
         """Tokenize prompt text without duplicating an opening token."""
         return prompt_format.encode_prompt(text, request, tokenizer)
 
+    def _augment_stops(self, request: GenerationRequest, tokenizer: Any) -> None:
+        """Give the fallback prompt format its own turn boundary as a stop sequence."""
+        prompt_format.augment_stops(request, tokenizer)
+
     def _begin_ttt(
         self,
         handle: CompiledAEGHandle,
@@ -1295,6 +1300,7 @@ class TorchBackend(Backend):
 
         text = self._request_text(request, handle.tokenizer)
         encoded = self._encode_prompt(text, request, handle.tokenizer)
+        self._augment_stops(request, handle.tokenizer)
         prompt_ids = np.asarray(encoded["input_ids"][0], dtype=np.int64)
         execution_engine, _reweight_metrics = self._engine_for_task_weights(
             handle, request.extra.get("task_weights")

@@ -36,9 +36,13 @@ logger = get_logger(__name__)
 
 __all__ = [
     "CHAT_TEMPLATE_KEY",
+    "TEMPLATE_OVERRIDE_KEY",
+    "augment_stops",
+    "can_render",
     "declares_chat_template",
-    "render_prompt",
     "encode_prompt",
+    "render_prompt",
+    "stop_sequences",
     "wants_chat_turn",
 ]
 
@@ -48,6 +52,51 @@ CHAT_TEMPLATE_KEY = "apply_chat_template"
 Absent means "raw completion", which is what a completion API has to stay. The
 interactive surfaces set it; the benchmark and the completion API do not, so their
 byte-for-byte comparison is unaffected."""
+
+TEMPLATE_OVERRIDE_KEY = "chat_template"
+"""Request key carrying a Jinja chat template supplied by the operator.
+
+Some checkpoints are instruction-tuned but package no template — their fine-tuning
+markers exist only in the weights and in the dataset card, not in any artifact
+metadata.  Nothing can recover the format from the artifact, so the only correct answer
+is to let whoever *does* know supply it.  Every serious runtime provides this lever for
+the same reason; the alternative is a table of model names, which is exactly the kind of
+per-family special case this project rejects."""
+
+#: Role prefixes used by the neutral fallback transcript.  Kept as data because the
+#: fallback's own turn marker doubles as its stop sequence: if Aether supplied the
+#: format, Aether knows where a turn ends.
+_FALLBACK_USER = "user:"
+_FALLBACK_ASSISTANT = "assistant:"
+
+#: Artifacts already warned about, so a per-request warning does not become a log flood.
+_WARNED: "set[int]" = set()
+
+
+def _warn_missing_template_once(tokenizer: Any) -> None:
+    """Say once, per tokenizer, that instruction following will be unreliable.
+
+    This is the part that was missing when a checkpoint packaged no template: the output
+    was poor and nothing said why.  A warning that names the remedy turns an inexplicable
+    answer into an actionable one.
+    """
+    key = id(tokenizer)
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    logger.warning(
+        "this artifact packages no chat template, so its instruction format is not "
+        "recoverable from the checkpoint. A neutral 'user:/assistant:' transcript is "
+        "being used; an instruction-tuned model that was trained on different markers "
+        "may ignore it and continue the text instead of answering. Supply the real "
+        "format with --chat-template (or chat_template=...) if you know it."
+    )
+
+
+def _override(request: Any) -> str | None:
+    """The operator-supplied template for this request, if any."""
+    value = (getattr(request, "extra", None) or {}).get(TEMPLATE_OVERRIDE_KEY)
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def declares_chat_template(tokenizer: Any) -> bool:
@@ -64,32 +113,50 @@ def declares_chat_template(tokenizer: Any) -> bool:
     return callable(getattr(tokenizer, "apply_chat_template", None))
 
 
+def can_render(request: Any, tokenizer: Any) -> bool:
+    """Whether a template is available at all — the checkpoint's or the operator's."""
+    if tokenizer is None or not callable(
+        getattr(tokenizer, "apply_chat_template", None)
+    ):
+        return False
+    return _override(request) is not None or declares_chat_template(tokenizer)
+
+
 def wants_chat_turn(request: Any, tokenizer: Any) -> bool:
-    """Whether this request should be rendered through the checkpoint's template."""
-    if not declares_chat_template(tokenizer):
+    """Whether this request will be rendered through a template.
+
+    Used by :func:`encode_prompt` to decide whether the opening token was already
+    supplied, so rendering and encoding cannot disagree about it.
+    """
+    if not can_render(request, tokenizer):
         return False
     if getattr(request, "messages", None) is not None:
         return True
     return bool((getattr(request, "extra", None) or {}).get(CHAT_TEMPLATE_KEY))
 
 
-def _render(tokenizer: Any, messages: "list[dict[str, Any]]") -> str | None:
-    """Render through the checkpoint's template, or ``None`` if it cannot be rendered.
+def _render(
+    tokenizer: Any, messages: "list[dict[str, Any]]", template: str | None = None
+) -> str | None:
+    """Render through a chat template, or ``None`` if it cannot be rendered.
 
-    A template comes out of an artifact, so it is untrusted input and may be malformed,
-    may reference a feature the renderer lacks, or may reject the messages it was given.
-    None of those may take down a request: the caller falls back to a legible transcript
-    and the reason is logged once, where an operator can act on it.
+    A template comes out of an artifact or from an operator, so it is untrusted input
+    and may be malformed, may reference a feature the renderer lacks, or may reject the
+    messages it was given.  None of those may take down a request: the caller falls back
+    to a legible transcript and the reason is logged once, where an operator can act on
+    it.
     """
     try:
-        return str(
-            tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        )
+        keywords: "dict[str, Any]" = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if template is not None:
+            keywords["chat_template"] = template
+        return str(tokenizer.apply_chat_template(messages, **keywords))
     except Exception as exc:  # noqa: BLE001 - artifact data must not break a request
         logger.warning(
-            "the packaged chat template could not be rendered (%s); falling back to a "
+            "the chat template could not be rendered (%s); falling back to a "
             "role-delimited transcript, which an instruction-tuned model may follow "
             "less closely",
             exc,
@@ -108,33 +175,81 @@ def _transcript(messages: "list[dict[str, Any]]") -> str:
         f"{message.get('role', 'user')}: {message.get('content', '')}"
         for message in messages
     )
-    return body + "\nassistant:"
+    return body + "\n" + _FALLBACK_ASSISTANT
 
 
 def render_prompt(request: Any, tokenizer: Any | None = None) -> str:
     """Return the text to encode for this request."""
+    template = _override(request)
     messages = getattr(request, "messages", None)
     if messages is not None:
-        if declares_chat_template(tokenizer):
-            rendered = _render(tokenizer, messages)
+        if can_render(request, tokenizer):
+            rendered = _render(tokenizer, messages, template)
             if rendered is not None:
                 return rendered
+        elif tokenizer is not None:
+            _warn_missing_template_once(tokenizer)
         return _transcript(messages)
     prompt = getattr(request, "prompt", None)
     if prompt is None:
         raise ValueError("either prompt or messages must be provided")
     if not (getattr(request, "extra", None) or {}).get(CHAT_TEMPLATE_KEY):
         return prompt
-    if declares_chat_template(tokenizer):
-        rendered = _render(tokenizer, [{"role": "user", "content": prompt}])
+    if can_render(request, tokenizer):
+        rendered = _render(tokenizer, [{"role": "user", "content": prompt}], template)
         if rendered is not None:
             return rendered
-    # Either no template is packaged, or the packaged one would not render. The
-    # checkpoint's real fine-tuning format is not recoverable — an SFT checkpoint may
-    # have used any markers at all — so the neutral transcript is used rather than
-    # guessing one. It is not the trained format, but it marks a turn boundary and hands
-    # over the assistant's turn, and a bare string is what made these models free-run.
+    elif tokenizer is not None:
+        _warn_missing_template_once(tokenizer)
+    # No template is available, or the available one would not render. The checkpoint's
+    # real fine-tuning format is not recoverable from the artifact — this model's markers
+    # are ordinary text, not added tokens, so nothing in the metadata records them — and
+    # inventing one would be a guess dressed as a fact. The neutral transcript at least
+    # marks a turn boundary and hands over the assistant's turn; a bare string is what
+    # made these models free-run.
     return _transcript([{"role": "user", "content": prompt}])
+
+
+def stop_sequences(request: Any, tokenizer: Any | None = None) -> "list[str]":
+    """Stop strings implied by the prompt format that was actually used.
+
+    This is the part that keeps an unstoppable model from burning the whole token
+    budget.  When a checkpoint declares its own template it also declares its own stop
+    tokens, and the engine already receives those.  When *Aether* supplied the format,
+    Aether knows where a turn ends: the fallback transcript's next-turn marker.  So the
+    stop sequence is derived from the format in force rather than guessed, and it is
+    added only on the path that needs it.
+    """
+    if getattr(request, "prompt", None) is None and getattr(request, "messages", None) is None:
+        return []
+    asked_for_chat = bool(
+        getattr(request, "messages", None) is not None
+        or (getattr(request, "extra", None) or {}).get(CHAT_TEMPLATE_KEY)
+    )
+    if not asked_for_chat or can_render(request, tokenizer):
+        return []
+    # The fallback format is ours, so its turn boundary is known exactly.
+    return ["\n" + _FALLBACK_USER, "\n" + _FALLBACK_ASSISTANT]
+
+
+def augment_stops(request: Any, tokenizer: Any | None = None) -> None:
+    """Add the format's own turn boundary to ``request.stop``, in place.
+
+    Only for the fallback format, and only additively.  A checkpoint that declares a
+    template also declares its stop tokens and the engine already receives those; the
+    fallback format is Aether's, so its boundary is Aether's to declare.  Without this an
+    instruction-tuned model with an unrecoverable format never reaches a turn end and
+    spends the entire token budget writing a fresh conversation with itself — which is
+    exactly what a 1024-token run of GPTNeo-SFT produced.
+    """
+    derived = stop_sequences(request, tokenizer)
+    if not derived:
+        return
+    existing = list(getattr(request, "stop", None) or [])
+    for sequence in derived:
+        if sequence not in existing:
+            existing.append(sequence)
+    request.stop = existing
 
 
 def encode_prompt(

@@ -242,7 +242,9 @@ def test_the_run_command_asks_for_a_chat_turn_by_default() -> None:
 
     # `run` is a click Command; the function it wraps is what carries the source.
     source = inspect.getsource(cli.run.callback)
-    assert "apply_chat_template=not raw" in source
-    assert any(
-        parameter.name == "raw" for parameter in cli.run.params
-    ), "the escape hatch must exist for base models and raw continuation"
+    assert '"apply_chat_template": not raw' in source
+    names = {parameter.name for parameter in cli.run.params}
+    assert "raw" in names, "the escape hatch must exist for base models"
+    assert "chat_template" in names, (
+        "a checkpoint that packages no template can only be fixed by supplying one"
+    )

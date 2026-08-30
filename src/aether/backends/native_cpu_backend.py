@@ -101,29 +101,32 @@ class PackagedTokenizer:
         *,
         tokenize: bool = False,
         add_generation_prompt: bool = True,
+        chat_template: str | None = None,
         **extra: Any,
     ) -> str:
-        """Render the checkpoint's own chat template over ``messages``.
+        """Render a chat template over ``messages``.
 
-        The artifact already carries the template — it is copied out of
-        ``tokenizer_config.json`` at compile time — but nothing could *render* it, so
-        every instruction-tuned model was handed an untemplated prompt and continued
-        it instead of answering.  That is one defect affecting every family at once,
-        and this is where it is repaired: the template is the checkpoint's own, so one
-        renderer serves Qwen's ChatML, Llama's header format, Gemma's turn markers,
-        Mistral's ``[INST]`` and any format a future checkpoint ships.
+        The template is the checkpoint's own by default — it is copied out of
+        ``tokenizer_config.json`` at compile time — and ``chat_template`` overrides it
+        for a checkpoint that packages none.  Before this existed the artifact carried
+        the template as data with nothing able to render it, so every instruction-tuned
+        model in every family received an untemplated prompt and continued it instead of
+        answering.
 
         Rendered with Jinja2 under the same options Transformers uses, and given the
         same globals real templates depend on (``raise_exception`` for validation
         branches, ``strftime_now`` for date-aware system prompts, ``tojson`` for tool
         schemas), so a template that works in Transformers works here byte for byte.
+        One renderer therefore serves Qwen's ChatML, Llama's header format, Gemma's turn
+        markers, Mistral's ``[INST]`` and any format a future checkpoint ships.
 
         Raises:
-            BackendError: When no template is packaged, or when Jinja2 is absent. The
+            BackendError: When no template is available, or when Jinja2 is absent. The
                 caller then falls back to a neutral role-delimited transcript rather
                 than silently sending an unmarked prompt.
         """
-        if not self.chat_template:
+        template = chat_template or self.chat_template
+        if not template:
             raise BackendError(
                 "this artifact packages no chat template",
                 backend_name="aether_cpu",
@@ -168,8 +171,8 @@ class PackagedTokenizer:
         environment.globals["strftime_now"] = strftime_now
         environment.filters.setdefault("tojson", json.dumps)
         try:
-            template = environment.from_string(self.chat_template)
-            return template.render(
+            compiled = environment.from_string(template)
+            return compiled.render(
                 messages=messages,
                 add_generation_prompt=add_generation_prompt,
                 bos_token=self.bos_token or "",
@@ -441,6 +444,10 @@ class NativeCPUBackend(Backend):
         """Tokenize prompt text without duplicating the checkpoint's opening token."""
         return prompt_format.encode_prompt(text, request, tokenizer)
 
+    def _augment_stops(self, request: GenerationRequest, tokenizer: Any) -> None:
+        """Give the fallback prompt format its own turn boundary as a stop sequence."""
+        prompt_format.augment_stops(request, tokenizer)
+
     @staticmethod
     def _stop_text(tokenizer: Any, token_ids: list[int], stops: list[str] | None) -> tuple[str, int, bool]:
         text = tokenizer.decode(token_ids, skip_special_tokens=True)
@@ -628,6 +635,7 @@ class NativeCPUBackend(Backend):
 
         text = self._request_text(request, handle.tokenizer)
         encoded = self._encode_prompt(text, request, handle.tokenizer)
+        self._augment_stops(request, handle.tokenizer)
         prompt_ids = np.asarray(encoded["input_ids"][0], dtype=np.int64)
         engine = handle.engine
         engine, task_metrics = self._engine_for_task_weights(handle, request.extra.get("task_weights"))
@@ -773,6 +781,7 @@ class NativeCPUBackend(Backend):
             raise BackendError("loaded AEG has no native tokenizer-backed engine", backend_name=self.name)
         text = self._request_text(request, handle.tokenizer)
         encoded = self._encode_prompt(text, request, handle.tokenizer)
+        self._augment_stops(request, handle.tokenizer)
         prompt_ids = np.asarray(encoded["input_ids"][0], dtype=np.int64)
         engine = handle.engine
         adapter_id = request.extra.get("adapter_id", request.extra.get("adapter_name"))

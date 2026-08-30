@@ -72,6 +72,24 @@ class TemplateWithoutRenderer:
         return {"input_ids": np.asarray([[1, 2, 3]], dtype=np.int64)}
 
 
+class Overridable(Templated):
+    """No packaged template, but a renderer that accepts one from the caller."""
+
+    chat_template = None
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True,  # noqa: ARG002
+                            chat_template=None):
+        template = chat_template or self.chat_template
+        if not template:
+            raise RuntimeError("no template available")
+        from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+        environment = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+        return environment.from_string(template).render(
+            messages=messages, add_generation_prompt=add_generation_prompt
+        )
+
+
 def chat(prompt: str = "Introduce yourself!") -> GenerationRequest:
     return GenerationRequest(
         model_id="m", prompt=prompt,
@@ -273,3 +291,132 @@ def test_a_missing_template_is_reported_not_guessed(tmp_path: Path) -> None:
     assert tokenizer.chat_template is None
     with pytest.raises(BackendError, match="no chat template"):
         tokenizer.apply_chat_template([{"role": "user", "content": "hi"}])
+
+# ── a checkpoint that packages no template ────────────────────────────────────
+#
+# GPTNeo350M-Instruct-SFT is the case: its turn markers (`<kinrel>`, `<user>`) are
+# ordinary BPE text, not added tokens, and its tokenizer_config declares no
+# chat_template. Nothing in the artifact records the format, so it cannot be recovered —
+# only supplied.
+
+
+def test_a_missing_template_warns_with_the_remedy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Silence was the worst part: bad output and nothing saying why.
+
+    The logger is captured directly rather than through ``caplog`` because the project
+    logs through structlog, and the assertion is about what Aether chose to say.
+    """
+    said: list[str] = []
+    monkeypatch.setattr(
+        prompt_format.logger, "warning",
+        lambda message, *_a, **_k: said.append(str(message)),
+    )
+    prompt_format._WARNED.clear()
+    prompt_format.render_prompt(chat(), NoTemplate())
+    assert said, "a checkpoint with no template must say so"
+    assert "no chat template" in said[0]
+    assert "--chat-template" in said[0], "the warning must name the remedy"
+
+
+def test_the_warning_is_emitted_once_per_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A per-request warning would become a log flood on a served model."""
+    said: list[str] = []
+    monkeypatch.setattr(
+        prompt_format.logger, "warning",
+        lambda message, *_a, **_k: said.append(str(message)),
+    )
+    prompt_format._WARNED.clear()
+    tokenizer = NoTemplate()
+    for _ in range(5):
+        prompt_format.render_prompt(chat(), tokenizer)
+    assert len(said) == 1
+
+
+def test_an_operator_supplied_template_is_used_verbatim() -> None:
+    """The only correct answer when the artifact cannot know: let whoever knows say."""
+    template = "{% for m in messages %}<user>{{ m['content'] }}<kinrel>{% endfor %}"
+    request = GenerationRequest(
+        model_id="m", prompt="Introduce yourself!",
+        extra={
+            prompt_format.CHAT_TEMPLATE_KEY: True,
+            prompt_format.TEMPLATE_OVERRIDE_KEY: template,
+        },
+    )
+    rendered = prompt_format.render_prompt(request, Overridable())
+    assert rendered == "<user>Introduce yourself!<kinrel>"
+
+
+def test_an_override_works_even_when_the_checkpoint_has_its_own_template() -> None:
+    """An operator reproducing a specific format must win over the packaged one."""
+    template = "{% for m in messages %}<<{{ m['content'] }}>>{% endfor %}"
+    request = GenerationRequest(
+        model_id="m", prompt="hi",
+        extra={
+            prompt_format.CHAT_TEMPLATE_KEY: True,
+            prompt_format.TEMPLATE_OVERRIDE_KEY: template,
+        },
+    )
+    assert prompt_format.render_prompt(request, Overridable()) == "<<hi>>"
+
+
+def test_the_override_is_ignored_for_a_raw_completion() -> None:
+    request = GenerationRequest(
+        model_id="m", prompt="hi",
+        extra={prompt_format.TEMPLATE_OVERRIDE_KEY: "{{ 1 }}"},
+    )
+    assert prompt_format.render_prompt(request, Overridable()) == "hi"
+
+
+# ── the fallback format declares its own turn boundary ────────────────────────
+
+def test_the_fallback_format_supplies_its_own_stop_sequences() -> None:
+    """Aether chose the format, so Aether knows where a turn ends."""
+    request = chat()
+    prompt_format.augment_stops(request, NoTemplate())
+    assert request.stop == [NEWLINE + "user:", NEWLINE + "assistant:"]
+
+
+def test_a_checkpoint_with_its_own_template_gets_no_invented_stops() -> None:
+    """It declares its own stop tokens and the engine already receives them."""
+    request = chat()
+    prompt_format.augment_stops(request, Templated())
+    assert not request.stop
+
+
+def test_a_raw_completion_gets_no_invented_stops() -> None:
+    request = completion()
+    prompt_format.augment_stops(request, NoTemplate())
+    assert not request.stop
+
+
+def test_caller_supplied_stops_are_kept() -> None:
+    request = chat()
+    request.stop = ["</done>"]
+    prompt_format.augment_stops(request, NoTemplate())
+    assert request.stop[0] == "</done>"
+    assert NEWLINE + "user:" in request.stop
+
+
+def test_augmenting_twice_does_not_duplicate() -> None:
+    request = chat()
+    prompt_format.augment_stops(request, NoTemplate())
+    prompt_format.augment_stops(request, NoTemplate())
+    assert len(request.stop) == len(set(request.stop))
+
+
+@pytest.mark.parametrize("backend_class", [TorchBackend, NativeCPUBackend])
+def test_both_backends_derive_the_same_stops(backend_class) -> None:
+    backend = backend_class.__new__(backend_class)
+    request = chat()
+    backend._augment_stops(request, NoTemplate())
+    assert request.stop == [NEWLINE + "user:", NEWLINE + "assistant:"]
+
+
+@requires_qwen
+def test_an_override_also_works_through_the_packaged_tokenizer() -> None:
+    tokenizer = PackagedTokenizer(QWEN_TOKENIZER)
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "hi"}],
+        chat_template="{% for m in messages %}[[{{ m['content'] }}]]{% endfor %}",
+    )
+    assert rendered == "[[hi]]"

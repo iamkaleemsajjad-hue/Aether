@@ -274,6 +274,16 @@ def pull(ctx: click.Context, model: str, compile_local: bool) -> None:
         "or to measure raw continuation."
     ),
 )
+@click.option(
+    "--chat-template",
+    "chat_template",
+    default=None,
+    help=(
+        "Jinja chat template, or a path to one, for a checkpoint that packages none. "
+        "Some instruction-tuned checkpoints record their turn format nowhere in the "
+        "artifact; this is how you supply it."
+    ),
+)
 @click.option("--non-interactive", is_flag=True, help="Run in non-interactive mode.")
 @click.pass_context
 def run(
@@ -285,6 +295,7 @@ def run(
     top_p: float,
     stream: bool,
     raw: bool,
+    chat_template: str | None,
     non_interactive: bool,
 ) -> None:
     """Run a model and generate text.
@@ -294,6 +305,9 @@ def run(
     and the prompt is rendered through it. Without that an instruction-tuned model
     does not answer — it continues the string, fluently and irrelevantly. Base models
     declare no template and are unaffected. ``--raw`` opts out.
+
+    A checkpoint that packages no template cannot have its format recovered from the
+    artifact, so a warning names ``--chat-template`` as the remedy.
     """
     rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
     with console.status(f"[bold green]Loading {model}..."):
@@ -302,6 +316,18 @@ def run(
     if not non_interactive:
         console.print(f"[bold]Aether Runtime[/bold] — model: {model} (backend: {rt._loaded_backends[model].name})")  # noqa: SLF001
 
+    template = chat_template
+    if template:
+        candidate = Path(template)
+        # A template is usually long and awkward to quote on a command line, so a path
+        # is accepted wherever the string is.
+        if candidate.is_file():
+            template = candidate.read_text(encoding="utf-8")
+
+    extra: dict[str, Any] = {"apply_chat_template": not raw}
+    if template:
+        extra["chat_template"] = template
+
     with console.status("[bold green]Generating..."):
         response = rt.generate(
             model_id=model,
@@ -309,7 +335,7 @@ def run(
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
-            apply_chat_template=not raw,
+            **extra,
         )
     console.print(f"[bold]Response:[/bold] {_display_text(response.text)}")
     console.print(f"[dim]Tokens: {response.usage}[/dim]")
