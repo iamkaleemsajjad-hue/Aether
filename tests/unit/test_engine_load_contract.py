@@ -27,8 +27,6 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from aether.backends.base import GenerationRequest  # noqa: E402
-from aether.backends.torch_backend import TorchBackend  # noqa: E402
 from aether.runtime.cpu_engine import (  # noqa: E402
     CPUExecutionEngine, LayerWeights, ModelWeights,
 )
@@ -228,141 +226,12 @@ def test_the_projection_falls_back_to_the_reference_without_a_calibration() -> N
     produced = engine._matmul(x, weight)
     assert torch.allclose(produced, torch.nn.functional.linear(x, weight), atol=1e-5)
 
-# ── prompt delivery ───────────────────────────────────────────────────────────
 
-
-class ChatTokenizer:
-    """Records what it was asked to encode, and renders a ChatML-style template."""
-
-    chat_template = "{% for m in messages %}...{% endfor %}"
-
-    def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
-
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):  # noqa: ARG002
-        newline = chr(10)
-        body = "".join(
-            f"<|im_start|>{m['role']}{newline}{m['content']}<|im_end|>{newline}"
-            for m in messages
-        )
-        tail = f"<|im_start|>assistant{newline}" if add_generation_prompt else ""
-        # Real templates emit the checkpoint's opening token themselves.
-        return "<s>" + body + tail
-
-    def __call__(self, text, return_tensors=None, add_special_tokens=True):  # noqa: ARG002
-        self.calls.append(
-            {"text": text, "add_special_tokens": add_special_tokens}
-        )
-        ids = [1] if add_special_tokens else []
-        ids += [2 + (ord(ch) % 90) for ch in text[:8]]
-        return {"input_ids": np.asarray([ids], dtype=np.int64)}
-
-
-class BaseTokenizer(ChatTokenizer):
-    """A base checkpoint: no template, so nothing to apply."""
-
-    chat_template = None
-
-    def apply_chat_template(self, *_a, **_k):  # pragma: no cover - must never run
-        raise AssertionError("a base checkpoint has no chat template to apply")
-
-
-def backend() -> TorchBackend:
-    return TorchBackend.__new__(TorchBackend)
-
-
-def test_a_completion_request_is_sent_verbatim() -> None:
-    """A completion API must deliver exactly the bytes it was given."""
-    request = GenerationRequest(model_id="m", prompt="Introduce yourself!")
-    assert backend()._request_text(request, ChatTokenizer()) == "Introduce yourself!"
-
-
-def test_a_bare_prompt_becomes_a_chat_turn_when_the_caller_asks() -> None:
-    """This is the fix: an instruct model must see its own turn delimiters."""
-    request = GenerationRequest(
-        model_id="m", prompt="Introduce yourself!",
-        extra={"apply_chat_template": True},
-    )
-    rendered = backend()._request_text(request, ChatTokenizer())
-    assert "<|im_start|>user" in rendered
-    assert "Introduce yourself!" in rendered
-    assert rendered.endswith("<|im_start|>assistant" + chr(10)), (
-        "the model must be handed the assistant turn to continue"
-    )
-
-
-def test_a_base_checkpoint_is_never_templated() -> None:
-    """The artifact decides. No template declared means none applied."""
-    request = GenerationRequest(
-        model_id="m", prompt="Introduce yourself!",
-        extra={"apply_chat_template": True},
-    )
-    assert backend()._request_text(request, BaseTokenizer()) == "Introduce yourself!"
-
-
-def test_chat_messages_are_templated_without_being_asked() -> None:
-    request = GenerationRequest(
-        model_id="m", messages=[{"role": "user", "content": "hi"}]
-    )
-    assert "<|im_start|>user" in backend()._request_text(request, ChatTokenizer())
-
-
-def test_messages_without_a_template_still_get_role_delimiters() -> None:
-    """A base checkpoint asked to chat gets a legible transcript, not raw content."""
-    request = GenerationRequest(
-        model_id="m", messages=[{"role": "user", "content": "hi"}]
-    )
-    rendered = backend()._request_text(request, BaseTokenizer())
-    assert "user: hi" in rendered
-    assert rendered.endswith("assistant:")
-
-
-@pytest.mark.parametrize(
-    ("request_kwargs", "expect_special"),
-    [
-        ({"prompt": "hi"}, True),
-        ({"prompt": "hi", "extra": {"apply_chat_template": True}}, False),
-        ({"messages": [{"role": "user", "content": "hi"}]}, False),
-    ],
-)
-def test_a_rendered_template_is_not_given_a_second_opening_token(
-    request_kwargs: dict, expect_special: bool
-) -> None:
-    """A doubled BOS shifts every position against training and is silent.
-
-    The template already emits the opening token, so the tokenizer must not add one.
-    Raw completions keep it, because there nothing else supplied it.
-    """
-    tokenizer = ChatTokenizer()
-    request = GenerationRequest(model_id="m", **request_kwargs)
-    text = backend()._request_text(request, tokenizer)
-    backend()._encode_prompt(text, request, tokenizer)
-    assert tokenizer.calls[-1]["add_special_tokens"] is expect_special
-
-
-def test_a_tokenizer_that_rejects_the_flag_is_still_usable() -> None:
-    """Not every tokenizer accepts add_special_tokens; none may crash a request."""
-
-    class Fussy(ChatTokenizer):
-        def __call__(self, text, return_tensors=None):  # noqa: ARG002 - no flag
-            self.calls.append({"text": text, "add_special_tokens": "unsupported"})
-            return {"input_ids": np.asarray([[1, 2, 3]], dtype=np.int64)}
-
-    tokenizer = Fussy()
-    request = GenerationRequest(
-        model_id="m", prompt="hi", extra={"apply_chat_template": True}
-    )
-    encoded = backend()._encode_prompt(
-        backend()._request_text(request, tokenizer), request, tokenizer
-    )
-    assert encoded["input_ids"].shape == (1, 3)
-
-
-def test_a_missing_tokenizer_never_raises() -> None:
-    request = GenerationRequest(
-        model_id="m", prompt="hi", extra={"apply_chat_template": True}
-    )
-    assert backend()._request_text(request, None) == "hi"
+# ── prompt delivery: the CLI default ─────────────────────────────────────────
+#
+# The formatting policy itself is covered once, for both backends and against the real
+# packaged Qwen template, in ``test_prompt_format.py``. Asserting it twice is how the
+# two backend implementations drifted apart in the first place.
 
 
 def test_the_run_command_asks_for_a_chat_turn_by_default() -> None:

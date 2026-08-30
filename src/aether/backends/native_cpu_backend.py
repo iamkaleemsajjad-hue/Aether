@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
-from aether.backends import batched_generation
+from aether.backends import batched_generation, prompt_format
 from aether.backends.compiled_handle import CompiledAEGHandle
 from aether.core.constants import AETHER_VERSION
 from aether.core.exceptions import BackendError
@@ -73,6 +73,118 @@ class PackagedTokenizer:
         self.bos_token_id = self._special_id(config.get("bos_token"), special.get("bos_token"))
         self.chat_template = config.get("chat_template")
         self.eos_token_ids = self._stop_token_ids(tokenizer_path, config, special)
+        self.bos_token = self._special_text(config.get("bos_token"), special.get("bos_token"))
+        self.eos_token = self._special_text(config.get("eos_token"), special.get("eos_token"))
+        self.pad_token = self._special_text(config.get("pad_token"), special.get("pad_token"))
+        self.unk_token = self._special_text(config.get("unk_token"), special.get("unk_token"))
+
+    @staticmethod
+    def _special_text(*values: Any) -> str | None:
+        """The *string* form of a special token, however the config spells it.
+
+        ``tokenizer_config.json`` stores a special token either as a bare string or as
+        an ``AddedToken`` object.  Chat templates reference these by name — Llama's
+        opens with ``{{ bos_token }}`` — so the string is needed, not just the id.
+        """
+        for value in values:
+            if isinstance(value, str) and value:
+                return value
+            if isinstance(value, dict):
+                content = value.get("content")
+                if isinstance(content, str) and content:
+                    return content
+        return None
+
+    def apply_chat_template(
+        self,
+        messages: "list[dict[str, Any]]",
+        *,
+        tokenize: bool = False,
+        add_generation_prompt: bool = True,
+        **extra: Any,
+    ) -> str:
+        """Render the checkpoint's own chat template over ``messages``.
+
+        The artifact already carries the template — it is copied out of
+        ``tokenizer_config.json`` at compile time — but nothing could *render* it, so
+        every instruction-tuned model was handed an untemplated prompt and continued
+        it instead of answering.  That is one defect affecting every family at once,
+        and this is where it is repaired: the template is the checkpoint's own, so one
+        renderer serves Qwen's ChatML, Llama's header format, Gemma's turn markers,
+        Mistral's ``[INST]`` and any format a future checkpoint ships.
+
+        Rendered with Jinja2 under the same options Transformers uses, and given the
+        same globals real templates depend on (``raise_exception`` for validation
+        branches, ``strftime_now`` for date-aware system prompts, ``tojson`` for tool
+        schemas), so a template that works in Transformers works here byte for byte.
+
+        Raises:
+            BackendError: When no template is packaged, or when Jinja2 is absent. The
+                caller then falls back to a neutral role-delimited transcript rather
+                than silently sending an unmarked prompt.
+        """
+        if not self.chat_template:
+            raise BackendError(
+                "this artifact packages no chat template",
+                backend_name="aether_cpu",
+            )
+        if tokenize:
+            raise BackendError(
+                "PackagedTokenizer.apply_chat_template renders text only; tokenize "
+                "the result with the tokenizer itself",
+                backend_name="aether_cpu",
+            )
+        try:
+            from jinja2.sandbox import ImmutableSandboxedEnvironment
+        except ImportError as exc:
+            raise BackendError(
+                "rendering a packaged chat template requires Jinja2. Install it "
+                "(pip install jinja2) so instruction-tuned artifacts receive the "
+                "prompt format they were trained on.",
+                backend_name="aether_cpu",
+            ) from exc
+
+        def raise_exception(message: str) -> None:
+            raise BackendError(
+                f"chat template rejected these messages: {message}",
+                backend_name="aether_cpu",
+            )
+
+        def strftime_now(fmt: str) -> str:
+            import datetime
+
+            return datetime.datetime.now().strftime(fmt)
+
+        # Sandboxed because the template is data from an untrusted artifact, and
+        # immutable so a template cannot mutate the caller's message list. Undefined
+        # names stay *falsy rather than fatal*, which is what Transformers does and
+        # what real templates require: nearly every one opens with a
+        # ``{%- if tools %}`` branch that is meant to be skipped when no tools were
+        # passed, and a strict environment would turn that into a render failure.
+        environment = ImmutableSandboxedEnvironment(
+            trim_blocks=True, lstrip_blocks=True
+        )
+        environment.globals["raise_exception"] = raise_exception
+        environment.globals["strftime_now"] = strftime_now
+        environment.filters.setdefault("tojson", json.dumps)
+        try:
+            template = environment.from_string(self.chat_template)
+            return template.render(
+                messages=messages,
+                add_generation_prompt=add_generation_prompt,
+                bos_token=self.bos_token or "",
+                eos_token=self.eos_token or "",
+                pad_token=self.pad_token or "",
+                unk_token=self.unk_token or "",
+                **extra,
+            )
+        except BackendError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a template is untrusted artifact data
+            raise BackendError(
+                f"packaged chat template failed to render: {exc}",
+                backend_name="aether_cpu",
+            ) from exc
 
     def _stop_token_ids(
         self, tokenizer_path: Path, config: dict[str, Any], special: dict[str, Any]
@@ -161,12 +273,23 @@ class PackagedTokenizer:
         padding: bool = False,
         truncation: bool = False,
         max_length: int | None = None,
+        add_special_tokens: bool = True,
         **_: Any,
     ) -> dict[str, np.ndarray]:
+        """Encode text, honouring ``add_special_tokens``.
+
+        The flag is load-bearing rather than cosmetic: a rendered chat template already
+        contains the checkpoint's opening token, so adding another produces a doubled
+        BOS.  That shifts every position by one relative to training and its only
+        symptom is a worse answer, so the caller has to be able to turn it off.
+        """
         if return_tensors not in {"np", "numpy"}:
             raise ValueError("PackagedTokenizer supports return_tensors='np' only")
         texts = text if isinstance(text, list) else [text]
-        encodings = [self._tokenizer.encode(value, add_special_tokens=True) for value in texts]
+        encodings = [
+            self._tokenizer.encode(value, add_special_tokens=bool(add_special_tokens))
+            for value in texts
+        ]
         ids = [encoding.ids for encoding in encodings]
         if truncation and max_length is not None:
             ids = [row[:max_length] for row in ids]
@@ -299,28 +422,24 @@ class NativeCPUBackend(Backend):
         """Return capabilities of the framework-free packaged-AEG path."""
         return self.info.capabilities
 
+    #: Request key that turns a bare ``prompt`` into a templated chat turn.
+    CHAT_TEMPLATE_KEY = prompt_format.CHAT_TEMPLATE_KEY
+
     def _request_text(self, request: GenerationRequest, tokenizer: Any | None = None) -> str:
-        """Render a request using only the packaged tokenizer contract."""
-        if request.messages is not None:
-            if (
-                tokenizer is not None
-                and hasattr(tokenizer, "apply_chat_template")
-                and getattr(tokenizer, "chat_template", None) is not None
-            ):
-                return str(
-                    tokenizer.apply_chat_template(
-                        request.messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                )
-            return "\n".join(
-                f"{message.get('role', 'user')}: {message.get('content', '')}"
-                for message in request.messages
-            )
-        if request.prompt is None:
-            raise ValueError("Either prompt or messages must be provided")
-        return request.prompt
+        """Render a request using only the packaged tokenizer contract.
+
+        Shared with the PyTorch backend through
+        :mod:`aether.backends.prompt_format`. These were separate implementations that
+        drifted: one applied the checkpoint's chat template and the other did not, so
+        the same artifact answered differently depending on which executor loaded it.
+        """
+        return prompt_format.render_prompt(request, tokenizer)
+
+    def _encode_prompt(
+        self, text: str, request: GenerationRequest, tokenizer: Any
+    ) -> Any:
+        """Tokenize prompt text without duplicating the checkpoint's opening token."""
+        return prompt_format.encode_prompt(text, request, tokenizer)
 
     @staticmethod
     def _stop_text(tokenizer: Any, token_ids: list[int], stops: list[str] | None) -> tuple[str, int, bool]:
@@ -508,7 +627,7 @@ class NativeCPUBackend(Backend):
         import time
 
         text = self._request_text(request, handle.tokenizer)
-        encoded = handle.tokenizer(text, return_tensors="np")
+        encoded = self._encode_prompt(text, request, handle.tokenizer)
         prompt_ids = np.asarray(encoded["input_ids"][0], dtype=np.int64)
         engine = handle.engine
         engine, task_metrics = self._engine_for_task_weights(handle, request.extra.get("task_weights"))
@@ -653,7 +772,7 @@ class NativeCPUBackend(Backend):
         if handle.engine is None or handle.tokenizer is None:
             raise BackendError("loaded AEG has no native tokenizer-backed engine", backend_name=self.name)
         text = self._request_text(request, handle.tokenizer)
-        encoded = handle.tokenizer(text, return_tensors="np")
+        encoded = self._encode_prompt(text, request, handle.tokenizer)
         prompt_ids = np.asarray(encoded["input_ids"][0], dtype=np.int64)
         engine = handle.engine
         adapter_id = request.extra.get("adapter_id", request.extra.get("adapter_name"))
