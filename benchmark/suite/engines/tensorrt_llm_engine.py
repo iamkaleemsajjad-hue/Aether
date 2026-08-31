@@ -25,6 +25,12 @@ from benchmark.backends import (
 )
 from benchmark.suite.engines import base
 
+#: TensorRT-LLM's published wheels are built for Ampere and newer. Turing support
+#: exists in source builds but not in the packages a pip install produces, so a
+#: pre-Ampere host is reported as inapplicable rather than told to install something
+#: that would not run.
+MIN_CAPABILITY = (8, 0)
+
 SPEC = base.EngineSpec(
     key="tensorrt_llm",
     display="TensorRT-LLM",
@@ -42,6 +48,7 @@ SPEC = base.EngineSpec(
     has_build_phase=True,
     artifact_persistence=base.ARTIFACT_PORTABLE,
     requires_cuda=True,
+    min_capability=MIN_CAPABILITY,
     ttft_method="single_token_call",
     notes=(
         "The engine plan is a file, but it is tied to the GPU architecture, the "
@@ -77,6 +84,8 @@ class Engine(base.BackendAdapterMixin):
             "engine_build_s": self._build_s,
             "generation": "tensorrt_llm.LLM.generate (offline)",
             "representation": "TensorRT engine plan built from the checkpoint",
+            "weight_storage_bits": 32 if self._precision == "fp32" else 16,
+            "weight_storage_format": self._precision,
             "quantized": False,
             "ttft_method": SPEC.ttft_method,
             "version": base.package_version("tensorrt_llm"),
@@ -172,7 +181,19 @@ _DTYPE = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}
 
 
 def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Availability:
-    return base.generic_probe(SPEC, hardware)
+    generic = base.generic_probe(SPEC, hardware)
+    if generic.status == "NOT_INSTALLED":
+        # Say what installing it would take, because on most hosts it is not a
+        # one-line pip install: the wheels are multi-gigabyte, they pin a CUDA and
+        # TensorRT pair, and the published builds target Ampere and newer.
+        capabilities = ", ".join(hardware.compute_capabilities) or "unknown"
+        return base.not_installed(
+            "tensorrt_llm is not installed. Its published wheels require a matching "
+            "CUDA and TensorRT installation and target compute capability 8.0 or "
+            f"newer; this host reports {capabilities}. Install it deliberately "
+            "(pip install tensorrt-llm, several GB) if this hardware supports it."
+        )
+    return generic
 
 
 def build(hardware: Any, model_id: str, precision: str, options: Any) -> Engine:

@@ -51,6 +51,36 @@ def _slug(text: str) -> str:
     return text.replace("/", "--").replace(" ", "_")
 
 
+#: Failure reasons are printed in full, wrapped, rather than truncated. A reason cut
+#: off at 100 characters routinely loses the actionable half - the required version,
+#: the compute capability, the flag to pass - which turns a diagnosable result into a
+#: dead end. The whole text is in the raw JSON either way; this is about the operator
+#: watching the run.
+_REASON_WIDTH = 96
+
+
+def _wrap(text: str, indent: str = "") -> list[str]:
+    """Wrap one reason for the console, preserving its own line breaks."""
+    import textwrap
+
+    if not text:
+        return []
+    lines: list[str] = []
+    for paragraph in str(text).splitlines():
+        stripped = paragraph.strip()
+        if not stripped:
+            continue
+        lines.extend(
+            textwrap.wrap(
+                stripped, width=_REASON_WIDTH, initial_indent=indent,
+                subsequent_indent=indent, break_long_words=False,
+                break_on_hyphens=False,
+            )
+            or [indent + stripped]
+        )
+    return lines
+
+
 def model_facts(model_id: str) -> dict[str, Any]:
     """Everything about the checkpoint the report is required to state.
 
@@ -256,16 +286,24 @@ def run(config: SuiteConfig) -> dict[str, Any]:
     plan_path.write_text(json.dumps(plan_dict, indent=2, sort_keys=True), encoding="utf-8")
 
     _log("=" * 78)
-    _log(f"Aether Runtime multi-engine inference benchmark - suite {SUITE_VERSION}")
+    _log(f"Multi-engine inference benchmark - suite {SUITE_VERSION}")
     _log("=" * 78)
     _log(f"\nHardware: {hardware.accelerator}, "
-         f"{hardware.gpu_count} accelerator(s), "
+         f"{hardware.gpu_count} accelerator(s) present, "
          f"{hardware.physical_cores or hardware.logical_cores} physical cores")
     for index, name in enumerate(hardware.gpu_names):
         vram = hardware.gpu_vram_bytes[index] / 1024 ** 3
         _log(f"  cuda:{index}  {name}  {vram:.1f} GiB  "
              f"sm_{hardware.compute_capabilities[index].replace('.', '')}")
-    _log(f"Precision: {precision} ({precision_reason})")
+    if hardware.nvidia:
+        _log("Accelerators visible to each engine: "
+             + (f"{config.devices} (every engine sees the same device, so no runtime is "
+                "measured on more hardware than another)" if config.devices
+                else "unrestricted - engines that shard will use more hardware than "
+                     "engines that do not"))
+    _log(f"Precision: {precision}")
+    for line in _wrap(precision_reason, indent="  "):
+        _log(line)
     _log(f"Threads pinned to {config.threads}" if config.pin_threads
          else "Thread counts inherited from the environment and NOT controlled")
     if config.excluded_engines:
@@ -371,7 +409,11 @@ def run(config: SuiteConfig) -> dict[str, Any]:
             entry = availability[key]
             mark = "run " if entry.usable else "skip"
             _log(f"    [{mark}] {key:15s} {entry.status:15s} "
-                 f"{(entry.version or '-'):12s} {entry.reason[:60]}")
+                 f"{(entry.version or '-'):12s}")
+            # The reason is what the operator acts on, so it is wrapped rather than
+            # truncated. A cut-off explanation is the same as no explanation.
+            for line in _wrap(entry.reason, indent=" " * 14):
+                _log(line)
 
         for key in order:
             entry = availability[key]
@@ -404,8 +446,10 @@ def run(config: SuiteConfig) -> dict[str, Any]:
                 record = _orphan_record(key, model_id, precision, process)
                 out_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
             payload["runs"].append(record)
-            _log(f"  [{key}] {record.get('status')} in {process['elapsed_s']:.1f}s"
-                 + (f" - {str(record.get('reason'))[:100]}" if record.get("reason") else ""))
+            _log(f"  [{key}] {record.get('status')} in {process['elapsed_s']:.1f}s")
+            if record.get("reason"):
+                for line in _wrap(str(record["reason"]), indent=" " * 8):
+                    _log(line)
 
         if config.reuse_probe:
             _run_reuse_probes(config, payload, model_id, order, raw_dir, plan_path,
@@ -468,6 +512,8 @@ def _run_reuse_probes(config: SuiteConfig, payload: dict[str, Any], model_id: st
             existing = _read_record(out_path)
             if existing is not None:
                 payload["reuse_runs"].append(existing)
+                _log(f"    [{key:15s}] reusing existing probe "
+                     f"({existing.get('status')})")
                 continue
         process = _spawn(
             _worker_command(plan_path, workload_path, key, model_id, out_path, "reuse"),

@@ -63,6 +63,14 @@ class SuiteConfig:
     top_p: float = 1.0
     top_k: int = 0
     threads: int | None = None
+    #: How many accelerators each engine may see. One by default, and that is a
+    #: fairness decision rather than a limitation: a runtime that shards a model
+    #: across every visible device is being measured on more hardware than one that
+    #: does not, so the two numbers would describe different machines. Nothing in any
+    #: engine's placement logic is modified - the worker restricts visibility, and
+    #: each engine then does whatever it does with one device. Raise it to compare
+    #: multi-device execution deliberately.
+    devices: int | None = 1
     #: Whether the thread budget is pinned at all. Kept separate from ``threads``
     #: because "nobody chose" and "deliberately inherited" are different states, and
     #: the orchestrator fills in a default for the first but must not for the second.
@@ -86,6 +94,11 @@ class SuiteConfig:
     gpu_sample_interval_s: float = 0.1
     correctness: bool = True
     charts: bool = True
+    #: Engine the report's detailed head-to-head drill-down describes. The standings,
+    #: the rankings and the pairwise matrix are computed for every engine regardless;
+    #: this only selects which engine gets the long-form section. None means the
+    #: drill-down is printed for every engine that produced a measurement.
+    focus: str | None = None
     #: Engine-specific knobs, passed through to the adapters that need them.
     aeg_cache_dir: str | None = None
     onnx_cache_dir: str | None = None
@@ -98,6 +111,7 @@ class SuiteConfig:
     mlc_map: dict[str, str] = field(default_factory=dict)
     vllm_gpu_utilization: float | None = None
     vllm_max_model_len: int | None = None
+    vllm_enforce_eager: bool = False
     sglang_memory_fraction: float | None = None
     llama_cpp_context: int | None = None
     compile_mode: str | None = None
@@ -131,6 +145,7 @@ class SuiteConfig:
             "top_p": self.top_p,
             "top_k": self.top_k,
             "threads": self.threads,
+            "devices": self.devices,
         }
 
 
@@ -184,6 +199,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--threads", type=int, default=None,
                         help="Pin every engine to this many CPU threads (default: physical cores).")
+    parser.add_argument("--devices", type=int, default=None,
+                        help="Accelerators each engine may see. 1 keeps every engine on "
+                             "the same single device, which is what makes the comparison "
+                             "a comparison of engines rather than of machines. 0 means "
+                             "no restriction.")
     parser.add_argument("--no-thread-pinning", action="store_true",
                         help="Leave thread counts inherited; the report marks them uncontrolled.")
     parser.add_argument("--amortization-runs", type=_int_list, default=None)
@@ -196,6 +216,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cooldown", type=float, default=None)
     parser.add_argument("--no-correctness", action="store_true")
     parser.add_argument("--no-charts", action="store_true")
+    parser.add_argument("--focus", default=None,
+                        help="Engine whose head-to-head section is printed in full. "
+                             "Default: every measured engine gets one. Does not affect "
+                             "any number, only which drill-downs the report includes.")
     parser.add_argument(
         "--quick", action="store_true",
         help="Narrow preset for a pipeline check: one model, small matrix, few iterations.")
@@ -224,6 +248,8 @@ def add_engine_options(parser: argparse.ArgumentParser) -> None:
                        help="Pre-compiled MLC model for a model; repeatable.")
     group.add_argument("--vllm-gpu-utilization", type=float, default=None)
     group.add_argument("--vllm-max-model-len", type=int, default=None)
+    group.add_argument("--vllm-enforce-eager", action="store_true",
+                       help="Skip vLLM's CUDA-graph capture; useful when capture fails.")
     group.add_argument("--sglang-memory-fraction", type=float, default=None)
     group.add_argument("--llama-cpp-context", type=int, default=None)
     group.add_argument("--compile-mode", default=None,
@@ -274,7 +300,7 @@ def parse_args(argv: list[str] | None = None) -> SuiteConfig:
         ("primary_output_tokens", args.primary_output_tokens),
         ("warmup_iters", args.warmup_iters), ("measure_iters", args.measure_iters),
         ("seed", args.seed), ("temperature", args.temperature), ("top_p", args.top_p),
-        ("top_k", args.top_k), ("threads", args.threads),
+        ("top_k", args.top_k), ("threads", args.threads), ("devices", args.devices),
         ("amortization_runs", args.amortization_runs), ("output_dir", args.output_dir),
         ("worker_timeout_s", args.worker_timeout), ("cooldown_s", args.cooldown),
         ("aeg_cache_dir", args.aeg_cache_dir), ("onnx_cache_dir", args.onnx_cache_dir),
@@ -285,7 +311,7 @@ def parse_args(argv: list[str] | None = None) -> SuiteConfig:
         ("vllm_max_model_len", args.vllm_max_model_len),
         ("sglang_memory_fraction", args.sglang_memory_fraction),
         ("llama_cpp_context", args.llama_cpp_context),
-        ("compile_mode", args.compile_mode),
+        ("compile_mode", args.compile_mode), ("focus", args.focus),
     ):
         if value is not None:
             setattr(config, name, value)
@@ -302,6 +328,8 @@ def parse_args(argv: list[str] | None = None) -> SuiteConfig:
         config.correctness = False
     if args.no_charts:
         config.charts = False
+    if args.vllm_enforce_eager:
+        config.vllm_enforce_eager = True
     if args.no_thread_pinning:
         config.pin_threads = False
         config.threads = None
@@ -327,6 +355,11 @@ def validate(config: SuiteConfig, pinning_requested: bool = True) -> None:
     if unknown_engines:
         raise SystemExit(
             f"unknown engine(s): {unknown_engines}. Known: {', '.join(engine_registry.KEYS)}"
+        )
+    if config.focus and config.focus not in engine_registry.KEYS:
+        raise SystemExit(
+            f"--focus must name a known engine; got {config.focus!r}. "
+            f"Known: {', '.join(engine_registry.KEYS)}"
         )
     unknown_models = [
         name for name in config.models

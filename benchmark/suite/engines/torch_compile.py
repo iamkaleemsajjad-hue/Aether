@@ -46,13 +46,34 @@ SPEC = base.EngineSpec(
         "run the measured shape, so recompilation is paid before the timed "
         "iterations rather than inside them, and the first unwarmed call is "
         "reported separately as the cold latency.",
+        "Whole-graph capture (fullgraph=True) is attempted first and falls back to "
+        "graph-broken compilation when the model or the generation loop is not "
+        "capturable in one piece - which is the common case, not the exception. The "
+        "configuration that actually compiled is recorded per model, because they "
+        "represent different amounts of compilation.",
     ),
 )
 
-#: Compilation mode. ``reduce-overhead`` is the mode PyTorch documents for
-#: latency-bound decoding (it enables CUDA graph capture); it is also the mode a
-#: user following the Transformers guide would apply, which is the point.
-COMPILE_MODE = "reduce-overhead"
+#: Compilation configurations, tried in order, best first.
+#:
+#: ``fullgraph=True`` is the strictest and the most flattering when it works: one
+#: whole-graph capture with no breaks. It also fails routinely on real generation
+#: code - Transformers' ``generate`` calls functions Dynamo marks as skipped, and
+#: models with length-dependent branches (Phi-3's LongRoPE among them) are
+#: data-dependent by construction. Refusing to fall back would report those models
+#: as "torch.compile unsupported", which is not true: what is unsupported is
+#: whole-graph capture. A graph-broken Inductor compilation is still a real
+#: torch.compile, and it is what a user following PyTorch's own guidance gets.
+#:
+#: Whichever configuration succeeds is recorded and printed, because they are not
+#: the same amount of compilation and the reader has to know which one produced the
+#: number.
+COMPILE_ATTEMPTS: tuple[dict[str, Any], ...] = (
+    {"mode": "reduce-overhead", "fullgraph": True},
+    {"mode": "reduce-overhead", "fullgraph": False},
+    {"mode": "default", "fullgraph": False},
+)
+COMPILE_MODE = COMPILE_ATTEMPTS[0]["mode"]
 
 
 class Engine(TransformersBackend):
@@ -60,12 +81,17 @@ class Engine(TransformersBackend):
 
     spec = SPEC
 
-    def __init__(self, device: str = "cuda", mode: str = COMPILE_MODE, **_: Any) -> None:
+    def __init__(self, device: str = "cuda", mode: str | None = None, **_: Any) -> None:
         super().__init__(device=device)
         self.name = SPEC.key
-        self.mode = mode
+        #: When the operator names a mode, it replaces the mode in every attempt but
+        #: the fullgraph ladder is kept, since that is what makes the engine runnable.
+        self.requested_mode = mode
+        self.mode: str | None = None
+        self.fullgraph: bool | None = None
         self._compile_s: float | None = None
         self._cache_implementation: str | None = None
+        self._attempts: list[dict[str, Any]] = []
 
     def describe(self) -> dict[str, Any]:
         record = super().describe()
@@ -74,9 +100,15 @@ class Engine(TransformersBackend):
             taxonomy=list(SPEC.taxonomy),
             generation="model.generate with a compiled forward and a static KV cache",
             compile_mode=self.mode,
+            compile_fullgraph=self.fullgraph,
+            compile_attempts=self._attempts,
             cache_implementation=self._cache_implementation,
             initial_compile_s=self._compile_s,
-            representation="published checkpoint, loaded at the benchmark precision",
+            representation=(
+                f"published checkpoint cast to {self._precision or '?'} tensors"
+            ),
+            weight_storage_bits=32 if self._precision == "fp32" else 16,
+            weight_storage_format=self._precision,
             quantized=False,
             ttft_method=SPEC.ttft_method,
         )
@@ -100,30 +132,46 @@ class Engine(TransformersBackend):
             raise UnsupportedConfiguration(
                 f"this Transformers version does not accept a static cache: {exc}"
             ) from exc
+
+        pristine = self._model.forward
         compile_start = time.perf_counter()
-        try:
-            self._model.forward = torch.compile(
-                self._model.forward, mode=self.mode, fullgraph=True
-            )
-            # Force the first trace here rather than inside a measured iteration.
-            probe_ids = self._tokenizer("compile probe", return_tensors="pt")
-            probe_ids = {k: v.to(self.device) for k, v in probe_ids.items()}
-            with torch.no_grad():
-                self._model.generate(
-                    **probe_ids, max_new_tokens=4, min_new_tokens=4, do_sample=False,
-                    use_cache=True, pad_token_id=self._tokenizer.pad_token_id,
+        for attempt in COMPILE_ATTEMPTS:
+            mode = self.requested_mode or attempt["mode"]
+            fullgraph = bool(attempt["fullgraph"])
+            try:
+                self._model.forward = torch.compile(
+                    pristine, mode=mode, fullgraph=fullgraph
                 )
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-        except Exception as exc:  # noqa: BLE001
+                self._trigger_first_trace(torch)
+            except Exception as exc:  # noqa: BLE001
+                # Restore the uncompiled forward before the next attempt, so a failed
+                # trace cannot leave a half-wrapped callable behind.
+                self._model.forward = pristine
+                self._attempts.append({
+                    "mode": mode, "fullgraph": fullgraph, "outcome": "failed",
+                    "error": f"{type(exc).__name__}: {exc}"[:600],
+                })
+                _reset_dynamo()
+                continue
+            self.mode, self.fullgraph = mode, fullgraph
+            self._attempts.append({
+                "mode": mode, "fullgraph": fullgraph, "outcome": "compiled",
+            })
+            break
+        else:
             raise UnsupportedConfiguration(
-                f"torch.compile could not build this model here: "
-                f"{type(exc).__name__}: {exc}"[:400]
-            ) from exc
+                "torch.compile could not build this model in any configuration. "
+                + "; ".join(
+                    f"[mode={item['mode']} fullgraph={item['fullgraph']}] {item['error']}"
+                    for item in self._attempts
+                )
+            )
         self._compile_s = time.perf_counter() - compile_start
         notes = dict(outcome.notes)
         notes.update(
             compile_mode=self.mode,
+            compile_fullgraph=self.fullgraph,
+            compile_attempts=self._attempts,
             initial_compile_s=self._compile_s,
             cache_implementation=self._cache_implementation,
             inductor_cache_dir=_inductor_cache_dir(),
@@ -135,6 +183,32 @@ class Engine(TransformersBackend):
             total_s=(outcome.download_s or 0.0) + outcome.load_s + self._compile_s,
             notes=notes,
         )
+
+    def _trigger_first_trace(self, torch: Any) -> None:
+        """Force compilation now, so no measured iteration pays for it."""
+        probe = self._tokenizer("compile probe", return_tensors="pt")
+        probe = {key: value.to(self.device) for key, value in probe.items()}
+        with torch.no_grad():
+            self._model.generate(
+                **probe, max_new_tokens=4, min_new_tokens=4, do_sample=False,
+                use_cache=True, pad_token_id=self._tokenizer.pad_token_id,
+            )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+
+def _reset_dynamo() -> None:
+    """Clear Dynamo's state between compilation attempts.
+
+    Without this, a failed trace leaves guards and cached graphs behind that make the
+    next attempt fail for the previous attempt's reason.
+    """
+    try:
+        import torch
+
+        torch._dynamo.reset()
+    except Exception:  # noqa: BLE001 - private API; absence is not fatal
+        pass
 
 
 def _inductor_cache_dir() -> str | None:
@@ -184,5 +258,5 @@ def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Av
 def build(hardware: Any, model_id: str, precision: str, options: Any) -> Engine:
     return Engine(
         device="cuda" if hardware.nvidia else "cpu",
-        mode=getattr(options, "compile_mode", None) or COMPILE_MODE,
+        mode=getattr(options, "compile_mode", None),
     )

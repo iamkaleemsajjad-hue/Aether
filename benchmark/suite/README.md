@@ -1,14 +1,21 @@
 # Multi-engine inference benchmark
 
-One command measures Aether Runtime against the field of inference stacks on the
-same models, the same weights, the same hardware and the same workload:
+One command measures a field of inference stacks against each other on the same
+models, the same weights, the same hardware and the same workload:
 
 ```bash
 python benchmark.py
 ```
 
-The suite answers one question: **given everything else held fixed, how does Aether
-compare against competing inference stacks — and exactly where does it lose?**
+The suite answers one question: **given everything else held fixed, how do these
+inference stacks compare?**
+
+It is engine-neutral by construction. Every engine is scored by the same code, the
+pairwise matrix is computed for every ordered pair, and the standings, rankings and
+per-engine win/loss sections come from one loop over the engine list. Aether is in the
+field because the suite lives in Aether's repository; that is not why any number comes
+out the way it does, and where Aether loses the report says so in the same words it uses
+when Aether wins.
 
 ## What is compared
 
@@ -56,11 +63,20 @@ test that pins it).
   count with the model's own tokenizer, and handed to every engine as the identical
   string. Each engine's tokenizer is then checked against the builder's, and any
   disagreement is printed in the compatibility table.
-- **Precision is resolved from the hardware and disclosed with its reason.** On CUDA
-  it is bf16: the checkpoints and Aether's artifact are both bf16, so it is the only
-  precision at which every engine holds identical values. Pass `--precision fp16` for
-  a hardware-native comparison, and Aether's bf16 weight residency is then reported
-  as a representation difference.
+- **Precision is the widest 16-bit format the whole field can execute**, resolved from
+  the device's compute capability and disclosed with its reason. bf16 tensor cores start
+  at capability 8.0; below that the suite chooses fp16, because engines in this field
+  refuse bf16 on older cards and choosing it would exclude them rather than measure them.
+  Comparability is then judged on compute precision and storage width, and a 16-bit
+  storage difference (fp16 tensors against Aether's bf16 artifact, both derived from the
+  same published bf16 checkpoint) is printed beside every comparison it affects.
+  `--precision bf16` gives the bit-exact configuration where the hardware allows it.
+- **Every engine sees the same number of accelerators**, one by default. Enforced by
+  restricting device visibility in each worker before any CUDA context exists, so no
+  engine's placement logic is modified - each simply finds one device. Without it, a
+  runtime that shards a model is measured on more hardware than one that does not, which
+  compares machines rather than engines. `--devices 2` measures multi-device execution
+  deliberately.
 - **Every engine is asked for a fixed number of tokens** with early stopping
   suppressed, so none can appear faster by generating less.
 - **Threads are pinned** (OMP, MKL, OpenBLAS, NumExpr and torch) to the physical core
@@ -72,6 +88,9 @@ test that pins it).
   cold starts, and peak memory attributable to exactly one engine.
 - **Engine order rotates per model**, so thermal drift over a long run cannot always
   penalize the same engine. The order used is recorded.
+- **Every failure carries its reason in full.** An engine that could not run reports the
+  compute capability, the version conflict or the missing artifact that decided it -
+  never a truncated traceback, and never a zero.
 
 ## How a missing measurement is handled
 
@@ -100,7 +119,9 @@ python benchmark.py --smoke                  # smallest real run; proves the pip
 python benchmark.py --engines aether,transformers,vllm
 python benchmark.py --models Qwen/Qwen3-0.6B --batch-sizes 1,2,4
 python benchmark.py --resume                 # reuse raw records already on disk
-python benchmark.py --precision fp16         # hardware-native instead of weight-exact
+python benchmark.py --precision bf16         # weight-exact, on hardware with bf16 cores
+python benchmark.py --devices 2               # measure multi-device execution deliberately
+python benchmark.py --focus vllm              # long-form drill-down for one engine only
 python benchmark.py --gguf-map Qwen/Qwen3-0.6B=/path/model-f16.gguf   # enable llama.cpp
 ```
 

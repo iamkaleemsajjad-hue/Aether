@@ -41,10 +41,12 @@ COLORS: dict[str, str] = {
 }
 FALLBACK_COLOR = "#525252"
 
-#: Aether is drawn last so it sits on top where series overlap, and is drawn thicker.
-#: That is presentational emphasis on the subject of the report, not a change to any
-#: value.
-SUBJECT = "aether"
+#: Every series is drawn at the same weight, in the same order, with the same marker.
+#: An earlier version drew one engine thicker and on top; that is a way of directing
+#: attention, and a benchmark that scores engines identically should not then draw one
+#: of them louder than the rest.
+LINE_WIDTH = 1.8
+MARKER_SIZE = 4
 
 
 def _color(engine: str) -> str:
@@ -144,8 +146,6 @@ def throughput_ranking(plt: Any, analysis: dict[str, Any], directory: Path,
     axis.barh(
         list(positions), values,
         color=[_color(row["engine"]) for row in rows],
-        edgecolor=["#161616" if row["engine"] == SUBJECT else "none" for row in rows],
-        linewidth=[1.2 if row["engine"] == SUBJECT else 0 for row in rows],
     )
     axis.set_yticks(list(positions))
     axis.set_yticklabels([row["engine"] for row in rows])
@@ -178,12 +178,12 @@ def batch_scaling(plt: Any, analysis: dict[str, Any], directory: Path,
         # trend the run never observed.
         return None
     figure, axis = plt.subplots(figsize=(7.0, 4.2))
-    for engine in sorted(by_engine, key=lambda name: name == SUBJECT):
+    for engine in sorted(by_engine):
         points = sorted(by_engine[engine])
         axis.plot(
             [point[0] for point in points], [point[1] for point in points],
-            marker="o", markersize=4, color=_color(engine), label=engine,
-            linewidth=2.4 if engine == SUBJECT else 1.5,
+            marker="o", markersize=MARKER_SIZE, color=_color(engine), label=engine,
+            linewidth=LINE_WIDTH,
         )
     axis.set_xscale("log", base=2)
     widths = sorted({point[0] for points in by_engine.values() for point in points})
@@ -222,11 +222,11 @@ def scaling_efficiency(plt: Any, analysis: dict[str, Any], directory: Path,
     if not by_engine:
         return None
     figure, axis = plt.subplots(figsize=(7.0, 4.2))
-    for engine in sorted(by_engine, key=lambda name: name == SUBJECT):
+    for engine in sorted(by_engine):
         points = sorted(by_engine[engine])
         axis.plot([p[0] for p in points], [p[1] for p in points], marker="o",
-                  markersize=4, color=_color(engine), label=engine,
-                  linewidth=2.4 if engine == SUBJECT else 1.5)
+                  markersize=MARKER_SIZE, color=_color(engine), label=engine,
+                  linewidth=LINE_WIDTH)
     axis.axhline(100.0, color="#161616", linestyle="--", linewidth=1.0)
     axis.text(0.01, 100.0, " 100% = perfectly linear scaling", fontsize=7,
               va="bottom", transform=axis.get_yaxis_transform())
@@ -257,8 +257,6 @@ def _simple_bar(plt: Any, analysis: dict[str, Any], directory: Path, model: str,
     axis.bar(
         range(len(rows)), values,
         color=[_color(row["engine"]) for row in rows],
-        edgecolor=["#161616" if row["engine"] == SUBJECT else "none" for row in rows],
-        linewidth=[1.2 if row["engine"] == SUBJECT else 0 for row in rows],
     )
     axis.set_xticks(range(len(rows)))
     axis.set_xticklabels([row["engine"] for row in rows], rotation=30, ha="right")
@@ -290,9 +288,7 @@ def compile_tradeoff(plt: Any, analysis: dict[str, Any], directory: Path) -> str
     for entry in entries:
         throughput = 1.0 / float(entry["steady_state_latency_s"])
         build = float(entry.get("build_s") or 0.0)
-        axis.scatter(build, throughput, s=70 if entry["engine"] == SUBJECT else 45,
-                     color=_color(entry["engine"]),
-                     edgecolor="#161616" if entry["engine"] == SUBJECT else "none",
+        axis.scatter(build, throughput, s=50, color=_color(entry["engine"]),
                      zorder=3)
         axis.annotate(
             f"{entry['engine']}\n{_short(entry['model'])}",
@@ -306,39 +302,63 @@ def compile_tradeoff(plt: Any, analysis: dict[str, Any], directory: Path) -> str
     return _save(figure, plt, directory, "07_compile_tradeoff.png")
 
 
-def improvement_bars(plt: Any, analysis: dict[str, Any], directory: Path) -> str | None:
-    """Graph 8: Aether's median improvement against each competitor.
+def pairwise_matrix(plt: Any, analysis: dict[str, Any], directory: Path) -> str | None:
+    """Graph 8: every engine against every other, as a signed matrix.
 
-    Signed, with zero drawn: a bar below the line is Aether losing, and it is
-    rendered exactly as prominently as a bar above it. Bars whose comparison crosses
-    a representation boundary are hatched, so a quantized competitor's result cannot
-    be read as a same-weights claim.
+    Anti-symmetric by construction: the cell for (A, B) is the negation of (B, A), so
+    the figure privileges no engine and a reader can enter it from any row. A diverging
+    colour scale centred on zero, so a loss reads as a loss at a glance without either
+    direction being drawn louder than the other.
     """
-    per_competitor = analysis["per_competitor"]
-    if not per_competitor:
+    engines = analysis.get("engines_measured") or []
+    if len(engines) < 2:
         return None
-    engines = sorted(per_competitor, key=lambda key: per_competitor[key][
-        "median_improvement_percent"])
-    values = [per_competitor[key]["median_improvement_percent"] for key in engines]
-    figure, axis = plt.subplots(figsize=(max(5.5, 0.9 * len(engines) + 2.4), 4.2))
-    bars = axis.bar(range(len(engines)), values,
-                    color=["#24A148" if value >= 0 else "#DA1E28" for value in values])
-    for index, key in enumerate(engines):
-        if per_competitor[key]["comparability"] != "SAME_REPRESENTATION":
-            bars[index].set_hatch("//")
-            bars[index].set_edgecolor("#161616")
-    axis.axhline(0.0, color="#161616", linewidth=1.0)
-    axis.set_xticks(range(len(engines)))
-    axis.set_xticklabels(engines, rotation=30, ha="right")
-    axis.set_ylabel("Aether median improvement (%)")
-    axis.set_title(
-        "Aether against each competitor - positive is Aether faster, "
-        "hatched crosses a representation boundary"
+
+    import numpy as np
+
+    grid = np.full((len(engines), len(engines)), np.nan)
+    labels: dict[tuple[int, int], str] = {}
+    for row_index, engine in enumerate(engines):
+        entry = (analysis["per_engine"].get(engine) or {}).get("per_competitor") or {}
+        for column_index, other in enumerate(engines):
+            if engine == other:
+                continue
+            record = entry.get(other)
+            if record is None:
+                labels[(row_index, column_index)] = "n/a"
+                continue
+            value = float(record["median_improvement_percent"])
+            grid[row_index, column_index] = value
+            marker = "" if record["comparability"] == "SAME_REPRESENTATION" else "*"
+            labels[(row_index, column_index)] = f"{value:+.0f}%{marker}"
+
+    finite = grid[~np.isnan(grid)]
+    limit = float(np.abs(finite).max()) if finite.size else 1.0
+    figure, axis = plt.subplots(
+        figsize=(max(6.0, 0.95 * len(engines) + 2.6),
+                 max(4.0, 0.7 * len(engines) + 2.0))
     )
-    for index, value in enumerate(values):
-        axis.text(index, value, f"{value:+.1f}%", ha="center",
-                  va="bottom" if value >= 0 else "top", fontsize=7)
-    return _save(figure, plt, directory, "08_aether_improvement.png")
+    image = axis.imshow(grid, cmap="RdBu", vmin=-limit, vmax=limit, aspect="auto")
+    axis.set_xticks(range(len(engines)))
+    axis.set_xticklabels(engines, rotation=30, ha="right", fontsize=7.5)
+    axis.set_yticks(range(len(engines)))
+    axis.set_yticklabels(engines, fontsize=8)
+    axis.set_xlabel("compared against")
+    axis.set_ylabel("engine")
+    axis.set_title(
+        "Median throughput difference, row engine against column engine\n"
+        "positive (blue) means the row engine was faster; * crosses a representation "
+        "boundary"
+    )
+    axis.grid(False)
+    for (row_index, column_index), text in labels.items():
+        axis.text(column_index, row_index, text, ha="center", va="center", fontsize=6.5,
+                  color="#161616")
+    for index in range(len(engines)):
+        axis.text(index, index, "—", ha="center", va="center", fontsize=7,
+                  color="#8D8D8D")
+    figure.colorbar(image, ax=axis, label="median difference (%)")
+    return _save(figure, plt, directory, "08_pairwise_matrix.png")
 
 
 def _sweep_line(plt: Any, analysis: dict[str, Any], directory: Path, model: str,
@@ -362,11 +382,11 @@ def _sweep_line(plt: Any, analysis: dict[str, Any], directory: Path, model: str,
         # trend that was never measured.
         return None
     figure, axis = plt.subplots(figsize=(7.0, 4.2))
-    for engine in sorted(by_engine, key=lambda name: name == SUBJECT):
+    for engine in sorted(by_engine):
         points = sorted(by_engine[engine])
         axis.plot([p[0] for p in points], [p[1] for p in points], marker="o",
-                  markersize=4, color=_color(engine), label=engine,
-                  linewidth=2.4 if engine == SUBJECT else 1.5)
+                  markersize=MARKER_SIZE, color=_color(engine), label=engine,
+                  linewidth=LINE_WIDTH)
     lengths = sorted({p[0] for points in by_engine.values() for p in points})
     axis.set_xticks(lengths)
     axis.set_xticklabels([str(length) for length in lengths])
@@ -387,7 +407,7 @@ def model_scaling(plt: Any, analysis: dict[str, Any], directory: Path) -> str | 
     if not rows:
         return None
     models = sorted({row["model"] for row in rows})
-    engines = sorted({row["engine"] for row in rows}, key=lambda name: name == SUBJECT)
+    engines = sorted({row["engine"] for row in rows})
     if len(models) < 2:
         return None
     figure, axis = plt.subplots(figsize=(max(7.0, 1.9 * len(models) + 2.0), 4.4))
@@ -558,7 +578,7 @@ def write_all(analysis: dict[str, Any], directory: Path) -> dict[str, Any]:
                 "output", "output_tokens", "generated tokens requested",
                 "Throughput against output length", f"10_output_length__{short}.png")
     attempt("07 compile trade-off", compile_tradeoff)
-    attempt("08 Aether improvement", improvement_bars)
+    attempt("08 pairwise matrix", pairwise_matrix)
     attempt("11 model scaling", model_scaling)
     attempt("12 heatmap", heatmap)
     return {"written": written, "skipped": skipped}

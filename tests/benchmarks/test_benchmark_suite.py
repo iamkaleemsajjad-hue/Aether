@@ -61,19 +61,35 @@ def _hardware(**overrides: Any) -> hardware.Hardware:
     return replace(base, **overrides)
 
 
-def test_cuda_resolves_to_bf16_so_every_engine_holds_the_same_weights() -> None:
-    """bf16 is chosen for weight fidelity, including where it is not native.
+def test_precision_is_the_widest_format_the_whole_field_can_execute() -> None:
+    """bf16 only where the hardware has bf16 tensor cores; fp16 otherwise.
 
-    The checkpoints and Aether's artifact are both bf16. Picking a format the device
-    runs faster would make one engine round another's weights, which is the thing the
-    suite exists not to do.
+    A precision only some engines support is not a fair benchmark precision, it is a
+    way of excluding engines - vLLM refuses bf16 below compute capability 8.0. So a
+    pre-Ampere host resolves to fp16 and the reason says why.
     """
     native = _hardware(nvidia=True, bf16_native=True, compute_capabilities=["8.0"])
-    emulated = _hardware(nvidia=True, bf16_native=False, compute_capabilities=["7.5"])
     assert hardware.resolve_precision("auto", native)[0] == "bf16"
-    resolved, reason = hardware.resolve_precision("auto", emulated)
-    assert resolved == "bf16"
-    assert "emulated" in reason and "--precision fp16" in reason
+
+    turing = _hardware(nvidia=True, bf16_native=False, torch_reports_bf16=True,
+                       compute_capabilities=["7.5", "7.5"])
+    resolved, reason = hardware.resolve_precision("auto", turing)
+    assert resolved == "fp16"
+    assert "8.0 or newer" in reason
+    assert "--precision bf16" in reason, "the weight-exact option must stay documented"
+    assert "software emulation" in reason, (
+        "when torch claims bf16 support on a pre-Ampere card, say what that claim is"
+    )
+
+
+def test_bf16_nativeness_comes_from_the_capability_not_from_torch() -> None:
+    """torch answers True on cards that only emulate bf16; the capability decides."""
+    turing = _hardware(nvidia=True, compute_capabilities=["7.5"], torch_reports_bf16=True)
+    assert hardware.meets_capability(turing, (8, 0)) is False
+    ampere = _hardware(nvidia=True, compute_capabilities=["8.6"])
+    assert hardware.meets_capability(ampere, (8, 0)) is True
+    assert hardware.min_compute_capability(turing) == (7, 5)
+    assert hardware.min_compute_capability(_hardware()) is None
 
 
 def test_cpu_resolves_to_fp32_and_an_explicit_request_is_honoured() -> None:
@@ -230,7 +246,7 @@ def test_a_missing_operand_never_becomes_a_zero() -> None:
 
 def test_verdict_is_symmetric_around_the_stated_tie_threshold() -> None:
     threshold = analysis.TIE_THRESHOLD * 100.0
-    assert analysis.verdict(threshold + 0.1) == "aether"
+    assert analysis.verdict(threshold + 0.1) == "subject"
     assert analysis.verdict(-(threshold + 0.1)) == "competitor"
     assert analysis.verdict(0.0) == "tie"
     assert analysis.verdict(threshold - 0.1) == "tie"
@@ -239,28 +255,38 @@ def test_verdict_is_symmetric_around_the_stated_tie_threshold() -> None:
 
 
 def test_representation_difference_is_labelled_on_both_sides() -> None:
-    same = {"quantized": False, "representation": "published checkpoint", "precision": "bf16"}
+    same = {"quantized": False, "representation": "published checkpoint",
+            "precision": "fp16", "weight_storage_bits": 16,
+            "weight_storage_format": "fp16"}
     assert analysis.comparability(same, dict(same))[0] == analysis.SAME_REPRESENTATION
 
-    quantized = {**same, "quantized": True}
+    quantized = {**same, "quantized": True, "weight_storage_bits": 4,
+                 "weight_storage_format": "Q4_K_M"}
     assert analysis.comparability(same, quantized)[0] == \
         analysis.REPRESENTATION_DIFFERENCE
-    exported = {**same, "representation": "ONNX graph exported from the checkpoint"}
-    assert analysis.comparability(same, exported)[0] == \
-        analysis.REPRESENTATION_DIFFERENCE
-    other_precision = {**same, "precision": "fp16"}
+    other_precision = {**same, "precision": "bf16"}
     assert analysis.comparability(same, other_precision)[0] == \
         analysis.REPRESENTATION_DIFFERENCE
-    # The subject's own artifact residency counts too: at fp32 Aether holds BF16
-    # weights, so it is the side that differs and the label must still appear.
-    aether_fp32 = {
-        "quantized": False, "precision": "fp32",
-        "representation": "compiled AEG artifact; compiler default residency BF16",
+
+    # A 32-bit export against 16-bit tensors is a different amount of memory traffic,
+    # so it is labelled even though neither side is quantized.
+    exported = {**same, "weight_storage_bits": 32, "weight_storage_format": "fp32",
+                "representation": "ONNX graph, float32 weights"}
+    assert analysis.comparability(same, exported)[0] == \
+        analysis.REPRESENTATION_DIFFERENCE
+
+    # Two different 16-bit containers at the same compute precision is a disclosed
+    # storage detail, not a different experiment: both are one rounding step from the
+    # same published bf16 checkpoint. The note has to say so.
+    bf16_storage = {
+        "quantized": False, "precision": "fp16",
+        "representation": "compiled AEG artifact, bf16 weight storage, fp16 compute",
+        "weight_storage_bits": 16, "weight_storage_format": "bf16",
     }
-    competitor_fp32 = {**same, "precision": "fp32"}
-    label, note = analysis.comparability(aether_fp32, competitor_fp32)
-    assert label == analysis.REPRESENTATION_DIFFERENCE
-    assert "BF16" in note
+    label, note = analysis.comparability(bf16_storage, same)
+    assert label == analysis.SAME_REPRESENTATION
+    assert "bf16" in note and "fp16" in note
+    assert "rounding step" in note
 
 
 # ── End-to-end analysis over a synthetic payload ────────────────────────────
@@ -373,14 +399,14 @@ def test_wins_and_losses_are_both_reported_from_the_same_cells() -> None:
     comparisons = result["comparisons"]
     assert len(comparisons) == 2
     by_batch = {item["batch_size"]: item for item in comparisons}
-    assert by_batch[1]["winner"] == "aether"
+    assert by_batch[1]["winner"] == "subject"
     assert by_batch[1]["throughput"]["subject_improvement_percent"] == pytest.approx(60.0)
     assert by_batch[4]["winner"] == "competitor"
     assert by_batch[4]["throughput"]["subject_improvement_percent"] == pytest.approx(-25.0)
 
     win_loss = result["win_loss"]["all"]
-    assert win_loss["aether_wins"] == 1
-    assert win_loss["aether_losses"] == 1
+    assert win_loss["wins"] == 1
+    assert win_loss["losses"] == 1
     assert win_loss["compared"] == 2
     # The extremes must name the real best and worst case, not the best twice.
     assert result["win_loss"]["largest_advantage"]["batch_size"] == 1
@@ -430,7 +456,10 @@ def test_break_even_solves_the_crossing_point_and_names_the_never_case() -> None
     assert entry["total_cost_s"]["100"]["warm_reused_artifact"] == pytest.approx(
         4.5 + 100 * 3.2
     )
-    crossing = economics["break_even"][0]
+    crossing = next(
+        item for item in economics["break_even"]
+        if item["subject"] == "aether" and item["competitor"] == "transformers"
+    )
     assert crossing["break_even_runs"] == pytest.approx(16.0 / 1.9, rel=1e-6)
 
     # Reverse it: when Aether is slower per request, no run count repays the build.
@@ -442,9 +471,13 @@ def test_break_even_solves_the_crossing_point_and_names_the_never_case() -> None
                                     sweeps=["batch", "prompt", "output"])],
              build_s=None, load_s=8.0),
     ]
-    never = analysis.analyze(_payload(slower))["compile_economics"]["break_even"][0]
+    never = next(
+        item for item in
+        analysis.analyze(_payload(slower))["compile_economics"]["break_even"]
+        if item["subject"] == "aether" and item["competitor"] == "transformers"
+    )
     assert never["break_even_runs"] is None
-    assert "never" in never["interpretation"]
+    assert "no number of requests" in never["interpretation"]
 
 
 def test_correctness_classes_separate_rounding_from_a_different_computation() -> None:
@@ -514,17 +547,22 @@ def test_comparison_csv_records_the_sign_of_every_result(tmp_path: Path) -> None
     report.write_comparison_csv(analyzed, target)
     rows = list(csv.DictReader(target.open(encoding="utf-8")))
     signs = {row["winner"] for row in rows}
-    assert signs == {"aether", "competitor"}
+    assert signs == {"subject", "competitor"}
     losing = next(row for row in rows if row["winner"] == "competitor")
-    assert float(losing["aether_improvement_percent"]) < 0
+    assert float(losing["subject_improvement_percent"]) < 0
+    # Ordered pairs: every comparison appears from both sides.
+    assert {row["subject"] for row in rows} == {"aether", "transformers"}
 
 
 def test_report_states_both_the_win_and_the_loss(tmp_path: Path) -> None:
     payload, analyzed = _analyzed()
     text = report.build_report(payload, analyzed, {"written": [], "skipped": [],
                                                    "directory": "graphs"})
-    assert "## Aether win/loss analysis" in text
-    assert "### Where Aether loses" in text
+    assert "## Head-to-head results" in text
+    assert "#### Cells `aether` lost" in text
+    assert "#### Cells `transformers` lost" in text, (
+        "every measured engine must get the same treatment"
+    )
     assert "-25.0%" in text, "the losing comparison must appear with its sign"
     assert "+60.0%" in text
     # The unmeasured cell has to be visible as unmeasured, not as absence.
@@ -626,3 +664,138 @@ def test_a_crashed_worker_leaves_a_record_with_no_measurement_in_it() -> None:
     assert record["cells"] == []
     assert "timeout" in record["reason"]
     assert not status_mod.is_measured(record)
+
+
+# ── Device parity ───────────────────────────────────────────────────────────
+
+def test_every_engine_sees_one_accelerator_by_default() -> None:
+    """A runtime that shards would otherwise be measured on more hardware."""
+    assert plan.SuiteConfig().devices == 1
+    assert plan.parse_args([]).devices == 1
+    assert plan.parse_args(["--devices", "2"]).devices == 2
+    assert plan.parse_args([]).workload_signature()["devices"] == 1
+
+
+def test_device_restriction_is_applied_through_visibility(monkeypatch: Any) -> None:
+    """Visibility, not a patched placement path: no engine's own logic is changed."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("AETHER_EXECUTION_DEVICES", raising=False)
+    record = hardware.visible_devices(1)
+    assert record["restricted"] is True
+    assert record["CUDA_VISIBLE_DEVICES"] == "0"
+    assert record["AETHER_EXECUTION_DEVICES"] == "cuda:0"
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    unrestricted = hardware.visible_devices(0)
+    assert unrestricted["restricted"] is False
+
+
+def test_aether_adapter_names_the_single_device_it_was_given() -> None:
+    """Belt and braces: the execution device is recorded, not left to be inferred."""
+    from benchmark.suite.engines import aether_engine
+
+    gpu = _hardware(nvidia=True, gpu_count=2, compute_capabilities=["7.5", "7.5"])
+    engine = aether_engine.build(gpu, "Qwen/Qwen3-0.6B", "fp16",
+                                plan.SuiteConfig(devices=1))
+    assert engine.execution_devices == ["cuda:0"]
+    two = aether_engine.build(gpu, "Qwen/Qwen3-0.6B", "fp16",
+                              plan.SuiteConfig(devices=2))
+    assert two.execution_devices == ["cuda:0", "cuda:1"]
+
+
+# ── torch.compile fallback ──────────────────────────────────────────────────
+
+def test_torch_compile_falls_back_instead_of_reporting_itself_unsupported() -> None:
+    """Whole-graph capture failing does not mean torch.compile cannot run the model.
+
+    Transformers' generate calls functions Dynamo skips, and length-dependent models
+    are data-dependent by construction. Reporting those as "torch.compile unsupported"
+    would be wrong: what is unsupported is fullgraph capture.
+    """
+    from benchmark.suite.engines import torch_compile
+
+    attempts = torch_compile.COMPILE_ATTEMPTS
+    assert attempts[0]["fullgraph"] is True, "the strictest configuration is tried first"
+    assert any(not item["fullgraph"] for item in attempts), (
+        "a graph-broken compilation must remain available"
+    )
+    assert len({(item["mode"], item["fullgraph"]) for item in attempts}) == len(attempts)
+
+
+# ── Neutrality ──────────────────────────────────────────────────────────────
+
+def test_the_pairwise_matrix_holds_every_ordered_pair() -> None:
+    _, analyzed = _analyzed()
+    pairs = {(item["subject"], item["competitor"]) for item in analyzed["pairwise"]
+             if item["throughput"].get("comparable")}
+    assert ("aether", "transformers") in pairs
+    assert ("transformers", "aether") in pairs
+
+
+def test_pairwise_comparisons_are_antisymmetric() -> None:
+    """A wins over B by x% must be recorded as B losing to A, from the same numbers."""
+    _, analyzed = _analyzed()
+    by_pair = {
+        (item["subject"], item["competitor"], item["batch_size"]): item
+        for item in analyzed["pairwise"] if item["throughput"].get("comparable")
+    }
+    for (subject, competitor, batch), item in by_pair.items():
+        mirror = by_pair.get((competitor, subject, batch))
+        assert mirror is not None, "every pairing must appear in both directions"
+        assert item["throughput"]["subject"] == pytest.approx(
+            mirror["throughput"]["other"]
+        )
+        # A won by +60% means B lost; the mirrored percentage is not the negation
+        # (percentages are asymmetric) but the verdicts must be opposite.
+        if item["winner"] == "subject":
+            assert mirror["winner"] == "competitor"
+        elif item["winner"] == "competitor":
+            assert mirror["winner"] == "subject"
+        else:
+            assert mirror["winner"] == "tie"
+
+
+def test_standings_score_every_engine_with_the_same_measure() -> None:
+    _, analyzed = _analyzed()
+    standings = analyzed["standings"]
+    assert {entry["engine"] for entry in standings} == {"aether", "transformers"}
+    assert [entry["rank"] for entry in standings] == [1, 2]
+    for entry in standings:
+        assert entry["compared"] > 0
+        assert 0.0 <= entry["win_rate_percent"] <= 100.0
+        assert entry["median_percent_of_best"] is not None
+        # A share of the fastest engine in a cell cannot exceed the fastest engine.
+        assert entry["median_percent_of_best"] <= 100.0
+    # Ordering follows the score, and the score alone.
+    assert standings[0]["median_percent_of_best"] >= standings[1]["median_percent_of_best"]
+
+
+def test_per_engine_views_exist_for_every_measured_engine() -> None:
+    _, analyzed = _analyzed()
+    assert set(analyzed["per_engine"]) == set(analyzed["engines_measured"])
+    for view in analyzed["per_engine"].values():
+        assert "win_loss" in view and "per_competitor" in view
+
+
+def test_report_gives_every_engine_the_same_treatment() -> None:
+    payload, analyzed = _analyzed()
+    text = report.build_report(payload, analyzed, {"written": [], "skipped": [],
+                                                   "directory": "graphs"})
+    assert "# Inference Engine Benchmark Report" in text
+    for engine in analyzed["engines_measured"]:
+        assert f"#### Cells `{engine}` won" in text
+        assert f"#### Cells `{engine}` lost" in text
+        assert f"#### `{engine}` against each opponent, aggregated" in text
+    assert "## Head-to-head results" in text
+    assert "### Pairwise matrix" in text
+
+
+def test_focus_narrows_the_drill_down_without_changing_any_number() -> None:
+    payload, analyzed = _analyzed()
+    focused = dict(analyzed, focus="transformers")
+    text = report.build_report(payload, focused, {"written": [], "skipped": [],
+                                                  "directory": "graphs"})
+    assert "#### Cells `transformers` won" in text
+    assert "#### Cells `aether` won" not in text
+    # The standings still cover the whole field.
+    assert "`aether`" in text

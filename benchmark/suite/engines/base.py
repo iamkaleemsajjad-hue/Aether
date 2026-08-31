@@ -66,6 +66,10 @@ class EngineSpec:
     artifact_persistence: str = ARTIFACT_NONE
     #: The engine cannot run without an NVIDIA CUDA device.
     requires_cuda: bool = False
+    #: Lowest CUDA compute capability the engine's kernels support, when it has a
+    #: floor. Checked before installation status, because "this card is too old" is a
+    #: more useful answer than "install it" for something that could not then run.
+    min_capability: tuple[int, int] | None = None
     #: The engine cannot run on this OS. Empty means no restriction.
     supported_os: tuple[str, ...] = ()
     #: True when the engine executes a representation that is not the published
@@ -88,6 +92,10 @@ class EngineSpec:
             "has_build_phase": self.has_build_phase,
             "artifact_persistence": self.artifact_persistence,
             "requires_cuda": self.requires_cuda,
+            "min_capability": (
+                f"{self.min_capability[0]}.{self.min_capability[1]}"
+                if self.min_capability else None
+            ),
             "alters_representation": self.alters_representation,
             "ttft_method": self.ttft_method,
             "notes": list(self.notes),
@@ -157,6 +165,12 @@ def module_importable(name: str) -> tuple[bool, str]:
     engines does not pull a dozen heavyweight CUDA libraries into the
     orchestrator process, where their allocators would then be resident for the
     rest of the run.
+
+    The cost of not importing is that a module which is *present but broken* - the
+    common case when a library and its host framework have drifted apart in
+    version - still looks importable here. :func:`requirement_conflicts` is the
+    cheap, no-import check for that, and every engine whose import can fail that way
+    calls it.
     """
     import importlib.util
 
@@ -167,6 +181,51 @@ def module_importable(name: str) -> tuple[bool, str]:
     if spec is None:
         return False, f"{name} is not installed"
     return True, ""
+
+
+def requirement_conflicts(distribution: str) -> list[str]:
+    """Declared requirements of ``distribution`` that the environment violates.
+
+    Read from installed metadata, so it costs no imports and cannot itself fail the
+    way the real import would. This is how a version skew becomes a sentence in the
+    compatibility table ("optimum-onnx needs transformers<4.58, found 5.16.1") instead
+    of an ``ImportError`` on a private symbol twenty minutes into a run.
+
+    Only hard version conflicts are reported. A missing optional extra, or a
+    requirement guarded by an environment marker that does not apply, is not a
+    conflict and is skipped.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, requires, version
+        from packaging.requirements import Requirement
+    except Exception:  # noqa: BLE001 - without packaging there is nothing to check
+        return []
+    try:
+        declared = requires(distribution) or []
+    except Exception:  # noqa: BLE001 - not installed; that is a different answer
+        return []
+    problems: list[str] = []
+    for entry in declared:
+        try:
+            requirement = Requirement(entry)
+        except Exception:  # noqa: BLE001
+            continue
+        if requirement.marker is not None and not requirement.marker.evaluate():
+            continue
+        if not str(requirement.specifier):
+            continue
+        try:
+            installed = version(requirement.name)
+        except PackageNotFoundError:
+            continue
+        except Exception:  # noqa: BLE001
+            continue
+        if not requirement.specifier.contains(installed, prereleases=True):
+            problems.append(
+                f"{distribution} requires {requirement.name}"
+                f"{requirement.specifier}, found {installed}"
+            )
+    return problems
 
 
 def generic_probe(spec: EngineSpec, hardware: Any) -> Availability:
@@ -183,6 +242,18 @@ def generic_probe(spec: EngineSpec, hardware: Any) -> Availability:
             f"{spec.display} requires an NVIDIA CUDA device; this host reports "
             f"accelerator={getattr(hardware, 'accelerator', 'unknown')}"
         )
+    if spec.min_capability and getattr(hardware, "nvidia", False):
+        from benchmark.suite import hardware as hardware_mod
+
+        if not hardware_mod.meets_capability(hardware, spec.min_capability):
+            capabilities = ", ".join(
+                getattr(hardware, "compute_capabilities", []) or []
+            ) or "unknown"
+            return not_applicable(
+                f"{spec.display} requires compute capability "
+                f"{spec.min_capability[0]}.{spec.min_capability[1]} or newer; this "
+                f"host is {capabilities}"
+            )
     if spec.supported_os and getattr(hardware, "os_name", "") not in spec.supported_os:
         return not_applicable(
             f"{spec.display} supports {', '.join(spec.supported_os)}; this host is "

@@ -85,12 +85,32 @@ class Engine(base.BackendAdapterMixin):
             "export_s": self._export_s,
             "generation": "ORTModelForCausalLM.generate (io-binding managed by optimum)",
             "representation": "ONNX graph exported from the checkpoint; float32 weights",
+            "weight_storage_bits": 32,
+            "weight_storage_format": "fp32",
             "quantized": False,
             "ttft_method": SPEC.ttft_method,
         }
 
     def load(self, model_id: str, precision: str) -> LoadOutcome:
-        from optimum.onnxruntime import ORTModelForCausalLM
+        try:
+            from optimum.onnxruntime import ORTModelForCausalLM
+        except ImportError as exc:
+            # The export stack is installed but does not agree with the transformers
+            # version this run is measuring everything else on. That is an
+            # environment incompatibility, not a defect in the engine, so it is
+            # reported as unsupported with the conflicts spelled out rather than as a
+            # bare traceback.
+            conflicts = [
+                problem
+                for distribution in _EXPORT_DISTRIBUTIONS
+                for problem in base.requirement_conflicts(distribution)
+            ]
+            raise UnsupportedConfiguration(
+                f"optimum.onnxruntime could not be imported: {exc}. "
+                + ("Declared conflicts: " + "; ".join(conflicts) if conflicts
+                   else "No declared version conflict was found, so this is likely an "
+                        "incompatibility the packages do not declare.")
+            ) from exc
         from transformers import AutoTokenizer
 
         self._precision = precision
@@ -209,6 +229,15 @@ def _tree_size(path: Path) -> int | None:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
 
+#: Distributions whose declared requirements decide whether the ONNX export path
+#: works at all. optimum's exporter lives in optimum-onnx on current releases and in
+#: optimum itself on older ones, and both pin a transformers range: when the host
+#: framework has moved past it, importing the exporter fails on a private symbol
+#: (``get_parameter_dtype`` is the usual one). Checking the declared range is how that
+#: becomes a stated incompatibility instead of a mid-run crash.
+_EXPORT_DISTRIBUTIONS = ("optimum-onnx", "optimum")
+
+
 def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Availability:
     generic = base.generic_probe(SPEC, hardware)
     if not generic.usable:
@@ -218,6 +247,20 @@ def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Av
         return base.not_installed(
             "optimum is installed but optimum.onnxruntime is not importable "
             f"({reason}); install optimum[onnxruntime] or optimum[onnxruntime-gpu]"
+        )
+    conflicts = [
+        problem
+        for distribution in _EXPORT_DISTRIBUTIONS
+        for problem in base.requirement_conflicts(distribution)
+        if "transformers" in problem or "onnx" in problem
+    ]
+    if conflicts:
+        return base.not_supported(
+            "the installed ONNX export stack does not support this environment: "
+            + "; ".join(conflicts)
+            + ". Install a compatible pair before the run - the whole field has to "
+            "share one transformers version, so pin transformers into the range this "
+            "exporter accepts rather than upgrading it afterwards."
         )
     version = base.package_version("optimum")
     if hardware.nvidia and base.package_version("onnxruntime-gpu") is None:

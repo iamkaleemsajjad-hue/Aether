@@ -27,6 +27,12 @@ from benchmark.backends import (
 from benchmark.prompts import flatten_ids
 from benchmark.suite.engines import base
 
+#: SGLang's attention kernels (FlashInfer, and its Triton fallbacks) target Ampere
+#: and newer. Below that the engine either refuses to start or falls back to a path
+#: its own documentation does not support, so a pre-Ampere host is reported as
+#: inapplicable with the capability that decided it rather than as a mystery failure.
+MIN_CAPABILITY = (8, 0)
+
 SPEC = base.EngineSpec(
     key="sglang",
     display="SGLang",
@@ -41,6 +47,7 @@ SPEC = base.EngineSpec(
     has_build_phase=True,
     artifact_persistence=base.ARTIFACT_DISK_CACHE,
     requires_cuda=True,
+    min_capability=MIN_CAPABILITY,
     ttft_method="single_token_call",
     notes=(
         "Prefix caching (RadixAttention) is disabled for every measured run via the "
@@ -84,7 +91,11 @@ class Engine(base.BackendAdapterMixin):
             "mem_fraction_static": self.memory_fraction,
             "engine_startup_s": self._startup_s,
             "generation": "sglang.Engine.generate (offline)",
-            "representation": "published checkpoint, loaded at the benchmark precision",
+            "representation": (
+                f"published checkpoint cast to {self._precision or '?'} tensors"
+            ),
+            "weight_storage_bits": 32 if self._precision == "fp32" else 16,
+            "weight_storage_format": self._precision,
             "quantized": False,
             "runtime_flags_overridden": {"disable_radix_cache": True},
             "runtime_flags_reason": (

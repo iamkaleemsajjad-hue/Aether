@@ -89,6 +89,8 @@ class Engine(base.BackendAdapterMixin):
             "bits_per_weight": self._bits,
             "generation": "ExLlamaV2DynamicGenerator",
             "representation": f"EXL2 quantized ({self._bits or 'unknown'} bpw)",
+            "weight_storage_bits": int(self._bits) if self._bits else 4,
+            "weight_storage_format": f"exl2-{self._bits or 'unknown'}bpw",
             "quantized": True,
             "ttft_method": SPEC.ttft_method,
             "version": base.package_version("exllamav2"),

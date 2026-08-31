@@ -55,7 +55,11 @@ class Engine(TransformersBackend):
             engine_key=SPEC.key,
             taxonomy=list(SPEC.taxonomy),
             generation="hand-written greedy/sampling loop over model(...) with a KV cache",
-            representation="published checkpoint, loaded at the benchmark precision",
+            representation=(
+                f"published checkpoint cast to {self._precision or '?'} tensors"
+            ),
+            weight_storage_bits=32 if self._precision == "fp32" else 16,
+            weight_storage_format=self._precision,
             quantized=False,
             ttft_method=SPEC.ttft_method,
         )

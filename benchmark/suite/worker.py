@@ -190,6 +190,11 @@ def run_full(plan: dict[str, Any], workload: dict[str, Any], engine_key: str,
 
     options = Options(plan)
     thread_record = hardware_mod.pin_threads(plan.get("threads"))
+    # Device visibility is restricted before anything touches torch, because
+    # CUDA_VISIBLE_DEVICES is only read when the CUDA context is created. Every
+    # engine therefore sees the same device count, and none of them has its own
+    # placement logic altered.
+    device_record = hardware_mod.visible_devices(plan.get("devices"))
     hardware = hardware_mod.detect()
     precision = workload["precision"]
     prompts = {int(key): value for key, value in workload["prompts"].items()}
@@ -202,6 +207,7 @@ def run_full(plan: dict[str, Any], workload: dict[str, Any], engine_key: str,
         "started_at": _now(),
         "spec": registry.spec_for(engine_key).to_dict(),
         "threads": thread_record,
+        "devices": device_record,
         "hardware": hardware.to_dict(),
         "host_before": host_snapshot(),
         "cells": [],
@@ -481,6 +487,7 @@ def run_reuse(plan: dict[str, Any], workload: dict[str, Any], engine_key: str,
     del prompt_mod  # prompts arrive pre-built; nothing to construct here
     options = Options(plan)
     thread_record = hardware_mod.pin_threads(plan.get("threads"))
+    device_record = hardware_mod.visible_devices(plan.get("devices"))
     hardware = hardware_mod.detect()
     precision = workload["precision"]
     prompts = {int(key): value for key, value in workload["prompts"].items()}
@@ -494,6 +501,7 @@ def run_reuse(plan: dict[str, Any], workload: dict[str, Any], engine_key: str,
         "started_at": _now(),
         "spec": registry.spec_for(engine_key).to_dict(),
         "threads": thread_record,
+        "devices": device_record,
         "host_before": host_snapshot(),
         "status": status_mod.FAILED,
     }

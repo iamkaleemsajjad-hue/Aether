@@ -82,6 +82,8 @@ class Engine(base.BackendAdapterMixin):
             "conversion_s": self._convert_s,
             "generation": "OVModelForCausalLM.generate",
             "representation": f"OpenVINO IR ({self._ir_element_type or 'unknown'})",
+            "weight_storage_bits": _element_bits(self._ir_element_type),
+            "weight_storage_format": self._ir_element_type,
             "quantized": False,
             "ttft_method": SPEC.ttft_method,
             "version": base.package_version("openvino"),
@@ -199,6 +201,23 @@ def _ir_element_type(model: Any) -> str | None:
                 return str(node.get_element_type())
     except Exception:  # noqa: BLE001 - reported as unknown rather than guessed
         return None
+    return None
+
+
+def _element_bits(element_type: str | None) -> int | None:
+    """Width, in bits, of the element type OpenVINO stored the weights as.
+
+    Read from the IR rather than assumed from the requested precision, because the
+    conversion decides this and the comparability label depends on it.
+    """
+    if not element_type:
+        return None
+    text = str(element_type).lower()
+    for name, bits in (("f32", 32), ("float32", 32), ("f16", 16), ("float16", 16),
+                       ("bf16", 16), ("bfloat16", 16), ("i8", 8), ("u8", 8),
+                       ("i4", 4), ("u4", 4)):
+        if name in text:
+            return bits
     return None
 
 

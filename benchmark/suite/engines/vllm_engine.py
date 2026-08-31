@@ -74,11 +74,13 @@ class Engine(base.BackendAdapterMixin):
         device: str = "cuda",
         gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION,
         max_model_len: int | None = None,
+        enforce_eager: bool = False,
         **_: Any,
     ) -> None:
         self.device = device
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
+        self.enforce_eager = enforce_eager
         self._llm: Any = None
         self._tokenizer: Any = None
         self._precision: str | None = None
@@ -93,9 +95,14 @@ class Engine(base.BackendAdapterMixin):
             "precision": self._precision,
             "gpu_memory_utilization": self.gpu_memory_utilization,
             "max_model_len": self.max_model_len,
+            "enforce_eager": self.enforce_eager,
             "engine_startup_s": self._startup_s,
             "generation": "vllm.LLM.generate with SamplingParams (offline engine)",
-            "representation": "published checkpoint, loaded at the benchmark precision",
+            "representation": (
+                f"published checkpoint cast to {self._precision or '?'} tensors"
+            ),
+            "weight_storage_bits": 32 if self._precision == "fp32" else 16,
+            "weight_storage_format": self._precision,
             "quantized": False,
             "ttft_method": SPEC.ttft_method,
             "version": base.package_version("vllm"),
@@ -110,6 +117,12 @@ class Engine(base.BackendAdapterMixin):
         # vLLM logs at INFO by default and the volume distorts a terminal summary;
         # quieting it does not change execution.
         os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+        # vLLM's V1 engine runs its core in a child process, which means its real
+        # traceback lands in that child's stderr and the parent only sees "engine core
+        # initialization failed". Keeping the core in-process makes the actual cause
+        # (an unsupported dtype, a missing runner, an allocation failure) reach the
+        # record, which is the difference between a diagnosable result and a dead end.
+        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
         start = time.perf_counter()
         try:
@@ -119,13 +132,18 @@ class Engine(base.BackendAdapterMixin):
                 "gpu_memory_utilization": self.gpu_memory_utilization,
                 "trust_remote_code": False,
                 "seed": 0,
+                # One device, like every other engine in the run. Visibility is already
+                # restricted by the worker; stating it keeps the record explicit.
+                "tensor_parallel_size": 1,
             }
             if self.max_model_len:
                 kwargs["max_model_len"] = self.max_model_len
+            if self.enforce_eager:
+                kwargs["enforce_eager"] = True
             self._llm = LLM(**kwargs)
         except Exception as exc:  # noqa: BLE001
             raise UnsupportedConfiguration(
-                f"vLLM could not start for {model_id}: {type(exc).__name__}: {exc}"[:400]
+                f"vLLM could not start for {model_id}: {type(exc).__name__}: {exc}"
             ) from exc
         self._startup_s = time.perf_counter() - start
         self._tokenizer = self._llm.get_tokenizer()
@@ -142,6 +160,7 @@ class Engine(base.BackendAdapterMixin):
                 "gpu_memory_utilization": self.gpu_memory_utilization,
                 "vllm_version": base.package_version("vllm"),
                 "startup_includes": "weight load, KV pool allocation, graph capture",
+                "tensor_parallel_size": 1,
             },
         )
 
@@ -225,8 +244,59 @@ class Engine(base.BackendAdapterMixin):
         super().unload()
 
 
+#: Architectures vLLM does not implement. Checked before a run rather than
+#: discovered from a pydantic validation error 25 seconds in, so the compatibility
+#: table can say *why* instead of quoting a stack trace. Kept short and specific:
+#: this is a list of known gaps, not a guess at vLLM's whole coverage, and anything
+#: not listed here is attempted for real.
+UNSUPPORTED_ARCHITECTURES: dict[str, str] = {
+    "GPTNeoForCausalLM": (
+        "vLLM implements GPT-NeoX and GPT-J but not the original GPT-Neo "
+        "architecture, so it has no model runner for this checkpoint"
+    ),
+    "GPT2LMHeadModel": (
+        "vLLM's GPT-2 support is limited and not present in every release; this "
+        "build reports no runner for it"
+    ),
+}
+
+#: bf16 needs Ampere. vLLM refuses it below compute capability 8.0 rather than
+#: emulating, so on an older card the benchmark precision decides whether this
+#: engine can be measured at all.
+BF16_MIN_CAPABILITY = (8, 0)
+
+
+def _architecture(model_id: str) -> str | None:
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_id)
+        return (getattr(config, "architectures", None) or [None])[0]
+    except Exception:  # noqa: BLE001 - an unreadable config is not this engine's fault
+        return None
+
+
 def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Availability:
-    return base.generic_probe(SPEC, hardware)
+    generic = base.generic_probe(SPEC, hardware)
+    if not generic.usable:
+        return generic
+    from benchmark.suite import hardware as hardware_mod
+
+    if precision == "bf16" and not hardware_mod.meets_capability(
+        hardware, BF16_MIN_CAPABILITY
+    ):
+        capabilities = ", ".join(hardware.compute_capabilities) or "unknown"
+        return base.not_supported(
+            f"vLLM requires compute capability 8.0 or newer for bf16; this host is "
+            f"{capabilities}. Re-run with --precision fp16 (or let --precision auto "
+            "choose it) and this engine becomes measurable."
+        )
+    architecture = _architecture(model_id)
+    if architecture in UNSUPPORTED_ARCHITECTURES:
+        return base.not_supported(
+            f"{architecture}: {UNSUPPORTED_ARCHITECTURES[architecture]}"
+        )
+    return base.available(base.package_version("vllm"))
 
 
 def build(hardware: Any, model_id: str, precision: str, options: Any) -> Engine:
@@ -235,4 +305,5 @@ def build(hardware: Any, model_id: str, precision: str, options: Any) -> Engine:
         gpu_memory_utilization=getattr(options, "vllm_gpu_utilization", None)
         or GPU_MEMORY_UTILIZATION,
         max_model_len=getattr(options, "vllm_max_model_len", None),
+        enforce_eager=bool(getattr(options, "vllm_enforce_eager", False)),
     )

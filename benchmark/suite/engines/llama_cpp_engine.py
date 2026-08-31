@@ -162,6 +162,8 @@ class Engine(base.BackendAdapterMixin):
             "conversion_s": self._convert_s,
             "generation": "llama_cpp.Llama.create_completion (single sequence)",
             "representation": f"GGUF ({self._quantization or 'unknown'})",
+            "weight_storage_bits": _quant_bits(self._quantization),
+            "weight_storage_format": self._quantization,
             "quantized": bool(self._quantization and "F16" not in str(self._quantization).upper()),
             "ttft_method": SPEC.ttft_method,
             "version": base.package_version("llama_cpp_python"),
@@ -281,6 +283,24 @@ class Engine(base.BackendAdapterMixin):
         self._llm = None
         self._tokenizer = None
         super().unload()
+
+
+def _quant_bits(label: str | None) -> int | None:
+    """Nominal bits per weight for a GGUF quantization label.
+
+    Approximate by construction - the k-quants mix bit widths per block - but exact
+    enough for the one decision it feeds: whether this engine is holding a 16-bit
+    rendering of the checkpoint or something narrower, which is what separates a
+    same-representation comparison from a labelled one.
+    """
+    if not label:
+        return None
+    text = str(label).upper()
+    for name, bits in (("F32", 32), ("F16", 16), ("BF16", 16), ("Q8", 8), ("Q6", 6),
+                       ("Q5", 5), ("Q4", 4), ("IQ4", 4), ("Q3", 3), ("Q2", 2)):
+        if name in text:
+            return bits
+    return None
 
 
 def _quant_from_name(name: str) -> str | None:

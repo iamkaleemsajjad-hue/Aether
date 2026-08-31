@@ -54,8 +54,10 @@ class Engine(AetherBackend):
 
     spec = SPEC
 
-    def __init__(self, device: str = "cuda", cache_dir: str | None = None, **_: Any) -> None:
-        super().__init__(device=device, cache_dir=cache_dir, keep_artifact=True)
+    def __init__(self, device: str = "cuda", cache_dir: str | None = None,
+                 execution_devices: list[str] | None = None, **_: Any) -> None:
+        super().__init__(device=device, cache_dir=cache_dir, keep_artifact=True,
+                         execution_devices=execution_devices)
         self.name = SPEC.key
 
     def describe(self) -> dict[str, Any]:
@@ -63,12 +65,19 @@ class Engine(AetherBackend):
         record.update(
             engine_key=SPEC.key,
             taxonomy=list(SPEC.taxonomy),
-            representation="compiled AEG artifact; compiler default residency BF16",
+            # The AEG blob stores the checkpoint's bf16 values; the compute dtype is
+            # whatever the run's precision is. Both halves are stated because the
+            # comparability check keys off the compute dtype and discloses the storage.
+            representation=(
+                f"compiled AEG artifact, bf16 weight storage, {self._precision or '?'} "
+                "compute"
+            ),
+            weight_storage_bits=16,
+            weight_storage_format="bf16",
             quantized=False,
             ttft_method=SPEC.ttft_method,
         )
         return record
-
 
     def generate(self, prompt: str, **kwargs: Any) -> Any:
         """Generate, and record how the reported token ids were obtained.
@@ -91,7 +100,17 @@ def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Av
 
 
 def build(hardware: Any, model_id: str, precision: str, options: Any) -> Engine:
+    # Name the single device explicitly as well as restricting visibility in the
+    # worker. Visibility alone is enough, but stating the execution device means the
+    # artifact's placement is recorded in the result rather than inferred, and it
+    # holds even if a future runtime learns to look past CUDA_VISIBLE_DEVICES.
+    devices = getattr(options, "devices", None)
+    execution_devices = (
+        [f"cuda:{index}" for index in range(devices)]
+        if hardware.nvidia and devices and devices >= 1 else None
+    )
     return Engine(
         device="cuda" if hardware.nvidia else "cpu",
         cache_dir=getattr(options, "aeg_cache_dir", None),
+        execution_devices=execution_devices,
     )

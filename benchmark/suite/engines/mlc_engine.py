@@ -86,6 +86,8 @@ class Engine(base.BackendAdapterMixin):
             "mlc_model": self.model,
             "generation": "MLCEngine.completions.create",
             "representation": "TVM-compiled library with quantized weight shards",
+            "weight_storage_bits": 4,
+            "weight_storage_format": "mlc-group-quantized",
             "quantized": True,
             "build_cost": "not measured; compilation happens in the mlc_llm toolchain",
             "ttft_method": SPEC.ttft_method,

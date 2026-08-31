@@ -64,7 +64,11 @@ class Engine(TransformersBackend):
             generation="model.generate over DeepSpeed-injected kernels",
             injected_modules=self._replaced,
             injection_s=self._inject_s,
-            representation="published checkpoint, loaded at the benchmark precision",
+            representation=(
+                f"published checkpoint cast to {self._precision or '?'} tensors"
+            ),
+            weight_storage_bits=32 if self._precision == "fp32" else 16,
+            weight_storage_format=self._precision,
             quantized=False,
             ttft_method=SPEC.ttft_method,
             version=base.package_version("deepspeed"),

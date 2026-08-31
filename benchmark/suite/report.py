@@ -19,7 +19,7 @@ from typing import Any
 
 from benchmark.reporting import _bytes, _fmt, _table
 from benchmark.suite import status as status_mod
-from benchmark.suite.analysis import SAME_REPRESENTATION, SUBJECT
+from benchmark.suite.analysis import SAME_REPRESENTATION
 
 
 def _pct(value: Any, digits: int = 1) -> str:
@@ -59,7 +59,7 @@ def executive_summary(payload: dict[str, Any], analysis: dict[str, Any]) -> str:
     answered with what is missing, not left blank.
     """
     rankings = analysis["rankings"]
-    win_loss = analysis["win_loss"]
+    standings = analysis["standings"]
     lines = ["## Executive summary", ""]
 
     def leader(name: str) -> str:
@@ -68,47 +68,95 @@ def executive_summary(payload: dict[str, Any], analysis: dict[str, Any]) -> str:
             return "not determined by this run"
         head = order[0]
         value = head["value"]
-        rendered = (
-            f"{float(value):,.2f}" if isinstance(value, (int, float)) else str(value)
-        )
+        # Rendered in the metric's own units. A byte count printed as a bare number
+        # with two decimals is unreadable, and a latency printed as tok/s is wrong.
+        if name in {"host_memory", "device_memory"}:
+            rendered = _bytes(value)
+        elif name in {"ttft", "latency", "cold_start"}:
+            rendered = _seconds(value)
+        elif isinstance(value, (int, float)):
+            rendered = f"{float(value):,.2f} tok/s"
+        else:
+            rendered = str(value)
         model = head.get("model")
         return (f"**{head['engine']}** ({rendered}"
                 + (f" on {_short(model)}" if model else "") + ")")
 
-    subject_rank = _rank_of(rankings.get("batch_1", {}), SUBJECT)
-    peak_rank = _rank_of(rankings.get("peak_throughput", {}), SUBJECT)
-    same = win_loss.get("same_representation", {})
-    # When no pairing held the same representation - which happens whenever the run's
-    # precision differs from Aether's BF16 artifact residency - counting "0 of 0"
-    # would read as a result. Fall back to every valid comparison and say so.
-    counted = same if same.get("compared") else win_loss.get("all", {})
-    scope = ("same-representation comparisons" if same.get("compared")
-             else "valid comparisons, none of which held the same representation on "
-                  "both sides (see the win/loss section for why)")
+    overall = standings[0]["engine"] if standings else "not determined"
     lines += [
-        f"1. **Fastest overall** (best cell anywhere in the matrix): {leader('peak_throughput')}.",
-        f"2. **Fastest at batch 1** (the single-user case): {leader('batch_1')}.",
-        f"3. **Best batch scaling**: {_scaling_leader(rankings)}.",
-        f"4. **Where Aether wins**: {counted.get('aether_wins', 0)} of "
-        f"{counted.get('compared', 0)} {scope}. "
-        "The full list is in the win/loss section; nothing is summarized away.",
-        f"5. **Where Aether loses**: {counted.get('aether_losses', 0)} of "
-        f"{counted.get('compared', 0)}, "
-        f"plus {counted.get('ties', 0)} statistical ties.",
-        f"6. **Largest measured Aether advantage**: {_extreme(win_loss, 'largest_advantage')}.",
-        f"7. **Largest measured Aether disadvantage**: "
-        f"{_extreme(win_loss, 'largest_disadvantage')}.",
-        f"8. **Strongest Aether model**: {_best_model(analysis)}.",
-        f"9. **Memory**: {_memory_answer(analysis)}.",
+        f"1. **Best overall across the matrix**: **{overall}**"
+        + (f" - median {standings[0]['median_percent_of_best']:.0f}% of the fastest "
+           f"engine in each cell, winning {standings[0]['win_rate_percent']:.0f}% of its "
+           f"{standings[0]['compared']} pairings" if standings else "")
+        + ".",
+        f"2. **Fastest single cell anywhere in the matrix**: {leader('peak_throughput')}.",
+        f"3. **Fastest at batch 1** (the single-user case): {leader('batch_1')}.",
+        f"4. **Best batch scaling**: {_scaling_leader(rankings)}.",
+        f"5. **Lowest time to first token**: {leader('ttft')}.",
+        f"6. **Lowest single-request latency**: {leader('latency')}.",
+        f"7. **Lowest peak memory**: {leader('host_memory')}.",
+        f"8. **Fastest cold start**: {leader('cold_start')}.",
+        f"9. **Closest competitions**: {_closest_answer(analysis)}.",
         f"10. **Compilation trade-off**: {_compile_answer(analysis)}.",
         "",
-        f"Aether's own position: rank {subject_rank} at batch 1, "
-        f"rank {peak_rank} on peak throughput, out of "
-        f"{len(rankings.get('batch_1', {}).get('order') or [])} engines that produced a "
-        "batch-1 measurement.",
+        "Every one of those is a different workload, and the engine that wins one does "
+        "not necessarily win another. The standings below score the whole matrix; the "
+        "per-workload rankings are at the end of the report.",
+        "",
+        _standings_table(analysis),
         "",
     ]
     return "\n".join(lines)
+
+
+def _standings_table(analysis: dict[str, Any]) -> str:
+    """The league table: every engine's record against the whole field.
+
+    ``% of best`` is the scale-free score: in each cell, an engine's throughput as a
+    share of the fastest engine's throughput in that cell, then the median across
+    cells. It does not depend on which engine is treated as the reference, which is
+    what makes it the neutral summary.
+    """
+    standings = analysis["standings"]
+    if not standings:
+        return "_No engine produced a comparable measurement, so there are no standings._\n"
+    rows = []
+    for entry in standings:
+        rows.append([
+            str(entry["rank"]),
+            f"`{entry['engine']}`",
+            (f"{entry['median_percent_of_best']:.0f}%"
+             if entry["median_percent_of_best"] is not None else "—"),
+            f"{entry['wins']}/{entry['losses']}/{entry['ties']}",
+            f"{entry['win_rate_percent']:.0f}%",
+            _pct(entry["median_improvement_percent"]),
+            str(entry["cells_measured"]),
+            f"{entry['same_representation']}/{entry['compared']}",
+        ])
+    return _table(
+        ["Rank", "Engine", "% of best (median)", "W/L/T", "Win rate",
+         "Median difference vs field", "Cells measured",
+         "Same-representation pairings"],
+        rows,
+    )
+
+
+def _closest_answer(analysis: dict[str, Any]) -> str:
+    """How many pairings were too close to call, at each stated threshold."""
+    buckets = analysis["win_loss"].get("closest") or {}
+    everything = analysis.get("pairwise") or []
+    comparable = [item for item in everything if item["throughput"].get("comparable")]
+    if not comparable:
+        return "no comparable pairing was produced"
+    counts = []
+    for threshold in (1, 5, 10):
+        within = [
+            item for item in comparable
+            if abs(item["throughput"]["subject_improvement_percent"]) <= threshold
+        ]
+        counts.append(f"{len(within)} within {threshold}%")
+    del buckets
+    return ", ".join(counts) + f" of {len(comparable)} ordered pairings"
 
 
 def _rank_of(ranking: dict[str, Any], engine: str) -> str:
@@ -127,13 +175,12 @@ def _scaling_leader(rankings: dict[str, Any]) -> str:
             f"batch {head['batch_size']} on {_short(head['model'])}")
 
 
-def _extreme(win_loss: dict[str, Any], key: str) -> str:
+def _extreme(win_loss: dict[str, Any], key: str, engine: str) -> str:
+    """The widest margin in one engine's favour, or against it."""
     entry = win_loss.get(key)
     if not entry:
-        # No same-representation pairing exists, so fall back to the widest
-        # comparison the run did make and label what it is.
         pool = (win_loss.get("all") or {}).get(
-            "wins" if key == "largest_advantage" else "losses"
+            "won" if key == "largest_advantage" else "lost"
         ) or []
         if not pool:
             return "no comparison of this kind was produced by this run"
@@ -141,17 +188,18 @@ def _extreme(win_loss: dict[str, Any], key: str) -> str:
         entry = chooser(
             pool, key=lambda item: item["throughput"]["subject_improvement_percent"]
         )
-        rendered = _extreme_text(entry)
-        return f"{rendered} - note: this comparison crosses a representation boundary"
+        return (f"{_extreme_text(entry)} - note: this comparison crosses a "
+                "representation boundary")
     throughput = entry["throughput"]
     if key == "largest_disadvantage" and throughput["subject_improvement_percent"] >= 0:
         # Reporting a positive number under the word "disadvantage" would read as a
         # loss that did not happen. Say plainly that there was none, and give the
         # narrowest margin instead, which is the nearest thing the run measured.
         return (
-            "none - Aether was not slower in any same-representation comparison. Its "
-            f"narrowest margin was {_pct(throughput['subject_improvement_percent'])} "
-            f"against `{entry['competitor']}` on {_short(entry['model'])} at batch "
+            f"none - `{engine}` was not slower in any same-representation comparison. "
+            f"Its narrowest margin was "
+            f"{_pct(throughput['subject_improvement_percent'])} against "
+            f"`{entry['competitor']}` on {_short(entry['model'])} at batch "
             f"{entry['batch_size']}"
         )
     return _extreme_text(entry)
@@ -169,10 +217,12 @@ def _extreme_text(entry: dict[str, Any]) -> str:
     )
 
 
-def _best_model(analysis: dict[str, Any]) -> str:
-    """The model where Aether's median same-representation advantage is largest."""
+def _best_model(comparisons: list[dict[str, Any]], engine: str) -> str:
+    """The model where one engine's median advantage over the field is largest."""
+    import statistics
+
     by_model: dict[str, list[float]] = {}
-    for item in analysis["comparisons"]:
+    for item in comparisons:
         if (item["comparability"] == SAME_REPRESENTATION
                 and item["throughput"].get("comparable")):
             by_model.setdefault(item["model"], []).append(
@@ -180,7 +230,7 @@ def _best_model(analysis: dict[str, Any]) -> str:
             )
     suffix = ""
     if not by_model:
-        for item in analysis["comparisons"]:
+        for item in comparisons:
             if item["throughput"].get("comparable"):
                 by_model.setdefault(item["model"], []).append(
                     item["throughput"]["subject_improvement_percent"]
@@ -188,53 +238,55 @@ def _best_model(analysis: dict[str, Any]) -> str:
         suffix = " (comparisons cross a representation boundary)"
     if not by_model:
         return "not determined; no comparison was produced by this run"
-    import statistics
-
-    scored = {
-        model: statistics.median(values) for model, values in by_model.items()
-    }
+    scored = {model: statistics.median(values) for model, values in by_model.items()}
     best = max(scored, key=lambda key: scored[key])
     count = len(by_model[best])
+    del engine
     return (f"`{_short(best)}`, median {_pct(scored[best])} across "
             f"{count} comparison{'' if count == 1 else 's'}{suffix}")
 
 
-def _memory_answer(analysis: dict[str, Any]) -> str:
-    host = [
-        item for item in analysis["comparisons"]
-        if item["host_memory"].get("comparable")
-    ]
-    if not host:
-        return "no comparable memory measurement"
+def _memory_answer(comparisons: list[dict[str, Any]], engine: str) -> str:
     import statistics
 
+    host = [item for item in comparisons if item["host_memory"].get("comparable")]
+    if not host:
+        return "no comparable memory measurement"
     values = [item["host_memory"]["subject_improvement_percent"] for item in host]
     median = statistics.median(values)
     direction = "less" if median > 0 else "more"
-    return (f"Aether's peak process memory was a median {abs(median):.1f}% {direction} "
-            f"than its competitors' across {len(host)} "
+    return (f"`{engine}` used a median {abs(median):.1f}% {direction} peak process "
+            f"memory than the engines it was compared against, across {len(host)} "
             f"comparison{'' if len(host) == 1 else 's'} "
             f"(range {min(values):+.1f}% to {max(values):+.1f}%)")
 
 
 def _compile_answer(analysis: dict[str, Any]) -> str:
+    """The soonest *build* cost anywhere in the matrix to pay for itself.
+
+    Restricted to engines that actually have a build phase. An engine with none has no
+    compilation trade-off to report, and quoting its load time under that heading would
+    answer a different question than the one asked.
+    """
     breaks = [
         item for item in analysis["compile_economics"]["break_even"]
         if item.get("break_even_runs") is not None
+        and item.get("subject_has_build_phase")
+        and (item.get("subject_build_s") or 0.0) > 0
     ]
     if not breaks:
         return (
-            "no break-even point was computable; either Aether was not faster per "
-            "request in the measured configuration, or no competitor produced a "
-            "comparable start-up measurement"
+            "no build cost was repaid in this run; either no engine with a build phase "
+            "was both slower to start and faster per request than another, or the "
+            "start-up measurements needed for it are missing"
         )
     soonest = min(breaks, key=lambda item: item["break_even_runs"])
     return (
-        f"against `{soonest['competitor']}` on {_short(soonest['model'])}: "
-        f"{soonest['interpretation']} "
-        f"(start-up {_seconds(soonest['aether_startup_s'], 1)} against "
+        f"on {_short(soonest['model'])}, {soonest['interpretation']} "
+        f"(build {_seconds(soonest['subject_build_s'], 1)}, start-up "
+        f"{_seconds(soonest['subject_startup_s'], 1)} against "
         f"{_seconds(soonest['competitor_startup_s'], 1)}, per request "
-        f"{_seconds(soonest['aether_latency_s'])} against "
+        f"{_seconds(soonest['subject_latency_s'])} against "
         f"{_seconds(soonest['competitor_latency_s'])})"
     )
 
@@ -270,6 +322,16 @@ def methodology_section(payload: dict[str, Any], analysis: dict[str, Any]) -> st
            "Inherited from the environment and *not* controlled; the recorded value "
            "per engine is in the raw results, and CPU comparisons should be read with "
            "that in mind."),
+        "- **Accelerators.** "
+        + (f"Each engine saw {plan.get('devices')} device(s), enforced by restricting "
+           "visibility in the worker before any CUDA context was created. No engine's "
+           "placement logic was modified; each simply found that many devices. This is "
+           "what stops a runtime that shards from being measured on more hardware than "
+           "one that does not."
+           if plan.get("devices") else
+           "Device visibility was *not* restricted, so a runtime that shards may have "
+           "used more hardware than one that does not. Each engine's device record is "
+           "in the raw results."),
         f"- **Iterations.** {plan.get('warmup_iters')} warm-up iterations, executed and "
         f"discarded, then {plan.get('measure_iters')} measured iterations per cell. "
         "The first unwarmed call is reported separately as cold latency and is never "
@@ -369,11 +431,18 @@ def environment_section(payload: dict[str, Any]) -> str:
         ["Property", "Value"],
         [
             ["Accelerator class", str(hardware.get("accelerator"))],
-            ["Native bf16 on this device", _fmt(hardware.get("bf16_native"))],
+            ["Accelerators present", _fmt(hardware.get("gpu_count"))],
+            ["Compute capability",
+             ", ".join(hardware.get("compute_capabilities") or []) or "-"],
+            ["bf16 tensor cores (capability >= 8.0)",
+             _fmt(hardware.get("bf16_native"))],
             ["Native fp16 on this device", _fmt(hardware.get("fp16_native"))],
             ["Benchmark precision", str(plan.get("resolved_precision"))],
             ["Precision chosen because", str(plan.get("precision_reason"))],
             ["Threads pinned to", _fmt(plan.get("threads"))],
+            ["Accelerators visible per engine",
+             _fmt(plan.get("devices")) if plan.get("devices") else "unrestricted"],
+            ["Native bf16 per torch", _fmt(hardware.get("torch_reports_bf16"))],
             ["Suite version", str(payload.get("suite_version"))],
             ["Invocation", f"`{plan.get('invocation') or 'not recorded'}`"],
         ],
@@ -592,109 +661,170 @@ def _sweep_table(analysis: dict[str, Any], model_id: str) -> str:
 
 
 def _model_comparison_table(analysis: dict[str, Any], model_id: str) -> str:
+    """Every engine on this model against the fastest engine in the same cell.
+
+    The comparison is against whichever engine was quickest in that cell, so the
+    reference changes per row and no engine is permanently the yardstick. The fastest
+    engine's own row compares it against the runner-up, which is the only comparison
+    that tells you anything about it.
+    """
     rows = []
-    for item in analysis["comparisons"]:
-        if item["model"] != model_id:
+    grouped: dict[tuple[int, int, int], dict[str, float]] = {}
+    for row in analysis["rows"]:
+        if row.get("model") != model_id or row.get("batch_size") is None:
             continue
-        throughput = item["throughput"]
-        rows.append([
-            str(item["batch_size"]),
-            f"`{item['competitor']}`",
-            _fmt(throughput.get("subject")),
-            _fmt(throughput.get("other")),
-            _pct(throughput.get("subject_improvement_percent")),
-            _pct(item["latency"].get("subject_improvement_percent")),
-            _pct(item["host_memory"].get("subject_improvement_percent")),
-            item["winner"],
-            "same" if item["comparability"] == SAME_REPRESENTATION else "differs",
-        ])
-    rows.sort(key=lambda item: (int(item[0]), item[1]))
+        if not status_mod.is_measured(row) or not row.get(analysis["primary_metric"]):
+            continue
+        key = (int(row["batch_size"]), int(row["prompt_tokens"]),
+               int(row["output_tokens"]))
+        grouped.setdefault(key, {})[row["engine"]] = float(
+            row[analysis["primary_metric"]]
+        )
+    for key in sorted(grouped):
+        ranked = sorted(grouped[key].items(), key=lambda pair: -pair[1])
+        for position, (engine, value) in enumerate(ranked, start=1):
+            # Compare against the leader, except for the leader itself, which is
+            # compared against the engine immediately behind it.
+            reference_engine, reference = ranked[1] if position == 1 else ranked[0]
+            difference = (value - reference) / reference * 100.0 if reference else None
+            rows.append([
+                f"b{key[0]} p{key[1]} o{key[2]}",
+                str(position),
+                f"`{engine}`",
+                _fmt(value),
+                f"`{reference_engine}`",
+                _pct(difference),
+            ])
+    if not rows:
+        return "_No engine produced a comparable measurement on this model._\n"
     return _table(
-        ["Batch", "Competitor", "Aether tok/s", "Competitor tok/s",
-         "Aether throughput", "Aether latency", "Aether memory", "Winner",
-         "Representation"],
+        ["Cell", "Rank", "Engine", "tok/s", "Compared against", "Difference"],
         rows,
     )
 
 
 def headline_tables(analysis: dict[str, Any]) -> str:
-    """The two tables the charter asks for by name.
+    """Who won each cell, and the full ordered pairwise matrix.
 
-    The first is Aether against the *best* competitor in every cell, which is the
-    hardest comparison available and therefore the only honest headline. The second is
-    Aether's position against each named competitor, with empty cells where the
-    comparison was not valid rather than a fabricated number.
+    The first table names the fastest engine in every cell and the margin over the
+    runner-up: the neutral answer to "who is fastest here". The second is the complete
+    matrix - every engine's median difference against every other - so no pairing is
+    privileged and none is omitted. A dash means the pairing was never comparable,
+    which is not the same as a zero.
     """
-    best_rows = []
-    grouped: dict[tuple[str, int, int, int], list[dict[str, Any]]] = {}
-    for item in analysis["comparisons"]:
-        if item["throughput"].get("comparable"):
-            key = (item["model"], item["batch_size"], item["prompt_tokens"],
-                   item["output_tokens"])
-            grouped.setdefault(key, []).append(item)
+    metric = analysis["primary_metric"]
+    grouped: dict[tuple[str, int, int, int], dict[str, float]] = {}
+    for row in analysis["rows"]:
+        if row.get("batch_size") is None or not status_mod.is_measured(row):
+            continue
+        if not row.get(metric):
+            continue
+        key = (row["model"], int(row["batch_size"]), int(row["prompt_tokens"]),
+               int(row["output_tokens"]))
+        grouped.setdefault(key, {})[row["engine"]] = float(row[metric])
+
+    winner_rows = []
     for key in sorted(grouped):
-        entries = grouped[key]
-        best = max(entries, key=lambda item: item["throughput"]["other"])
-        best_rows.append([
+        ranked = sorted(grouped[key].items(), key=lambda pair: -pair[1])
+        leader, best = ranked[0]
+        runner_up, second = ranked[1] if len(ranked) > 1 else (None, None)
+        margin = (best - second) / second * 100.0 if second else None
+        winner_rows.append([
             _short(key[0]),
-            str(key[1]),
-            _fmt(best["throughput"]["subject"]),
-            f"`{best['competitor']}`",
-            _fmt(best["throughput"]["other"]),
-            _pct(best["throughput"]["subject_improvement_percent"]),
-            "Aether" if best["winner"] == "aether"
-            else ("tie" if best["winner"] == "tie" else best["competitor"]),
+            f"b{key[1]}",
+            f"p{key[2]}/o{key[3]}",
+            f"**{leader}**",
+            _fmt(best),
+            f"`{runner_up}`" if runner_up else "—",
+            _fmt(second),
+            _pct(margin) if margin is not None else "—",
+            str(len(ranked)),
         ])
 
-    competitors = sorted(analysis["per_competitor"])
+    engines = analysis.get("engines_measured") or []
     matrix_rows = []
-    for key in sorted(grouped):
-        entries = {item["competitor"]: item for item in grouped[key]}
-        subject = next(iter(grouped[key]))["throughput"]["subject"]
-        ranked = sorted(
-            [(item["competitor"], item["throughput"]["other"]) for item in grouped[key]]
-            + [(SUBJECT, subject)],
-            key=lambda pair: -pair[1],
-        )
-        position = next(
-            index for index, pair in enumerate(ranked, start=1) if pair[0] == SUBJECT
-        )
-        row = [_short(key[0]), str(key[1]), f"{position}", f"{len(ranked)}"]
-        for competitor in competitors:
-            item = entries.get(competitor)
+    for engine in engines:
+        entry = (analysis["per_engine"].get(engine) or {}).get("per_competitor") or {}
+        row = [f"`{engine}`"]
+        for other in engines:
+            if other == engine:
+                row.append("—")
+                continue
+            record = entry.get(other)
             row.append(
-                _pct(item["throughput"]["subject_improvement_percent"]) if item else "—"
+                _pct(record["median_improvement_percent"]) if record else "—"
             )
         matrix_rows.append(row)
 
     return "\n".join([
-        "## Headline comparison",
+        "## Who won each cell",
         "",
-        "Aether against the fastest engine that produced a measurement in each cell. "
-        "A cell where Aether is not the winner says so.",
-        "",
-        _table(
-            ["Model", "Batch", "Aether tok/s", "Best competitor",
-             "Best competitor tok/s", "Aether vs best", "Winner"],
-            best_rows,
-        ),
-        "",
-        "Aether's rank in each cell, and its position against every engine "
-        "individually. A dash means the comparison was not valid, which is not the "
-        "same as a zero.",
+        "The fastest engine in every measured configuration, and how far ahead of the "
+        "runner-up it was. `engines` is how many produced a comparable measurement "
+        "there - a cell with fewer engines is an easier cell to lead.",
         "",
         _table(
-            ["Model", "Batch", "Aether rank", "Engines compared",
-             *[f"vs {name}" for name in competitors]],
-            matrix_rows,
+            ["Model", "Batch", "Workload", "Fastest", "tok/s", "Runner-up", "tok/s",
+             "Margin", "Engines"],
+            winner_rows,
         ),
+        "",
+        "### Pairwise matrix",
+        "",
+        "Median difference of the row engine against the column engine, over every "
+        "cell both measured. Positive means the row engine was faster. Every pairing "
+        "appears in both directions, so the matrix is anti-symmetric by construction "
+        "and no engine holds a privileged position in it.",
+        "",
+        _table(["Engine", *[f"vs {name}" for name in engines]], matrix_rows),
         "",
     ])
 
 
 def win_loss_section(analysis: dict[str, Any]) -> str:
-    """Wins, losses, ties and invalid comparisons, in that order and equal detail."""
-    win_loss = analysis["win_loss"]
+    """Head-to-head results, one subsection per engine, in identical detail.
+
+    Every measured engine gets the same treatment: its record against the field, the
+    cells it won, the cells it lost, the ties, and the pairings that could not be made.
+    The sections are generated by one loop over the engine list, so there is no way for
+    one engine to receive a fuller or a kinder accounting than another.
+    """
+    engines = analysis.get("engines_measured") or []
+    focus = analysis.get("focus")
+    shown = [focus] if focus and focus in engines else engines
+    parts = [
+        "## Head-to-head results",
+        "",
+        f"A difference of at most {analysis['tie_threshold_percent']:.0f}% is reported "
+        "as a tie, because run-to-run variation at these iteration counts is of that "
+        "order and a smaller gap is not evidence of a difference.",
+        "",
+        "Each engine below is scored against every other engine it shared a measured "
+        "cell with. The same code produces every subsection.",
+        "",
+    ]
+    if focus and focus in engines:
+        parts += [
+            f"_Only `{focus}` is shown, because the run was invoked with "
+            f"`--focus {focus}`. Every other engine's record is in the standings table "
+            "and in `benchmark_comparisons.csv`._",
+            "",
+        ]
+    if not shown:
+        parts += ["_No engine produced a comparable measurement._", ""]
+        return "\n".join(parts)
+    for engine in shown:
+        parts += _engine_head_to_head(analysis, engine)
+    return "\n".join(parts)
+
+
+def _engine_head_to_head(analysis: dict[str, Any], engine: str) -> list[str]:
+    """One engine's full record: wins, losses, ties, gaps, aggregated opponents."""
+    view = analysis["per_engine"].get(engine) or {}
+    win_loss = view.get("win_loss") or {}
+    everything = win_loss.get("all") or {}
+    same = win_loss.get("same_representation") or {}
+    different = win_loss.get("representation_difference") or {}
 
     def render(entries: list[dict[str, Any]]) -> str:
         rows = [
@@ -714,84 +844,81 @@ def win_loss_section(analysis: dict[str, Any]) -> str:
             )
         ]
         return _table(
-            ["Model", "Batch", "Workload", "Competitor", "Aether tok/s",
-             "Competitor tok/s", "Difference", "Representation"],
+            ["Model", "Batch", "Workload", "Opponent", f"{engine} tok/s",
+             "Opponent tok/s", "Difference", "Representation"],
             rows,
         )
 
-    everything = win_loss["all"]
-    same = win_loss["same_representation"]
-    different = win_loss["representation_difference"]
     parts = [
-        "## Aether win/loss analysis",
-        "",
-        f"A difference of at most {analysis['tie_threshold_percent']:.0f}% is reported "
-        "as a tie, because run-to-run variation at these iteration counts is of that "
-        "order and a smaller gap is not evidence of a difference.",
+        f"### `{engine}`",
         "",
         _table(
-            ["Comparison set", "Compared", "Aether wins", "Aether loses", "Ties"],
+            ["Comparison set", "Compared", "Won", "Lost", "Tied"],
             [
-                ["All valid comparisons", str(everything["compared"]),
-                 str(everything["aether_wins"]), str(everything["aether_losses"]),
-                 str(everything["ties"])],
+                ["All valid comparisons", str(everything.get("compared", 0)),
+                 str(everything.get("wins", 0)), str(everything.get("losses", 0)),
+                 str(everything.get("ties", 0))],
                 ["Same representation (supports execution claims)",
-                 str(same["compared"]), str(same["aether_wins"]),
-                 str(same["aether_losses"]), str(same["ties"])],
-                ["Representation differs (does not)", str(different["compared"]),
-                 str(different["aether_wins"]), str(different["aether_losses"]),
-                 str(different["ties"])],
+                 str(same.get("compared", 0)), str(same.get("wins", 0)),
+                 str(same.get("losses", 0)), str(same.get("ties", 0))],
+                ["Representation differs (does not)", str(different.get("compared", 0)),
+                 str(different.get("wins", 0)), str(different.get("losses", 0)),
+                 str(different.get("ties", 0))],
             ],
         ),
         "",
-        "### Where Aether wins",
+        f"- Largest advantage: {_extreme(win_loss, 'largest_advantage', engine)}.",
+        f"- Largest disadvantage: {_extreme(win_loss, 'largest_disadvantage', engine)}.",
+        f"- Strongest model: {_best_model(view.get('comparisons') or [], engine)}.",
+        f"- Memory: {_memory_answer(view.get('comparisons') or [], engine)}.",
         "",
-        render(everything["wins"]) if everything["wins"] else "_No cell._\n",
+        f"#### Cells `{engine}` won",
         "",
-        "### Where Aether loses",
+        render(everything.get("won") or []) if everything.get("won") else "_No cell._\n",
         "",
-        render(everything["losses"]) if everything["losses"] else "_No cell._\n",
+        f"#### Cells `{engine}` lost",
         "",
-        "### Statistical ties",
+        render(everything.get("lost") or []) if everything.get("lost") else "_No cell._\n",
         "",
-        render(everything["tied"]) if everything["tied"] else "_No cell._\n",
+        f"#### Statistical ties for `{engine}`",
         "",
-        "### Closest competitions",
+        render(everything.get("tied") or []) if everything.get("tied") else "_No cell._\n",
+        "",
+        f"#### `{engine}` against each opponent, aggregated",
+        "",
+        _per_competitor_table(view.get("per_competitor") or {}, engine),
         "",
     ]
-    for label, entries in win_loss["closest"].items():
-        threshold = label.replace("within_", "").replace("_percent", "")
-        parts.append(f"- within ±{threshold}%: **{len(entries)}** comparisons")
-    parts += ["", "### Comparisons that could not be made", ""]
-    incomparable = win_loss["incomparable"]
+    incomparable = win_loss.get("incomparable") or []
     if incomparable:
-        parts.append(_table(
-            ["Model", "Batch", "Competitor", "Reason"],
-            [[_short(item["model"]), str(item["batch_size"]),
-              f"`{item['competitor']}`", item["reason"]] for item in incomparable],
-        ))
-    else:
-        parts.append("_Every attempted pairing produced a comparison._\n")
-    parts += ["", "### Aether against each competitor, aggregated", "",
-              _per_competitor_table(analysis), ""]
-    return "\n".join(parts)
+        parts += [
+            f"#### Pairings `{engine}` could not be compared on",
+            "",
+            _table(
+                ["Model", "Batch", "Opponent", "Reason"],
+                [[_short(item["model"]), str(item["batch_size"]),
+                  f"`{item['competitor']}`", item["reason"]] for item in incomparable],
+            ),
+            "",
+        ]
+    return parts
 
 
-def _per_competitor_table(analysis: dict[str, Any]) -> str:
+def _per_competitor_table(per_competitor: dict[str, Any], engine: str) -> str:
     rows = []
-    for engine, entry in sorted(analysis["per_competitor"].items()):
+    for opponent, entry in sorted(per_competitor.items()):
         rows.append([
-            f"`{engine}`",
+            f"`{opponent}`",
             str(entry["cells"]),
             _pct(entry["median_improvement_percent"]),
             _pct(entry.get("median_improvement_percent_same_representation")),
             f"{_pct(entry['min_improvement_percent'])} to "
             f"{_pct(entry['max_improvement_percent'])}",
-            f"{entry['aether_wins']}/{entry['aether_losses']}/{entry['ties']}",
+            f"{entry['wins']}/{entry['losses']}/{entry['ties']}",
             "same" if entry["comparability"] == SAME_REPRESENTATION else "differs",
         ])
     return _table(
-        ["Competitor", "Cells", "Median Aether difference",
+        ["Opponent", "Cells", f"Median {engine} difference",
          "Median, same representation only", "Range", "W/L/T", "Representation"],
         rows,
     )
@@ -842,20 +969,22 @@ def compile_section(analysis: dict[str, Any]) -> str:
         "",
         "Solved from the measured start-up costs and the measured per-request latency: "
         "with a fixed start-up S and per-request cost L on each side, the totals cross "
-        "at N = (S_aether - S_other) / (L_other - L_aether). A blank means Aether was "
-        "not faster per request there, so no number of requests would repay the build.",
+        "at N = (S_row - S_column) / (L_column - L_row). Computed for every ordered "
+        "pair, so the question can be asked of any engine. A blank means the row engine "
+        "was not faster per request there, so no number of requests would repay its "
+        "build.",
         "",
         _table(
-            ["Model", "Competitor", "Aether start-up", "Competitor start-up",
-             "Aether latency", "Competitor latency", "Break-even requests",
-             "Reading"],
+            ["Model", "Engine", "Opponent", "Engine start-up", "Opponent start-up",
+             "Engine latency", "Opponent latency", "Break-even requests", "Reading"],
             [
                 [
                     _short(item["model"]),
+                    f"`{item['subject']}`",
                     f"`{item['competitor']}`",
-                    _seconds(item["aether_startup_s"], 1),
+                    _seconds(item["subject_startup_s"], 1),
                     _seconds(item["competitor_startup_s"], 1),
-                    _seconds(item["aether_latency_s"]),
+                    _seconds(item["subject_latency_s"]),
                     _seconds(item["competitor_latency_s"]),
                     (f"{item['break_even_runs']:.0f}"
                      if item.get("break_even_runs") is not None else "—"),
@@ -1057,49 +1186,69 @@ def rankings_section(analysis: dict[str, Any]) -> str:
 
 
 def cross_model_section(analysis: dict[str, Any]) -> str:
-    """Whether Aether's position depends on the model, the batch, or the length."""
+    """Whether the ordering of the field depends on the configuration.
+
+    Asked of the whole field rather than of one engine: for each slice of the matrix,
+    which engine led, how far ahead of the field's median it was, and how wide the
+    spread was. An engine that leads everywhere is a general result; one that leads only
+    at batch 16, or only on one model, is a conditional one, and this is the section
+    that tells them apart.
+    """
     import statistics as stats_mod
 
-    def group(field: str) -> list[list[str]]:
-        buckets: dict[Any, list[float]] = {}
-        for item in analysis["comparisons"]:
-            if (item["comparability"] == SAME_REPRESENTATION
-                    and item["throughput"].get("comparable")):
-                buckets.setdefault(item[field], []).append(
-                    item["throughput"]["subject_improvement_percent"]
-                )
-        return [
-            [
-                _short(str(key)) if field == "model" else str(key),
-                str(len(values)),
-                _pct(stats_mod.median(values)),
-                f"{_pct(min(values))} to {_pct(max(values))}",
-            ]
-            for key, values in sorted(buckets.items(), key=lambda item: str(item[0]))
-        ]
+    metric = analysis["primary_metric"]
+    measured = [
+        row for row in analysis["rows"]
+        if status_mod.is_measured(row) and row.get(metric)
+        and row.get("batch_size") is not None
+    ]
 
+    def group(field: str) -> list[list[str]]:
+        buckets: dict[Any, dict[str, list[float]]] = {}
+        for row in measured:
+            buckets.setdefault(row[field], {}).setdefault(row["engine"], []).append(
+                float(row[metric])
+            )
+        rows = []
+        for key, engines_here in sorted(buckets.items(), key=lambda item: str(item[0])):
+            medians = {
+                engine: stats_mod.median(values)
+                for engine, values in engines_here.items()
+            }
+            ordered = sorted(medians.items(), key=lambda pair: -pair[1])
+            leader, best = ordered[0]
+            slowest = ordered[-1][1]
+            field_median = stats_mod.median(list(medians.values()))
+            rows.append([
+                _short(str(key)) if field == "model" else str(key),
+                str(len(medians)),
+                f"**{leader}**",
+                _fmt(best),
+                _pct((best / field_median - 1.0) * 100.0 if field_median else None),
+                (f"{best / slowest:.2f}x" if slowest else "—"),
+            ])
+        return rows
+
+    headers = ["Engines", "Fastest", "tok/s (median)", "vs field median",
+               "Fastest / slowest"]
     return "\n".join([
-        "## Cross-model analysis",
+        "## Cross-configuration analysis",
         "",
-        "Whether Aether's measured advantage is a property of the runtime or of the "
-        "configuration. Same-representation comparisons only, since those are the ones "
-        "that describe execution.",
+        "Whether the ordering of the field is a property of the engines or of the "
+        "configuration. Each row is a slice of the matrix: which engine led it, and how "
+        "wide the field was.",
         "",
         "**By model**", "",
-        _table(["Model", "Comparisons", "Median Aether difference", "Range"],
-               group("model")),
+        _table(["Model", *headers], group("model")),
         "",
         "**By batch width**", "",
-        _table(["Batch", "Comparisons", "Median Aether difference", "Range"],
-               group("batch_size")),
+        _table(["Batch", *headers], group("batch_size")),
         "",
         "**By prompt length**", "",
-        _table(["Prompt tokens", "Comparisons", "Median Aether difference", "Range"],
-               group("prompt_tokens")),
+        _table(["Prompt tokens", *headers], group("prompt_tokens")),
         "",
         "**By output length**", "",
-        _table(["Output tokens", "Comparisons", "Median Aether difference", "Range"],
-               group("output_tokens")),
+        _table(["Output tokens", *headers], group("output_tokens")),
         "",
     ])
 
@@ -1125,6 +1274,25 @@ LIMITATIONS: tuple[str, ...] = (
     "framework engines. Their rows are measured and reported because they are how "
     "people actually deploy, and every percentage derived from them is labelled "
     "REPRESENTATION_DIFFERENCE.",
+    "Comparability is judged on compute precision and on weight storage width. Two "
+    "engines at the same compute precision holding the same 16-bit width in different "
+    "containers - fp16 tensors against Aether's bf16 artifact, both derived from the "
+    "same published bf16 checkpoint - are treated as comparable, with the storage "
+    "difference printed next to every such comparison. That is a judgement, not a "
+    "measurement: each side is one rounding step from the checkpoint, in a different "
+    "direction, and a reader who wants the bit-exact configuration should run "
+    "--precision bf16 on hardware with bf16 tensor cores.",
+    "The benchmark precision is the widest 16-bit format the whole field can execute "
+    "on the detected device. On pre-Ampere CUDA that is fp16, because engines in this "
+    "field refuse bf16 below compute capability 8.0 - choosing bf16 there would exclude "
+    "them rather than measure them. The consequence is that a pre-Ampere run is not the "
+    "weight-exact configuration; --precision bf16 is, at the cost of those engines.",
+    "Every engine sees the same number of accelerators, one by default, enforced by "
+    "restricting device visibility in each worker rather than by altering any engine's "
+    "placement logic. A runtime that would shard across several devices therefore runs "
+    "single-device here. That is what makes the comparison a comparison of engines; it "
+    "is also not a measurement of what that runtime can do with more hardware, which "
+    "this run does not test. Raise --devices to measure that deliberately.",
     "Serving engines reserve device memory by policy rather than by need, so their "
     "peak-memory rows describe a reservation, not a working set. The reservation "
     "fraction is recorded with each result.",
@@ -1132,10 +1300,11 @@ LIMITATIONS: tuple[str, ...] = (
     "measurement, through public configuration flags, because the benchmark issues one "
     "prompt repeatedly and both would return a cached answer instead of running "
     "inference. Both overrides are recorded per engine; no other default is changed.",
-    "Aether's compiled artifact stores weights at BF16 by default, so at fp16 or fp32 "
-    "it is not holding bit-identical values to the published checkpoint the framework "
-    "engines load. Where the hardware supports bf16 natively, bf16 is the primary "
-    "configuration for exactly this reason.",
+    "torch.compile is attempted with whole-graph capture first and falls back to "
+    "graph-broken compilation when the model or the generation loop is not capturable "
+    "in one piece. The configuration that compiled is recorded per model; a row that "
+    "fell back is doing less compilation than one that did not, and the two should not "
+    "be read as the same engine.",
     "Build costs are measured once per engine per model on this machine. A first-time "
     "compile on a shared host includes filesystem and network variance that a "
     "repeated compile would not, so a single build time is a weaker measurement than "
@@ -1207,12 +1376,14 @@ def build_report(payload: dict[str, Any], analysis: dict[str, Any],
                  charts: dict[str, Any]) -> str:
     """Assemble the whole document from whichever sections the run supports."""
     plan = payload.get("plan") or {}
+    devices = plan.get("devices")
     parts = [
-        "# Aether Runtime Inference Benchmark Report",
+        "# Inference Engine Benchmark Report",
         "",
         f"Generated: {payload.get('generated_at', '—')}  ",
         f"Suite version: {payload.get('suite_version')}  ",
         f"Benchmark precision: {plan.get('resolved_precision')}  ",
+        f"Accelerators visible to each engine: {devices if devices else 'unrestricted'}  ",
         f"Models: {len(plan.get('models') or [])}  "
         f"Engines attempted: {len(plan.get('engines') or [])}",
         "",
@@ -1222,6 +1393,13 @@ def build_report(payload: dict[str, Any], analysis: dict[str, Any],
         "some are serving engines - and the section below classifies each one, because "
         "the comparison only means what it says if the reader knows what is being "
         "compared.",
+        "",
+        "Every engine is scored by the same code. The standings, the rankings and the "
+        "pairwise matrix are computed for each engine identically, and no engine "
+        "occupies a privileged position in any of them. The suite lives in the Aether "
+        "Runtime repository, which is why Aether is in the field; it is not why any "
+        "number here comes out the way it does, and where Aether loses the report says "
+        "so in the same words it uses when Aether wins.",
         "",
         executive_summary(payload, analysis),
         "",
@@ -1367,40 +1545,49 @@ def write_csv(analysis: dict[str, Any], path: Path) -> str:
 
 
 def write_comparison_csv(analysis: dict[str, Any], path: Path) -> str:
-    """Write the win/loss matrix as its own table, one row per comparison."""
+    """Write the full pairwise matrix, one row per ordered pair per cell.
+
+    Ordered pairs, so every comparison appears from both sides and the file carries no
+    assumption about which engine is the subject of interest. Column names name
+    positions, not engines.
+    """
     import csv
 
     columns = (
-        "model", "batch_size", "prompt_tokens", "output_tokens", "competitor",
-        "comparability", "winner", "aether_tokens_per_s", "competitor_tokens_per_s",
-        "aether_improvement_percent", "aether_latency_improvement_percent",
-        "aether_host_memory_improvement_percent",
-        "aether_device_memory_improvement_percent", "aether_ttft_improvement_percent",
+        "model", "batch_size", "prompt_tokens", "output_tokens", "subject",
+        "competitor", "comparability", "comparability_note", "winner",
+        "subject_tokens_per_s", "competitor_tokens_per_s",
+        "subject_improvement_percent", "subject_latency_improvement_percent",
+        "subject_host_memory_improvement_percent",
+        "subject_device_memory_improvement_percent",
+        "subject_ttft_improvement_percent",
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(columns))
         writer.writeheader()
-        for item in analysis["comparisons"]:
+        for item in analysis.get("pairwise") or analysis["comparisons"]:
             writer.writerow({
                 "model": item["model"],
                 "batch_size": item["batch_size"],
                 "prompt_tokens": item["prompt_tokens"],
                 "output_tokens": item["output_tokens"],
+                "subject": item.get("subject"),
                 "competitor": item["competitor"],
                 "comparability": item["comparability"],
+                "comparability_note": item.get("comparability_note"),
                 "winner": item["winner"],
-                "aether_tokens_per_s": item["throughput"].get("subject"),
+                "subject_tokens_per_s": item["throughput"].get("subject"),
                 "competitor_tokens_per_s": item["throughput"].get("other"),
-                "aether_improvement_percent":
+                "subject_improvement_percent":
                     item["throughput"].get("subject_improvement_percent"),
-                "aether_latency_improvement_percent":
+                "subject_latency_improvement_percent":
                     item["latency"].get("subject_improvement_percent"),
-                "aether_host_memory_improvement_percent":
+                "subject_host_memory_improvement_percent":
                     item["host_memory"].get("subject_improvement_percent"),
-                "aether_device_memory_improvement_percent":
+                "subject_device_memory_improvement_percent":
                     item["device_memory"].get("subject_improvement_percent"),
-                "aether_ttft_improvement_percent":
+                "subject_ttft_improvement_percent":
                     item["ttft"].get("subject_improvement_percent"),
             })
     return path.name
@@ -1411,19 +1598,20 @@ def terminal_summary(payload: dict[str, Any], analysis: dict[str, Any],
     """The concise summary printed when the run finishes.
 
     Deliberately the same numbers as the report's executive summary, read from the same
-    analysis, so the terminal and the document can never disagree.
+    analysis, so the terminal and the document can never disagree. Every measured engine
+    appears; none is singled out.
     """
     rankings = analysis["rankings"]
-    win_loss = analysis["win_loss"]["all"]
-    same = analysis["win_loss"]["same_representation"]
-    lines = ["", "=" * 72, "AETHER BENCHMARK SUMMARY", "=" * 72, ""]
+    standings = analysis["standings"]
+    lines = ["", "=" * 78, "BENCHMARK SUMMARY", "=" * 78, ""]
 
     for label, key, unit in (
-        ("Best batch-1 engine", "batch_1", "tok/s"),
+        ("Best at batch 1", "batch_1", "tok/s"),
         ("Best peak throughput", "peak_throughput", "tok/s"),
-        ("Best TTFT", "ttft", "s"),
-        ("Best latency", "latency", "s"),
-        ("Best host memory", "host_memory", "bytes"),
+        ("Lowest TTFT", "ttft", "s"),
+        ("Lowest latency", "latency", "s"),
+        ("Lowest host memory", "host_memory", "bytes"),
+        ("Fastest cold start", "cold_start", "s"),
     ):
         order = (rankings.get(key) or {}).get("order") or []
         if not order:
@@ -1438,45 +1626,62 @@ def terminal_summary(payload: dict[str, Any], analysis: dict[str, Any],
         )
         lines.append(f"  {label:22s} {head['engine']}  ({rendered})")
 
-    lines += ["", "  Aether:"]
-    lines.append(f"    batch-1 rank        {_rank_of(rankings.get('batch_1', {}), SUBJECT)}"
-                 f" / {len(rankings.get('batch_1', {}).get('order') or [])}")
-    subject_batch1 = next(
-        (entry["value"] for entry in (rankings.get("batch_1") or {}).get("order") or []
-         if entry["engine"] == SUBJECT), None
-    )
-    subject_peak = next(
-        (entry["value"] for entry in (rankings.get("peak_throughput") or {}).get("order") or []
-         if entry["engine"] == SUBJECT), None
-    )
-    lines.append("    batch-1 throughput  "
-                 + (f"{float(subject_batch1):,.2f} tok/s" if subject_batch1 else "not measured"))
-    lines.append("    best throughput     "
-                 + (f"{float(subject_peak):,.2f} tok/s" if subject_peak else "not measured"))
-
-    lines += ["", "  Aether against each engine (median across cells):"]
-    if analysis["per_competitor"]:
-        for engine, entry in sorted(analysis["per_competitor"].items()):
-            marker = "" if entry["comparability"] == SAME_REPRESENTATION \
-                else "   [representation differs]"
+    lines += ["", "  Standings (median share of the fastest engine per cell):", ""]
+    if standings:
+        lines.append(f"    {'#':>2}  {'engine':18s} {'% of best':>9s}  "
+                     f"{'W/L/T':>10s}  {'win rate':>8s}  cells")
+        for entry in standings:
+            share = (f"{entry['median_percent_of_best']:.0f}%"
+                     if entry["median_percent_of_best"] is not None else "-")
+            record = f"{entry['wins']}/{entry['losses']}/{entry['ties']}"
             lines.append(
-                f"    vs {engine:16s} {entry['median_improvement_percent']:+7.1f}%"
-                f"   W/L/T {entry['aether_wins']}/{entry['aether_losses']}/"
-                f"{entry['ties']}{marker}"
+                f"    {entry['rank']:>2}  {entry['engine']:18s} {share:>9s}  "
+                f"{record:>10s}  {entry['win_rate_percent']:>7.0f}%  "
+                f"{entry['cells_measured']}"
             )
     else:
-        lines.append("    no valid comparison was produced by this run")
+        lines.append("    no engine produced a comparable measurement")
 
-    lines += [
-        "",
-        f"  Wins {win_loss['aether_wins']}   Losses {win_loss['aether_losses']}   "
-        f"Ties {win_loss['ties']}   (of {win_loss['compared']} valid comparisons)",
-        f"  Same-representation only: wins {same['aether_wins']}, "
-        f"losses {same['aether_losses']}, ties {same['ties']} of {same['compared']}",
-        "",
-        "  Outputs:",
+    lines += ["", "  Pairwise medians (row engine against column engine):", ""]
+    engines = analysis.get("engines_measured") or []
+    if len(engines) > 1:
+        header = "    " + " " * 18 + "".join(f"{name[:9]:>11s}" for name in engines)
+        lines.append(header)
+        for engine in engines:
+            entry = (analysis["per_engine"].get(engine) or {}).get("per_competitor") or {}
+            cells = []
+            for other in engines:
+                if other == engine:
+                    cells.append(f"{'-':>11s}")
+                    continue
+                record = entry.get(other)
+                cells.append(
+                    f"{record['median_improvement_percent']:>+10.1f}%" if record
+                    else f"{'n/a':>11s}"
+                )
+            lines.append(f"    {engine:18s}" + "".join(cells))
+    else:
+        lines.append("    fewer than two engines produced a comparable measurement")
+
+    unmeasured = [
+        entry for entry in analysis["compatibility"]
+        if entry["status"] != status_mod.MEASURED
     ]
+    if unmeasured:
+        lines += ["", "  Not measured (reason, not a zero):"]
+        seen: set[tuple[str, str]] = set()
+        for entry in unmeasured:
+            key = (entry["engine"], str(entry["status"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(
+                f"    {entry['engine']:18s} {entry['status']:15s} "
+                f"{str(entry.get('reason') or '')[:70]}"
+            )
+
+    lines += ["", "  Outputs:"]
     for label, value in paths.items():
         lines.append(f"    {label:22s} {value}")
-    lines += ["", "=" * 72, ""]
+    lines += ["", "=" * 78, ""]
     return "\n".join(lines)

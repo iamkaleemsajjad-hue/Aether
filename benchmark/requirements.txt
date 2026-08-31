@@ -18,13 +18,23 @@ huggingface-hub>=0.27.0  # model download and revision resolution
 # absent as NOT_INSTALLED rather than pulling it in, because installing a serving
 # engine changes the environment every other engine is then measured in.
 #
+# One transformers version has to serve the whole field, and the ONNX exporter is the
+# component with the narrowest range: optimum's ONNX path declares transformers<4.58 and
+# imports a symbol that transformers 5.x removed. On an image that ships 5.x, pin it
+# *after* installing the engines, or ONNX Runtime fails at load:
+#
+#   pip install "transformers==4.57.1"
+#
 # Install only what the host can genuinely run:
 #   pip install "optimum[onnxruntime]"        # ONNX Runtime  (CPU or GPU build)
 #   pip install "optimum[openvino]"           # OpenVINO      (Intel CPU / iGPU)
 #   pip install llama-cpp-python              # llama.cpp     (needs a GGUF)
 #   pip install vllm                          # vLLM          (NVIDIA only)
-#   pip install "sglang[all]"                 # SGLang        (NVIDIA only)
-#   pip install tensorrt-llm                   # TensorRT-LLM  (NVIDIA only)
-#   pip install deepspeed                      # DeepSpeed     (NVIDIA only)
-#   pip install exllamav2                      # ExLlamaV2     (needs EXL2 weights)
-#   pip install mlc-llm-nightly                # MLC LLM       (needs a compiled model)
+#   pip install "sglang[all]"                 # SGLang        (NVIDIA, capability 8.0+)
+#   pip install tensorrt-llm                  # TensorRT-LLM  (NVIDIA, capability 8.0+)
+#   pip install deepspeed                     # DeepSpeed     (NVIDIA; policy-dependent)
+#   pip install exllamav2                     # ExLlamaV2     (needs EXL2 weights)
+#   pip install mlc-llm-nightly               # MLC LLM       (needs a compiled model)
+#
+# Engines with a hardware floor report NOT_APPLICABLE with the host's compute
+# capability rather than telling you to install something that could not then run.

@@ -168,8 +168,11 @@ benchmark/results/*
 # result set is a deliberate act - copy it somewhere tracked and say which host it
 # came from.
 benchmark_results/
-bench_out*/
 benchmark_results_*/
+# Scratch output directories from local pipeline checks.
+bench_out*/
+bench_v*/
+bench_fixture/
 
 # Internal product requirements and publishing guides
 PRD.md
@@ -177,3 +180,9 @@ PRD_v2.md
 PUBLISHING.md
 docs/architecture-execution-planner.html
 *architecture-execution-planner*
+
+# Jupyter Notebooks
+notebook7ce33da9c5.ipynb
+notebook7ce33da9c5.jpynb
+.ipynb_checkpoints/
+
