@@ -14,15 +14,14 @@ from dataclasses import asdict, dataclass, field
 #: The models this benchmark is defined over.  Every engine loads the same
 #: repository at the same revision; see ``resolve_revision`` in system_info.
 #: The list is fixed by the benchmark's charter and by the hardware budget it
-#: was chosen for — a 135M, a 0.6B, a 350M and a 3.8B checkpoint, which is the
-#: largest that fits one 15 GiB accelerator at 16-bit weights alongside a KV
-#: cache.  Adding to it or substituting into it invalidates cross-run
+#: was chosen for — a 135M, a 0.6B and a 350M checkpoint, all of which fit one
+#: 15 GiB accelerator at 16-bit weights alongside a KV cache with room to
+#: spare.  Adding to it or substituting into it invalidates cross-run
 #: comparison, so it is changed only by amending this tuple deliberately.
 MODELS: tuple[str, ...] = (
     "HuggingFaceTB/SmolLM2-135M-Instruct",
     "Qwen/Qwen3-0.6B",
     "SummerSigh/GPTNeo350M-Instruct-SFT",
-    "microsoft/Phi-3.5-mini-instruct",
 )
 
 #: Prompt sizes in *tokens*, measured with each model's own tokenizer rather

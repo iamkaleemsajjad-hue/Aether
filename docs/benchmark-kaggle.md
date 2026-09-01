@@ -115,9 +115,10 @@ with a reason in full — no truncation. Fix anything surprising there before st
 !python benchmark.py --output-dir /kaggle/working/benchmark_results
 ```
 
-Four models, every engine the host accepts, batch 1/2/4/8/16, prompts 32/256/1024,
-outputs 32/128/512, correctness validation and the compile-once probe. Expect 3-6 hours
-on 2x T4, most of it Phi-3.5-mini.
+Three models, every engine the host accepts, batch 1/2/4/8/16, prompts 32/256/1024,
+outputs 32/128/512, correctness validation and the compile-once probe. The largest
+checkpoint in the set is 0.6B, so the run is a fraction of the wall-clock a
+multi-billion-parameter model cost.
 
 A shorter run that still fills every section of the report:
 

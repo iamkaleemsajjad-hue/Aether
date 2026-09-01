@@ -105,10 +105,10 @@ def test_charter_models_are_fixed() -> None:
         "HuggingFaceTB/SmolLM2-135M-Instruct",
         "Qwen/Qwen3-0.6B",
         "SummerSigh/GPTNeo350M-Instruct-SFT",
-        "microsoft/Phi-3.5-mini-instruct",
     )
     assert is_charter_model(MODELS[0])
-    assert is_charter_model("microsoft/Phi-3.5-mini-instruct")
+    assert is_charter_model("SummerSigh/GPTNeo350M-Instruct-SFT")
+    assert not is_charter_model("microsoft/Phi-3.5-mini-instruct")
     assert not is_charter_model("./some/local/checkpoint")
 
 

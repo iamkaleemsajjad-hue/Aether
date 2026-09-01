@@ -51,7 +51,6 @@ it was chosen for:
 - `HuggingFaceTB/SmolLM2-135M-Instruct`
 - `Qwen/Qwen3-0.6B`
 - `SummerSigh/GPTNeo350M-Instruct-SFT`
-- `microsoft/Phi-3.5-mini-instruct`
 
 `--models` can only narrow that list. Results from two different model sets are not
 comparable, so adding to it is a deliberate edit in two places (the tuple and the

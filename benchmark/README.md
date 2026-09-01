@@ -22,16 +22,15 @@ fail are recorded rather than worked around.
 
 ## Models
 
-Fixed by the benchmark's charter — four decoder families with deliberately
-different structure, and a size range that spans two orders of magnitude while
-still fitting one 15 GiB accelerator at 16-bit weights:
+Fixed by the benchmark's charter — three decoder families with deliberately
+different structure, and a size range that spans half an order of magnitude
+while fitting one 15 GiB accelerator at 16-bit weights:
 
 | Model | Params | Layers | Positional scheme |
 |-------|-------:|-------:|-------------------|
 | `HuggingFaceTB/SmolLM2-135M-Instruct` | 135M | 30 | RoPE |
 | `Qwen/Qwen3-0.6B` | 0.6B | 28 | RoPE + per-head Q/K norm |
 | `SummerSigh/GPTNeo350M-Instruct-SFT` | 350M | 24 | learned absolute (no RoPE) |
-| `microsoft/Phi-3.5-mini-instruct` | 3.8B | 32 | LongRoPE, fused QKV, SwiGLU |
 
 They are downloaded automatically from the Hub. Nothing is fetched by hand, and
 both backends load the same repository at the same revision — which the report
