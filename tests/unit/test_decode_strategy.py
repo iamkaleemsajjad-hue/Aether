@@ -315,16 +315,50 @@ def test_a_store_that_cannot_persist_is_not_fatal() -> None:
 
 # ── engine integration ────────────────────────────────────────────────────────
 
-def test_the_engine_resolves_one_strategy_per_pass_not_per_projection() -> None:
+def _expected_classes(eng, phase: str, rows: int) -> set:
+    """The shape classes a pass of this width covers, as the calibrator keys them."""
+    from aether.runtime.kernel_strategy import ShapeClass
+
+    return {
+        ShapeClass.of(
+            phase=phase, rows=rows,
+            in_features=int(weight.shape[1]), out_features=int(weight.shape[0]),
+            dtype=str(weight.dtype).replace("torch.", ""), device_kind="cpu",
+        ).key
+        for weight, _ in eng._projection_probe_shapes()
+    }
+
+
+def test_the_engine_resolves_one_strategy_per_class_per_pass_and_none_per_step() -> None:
+    """A pass resolves each class it covers once; a step after the first resolves none.
+
+    The granularity is per *shape*, not per pass: a block holds several weight
+    magnitudes and :class:`ShapeClass` keys on the magnitude, so one winner cannot
+    stand for all of them.  Two shapes can still share a class -- the magnitude is
+    bucketed by powers of two -- which is why the expectation is derived from the
+    keys rather than from the number of shapes.  What must not happen is a
+    measurement on the hot path, and that is what the decode loop asserts.
+    """
     eng = engine()
+    shapes = len(eng._projection_probe_shapes())
+    assert shapes > 1, "the fixture must hold more than one projection magnitude"
+
     ids = np.arange(16, dtype=np.int64) % 256
     _, cache = eng._forward_device(ids, None, reserve=64, logits="last")
-    classes = len(eng._strategies._choices)
+    prefill_classes = _expected_classes(eng, "prefill", 16)
+    assert set(eng._strategies._choices) == prefill_classes
+    assert len(eng._projection_table) == shapes, "the table is keyed per shape"
+
     token = torch.zeros(1, dtype=torch.long)
+    _, cache = eng._forward_device(token, cache, logits="last")
+    decode_classes = _expected_classes(eng, "decode", 1)
+    assert set(eng._strategies._choices) == prefill_classes | decode_classes
+    resolved = len(eng._strategies._choices)
+
     for _ in range(10):
         _, cache = eng._forward_device(token, cache, logits="last")
-    assert len(eng._strategies._choices) == classes + 1, (
-        "one new class for decode, and nothing per step after that"
+    assert len(eng._strategies._choices) == resolved, (
+        "nothing is measured per step after the first"
     )
 
 

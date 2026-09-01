@@ -54,8 +54,120 @@ def _release_host_weights_enabled() -> bool:
     path (task-vector merging, compiled LoRA selection, or R5 fast weights) against
     an accelerator-resident engine.
     """
-    keep = os.environ.get("AETHER_KEEP_HOST_WEIGHTS", "").strip().lower()
-    return keep not in {"1", "true", "yes"}
+    from aether.runtime.torch_engine import host_weights_reclaimable
+
+    return host_weights_reclaimable()
+
+
+def _log_memory_census(engine: Any, stage: str) -> None:
+    """Log an exact host/device byte census, when asked for one.
+
+    ``AETHER_MEMORY_REPORT=1`` turns the load into a measurement of itself. Off by
+    default because it is diagnostic rather than operational, and because the census
+    walks every weight -- cheap next to a load, but not free.
+
+    Three stages are logged rather than one, because the interesting quantities are
+    the *differences*: device bytes before and after the host release prove the two
+    copies were independent, and reserved bytes before and after the reclaim prove
+    the load's transients actually went back to the driver instead of being folded
+    into every peak the process reports afterwards.
+    """
+    flag = os.environ.get("AETHER_MEMORY_REPORT", "").strip().lower()
+    if flag not in {"1", "true", "yes", "on"}:
+        return
+    census = getattr(engine, "memory_census", None)
+    if not callable(census):
+        return
+    try:
+        report = census()
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must never fail a load
+        logger.debug("memory census unavailable at %r: %s", stage, exc)
+        return
+    gib = 1024**3
+    parts = [f"stage={stage}"]
+    for key, value in report.items():
+        if key.endswith("_bytes") and isinstance(value, int):
+            parts.append(f"{key[:-6]}={value / gib:.3f}GiB")
+        else:
+            parts.append(f"{key}={value}")
+    logger.info("memory census: %s", " ".join(parts))
+
+
+def _prefer_expandable_segments(torch: Any) -> bool:
+    """Ask CUDA for one growable virtual range instead of many fixed segments.
+
+    The default allocator serves each size class from its own ``cudaMalloc``
+    segment, and blocks in different segments can never be merged.  So a load that
+    allocates many small tensors and then one large one cannot satisfy the large
+    request from the space the small ones freed: it takes a new segment, and the old
+    ones stay reserved.  That difference is already recorded in this codebase --
+    :mod:`aether.placement.ledger` carries a fragmentation prior of 1.25 for the
+    default allocator against 1.08 for expandable segments -- and reserved bytes,
+    not allocated bytes, are what a capacity check and a peak report both see.
+
+    ``expandable_segments:True`` reserves one virtual address range per device and
+    maps physical pages into it on demand, so freed neighbours coalesce and the
+    process stops accumulating unusable holes.  The cost is page-granular rounding
+    (2 MiB), which is small next to the holes it removes.
+
+    Applied only when the operator has expressed no preference and the allocator has
+    not been configured yet: the setting is read once, when the caching allocator
+    first initialises, so writing it afterwards would be a silent no-op rather than a
+    change.  An explicit ``PYTORCH_CUDA_ALLOC_CONF`` always wins.
+    """
+    if os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
+        return False
+    try:
+        if getattr(torch.version, "hip", None):
+            return False
+        if not torch.cuda.is_available() or torch.cuda.is_initialized():
+            return False
+    except Exception:  # noqa: BLE001 - probing capability must never fail a load
+        return False
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    logger.info(
+        "Enabled CUDA expandable segments so freed blocks coalesce instead of "
+        "leaving reserved holes; set PYTORCH_CUDA_ALLOC_CONF to override."
+    )
+    return True
+
+
+def _release_load_reservations(device: str | None) -> None:
+    """Hand the driver back the segments only loading needed.
+
+    Loading allocates transients that inference never allocates again: staging
+    buffers for the weight upload, and the calibration probe's activations and KV
+    cache. Freeing the tensors returns those blocks to PyTorch's cache but not to the
+    driver — a segment stays reserved for the process's lifetime unless it is empty
+    *and* explicitly released.
+
+    That gap is not cosmetic, for two reasons. It is what every capacity check on the
+    device sees, including the planner's own ``cuda_used - torch_reserved`` reading and
+    any other process sharing the GPU. And ``reset_peak_memory_stats`` sets the peak to
+    *currently reserved* rather than to zero, so a reservation that is never released
+    is folded into every peak the process reports from then on, forever — which is
+    exactly how a lean steady state comes to be reported as a large one.
+
+    Called once, after load and before warm-up, so the cost — re-acquiring segments on
+    the next allocation — lands where no request is waiting on it and steady-state
+    decode is untouched.
+    """
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch-free install
+        return
+    kind = str(device or "").split(":")[0]
+    try:
+        if kind == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        elif kind == "xpu" and hasattr(getattr(torch, "xpu", None), "empty_cache"):
+            torch.xpu.synchronize()
+            torch.xpu.empty_cache()
+        elif kind == "mps" and hasattr(getattr(torch, "mps", None), "empty_cache"):
+            torch.mps.empty_cache()
+    except Exception as exc:  # noqa: BLE001 - reclaiming must never fail a load
+        logger.debug("could not release load-time reservations on %s: %s", device, exc)
 
 
 class TorchBackend(Backend):
@@ -94,6 +206,7 @@ class TorchBackend(Backend):
         """Auto-detect the best available device for PyTorch."""
         try:
             import torch
+            _prefer_expandable_segments(torch)
             if torch.cuda.is_available():
                 self._device = "cuda"
                 self._devices = [f"cuda:{index}" for index in range(torch.cuda.device_count())]
@@ -281,8 +394,15 @@ class TorchBackend(Backend):
             return None
         if not planner.needs_bootstrap(decision):
             return None
+        # Prefer the engine's dedicated calibration probe. ``forward`` is the
+        # *inspection* entry point: it projects logits at every position and copies
+        # them to the host as FP32, none of which a generation step does. Measuring
+        # through it inflates the peak by the size of that discarded tensor — at the
+        # 2048-token default ceiling on Qwen3-0.6B, ~1.8 GiB of device memory that is
+        # never released — and calibrates sigma against a pass that never runs.
+        probe = getattr(engine, "calibration_pass", None)
         forward = getattr(engine, "forward", None)
-        if not callable(forward):
+        if not callable(probe) and not callable(forward):
             return None
 
         def one_pass(batch: int, tokens: int) -> Any:
@@ -292,6 +412,8 @@ class TorchBackend(Backend):
             # it is the step whose peak the margin has to cover. Token *values* are
             # irrelevant to the footprint; only the shape is. Zeros are used because
             # every vocabulary contains index 0.
+            if callable(probe):
+                return probe(batch, tokens)
             ids = np.zeros(max(1, int(tokens)), dtype=np.int64)
             return forward(ids)
 
@@ -605,6 +727,7 @@ class TorchBackend(Backend):
                     # TorchAEGEngine.release_host_weights.  The cost it removes is
                     # linear in parameter count, which is what makes it a
                     # large-model requirement rather than a tidy-up.
+                    _log_memory_census(engine, "device weights materialized")
                     reclaim = getattr(engine, "release_host_weights", None)
                     if callable(reclaim) and _release_host_weights_enabled():
                         freed = reclaim()
@@ -614,10 +737,27 @@ class TorchBackend(Backend):
                                 "materializing the device copy.",
                                 freed / 1024**3,
                             )
+                        _log_memory_census(engine, "host weights released")
                     # The weights are now resident, which is the first moment a peak
                     # memory reading means anything. One pass at the workload ceiling
                     # turns the planner's conservative prior into a measurement.
                     self.bootstrap_placement(engine)
+                    _release_load_reservations(self._device)
+                    _log_memory_census(engine, "load-time reservations returned")
+                    # Decode kernel selection is measured, and a measurement left to
+                    # the hot path is charged to the first request's first token.
+                    # Two one-token forwards here resolve the decode shape classes
+                    # while nothing is waiting, which is where the calibrator's own
+                    # cost model already assumed the cost lived. Deliberately after
+                    # the reservation release, so what it re-acquires is the block
+                    # size decode actually asks for.
+                    warm = getattr(engine, "warmup_kernels", None)
+                    if callable(warm):
+                        try:
+                            if warm():
+                                _log_memory_census(engine, "decode kernels warmed")
+                        except Exception as exc:  # noqa: BLE001 - never fail a load
+                            logger.debug("decode kernel warm-up skipped: %s", exc)
                 tokenizer_root = root / "tokenizer"
                 if tokenizer_root.exists():
                     # The tokenizer is part of the authenticated AEG.  Do

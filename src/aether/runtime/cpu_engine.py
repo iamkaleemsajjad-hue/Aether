@@ -564,12 +564,58 @@ class CPUExecutionEngine:
 
     # ── Setup ────────────────────────────────────────────────────────────────
 
-    def _build_rope_tables(self, max_positions: int = 4096) -> tuple[np.ndarray, np.ndarray]:
+    def _build_rope_tables(
+        self, max_positions: int = 4096, *, length: int | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Precompute RoPE cos/sin tables for positions ``[0, max_positions)``."""
-        return self._rope_tables_for_theta(float(self.weights.rope_theta), max_positions)
+        return self._rope_tables_for_theta(
+            float(self.weights.rope_theta), max_positions, length=length, record=True
+        )
+
+    def _rope_scaling_spec(self) -> Any:
+        """The parsed rotary scaling spec, resolved once per engine."""
+        spec = getattr(self, "_rope_spec_cache", False)
+        if spec is not False:
+            return spec
+        from aether.runtime.rope_scaling import parse_rope_scaling
+
+        declared_context = int(getattr(self.weights, "context_length", 0) or 0) or None
+        spec = parse_rope_scaling(
+            getattr(self.weights, "rope_scaling", None),
+            context_length=declared_context,
+            original_context_length=getattr(
+                self.weights, "original_context_length", None
+            ),
+        )
+        self._rope_spec_cache = spec
+        return spec
+
+    def _rope_is_length_sensitive(self) -> bool:
+        """Whether these frequencies move with the length being evaluated.
+
+        ``dynamic`` rescales the base with the length and ``longrope`` switches
+        between a short and a long factor table at the trained context; every other
+        scheme is a function of the configuration alone.  Only the two that move pay
+        the per-pass re-derivation in :meth:`_ensure_rope_capacity`.
+        """
+        cached = getattr(self, "_rope_sensitive_cache", None)
+        if cached is None:
+            spec = self._rope_scaling_spec()
+            cached = bool(
+                spec is not None
+                and not spec.is_identity
+                and str(spec.rope_type) in {"dynamic", "longrope"}
+            )
+            self._rope_sensitive_cache = cached
+        return cached
 
     def _rope_tables_for_theta(
-        self, theta: float, max_positions: int
+        self,
+        theta: float,
+        max_positions: int,
+        *,
+        length: int | None = None,
+        record: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Build cos/sin tables for one rotary base.
 
@@ -585,23 +631,29 @@ class CPUExecutionEngine:
         correction the scheme carries is folded into the tables, matching the
         reference implementation, because it scales the *rotated* query and key and
         is therefore not interchangeable with the softmax scale.
-        """
-        from aether.runtime.rope_scaling import (
-            parse_rope_scaling,
-            scaled_inverse_frequencies,
-        )
 
-        declared_context = int(getattr(self.weights, "context_length", 0) or 0) or None
-        spec = parse_rope_scaling(
-            getattr(self.weights, "rope_scaling", None),
-            context_length=declared_context,
-            original_context_length=getattr(
-                self.weights, "original_context_length", None
-            ),
-        )
+        ``max_positions`` is the table's *height*; ``length`` is the sequence length
+        the frequencies are derived for.  They are separate because the height is
+        chosen for amortization — :meth:`_ensure_rope_capacity` doubles it — while two
+        schemes pick their frequencies by length.  Deriving from the height asks about
+        a length the request does not have: doubling a 16384-row table for a 20000
+        position request derives at 32768, and a LongRoPE checkpoint trained to 32768
+        would hand that request the long factor table it is not supposed to see yet.
+        ``length`` defaults to the height, which is the right answer whenever the
+        scheme does not depend on it.
+        """
+        from aether.runtime.rope_scaling import scaled_inverse_frequencies
+
+        spec = self._rope_scaling_spec()
+        evaluated = int(length if length is not None else max_positions)
         inv_freq, attention = scaled_inverse_frequencies(
-            theta, self._rotary_dim, spec, sequence_length=int(max_positions)
+            theta, self._rotary_dim, spec, sequence_length=evaluated
         )
+        if record:
+            # Only the global base's frequencies answer "were these tables derived
+            # for this length"; a second base (Gemma-3's local layers) would
+            # overwrite the answer with a different rotation's.
+            self._rope_inv_freq = inv_freq
         angles = np.arange(max_positions, dtype=np.float64)[:, None] * inv_freq[None, :]
         cos, sin = np.cos(angles), np.sin(angles)
         if attention != 1.0:
@@ -917,14 +969,47 @@ class CPUExecutionEngine:
                     raise ValueError(f"LoRA adapter {adapter_id!r} has invalid scale")
 
     def _ensure_rope_capacity(self, required: int) -> None:
-        """Grow the RoPE tables when a sequence runs past the precomputed range."""
-        if required <= self._cos.shape[0]:
+        """Grow the RoPE tables when a sequence runs past the precomputed range.
+
+        Height is not the only reason to rebuild.  ``dynamic`` and ``longrope`` derive
+        their frequencies from the length being evaluated, so a table that is tall
+        enough can still hold the wrong rotation — a LongRoPE checkpoint switches
+        factor tables at its trained context, and a request that crosses that boundary
+        needs the other table at every position, not just the new ones.  A cache keyed
+        on height alone serves the stale one, silently, and the output degrades without
+        anything failing.
+
+        The re-derivation is a power over the rotary half-width on the host, so it is
+        taken only for the two schemes that move with length; every other model keeps
+        the pure height check it had.
+        """
+        height = int(self._cos.shape[0])
+        if required <= height and not self._rope_is_length_sensitive():
             return
-        capacity = max(required, 2 * self._cos.shape[0])
-        self._cos, self._sin = self._build_rope_tables(max_positions=capacity)
+        if required <= height:
+            from aether.runtime.rope_scaling import scaled_inverse_frequencies
+
+            inverse, _ = scaled_inverse_frequencies(
+                float(self.weights.rope_theta),
+                self._rotary_dim,
+                self._rope_scaling_spec(),
+                sequence_length=int(required),
+            )
+            current = getattr(self, "_rope_inv_freq", None)
+            if current is not None and np.array_equal(current, inverse):
+                return
+        # Double only when growing.  A rebuild forced by a *factor* change needs no
+        # more rows than it already has, and doubling on one would let a short request
+        # that follows a long one reserve positions the model can never reach.
+        capacity = height if required <= height else max(required, 2 * height)
+        self._cos, self._sin = self._build_rope_tables(
+            max_positions=capacity, length=int(required)
+        )
         if self._local_cos is not None:
             self._local_cos, self._local_sin = self._rope_tables_for_theta(
-                float(self.weights.rope_local_theta or self.weights.rope_theta), capacity
+                float(self.weights.rope_local_theta or self.weights.rope_theta),
+                capacity,
+                length=int(required),
             )
 
     # ── Primitives ───────────────────────────────────────────────────────────

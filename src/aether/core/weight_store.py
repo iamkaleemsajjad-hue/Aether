@@ -131,6 +131,10 @@ class WeightStore:
     def __init__(self, directory: Path | str) -> None:
         self.directory = Path(directory)
         self.entries: dict[str, WeightEntry] = {}
+        #: Lazily opened read-only mapping of the weight blob, plus the file object
+        #: keeping it valid.  Both stay ``None`` until a zero-copy view is asked for.
+        self._mmap: Any = None
+        self._mmap_file: Any = None
 
     @property
     def blob_path(self) -> Path:
@@ -294,13 +298,194 @@ class WeightStore:
         )
 
     def _read_array(self, blob: Any, offset: int, size: int, dtype: str) -> np.ndarray:
-        """Read ``size`` bytes at ``offset`` and view them as ``dtype``."""
-        blob.seek(offset)
-        raw = blob.read(size)
-        if len(raw) != size:
-            msg = f"weight blob truncated: expected {size} bytes at offset {offset}, got {len(raw)}"
+        """Read ``size`` bytes at ``offset`` into one freshly allocated array.
+
+        Filling a destination array with ``readinto`` costs *one* host copy. The
+        obvious spelling — ``np.frombuffer(blob.read(size)).copy()`` — costs two,
+        because the ``bytes`` object is a full materialization of the tensor that
+        exists only to be copied out of. At load time every tensor pays that, so the
+        transient host high-water mark carries an extra copy of the largest tensor in
+        the model for no benefit. On a 151936x1024 embedding that is 297 MiB of pure
+        overhead per read.
+        """
+        dt = np.dtype(dtype)
+        if size % dt.itemsize:
+            msg = (
+                f"weight blob entry is not a whole number of {dt} items: "
+                f"{size} bytes at offset {offset}"
+            )
             raise AEGFormatError(msg)
-        return np.frombuffer(raw, dtype=np.dtype(dtype)).copy()
+        out = np.empty(size // dt.itemsize, dtype=dt)
+        blob.seek(offset)
+        read = blob.readinto(memoryview(out).cast("B")) if hasattr(blob, "readinto") else None
+        if read is None:  # a file object without readinto (BytesIO always has one)
+            raw = blob.read(size)
+            if len(raw) != size:
+                msg = f"weight blob truncated: expected {size} bytes at offset {offset}, got {len(raw)}"
+                raise AEGFormatError(msg)
+            return np.frombuffer(raw, dtype=dt).copy()
+        if read != size:
+            msg = f"weight blob truncated: expected {size} bytes at offset {offset}, got {read}"
+            raise AEGFormatError(msg)
+        return out
+
+    # ── Zero-copy blob access ────────────────────────────────────────────────
+
+    def _blob_mmap(self) -> Any:
+        """Map the weight blob read-only, once, and keep the mapping alive.
+
+        A mapping lets a caller compare or reinterpret stored bytes without
+        allocating anything: the pages are the OS page cache, shared rather than
+        copied. It is opened lazily so a store that is only indexed never maps.
+        """
+        import mmap
+
+        existing = getattr(self, "_mmap", None)
+        if existing is not None:
+            return existing
+        if not self.blob_path.exists():
+            msg = f"weight blob missing: {self.blob_path}"
+            raise AEGFormatError(msg)
+        handle = self.blob_path.open("rb")
+        try:
+            mapped = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+        except (OSError, ValueError):  # empty file, or a platform that refuses
+            handle.close()
+            raise
+        self._mmap_file = handle
+        self._mmap = mapped
+        return mapped
+
+    def raw_view(self, name: str, *, part: str = "codes") -> np.ndarray:
+        """Return a read-only, zero-copy view of one stored payload.
+
+        Args:
+            name: Weight name as stored in the index.
+            part: ``"codes"``, ``"scales"`` or ``"zero_points"``.
+
+        Raises:
+            KeyError: If the name is not in the index.
+            AEGFormatError: If the blob is missing or the region is truncated.
+        """
+        if not self.entries:
+            self.load_index()
+        entry = self.entries.get(name)
+        if entry is None:
+            msg = f"weight '{name}' is not in the index ({len(self.entries)} tensors available)"
+            raise KeyError(msg)
+        offset, size, dtype = {
+            "codes": (entry.codes_offset, entry.codes_bytes, entry.codes_dtype),
+            "scales": (entry.scales_offset, entry.scales_bytes, entry.scales_dtype),
+            "zero_points": (
+                entry.zero_points_offset, entry.zero_points_bytes, entry.zero_points_dtype,
+            ),
+        }[part]
+        if not size:
+            return np.empty(0, dtype=np.uint8)
+        mapped = self._blob_mmap()
+        if offset + size > len(mapped):
+            msg = (
+                f"weight blob truncated: expected {size} bytes at offset {offset}, "
+                f"blob is {len(mapped)} bytes"
+            )
+            raise AEGFormatError(msg)
+        dt = np.dtype(dtype)
+        view = np.frombuffer(mapped, dtype=dt, count=size // dt.itemsize, offset=offset)
+        view.flags.writeable = False
+        return view
+
+    def payloads_identical(self, first: str, second: str) -> bool:
+        """Whether two stored tensors hold byte-identical payloads.
+
+        This is what lets the loader prove that a tied ``lm_head`` really is the
+        embedding matrix before aliasing the two, instead of trusting a manifest flag
+        about a tensor it has not looked at.
+
+        Compared in bounded chunks rather than through :meth:`raw_view`. A mapped
+        comparison allocates nothing, but touching a mapped page charges it to the
+        process's resident set, so proving two 300 MiB matrices equal would add
+        600 MiB of resident file pages -- and leave the mapping open behind it. A
+        fixed pair of buffers keeps the proof O(1) in memory instead, which matters
+        because the whole point of the check is to *save* memory.
+        """
+        if not self.entries:
+            self.load_index()
+        left, right = self.entries.get(first), self.entries.get(second)
+        if left is None or right is None:
+            return False
+        if (left.shape, left.precision, left.bits, left.block_size, left.packed) != (
+            right.shape, right.precision, right.bits, right.block_size, right.packed
+        ):
+            return False
+        regions = [
+            ((left.codes_offset, left.codes_bytes), (right.codes_offset, right.codes_bytes)),
+            ((left.scales_offset, left.scales_bytes), (right.scales_offset, right.scales_bytes)),
+            (
+                (left.zero_points_offset, left.zero_points_bytes),
+                (right.zero_points_offset, right.zero_points_bytes),
+            ),
+        ]
+        if any(a[1] != b[1] for a, b in regions):
+            return False
+        try:
+            with self.blob_path.open("rb") as blob:
+                return all(
+                    self._regions_identical(blob, a[0], b[0], a[1]) for a, b in regions
+                )
+        except OSError:
+            return False
+
+    #: Comparison buffer size.  The comparison's footprint is this constant rather
+    #: than the tensor size, so the only thing the value trades is syscall count
+    #: against a footprint that is already negligible beside any tensor worth
+    #: comparing; a few MiB puts both sides of that trade in the noise.
+    _COMPARE_CHUNK_BYTES = 8 * 1024 * 1024
+
+    def _regions_identical(self, blob: Any, first: int, second: int, size: int) -> bool:
+        """Whether two equal-length regions of one open blob hold the same bytes."""
+        if size <= 0:
+            return True
+        chunk = min(size, self._COMPARE_CHUNK_BYTES)
+        left, right = bytearray(chunk), bytearray(chunk)
+        left_view, right_view = memoryview(left), memoryview(right)
+        done = 0
+        while done < size:
+            width = min(chunk, size - done)
+            blob.seek(first + done)
+            if blob.readinto(left_view[:width]) != width:
+                return False
+            blob.seek(second + done)
+            if blob.readinto(right_view[:width]) != width:
+                return False
+            if left_view[:width] != right_view[:width]:
+                return False
+            done += width
+        return True
+
+    def close(self) -> None:
+        """Release the blob mapping, if one was opened.
+
+        A mapping with live ``numpy`` views cannot be unmapped — those views point
+        into it — so the attempt is allowed to fail and the mapping is simply
+        dropped, leaving the OS to reclaim it when the last view dies. Refusing to
+        close is correct here: closing it out from under a view would hand the caller
+        a dangling pointer.
+        """
+        mapped = getattr(self, "_mmap", None)
+        if mapped is not None:
+            try:
+                mapped.close()
+            except BufferError:
+                return  # views are still live; keep the mapping valid for them
+            finally:
+                if getattr(self, "_mmap", None) is mapped and mapped.closed:
+                    self._mmap = None
+        handle = getattr(self, "_mmap_file", None)
+        if handle is not None and getattr(self, "_mmap", None) is None:
+            try:
+                handle.close()
+            finally:
+                self._mmap_file = None
 
     def load_all(self) -> dict[str, QuantizedTensor]:
         """Read every tensor in the index."""

@@ -9,6 +9,7 @@ weights.
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -676,10 +677,34 @@ def test_every_engine_sees_one_accelerator_by_default() -> None:
     assert plan.parse_args([]).workload_signature()["devices"] == 1
 
 
+#: Environment variables :func:`hardware.visible_devices` writes for real.  It has
+#: to write them: it runs in the worker before torch opens a CUDA context, which is
+#: the last moment ``CUDA_VISIBLE_DEVICES`` is still read.  A test that calls it in
+#: the pytest process is therefore editing the session's own environment.
+_VISIBILITY_VARIABLES = (
+    "CUDA_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
+    "AETHER_EXECUTION_DEVICES",
+    "AETHER_FORCE_TENSOR_PARALLEL",
+)
+
+#: Those variables as this module found them, captured at import time - before any
+#: test in it has run - so the guard below compares against the environment the
+#: developer actually has.  A multi-GPU host exports ``CUDA_VISIBLE_DEVICES``
+#: legitimately, and asserting it is empty would fail there for the wrong reason.
+_VISIBILITY_ON_IMPORT = {name: os.environ.get(name) for name in _VISIBILITY_VARIABLES}
+
+
 def test_device_restriction_is_applied_through_visibility(monkeypatch: Any) -> None:
     """Visibility, not a patched placement path: no engine's own logic is changed."""
-    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    monkeypatch.delenv("AETHER_EXECUTION_DEVICES", raising=False)
+    for name in _VISIBILITY_VARIABLES:
+        # Registering the current value is what gives the function's writes an undo.
+        # ``delenv`` alone records nothing when the variable is already absent, so the
+        # ``cuda:0`` this test provokes used to outlive it and make every later
+        # ``load_model`` in the session demand a GPU this host need not have.
+        monkeypatch.setenv(name, os.environ.get(name, ""))
+        monkeypatch.delenv(name, raising=False)
+
     record = hardware.visible_devices(1)
     assert record["restricted"] is True
     assert record["CUDA_VISIBLE_DEVICES"] == "0"
@@ -688,6 +713,20 @@ def test_device_restriction_is_applied_through_visibility(monkeypatch: Any) -> N
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     unrestricted = hardware.visible_devices(0)
     assert unrestricted["restricted"] is False
+
+
+def test_restricting_visibility_does_not_outlive_the_call_that_asked_for_it() -> None:
+    """The suite's own tests must not leave a GPU demand in the session's environment.
+
+    This is the guard for the failure it replaces: three unrelated ``load_model``
+    tests failed with "requested CUDA device 'cuda:0' is unavailable" purely because
+    they ran after the test above in the same process.
+    """
+    for name, original in _VISIBILITY_ON_IMPORT.items():
+        assert os.environ.get(name) == original, (
+            f"{name} was left as {os.environ.get(name)!r} by an earlier test in this "
+            f"process; it was {original!r} before the module ran"
+        )
 
 
 def test_aether_adapter_names_the_single_device_it_was_given() -> None:

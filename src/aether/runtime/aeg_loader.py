@@ -575,6 +575,15 @@ def _load_hybrid_engine_from_package(
             final_norm_bias=None if final_norm_bias is None else _norm_vector(final_norm_bias, hidden),
             position_type=position_type,
             rope_theta=float(architecture.get("rope_theta", 10000.0) or 10000.0),
+            rope_scaling=_rope_scaling_mapping(architecture),
+            original_context_length=(
+                int(architecture["original_context_length"])
+                if architecture.get("original_context_length") else None
+            ),
+            context_length=(
+                int(architecture["context_length"])
+                if architecture.get("context_length") else None
+            ),
             norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
             norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
             ffn_type=ffn_type,
@@ -1178,6 +1187,61 @@ def _validate_decoder_vocabulary_contract(
         )
 
 
+def _tied_head_is_duplicate(package: Any) -> bool:
+    """Whether the stored ``lm_head`` is a redundant copy of ``embedding``.
+
+    Weight tying means one parameter serves as both the input embedding and the
+    output projection, so a tied checkpoint has *one* matrix. Compilers that write
+    the model out tensor-by-tensor persist it twice anyway, and every consumer then
+    pays for the duplicate: twice on disk, twice as a host FP32 array, and twice as
+    an accelerator tensor. On Qwen3-0.6B the redundant copy is 151936x1024 — 26% of
+    the model's entire parameter count.
+
+    Two conditions must both hold before the two are aliased. The manifest has to
+    declare tying, which is the artifact's own statement about the source model; and
+    the stored payloads have to be byte-identical, which is proof rather than trust.
+    The comparison is made against the mapped blob, so it allocates nothing, and it
+    reads only bytes the loader was about to read regardless — so it removes work
+    (one 311 MiB read, one 622 MiB FP32 widening) instead of adding any.
+    """
+    architecture = _architecture_of(package)
+    if not bool(architecture.get("tie_word_embeddings", False)):
+        return False
+    store = package.weight_store()
+    if "embedding" not in store.entries or "lm_head" not in store.entries:
+        return False
+    checker = getattr(store, "payloads_identical", None)
+    if not callable(checker):
+        return False
+    try:
+        identical = bool(checker("embedding", "lm_head"))
+    except Exception as exc:  # noqa: BLE001 - a failed check must not fail the load
+        logger.debug("could not compare tied embedding payloads: %s", exc)
+        return False
+    if identical:
+        logger.info(
+            "Tied embedding: lm_head is byte-identical to the embedding matrix, so "
+            "one copy is materialized instead of two"
+        )
+    else:
+        logger.warning(
+            "manifest declares tied embeddings but the stored lm_head differs from "
+            "the embedding matrix; keeping both, as the artifact says they differ"
+        )
+    return identical
+
+
+def _architecture_of(package: Any) -> dict[str, Any]:
+    """The manifest's architecture block as a plain dict, or an empty one."""
+    manifest = getattr(package, "manifest", None)
+    architecture = getattr(manifest, "architecture", None)
+    if architecture is None:
+        return {}
+    if isinstance(architecture, dict):
+        return architecture
+    return dict(getattr(architecture, "__dict__", {}) or {})
+
+
 def _dequantized_by_key(package: Any) -> dict[tuple[int | None, str | None], np.ndarray]:
     """Read every tensor and index it by ``(layer_index, component)``."""
     from aether.compiler.stage1_ingestion.ingestion import IngestionPipeline
@@ -1185,7 +1249,12 @@ def _dequantized_by_key(package: Any) -> dict[tuple[int | None, str | None], np.
 
     store = package.weight_store()
     result: dict[tuple[int | None, str | None], np.ndarray] = {}
+    alias_lm_head = _tied_head_is_duplicate(package)
     for name in store.entries:
+        if name == "lm_head" and alias_lm_head:
+            # Deferred: aliased to the embedding once the loop has materialized it,
+            # so neither the FP32 array nor the read that fills it happens twice.
+            continue
         # The ingestion normalizer intentionally groups checkpoint q/k/v names
         # under ``qkv``.  The persisted AEG store has already split those
         # projections, so preserve their exact component names here.
@@ -1223,6 +1292,8 @@ def _dequantized_by_key(package: Any) -> dict[tuple[int | None, str | None], np.
             continue
         # First writer wins, matching the ingestion side's fused-tensor handling.
         result.setdefault(key, dequantize_tensor(store.load_tensor(name)))
+    if alias_lm_head and (None, "embedding") in result:
+        result[(None, "lm_head")] = result[(None, "embedding")]
     return result
 
 

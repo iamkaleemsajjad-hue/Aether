@@ -225,6 +225,65 @@ class ModelProfile:
 
 # ── operation counting ────────────────────────────────────────────────────────
 
+DECODE_OPS_PER_BLOCK = 45
+"""Host-dispatched operations in one decoder block, per decode step.
+
+Measured, not enumerated.  Counting the block by reading the source and naming the
+operations one expects to see undercounted it by 2.6x — the earlier estimate was 17 —
+because a dispatch is not a line of code.  ``aten.slice``, ``unsqueeze``,
+``transpose``, ``reshape`` and ``index_select`` are each a real launch, and the
+executor issues sixteen slices and seven unsqueezes per block that no reading of the
+block's arithmetic would predict: splitting a fused QKV projection into three views,
+indexing the rotary tables, addressing the KV frontier, and shaping operands for
+attention.
+
+The number therefore comes from tracing the executor itself, at the same granularity
+the roof charges for: every ``aten`` call a decode step makes, counted with
+``TorchDispatchMode``, differenced between a 1-layer and a 3-layer engine so the
+per-block cost separates cleanly from the fixed cost.  The configuration is the one
+the loader actually produces for a Llama/Qwen/Phi-shaped checkpoint: fused QKV, fused
+gate/up, gated SwiGLU, pre-norm, no Q/K normalization.
+``tests/unit/test_dispatch_roof.py`` re-derives it from a live engine and fails if the
+executor drifts, so the constant cannot go stale in the direction that matters.
+
+Why it is load-bearing: the roof is ``n_ops · t_dispatch``, the term that explains why
+splitting a small model across two devices makes it slower.  Understating it by 2.6x
+understates the launch-bound region by 2.6x, so a plan is judged bandwidth-bound where
+it is really dispatch-bound and the host is invisible to the decision.
+"""
+
+DECODE_OPS_FIXED = 18
+"""Per-token operations outside the layer stack.
+
+Thirteen in the graph — embedding lookup, position arange, final norm, the LM head
+projection, and the slicing and detaching around them — plus five for greedy sampling
+and the pinned readback of the token, which the generation loop runs once per token on
+the same critical path.  Measured the same way as :data:`DECODE_OPS_PER_BLOCK`.
+"""
+
+_OPS_QK_NORM = 3
+"""Two normalizations and the extra rotary pass they force.
+
+Q/K normalization is what makes the fused QKV split un-rotatable in one call: the
+executor rotates the concatenated Q and K together when nothing intervenes, and has to
+rotate them separately when a norm does."""
+
+_OPS_SANDWICH_NORM = 2
+"""Gemma-2/3 and EXAONE-4 normalize each sublayer's output as well as its input."""
+
+_OPS_NON_GATED_FFN = -3
+"""A plain MLP drops the up projection, the gate-times-up product, and one reshape."""
+
+_OPS_MOE_ROUTED = 20
+"""Routing machinery plus the first activated expert, in place of the dense FFN.
+
+Router projection, softmax, top-k, weight normalization, the gather/scatter around the
+expert call, and the expert's own gate/act/up/down."""
+
+_OPS_MOE_PER_EXTRA_EXPERT = 10
+"""Each additional activated expert repeats its own projections and scatter-add."""
+
+
 def _ops_per_layer(
     *,
     gated_ffn: bool,
@@ -238,26 +297,36 @@ def _ops_per_layer(
 
     The dispatch roof is ``ops × t_dispatch``, so this count is load-bearing: it is
     the term that explains why splitting a small model across two devices makes it
-    slower. Every adjustment below corresponds to a real structural difference that
-    adds or removes kernel launches.
+    slower. Every adjustment below is a *measured* difference between two engines that
+    differ only in that structural feature — see :data:`DECODE_OPS_PER_BLOCK` for the
+    method and ``tests/unit/test_dispatch_roof.py`` for the check that keeps them true.
+
+    Two features that read as if they should change the count do not, and the
+    measurement is why they are absent rather than guessed at:
+
+    * ``parallel_residual`` (GPT-NeoX, Falcon, Phi-1/2) shares the pre-norm between
+      the two branches but still adds two residuals, and the executor still
+      normalizes both — net zero.
+    * ``post`` placement (OLMo-2) removes the input normalization and adds an output
+      one — also net zero.
     """
-    # norm, q, k, v, rope_q, rope_k, cache_append, attn, o_proj, residual,
-    # post_norm, gate, act, down, residual
-    ops = 15
-    if gated_ffn:
-        ops += 2          # up projection and the gate·up product
+    ops = DECODE_OPS_PER_BLOCK
+    if not gated_ffn:
+        ops += _OPS_NON_GATED_FFN
     if qk_norm:
-        ops += 2
-    if parallel_residual:
-        ops -= 1          # one shared norm and one fused residual add
+        ops += _OPS_QK_NORM
     if norm_placement in ("sandwich", "sandwich_glm"):
-        ops += 2
-    elif norm_placement == "post":
-        ops += 0
+        ops += _OPS_SANDWICH_NORM
     if is_moe:
-        # router + top-k, then a gate/act/down triple per activated expert in place
-        # of the single dense FFN, plus the weighted scatter-add.
-        ops += 2 + max(0, experts_per_token - 1) * (5 if gated_ffn else 3) + 1
+        ops += _OPS_MOE_ROUTED
+        ops += max(0, experts_per_token - 1) * _OPS_MOE_PER_EXTRA_EXPERT
+        if not gated_ffn:
+            # Undo the dense deduction: a routed expert is gated whatever the dense
+            # FFN declares.  ``ExpertWeights.up_proj`` is a required field, and
+            # ``_moe_ffn`` projects gate and up unconditionally, so the expert triple
+            # keeps the launches the dense MLP drops.  Structural, not measured --
+            # the executable representation has no non-gated expert to measure.
+            ops -= _OPS_NON_GATED_FFN
     return ops
 
 
@@ -356,7 +425,7 @@ def profile_from_architecture(
             is_moe=is_moe,
             experts_per_token=experts_per_token,
         ),
-        ops_fixed=4,
+        ops_fixed=DECODE_OPS_FIXED,
         gated_ffn=gated,
         flash_attention=flash_attention,
         is_moe=is_moe,
@@ -485,7 +554,7 @@ def profile_from_engine(
                 norm_placement="pre", is_moe=is_moe, experts_per_token=experts_per_token,
             )
         ),
-        ops_fixed=4,
+        ops_fixed=DECODE_OPS_FIXED,
         gated_ffn=gated if base is None else base.gated_ffn,
         flash_attention=flash_attention,
         is_moe=is_moe or (base.is_moe if base else False),

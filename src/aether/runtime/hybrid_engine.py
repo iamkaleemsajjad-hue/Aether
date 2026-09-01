@@ -39,6 +39,15 @@ class HybridModelWeights:
     final_norm_bias: np.ndarray | None = None
     position_type: str = "RoPE"
     rope_theta: float = 10000.0
+    #: The declared ``rope_scaling`` mapping, verbatim, and the two context lengths
+    #: LongRoPE needs to read it.  A hybrid checkpoint carries these for the same
+    #: reason a dense one does: without them the attention layers of a
+    #: context-extended model rotate at the unscaled rate, which is not a crash but
+    #: a quality loss that grows with the prompt.  Kept raw and parsed at use, so
+    #: this dataclass stays free of the rotary vocabulary.
+    rope_scaling: dict[str, Any] | None = None
+    original_context_length: int | None = None
+    context_length: int | None = None
     norm_eps: float = 1e-5
     norm_type: str = "RMSNorm"
     ffn_type: str = "SwiGLU"
@@ -119,6 +128,13 @@ class HybridExecutionEngine:
             final_norm_bias=weights.final_norm_bias,
             position_type=weights.position_type,
             rope_theta=weights.rope_theta,
+            # The rotary transform is part of the attention contract, so it travels
+            # with the transformer half of the schedule.  Omitting it here was the
+            # whole of the defect: the audited engine implements all five schemes,
+            # and this constructor simply never told it there was one.
+            rope_scaling=weights.rope_scaling,
+            original_context_length=weights.original_context_length,
+            context_length=weights.context_length,
             norm_eps=weights.norm_eps,
             norm_type=weights.norm_type,
             ffn_type=weights.ffn_type,

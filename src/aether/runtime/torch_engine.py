@@ -129,6 +129,20 @@ _BULK_LAYER_ARRAYS: tuple[str, ...] = (
 _BULK_EXPERT_ARRAYS: tuple[str, ...] = ("gate_proj", "up_proj", "down_proj")
 
 
+def host_weights_reclaimable() -> bool:
+    """Whether host weight copies may be freed once the device owns its own.
+
+    The canonical reading of ``AETHER_KEEP_HOST_WEIGHTS``, defined here rather than
+    in the backend so the streaming release inside a load and the sweep after it
+    cannot disagree about whether the operator asked to keep the host set.
+
+    Set it when driving a host-weight-dependent path (task-vector merging, compiled
+    LoRA selection, R5 fast weights) against an accelerator-resident engine.
+    """
+    keep = os.environ.get("AETHER_KEEP_HOST_WEIGHTS", "").strip().lower()
+    return keep not in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class TorchKVCache:
     """Device-resident incremental KV state used by :class:`TorchAEGEngine`."""
@@ -246,6 +260,28 @@ class TorchAEGEngine:
     #: Set once ``release_host_weights`` has dropped the bulk host arrays.
     host_weights_released = False
 
+    #: Host bytes already freed during the upload itself.  Zero is the honest
+    #: default for any path that did not stream (a sharded executor uploads its own
+    #: slices), and ``release_host_weights`` adds it to what it reclaims.
+    host_bytes_streamed: int = 0
+
+    #: Reusable pinned staging slots for sampled-token readback, or ``None`` when
+    #: this device cannot stage asynchronously.  ``False`` means "not yet probed";
+    #: the distinction matters because ``None`` is a valid, final answer.
+    _readback_slots: "list[tuple[Any, Any]] | None | bool" = False
+
+    #: Which staging slot the next readback will use.
+    _readback_slot: int = 0
+
+    #: Whether this model's rotary frequencies move with the length being
+    #: evaluated.  ``None`` means "not yet derived from the scaling spec".
+    _rope_length_sensitive: "bool | None" = None
+
+    #: Rotary schemes whose frequencies are a function of the sequence length.
+    #: Every other scheme in :mod:`aether.runtime.rope_scaling` derives them from
+    #: the checkpoint's configuration alone, so their tables are final once built.
+    _LENGTH_SENSITIVE_ROPE = frozenset({"dynamic", "longrope"})
+
     #: Persisted optimizer plans this accelerator path does not implement.
     _ignored_optimized_plans: "dict[str, Any] | frozenset[str] | tuple[str, ...]" = ()
 
@@ -254,7 +290,9 @@ class TorchAEGEngine:
     _projection: "Any | None" = None
     _reference_projection: "Any | None" = None
     _projection_choice: "Any | None" = None
-    _projection_rows: int = -1
+    _projection_choices: "dict[Any, Any] | None" = None
+    _projection_table: "dict[Any, Any] | None" = None
+    _projection_rows: "tuple[int, str] | None" = None
     _strategies: "Any | None" = None
 
     def __init__(self, cpu_engine: Any, device: str) -> None:
@@ -306,7 +344,7 @@ class TorchAEGEngine:
         self.embedding = self._tensor(self.weights.embedding)
         self.final_norm = self._norm_tensor(self.weights.final_norm)
         self.final_norm_bias = self._optional_tensor(getattr(self.weights, "final_norm_bias", None))
-        self.lm_head = self._tensor(self.weights.lm_head)
+        self.lm_head = self._tied_tensor(self.weights.lm_head, self.weights.embedding, self.embedding)
         self.embedding_norm = (
             self._norm_tensor(self.weights.embedding_norm)
             if self.weights.embedding_norm is not None else None
@@ -319,7 +357,10 @@ class TorchAEGEngine:
             self._tensor(self.weights.position_embedding)
             if self.weights.position_embedding is not None else None
         )
-        self.layers = [self._convert_layer(layer) for layer in self.weights.layers]
+        #: Host bytes freed *during* the upload rather than after it, so
+        #: ``release_host_weights`` can still report the load's true total.
+        self.host_bytes_streamed = 0
+        self.layers = self._convert_layers()
         # ── Decode kernel strategy ─────────────────────────────────────────
         # The projection formulation is measured per (device class, phase, row
         # count, dtype) and cached; until a measurement exists this is exactly
@@ -329,7 +370,9 @@ class TorchAEGEngine:
         self._reference_projection = self._reference_projection_factory(torch)
         self._projection = self._reference_projection
         self._projection_choice: Any = None
-        self._projection_rows: int = -1
+        self._projection_choices: dict[Any, Any] = {}
+        self._projection_table: dict[Any, Any] = {}
+        self._projection_rows: "tuple[int, str] | None" = None
         self._strategies = self._build_strategy_calibrator()
         self._cos: Any | None = None
         self._sin: Any | None = None
@@ -471,6 +514,68 @@ class TorchAEGEngine:
             np.asarray(value, dtype=np.float32), device=self.device, dtype=self.compute_dtype
         )
 
+    def _tied_tensor(self, value: Any, tied_to: Any, resident: Any) -> Any:
+        """Materialize ``value``, reusing ``resident`` when it is the same matrix.
+
+        A tied language model has one matrix serving as both the input embedding and
+        the output projection. Uploading it twice costs a second full copy of the
+        largest tensor in a small model — 297 MiB of a 1.1 GiB Qwen3-0.6B residency,
+        26% of the total — for storage that is read identically by both sites and
+        written by neither.
+
+        Identity is decided on the host array, not on the manifest: the loader aliases
+        the two only after proving their stored bytes match, so ``is`` here means the
+        same parameter, and ``lm_head`` genuinely being a distinct matrix still gets
+        its own upload.
+        """
+        if value is tied_to and resident is not None:
+            return resident
+        return self._tensor(value)
+
+    def _host_tensor(self, value: Any) -> Any:
+        """Wrap a host array as a CPU tensor without copying it.
+
+        ``torch.from_numpy`` shares the buffer, so this costs nothing and lets a
+        device-side ``copy_`` perform the host-to-device transfer *and* the dtype
+        narrowing in one step, with no intermediate of either dtype.
+        """
+        array = np.asarray(value)
+        if array.dtype.kind != "f":
+            array = array.astype(np.float32)
+        return self.torch.from_numpy(np.ascontiguousarray(array))
+
+    def _packed_tensor(self, parts: "list[Any]") -> Any:
+        """Upload host matrices straight into the row slices of one device buffer.
+
+        The fused ``qkv`` and ``gate_up`` projections are algebraically a row
+        concatenation, and the obvious spelling is to materialize each part on the
+        device and ``torch.cat`` them. That is the worst possible order for the
+        caching allocator, on two counts the allocator cannot recover from:
+
+        * It holds every part *and* the concatenation live at once, so the transient
+          device high-water mark during load is twice the fused projection's size.
+        * It asks for several small blocks and then one large block. Blocks in
+          different segments can never be merged, so the parts' memory cannot satisfy
+          the fused request: it comes from fresh segments, and the freed parts stay
+          reserved-but-unusable for the process's lifetime. That gap is exactly what
+          ``peak_reserved`` reports.
+
+        Allocating the destination first and filling its slices inverts both: one
+        allocation, no transient device copy, and a single large segment the allocator
+        can subdivide and reuse afterwards.
+        """
+        rows = sum(int(part.shape[0]) for part in parts)
+        trailing = tuple(int(dim) for dim in parts[0].shape[1:])
+        out = self.torch.empty(
+            (rows, *trailing), device=self.device, dtype=self.compute_dtype
+        )
+        offset = 0
+        for part in parts:
+            height = int(part.shape[0])
+            out[offset:offset + height].copy_(self._host_tensor(part))
+            offset += height
+        return out
+
     def _norm_tensor(self, value: Any) -> Any:
         """Materialize a normalization weight in its effective form.
 
@@ -490,8 +595,24 @@ class TorchAEGEngine:
         return None if value is None else self._norm_tensor(value)
 
     def _convert_layer(self, layer: Any) -> dict[str, Any | None]:
+        # Which projections fuse is settled *before* anything is uploaded, so a
+        # fused member never exists as a standalone device tensor.  The fused
+        # layout is the only one the decode path reads, and materializing the
+        # parts first would double this layer's transient device cost for nothing.
+        hidden = int(self.weights.embedding.shape[1])
+        qkv_group = self._fusible(layer, ("q_proj", "k_proj", "v_proj"), hidden)
+        ffn_group = self._fusible(layer, ("gate_proj", "up_proj"), hidden)
+        fused: set[str] = set()
+        if qkv_group is not None:
+            fused |= {"q_proj", "k_proj", "v_proj",
+                      "q_proj_bias", "k_proj_bias", "v_proj_bias"}
+        if ffn_group is not None:
+            fused |= {"gate_proj", "up_proj", "gate_proj_bias", "up_proj_bias"}
         converted: dict[str, Any | None] = {
-            name: self._optional_tensor(getattr(layer, name, None))
+            name: (
+                None if name in fused
+                else self._optional_tensor(getattr(layer, name, None))
+            )
             for name in (
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
@@ -524,7 +645,6 @@ class TorchAEGEngine:
         # costs a handful of Python operations for every projection in every
         # layer for every token — on a small model that is a real share of the
         # step.  Orienting them here lets the decode loop call the GEMM directly.
-        hidden = int(self.weights.embedding.shape[1])
         attention_width = self.num_heads * self.head_dim
         for name in ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"):
             if converted[name] is not None:
@@ -534,12 +654,16 @@ class TorchAEGEngine:
                 converted["o_proj"], attention_width, "o_proj"
             )
         # The FFN input width follows from whichever gate/up projection exists;
-        # a GELU block (GPT-2, GPT-Neo) has only the one.
+        # a GELU block (GPT-2, GPT-Neo) has only the one.  When the pair was fused
+        # it comes from the host arrays, which the fused upload read but never
+        # materialized on the device.
         ffn_width = next(
             (int(converted[name].shape[0]) for name in ("gate_proj", "up_proj")
              if converted[name] is not None),
             None,
         )
+        if ffn_width is None and ffn_group is not None:
+            ffn_width = int(ffn_group[0][0].shape[0])
         if converted["down_proj"] is not None and ffn_width is not None:
             converted["down_proj"] = self._orient(
                 converted["down_proj"], ffn_width, "down_proj"
@@ -562,35 +686,79 @@ class TorchAEGEngine:
         # The concatenation is algebraically lossless and removes two launch
         # boundaries from the decode hot path.  Keep the logical AEG layout in
         # the source engine; only the device-resident representation is packed.
-        q, k, v = converted["q_proj"], converted["k_proj"], converted["v_proj"]
-        if q is not None and k is not None and v is not None:
-            biases = (
-                converted["q_proj_bias"],
-                converted["k_proj_bias"],
-                converted["v_proj_bias"],
+        #
+        # The parts are uploaded straight into the fused buffer's row slices
+        # (:meth:`_packed_tensor`) rather than materialized on the device and then
+        # concatenated, so the fused layout costs one device allocation instead of
+        # two and leaves the allocator nothing it cannot reuse.
+        if qkv_group is not None:
+            parts, biases = qkv_group
+            converted["qkv_weight"] = self._packed_tensor(list(parts))
+            converted["qkv_bias"] = (
+                None if biases[0] is None else self._packed_tensor(list(biases))
             )
-            if all(bias is None for bias in biases) or all(bias is not None for bias in biases):
-                converted["qkv_weight"] = self.torch.cat((q, k, v), dim=0)
-                converted["qkv_bias"] = None if biases[0] is None else self.torch.cat(biases, dim=0)
-                converted["q_width"] = int(q.shape[0])
-                converted["k_width"] = int(k.shape[0])
-                converted["v_width"] = int(v.shape[0])
-                converted["q_proj"] = converted["k_proj"] = converted["v_proj"] = None
-                converted["q_proj_bias"] = converted["k_proj_bias"] = converted["v_proj_bias"] = None
-
-        gate, up = converted["gate_proj"], converted["up_proj"]
-        if gate is not None and up is not None and int(gate.shape[1]) == int(up.shape[1]):
-            gate_bias, up_bias = converted["gate_proj_bias"], converted["up_proj_bias"]
-            if (gate_bias is None) == (up_bias is None):
-                converted["gate_up_weight"] = self.torch.cat((gate, up), dim=0)
-                converted["gate_up_bias"] = (
-                    None if gate_bias is None else self.torch.cat((gate_bias, up_bias), dim=0)
-                )
-                converted["gate_width"] = int(gate.shape[0])
-                converted["up_width"] = int(up.shape[0])
-                converted["gate_proj"] = converted["up_proj"] = None
-                converted["gate_proj_bias"] = converted["up_proj_bias"] = None
+            converted["q_width"] = int(parts[0].shape[0])
+            converted["k_width"] = int(parts[1].shape[0])
+            converted["v_width"] = int(parts[2].shape[0])
+        if ffn_group is not None:
+            parts, biases = ffn_group
+            converted["gate_up_weight"] = self._packed_tensor(list(parts))
+            converted["gate_up_bias"] = (
+                None if biases[0] is None else self._packed_tensor(list(biases))
+            )
+            converted["gate_width"] = int(parts[0].shape[0])
+            converted["up_width"] = int(parts[1].shape[0])
         return converted
+
+    def _fusible(
+        self, layer: Any, names: "tuple[str, ...]", in_features: int
+    ) -> "tuple[tuple[Any, ...], tuple[Any, ...]] | None":
+        """Host arrays for a fusible projection group, oriented, or ``None``.
+
+        A group fuses only when every member is present and the biases are either
+        all present or all absent — a partially-biased fusion would silently change
+        the arithmetic. Deciding this from the *host* arrays, before anything is
+        uploaded, is what lets the members go straight into the fused device buffer
+        instead of existing as separate device tensors first.
+        """
+        parts = [getattr(layer, name, None) for name in names]
+        if any(part is None for part in parts):
+            return None
+        biases = [getattr(layer, f"{name}_bias", None) for name in names]
+        present = [bias is not None for bias in biases]
+        if any(present) and not all(present):
+            return None
+        try:
+            oriented = [
+                self._orient_host(np.asarray(part), in_features, name)
+                for part, name in zip(parts, names)
+            ]
+        except (ValueError, IndexError):
+            return None  # an unexpected layout: fall back to the unfused path
+        if len({int(part.shape[1]) for part in oriented}) != 1:
+            return None
+        return tuple(oriented), tuple(
+            None if bias is None else np.asarray(bias).reshape(-1) for bias in biases
+        )
+
+    @staticmethod
+    def _orient_host(value: Any, in_features: int, role: str) -> Any:
+        """``_orient`` for a host array: returns a ``(out, in)`` view, no copy.
+
+        The transpose is a view, and the contiguous copy the transfer needs is made
+        by :meth:`_host_tensor` during the upload — so a Conv1D checkpoint pays one
+        host copy per projection rather than a device round trip.
+        """
+        if value.ndim != 2:
+            raise ValueError(f"{role} projection is not a matrix: shape {tuple(value.shape)}")
+        if int(value.shape[1]) == in_features:
+            return value
+        if int(value.shape[0]) == in_features:
+            return value.T
+        raise ValueError(
+            f"{role} projection does not contract {in_features} input features: "
+            f"got shape {tuple(value.shape)}"
+        )
 
     @staticmethod
     def _orient(value: Any, in_features: int, role: str) -> Any:
@@ -610,6 +778,26 @@ class TorchAEGEngine:
             f"got shape {tuple(value.shape)}"
         )
 
+    def _rope_is_length_sensitive(self) -> bool:
+        """Whether the rotary frequencies must be re-derived per length.
+
+        Derived once from the scaling spec, because the answer is a property of the
+        compiled checkpoint and cannot change while the engine lives.  ``dynamic``
+        rescales the base with the current length and ``longrope`` switches tables
+        at a threshold; identity, ``linear``/``su``, ``yarn`` and ``llama3`` are
+        functions of the configuration alone.
+        """
+        cached = self._rope_length_sensitive
+        if cached is None:
+            spec = self.rope_scaling_spec
+            cached = bool(
+                spec is not None
+                and not spec.is_identity
+                and str(spec.rope_type) in self._LENGTH_SENSITIVE_ROPE
+            )
+            self._rope_length_sensitive = cached
+        return cached
+
     def _ensure_rope(self, required: int, device: Any | None = None) -> None:
         """Grow the rotary tables to cover ``required`` positions.
 
@@ -621,6 +809,21 @@ class TorchAEGEngine:
         as well without the runaway.
         """
         device = device or self.device
+        if (
+            self._cos is not None
+            and int(self._cos.shape[0]) >= required
+            and self._cos.device == device
+            and self._rope_inv_freq is not None
+            and not self._rope_is_length_sensitive()
+        ):
+            # The tables already cover this length, and this model's frequencies do
+            # not move with it, so recomputing them could only establish that they
+            # are unchanged.  Establishing that costs a double-precision power over
+            # the head half-width plus a full array comparison, on the host, at the
+            # head of every forward pass — including the prompt pass, where it is
+            # the first thing time-to-first-token pays for.  The two schemes that
+            # *are* length-dependent skip this and take the path below, unchanged.
+            return
         inverse, attention = scaled_inverse_frequencies(
             self.rope_theta,
             self.rotary_dim,
@@ -651,13 +854,29 @@ class TorchAEGEngine:
                 f"sequence length {required} exceeds the compiled context length "
                 f"{self.max_positions}"
             )
-        self._cos, self._sin = self._rope_tables(self.rope_theta, capacity, device)
+        # The frequencies were derived for ``required`` — the length this request will
+        # actually evaluate — and ``capacity`` is only how many rows of the table are
+        # materialized so the next few steps need no rebuild.  Handing the derived
+        # pair down, rather than letting the table builder re-derive at ``capacity``,
+        # is what keeps the two in agreement; see the note in :meth:`_rope_tables`.
+        self._cos, self._sin = self._rope_tables(
+            self.rope_theta, capacity, device, frequencies=(inverse, attention)
+        )
         if self.rope_local_theta is not None:
+            # A second base needs its own derivation, but at the same length.
             self._local_cos, self._local_sin = self._rope_tables(
-                self.rope_local_theta, capacity, device
+                self.rope_local_theta, capacity, device, length=int(required)
             )
 
-    def _rope_tables(self, theta: float, required: int, device: Any) -> tuple[Any, Any]:
+    def _rope_tables(
+        self,
+        theta: float,
+        required: int,
+        device: Any,
+        *,
+        frequencies: "tuple[np.ndarray, float] | None" = None,
+        length: int | None = None,
+    ) -> tuple[Any, Any]:
         """Build cos/sin tables for one rotary base, pre-expanded to full width.
 
         The angles span ``rotary_dim / 2`` frequencies — the full head half-width
@@ -671,10 +890,34 @@ class TorchAEGEngine:
         with no table reshaping and no dtype conversion at all.  Storing the
         expansion once, at table-build time, removes several tensor operations
         per layer per token, which is the dominant cost of small-model decode.
+
+        ``required`` is the table *height* — how many absolute positions to
+        materialize — and it is deliberately not the length the frequencies are
+        derived for.  Two rotary schemes choose their frequencies by length
+        (``dynamic`` rescales the base, ``longrope`` switches between a short and a
+        long factor table at the trained context), and the height carries headroom so
+        the next few steps need no rebuild.  Deriving from the height would therefore
+        answer a question nobody asked: for a Phi-3.5 prompt of 3700 positions the
+        height is 4212, which is past the trained 4096 boundary, so the table would be
+        built with the *long* factors for a request the reference evaluates with the
+        short ones — every slow dimension rotated at a fraction of its correct rate.
+
+        So the length is stated separately.  ``frequencies`` passes a pair the caller
+        already derived — the normal path, because the caller has to record what the
+        tables were built from — and ``length`` derives a second base at the same
+        length.  When neither is given the height stands in, which is correct only for
+        a length-insensitive scheme and is kept for callers that have no length to
+        offer.
         """
-        inverse, attention = scaled_inverse_frequencies(
-            theta, self.rotary_dim, self.rope_scaling_spec, sequence_length=int(required)
-        )
+        if frequencies is not None:
+            inverse, attention = frequencies
+        else:
+            inverse, attention = scaled_inverse_frequencies(
+                theta,
+                self.rotary_dim,
+                self.rope_scaling_spec,
+                sequence_length=int(length if length is not None else required),
+            )
         positions = self.torch.arange(required, device=device, dtype=self.torch.float32)[:, None]
         inv_freq = self.torch.as_tensor(
             inverse, device=device, dtype=self.torch.float32
@@ -817,16 +1060,29 @@ class TorchAEGEngine:
         for every token — enough to matter on a small model where each kernel is
         only microseconds of real work.
 
-        ``self._projection`` is the *measured* formulation for this pass's shape
-        class; see :mod:`aether.runtime.kernel_strategy`.  It is
-        ``F.linear`` until a calibration says otherwise, so an uncalibrated device
-        behaves exactly as it did before the mechanism existed.
+        ``self._projection_table`` holds the *measured* formulation for each
+        projection shape this pass will run; see
+        :mod:`aether.runtime.kernel_strategy`.  The lookup is by the weight's own
+        ``(out, in)``, because that — not the row count alone — is what decides
+        which formulation wins: :class:`~aether.runtime.kernel_strategy.ShapeClass`
+        keys on the weight magnitude as well as on ``M``, and a decoder layer
+        contains several magnitudes.  Selecting on one of them and applying the
+        winner to the rest asks the backend for a layout that was measured on a
+        different GEMM, which is exactly the case a measured mechanism exists to
+        avoid.  Everything is ``F.linear`` until a calibration says otherwise, so
+        an uncalibrated device behaves exactly as it did before the mechanism
+        existed.
 
         ``None`` means a subclass never ran the parent constructor — the
         tensor-parallel executor is the case — and the reference kernel is used
         directly.  Reading the attribute rather than requiring it is what keeps a
         subclass from having to know that this optimisation exists at all.
         """
+        table = self._projection_table
+        if table:
+            projection = table.get(weight.shape)
+            if projection is not None:
+                return projection(x, weight, bias)
         projection = self._projection
         if projection is None:
             return self.torch.nn.functional.linear(x, weight, bias)
@@ -890,71 +1146,107 @@ class TorchAEGEngine:
             pass
         return self.device.type
 
-    def _projection_probe_shape(self) -> "tuple[Any, Any | None] | None":
-        """The largest projection in the first layer, as the class representative.
+    _PROBE_NAMES = (
+        "qkv_weight", "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_up_weight", "gate_proj", "up_proj", "down_proj",
+    )
+    """Projection slots a decoder block can hold, in the order a block runs them."""
 
-        Calibrating every ``(K, N)`` a model contains would run a probe per weight;
-        the flat-GEMM effect is dominated by the row count with only a weak dependence
-        on the weight's magnitude, so one representative per layer stack is the right
-        granularity.  The *largest* weight is chosen because it is the one whose kernel
-        selection actually moves the step time.
+    def _projection_probe_shapes(self) -> "list[tuple[Any, Any | None]]":
+        """One class representative per *distinct projection shape* in a block.
+
+        A shape class is ``(phase, M, K·N, dtype, device)`` — the weight's magnitude
+        is part of it, because which formulation wins depends on how the backend
+        tiles that particular ``(K, N)`` and not only on how thin ``M`` is.  A
+        decoder block holds several magnitudes: Phi-3.5-mini's are ``9216×3072``
+        (fused QKV), ``3072×3072`` (output), ``16384×3072`` (fused gate/up) and
+        ``3072×8192`` (down).  Measuring one of them and applying its winner to the
+        others hands the backend a formulation chosen for a different GEMM — the
+        mistake a measured mechanism exists to prevent, and one that stays invisible
+        until the model is large enough for the projections to dominate the step.
+
+        The count is bounded by the architecture rather than by the model: a block
+        has at most this many distinct projection shapes however many layers or
+        parameters the model has, and every layer in the stack repeats the same set.
+        Shapes are returned largest first, so if the calibration budget runs out the
+        projection that moves the step time most is the one that was measured.
         """
         if not self.layers:
-            return None
-        best: Any = None
-        for name in (
-            "down_proj", "gate_up_weight", "up_proj", "gate_proj",
-            "qkv_weight", "o_proj", "q_proj",
-        ):
-            weight = self.layers[0].get(name)
-            if weight is None:
+            return []
+        block = self.layers[0]
+        candidates: "list[Any]" = [block.get(name) for name in self._PROBE_NAMES]
+        # An MoE block's experts carry their own shapes, and the activated experts
+        # are as much of the step as a dense FFN is.
+        for expert in (block.get("experts") or [])[:1]:
+            candidates.extend(
+                expert.get(name) for name in ("gate_proj", "up_proj", "down_proj")
+            )
+        # The head is a projection every step runs exactly once, and on a model with
+        # a large vocabulary it is one of the largest reads in the step.
+        candidates.append(getattr(self, "lm_head", None))
+        seen: "dict[Any, Any]" = {}
+        for weight in candidates:
+            if weight is None or getattr(weight, "ndim", 0) != 2:
                 continue
-            if best is None or int(weight.numel()) > int(best.numel()):
-                best = weight
-        return None if best is None else (best, None)
+            seen.setdefault(tuple(weight.shape), weight)
+        ordered = sorted(seen.values(), key=lambda weight: -int(weight.numel()))
+        return [(weight, None) for weight in ordered]
 
     def _resolve_projection(self, rows: int, phase: str) -> None:
-        """Select the projection formulation for this pass, measuring at most once.
+        """Select a projection formulation per shape class, measuring at most once.
 
-        Called once per forward pass rather than once per projection: every layer in a
-        pass shares the same row count, which is the dimension the choice turns on. The
-        calibrator memoises per shape class, so this is a dictionary lookup after the
-        first pass of each class and performs no measurement on the hot path.
+        Called once per forward pass rather than once per projection: every layer in
+        a pass shares the same row count, and every layer repeats the same set of
+        weight shapes, so one resolution covers the whole stack.  Within a pass the
+        choice is made *per shape*, because that is the granularity the calibrator's
+        own key already has — see :meth:`_projection_probe_shapes`.  The calibrator
+        memoises per shape class, so after the first pass of each class this is a
+        handful of dictionary lookups and performs no measurement on the hot path.
         """
         calibrator = self._strategies
         if calibrator is None:
             return
-        probe_shape = self._projection_probe_shape()
-        if probe_shape is None:
-            return
-        weight, bias = probe_shape
         torch = self.torch
+        table: "dict[Any, Any]" = {}
+        choices: "dict[Any, Any]" = {}
+        for weight, bias in self._projection_probe_shapes():
 
-        def probe() -> "tuple[Any, Any, Any | None]":
-            # The real weight, not a copy: it measures the layout that will actually
-            # be used and costs no extra device memory at a moment when the model is
-            # already resident.
-            activation = torch.zeros(
-                (int(rows), int(weight.shape[1])),
-                dtype=weight.dtype, device=weight.device,
-            )
-            return activation, weight, bias
+            def probe(weight: Any = weight, bias: Any = bias) -> "tuple[Any, Any, Any | None]":
+                # The real weight, not a copy: it measures the layout that will
+                # actually be used and costs no extra device memory at a moment when
+                # the model is already resident.
+                activation = torch.zeros(
+                    (int(rows), int(weight.shape[1])),
+                    dtype=weight.dtype, device=weight.device,
+                )
+                return activation, weight, bias
 
-        try:
-            choice = calibrator.choose(
-                phase=phase, rows=int(rows),
-                in_features=int(weight.shape[1]), out_features=int(weight.shape[0]),
-                dtype=weight.dtype, probe=probe,
+            try:
+                choice = calibrator.choose(
+                    phase=phase, rows=int(rows),
+                    in_features=int(weight.shape[1]), out_features=int(weight.shape[0]),
+                    dtype=weight.dtype, probe=probe,
+                )
+            except Exception as exc:  # noqa: BLE001 - never let selection break a pass
+                logger.debug("projection strategy selection failed: %s", exc)
+                continue
+            shape = tuple(weight.shape)
+            choices[shape] = choice
+            table[shape] = (
+                calibrator.strategy(choice)
+                if choice.name != "linear"
+                else self._reference_projection
             )
-        except Exception as exc:  # noqa: BLE001 - never let selection break a pass
-            logger.debug("projection strategy selection failed: %s", exc)
+        if not table:
             return
-        self._projection_choice = choice
-        self._projection = (
-            calibrator.strategy(choice)
-            if choice.name != "linear"
-            else self._reference_projection
-        )
+        self._projection_table = table
+        self._projection_choices = choices
+        # The largest shape's choice stands in for any projection a block does not
+        # hold — an adapter, or a shape that appears only in a later layer.  It is
+        # the reference kernel unless a measurement replaced it, exactly as before.
+        largest = max(choices, key=lambda shape: shape[0] * shape[1])
+        self._projection_choice = choices[largest]
+        self._projection = table[largest]
 
     def projection_report(self) -> dict[str, Any]:
         """Which projection formulation is in force, and how it was chosen."""
@@ -963,6 +1255,11 @@ class TorchAEGEngine:
         report = self._strategies.report()
         if self._projection_choice is not None:
             report["active"] = self._projection_choice.to_dict()
+        if self._projection_choices:
+            report["per_shape"] = {
+                str(shape): choice.to_dict()
+                for shape, choice in self._projection_choices.items()
+            }
         return report
 
     def _linear(self, x: Any, weight: Any, bias: Any | None = None) -> Any:
@@ -1354,15 +1651,31 @@ class TorchAEGEngine:
         # stream.  Public ``forward`` and the initial prompt still opt into
         # validation; internally generated tokens are already produced by the
         # model and do not need a second round trip through the host.
+        vocabulary = int(self.embedding.shape[0])
         if isinstance(token_ids, torch.Tensor):
             ids = token_ids if batched else token_ids.reshape(-1)
             if ids.device != self.device or ids.dtype != torch.long:
                 ids = ids.to(device=self.device, dtype=torch.long)
+            if validate_ids and ids.numel():
+                # One readback for both bounds instead of two.  Each ``.item()`` is a
+                # blocking copy, and this check runs at the head of the prompt pass —
+                # the two it used to issue were the first thing time-to-first-token
+                # paid for, before any arithmetic had been queued.
+                low, high = torch.stack((ids.min(), ids.max())).tolist()
+                if low < 0 or high >= vocabulary:
+                    raise ValueError("token id is outside the compiled vocabulary")
         else:
             array = np.asarray(token_ids, dtype=np.int64)
-            ids = torch.as_tensor(
-                array if batched else array.reshape(-1), device=self.device
-            )
+            if not batched:
+                array = array.reshape(-1)
+            if validate_ids and array.size:
+                # The ids arrive from a tokenizer as a host array, so their bounds are
+                # a host question.  Asking it before the upload keeps the answer free:
+                # asking it afterwards means copying two scalars back off the device,
+                # which stalls the stream to learn something the host already knew.
+                if int(array.min()) < 0 or int(array.max()) >= vocabulary:
+                    raise ValueError("token id is outside the compiled vocabulary")
+            ids = torch.as_tensor(array, device=self.device)
         if batched and ids.dim() != 2:
             raise ValueError(
                 "a batched forward pass requires rank-2 (batch, seq) ids, got rank "
@@ -1370,8 +1683,6 @@ class TorchAEGEngine:
             )
         if ids.numel() == 0:
             raise ValueError("forward() requires at least one token")
-        if validate_ids and (int(ids.min()) < 0 or int(ids.max()) >= self.embedding.shape[0]):
-            raise ValueError("token id is outside the compiled vocabulary")
         if cache is None:
             cache = (
                 self._new_batched_cache(batch_size=int(ids.shape[0]), reserve=reserve)
@@ -1431,10 +1742,18 @@ class TorchAEGEngine:
         # pass's row count, which is the dimension the choice turns on. Memoised inside
         # the calibrator, so this is a dictionary lookup after the first pass of each
         # shape class and never a measurement on the hot path.
+        #
+        # The gate carries the phase as well as the row count, because the phase is
+        # part of the calibrator's key and the two are not in one-to-one
+        # correspondence: a batch-8 decode step and an 8-token prefill both have eight
+        # rows.  Keying on rows alone let whichever came first supply the other's
+        # formulation — the same category error as choosing on one weight shape and
+        # applying it to all of them.
         rows = int(ids.numel())
-        if rows != self._projection_rows:
-            self._projection_rows = rows
-            self._resolve_projection(rows, "prefill" if seq_len > 1 else "decode")
+        phase = "prefill" if seq_len > 1 else "decode"
+        if (rows, phase) != self._projection_rows:
+            self._projection_rows = (rows, phase)
+            self._resolve_projection(rows, phase)
         # The rotation factors depend only on the positions and the rotary base,
         # so gather them once per step instead of twice per layer.
         rope_global = self._rope_slice(positions, local=False) if self.uses_rope else None
@@ -1650,6 +1969,126 @@ class TorchAEGEngine:
         logits, cache = self._forward_device(token_ids, cache, validate_ids=True)
         return logits.detach().float().cpu().numpy(), cache
 
+    def calibration_pass(self, batch: int = 1, tokens: int = 1) -> None:
+        """Run one prefill of the given shape exactly as generation would, then discard.
+
+        The placement planner calibrates its memory margin from a measured peak, and
+        the measurement is only worth having if it measures the pass that will actually
+        run. The obvious probe — call the public :meth:`forward` — does not: ``forward``
+        is the *inspection* entry point, so it projects logits at every position and
+        then copies them to the host as FP32. At the planner's default 2048-token
+        ceiling on Qwen3-0.6B that is a ``(2048, 151936)`` FP16 tensor (594 MiB), an
+        FP32 widening of the same (1.19 GiB), and a host copy of the FP32 — none of
+        which any generation step ever allocates, because :meth:`generate_iter` asks
+        for ``logits="last"`` and keeps them on the device.
+
+        Probing through ``forward`` therefore did two things wrong at once. It
+        inflated the load-time high-water mark by ~1.8 GiB of device memory that is
+        never released afterwards, and it taught the ledger a residual for a pass that
+        does not exist — which makes every later plan reserve transient headroom for
+        phantom logits and hand the KV cache less than it could have.
+
+        This probe takes the generation path: the prefill shape the plan has to
+        survive, ``logits="last"``, KV reserved for the whole workload as
+        :meth:`generate_iter` reserves it, and no host round trip. What it measures is
+        what a request costs.
+
+        It then takes one decode step on the cache the prefill built, for two reasons.
+        A request is a prefill *and* a decode loop, so the peak the margin has to cover
+        includes the decode step's transients — small, but they are allocated after the
+        prefill's have been freed, which is exactly the pattern a fragmentation margin
+        exists to survive. And the decode step is what resolves the decode kernel shape
+        classes, so measuring it here is also what keeps that measurement off the first
+        request's time-to-first-token. The KV cache is reserved one position longer so
+        the step fits the allocation the prefill already made rather than doubling it.
+        """
+        tokens = max(1, int(tokens))
+        batch = max(1, int(batch))
+        ids = np.zeros(tokens, dtype=np.int64)
+        # Reserve as generation does, so the KV cache is allocated at its final size
+        # once instead of doubling — the same allocation shape a real request makes.
+        # The +1 is the decode step below: without it the append would find the cache
+        # exactly full and double it, which would report a peak no request ever hits.
+        reserve = tokens + 1
+        cache = None
+        logits = None
+        try:
+            if batch > 1 and self.supports_batch(batch):
+                logits, cache = self._forward_device(
+                    np.broadcast_to(ids, (batch, tokens)).copy(),
+                    None,
+                    reserve=reserve,
+                    batched=True,
+                    logits="last",
+                )
+                logits, cache = self._forward_device(
+                    np.zeros((batch, 1), dtype=np.int64),
+                    cache,
+                    reserve=reserve,
+                    batched=True,
+                    logits="last",
+                )
+            else:
+                logits, cache = self._forward_device(
+                    ids, None, reserve=reserve, logits="last"
+                )
+                logits, cache = self._forward_device(
+                    np.zeros(1, dtype=np.int64), cache, reserve=reserve, logits="last"
+                )
+        finally:
+            del logits, cache
+
+    def warmup_kernels(self) -> bool:
+        """Resolve the decode kernel shape classes before any request exists.
+
+        Which GEMM formulation is fastest for a projection is *measured*, not assumed
+        (see :mod:`aether.runtime.kernel_strategy`), and a measurement has to happen
+        somewhere. Left to the hot path it happens inside the first request, where it
+        is charged to that request's time-to-first-token: four candidates × sixteen
+        iterations for each distinct projection shape in a block, on a device that is
+        also paying allocator growth and first-touch for the same shapes. The
+        calibrator's own docstring calls this "a bound on a load path rather than a
+        per-request cost" — this method is what makes that true.
+
+        The pass is deliberately the smallest one that resolves the classes that
+        matter: a one-token prefill and a one-token decode step. Decode is where a
+        request spends nearly all of its time and its row count is always one, so one
+        step fixes the whole class. Prefill row counts vary per request and cannot be
+        enumerated, so no attempt is made to cover them; a prefill still resolves its
+        own class on first use, and it is the pass that amortizes a probe best.
+
+        Cheap enough to be unconditional: two forwards at one token, a two-position KV
+        cache, and the probes' own thin activations. Everything is released on the way
+        out. It also warms what the first request would otherwise warm anyway — the
+        allocator's decode-sized blocks and the backend's kernel selection cache.
+
+        Non-fatal by construction. Returns whether the pass ran; a failure leaves the
+        engine exactly as it was, with the classes to be resolved on first use.
+
+        ``AETHER_KERNEL_WARMUP=0`` skips it, because an operator reproducing a
+        first-token measurement needs to be able to put the cost back where it was.
+        """
+        setting = os.environ.get("AETHER_KERNEL_WARMUP", "1").strip().lower()
+        if setting in {"0", "false", "no", "off"}:
+            return False
+        if not self.layers:
+            return False
+        cache = None
+        logits = None
+        try:
+            logits, cache = self._forward_device(
+                np.zeros(1, dtype=np.int64), None, reserve=2, logits="last"
+            )
+            logits, cache = self._forward_device(
+                np.zeros(1, dtype=np.int64), cache, reserve=2, logits="last"
+            )
+        except Exception as exc:  # noqa: BLE001 - warming must never fail a load
+            logger.debug("decode kernel warm-up unavailable: %s", exc)
+            return False
+        finally:
+            del logits, cache
+        return True
+
     def _sample(self, logits: Any, temperature: float, top_k: int, top_p: float) -> int:
         return int(self._sample_device(logits, temperature, top_k, top_p).item())
 
@@ -1681,6 +2120,86 @@ class TorchAEGEngine:
             return self._sample_top_p(probs, float(top_p))
         drawn = torch.multinomial(probs, 1)
         return drawn.reshape(-1) if batched else drawn.reshape(())
+
+    # ── sampled-token handoff ─────────────────────────────────────────────────
+    #
+    # A decode step ends with one number the host needs: the token, to yield it and
+    # to test it for a stop.  Where that number is *read* is a latency decision that
+    # is independent of where the next step is *launched*, and conflating the two is
+    # what makes a token wait for work it does not depend on.
+    #
+    # ``token.item()`` is a blocking copy, so it completes only after everything
+    # already queued ahead of it.  Issued after the lookahead step has been queued —
+    # which is what keeps the device busy and is worth keeping — it waits for that
+    # entire step.  The token was ready before it started.
+    #
+    # Staging the copy to pinned host memory the moment the token is sampled, and
+    # waiting on an event recorded right after it, separates the two: the stream is
+    # in order, so the event completes when the copy does, no matter how much work
+    # was queued behind it.  The lookahead still overlaps the host's launch cost, and
+    # the token no longer waits a step to be read.
+
+    def _readback_staging(self) -> "list[tuple[Any, Any]] | None":
+        """Pinned slots and completion events for asynchronous token readback.
+
+        ``None`` when this device cannot stage asynchronously, which is not a
+        failure: the caller then falls back to reading the token late, exactly as
+        before.  Two slots, because one token is in flight while the next is sampled.
+        """
+        slots = self._readback_slots
+        if slots is not False:
+            return slots  # type: ignore[return-value]
+        torch = self.torch
+        built: "list[tuple[Any, Any]] | None" = None
+        try:
+            namespace = getattr(torch, self.device.type, None)
+            event_type = getattr(namespace, "Event", None)
+            if event_type is not None:
+                built = [
+                    (
+                        torch.empty(1, dtype=torch.long, pin_memory=True),
+                        event_type(),
+                    )
+                    for _ in range(2)
+                ]
+        except Exception as exc:  # noqa: BLE001 - staging is an optimization
+            logger.debug("token readback staging unavailable on %s: %s", self.device, exc)
+            built = None
+        self._readback_slots = built
+        return built
+
+    def _begin_readback(self, token: Any) -> "tuple[int | None, Any, Any, Any]":
+        """Start moving one sampled token to the host without draining the queue.
+
+        Returns ``(value, buffer, event, tensor)``, of which exactly one route to the
+        token is live: ``value`` when it is already on the host, ``buffer`` with
+        ``event`` when a staged copy is in flight, and ``tensor`` when this device
+        offers no staging and the token must be read late — the behaviour that
+        predates this method, kept so no device regresses.
+        """
+        if self.device.type == "cpu":
+            # Nothing is asynchronous here, so reading now costs nothing and there
+            # is no queue for a late read to skip ahead of.
+            return int(token.item()), None, None, None
+        slots = self._readback_staging()
+        if slots is None:
+            return None, None, None, token
+        buffer, event = slots[self._readback_slot]
+        self._readback_slot = (self._readback_slot + 1) % len(slots)
+        buffer.copy_(token.reshape(1), non_blocking=True)
+        event.record()
+        return None, buffer, event, None
+
+    @staticmethod
+    def _finish_readback(handoff: "tuple[int | None, Any, Any, Any]") -> int:
+        """Obtain the token, waiting for its own copy and nothing else."""
+        value, buffer, event, tensor = handoff
+        if value is not None:
+            return value
+        if event is not None:
+            event.synchronize()
+            return int(buffer[0])
+        return int(tensor.item())
 
     def _sample_top_p(self, probs: Any, top_p: float) -> Any:
         """Nucleus sampling, entirely on the execution device.
@@ -1761,16 +2280,33 @@ class TorchAEGEngine:
         launch work — that alternation roughly doubles the time per token.
 
         So the next step's forward pass and sampling are queued *first*, and only
-        then is the current token read back.  The synchronization still happens
-        once per token, but by that point the device already has a full step of
-        work in flight, and the host's launch cost overlaps device execution
-        instead of following it.
+        then is the current token collected.  The host's launch cost overlaps
+        device execution instead of following it.
+
+        What the queue-first ordering must *not* also do is make the token wait for
+        that lookahead.  ``token.item()`` would: it is a blocking copy issued behind
+        a full step of queued kernels, so the first token — which the prefill had
+        already determined — arrived one whole decode step late, and every token
+        after it arrived a step late too.  The token's copy is therefore staged the
+        moment it is sampled, before the lookahead is queued, and only that copy is
+        waited on.  See :meth:`_begin_readback`.  Identical kernels, identical
+        overlap, identical tokens; each one just stops waiting for the next.
 
         The lookahead step is speculative: when generation stops early its KV
         rows are discarded by rewinding the cache length, so the returned cache
         describes exactly the tokens that were yielded.
         """
+        if self.device.type == "cpu":
+            # A synchronous device has no queue for the lookahead to overlap with, so
+            # running it before yielding would only postpone the token by a whole
+            # step.  Same kernels, same count, same tokens — just not in an order
+            # that pays for an overlap this device cannot provide.
+            yield from self._generate_serially(
+                cache, next_logits, max_tokens, temperature, top_k, top_p, eos_token_id
+            )
+            return
         token_device = self._sample_device(next_logits, temperature, top_k, top_p)
+        handoff = self._begin_readback(token_device)
         stops = stop_token_set(eos_token_id)
         for _ in range(int(max_tokens)):
             checkpoint = int(cache.length)
@@ -1778,14 +2314,45 @@ class TorchAEGEngine:
                 token_device.reshape(1), cache, logits="last"
             )
             following = self._sample_device(cache.last_logits, temperature, top_k, top_p)
-            # The queue now holds a complete step; syncing here costs only the
-            # residual device time rather than the whole step.
-            token = int(token_device.item())
+            following_handoff = self._begin_readback(following)
+            token = self._finish_readback(handoff)
             yield token
             if token in stops:
                 cache.length = checkpoint
                 break
-            token_device = following
+            token_device, handoff = following, following_handoff
+
+    def _generate_serially(
+        self,
+        cache: TorchKVCache,
+        next_logits: Any,
+        max_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        eos_token_id: int | None,
+    ) -> Iterator[int]:
+        """Decode on a device that executes as it is called.
+
+        The lookahead in :meth:`_generate_pipelined` buys nothing here — there is no
+        asynchronous queue for the host's launch cost to hide behind — and it costs
+        the token a full step of latency plus, when generation stops, one forward
+        pass whose rows are discarded.  So this yields each token as soon as it is
+        sampled.  The arithmetic, the sampling and the stop rule are the same, so the
+        token sequence is the same.
+        """
+        stops = stop_token_set(eos_token_id)
+        logits = next_logits
+        for _ in range(int(max_tokens)):
+            token_device = self._sample_device(logits, temperature, top_k, top_p)
+            token = int(token_device.item())
+            yield token
+            if token in stops:
+                break
+            _, cache = self._forward_device(
+                token_device.reshape(1), cache, logits="last"
+            )
+            logits = cache.last_logits
 
     def _generate_constrained(
         self,
@@ -1861,6 +2428,70 @@ class TorchAEGEngine:
     # passing a ``(1, seq)`` array to ``forward`` has always meant one sequence,
     # and still does.
 
+    def _convert_layers(self) -> list[dict[str, Any]]:
+        """Upload every layer, freeing each host copy as soon as the device has it.
+
+        Converting all layers and *then* releasing the host set means the load's
+        high-water mark holds both copies in full: for a 3.8B model at FP32 on the
+        host and FP16 on the device that is ~15 GiB plus ~7.6 GiB at the same
+        instant, and the peak is what decides whether a load fits. Releasing layer
+        ``i`` before layer ``i+1`` is uploaded replaces that with one shrinking copy
+        beside one growing copy, so the peak is the size of the larger set plus a
+        single layer rather than the sum of both.
+
+        It is the same operation :meth:`release_host_weights` performs and rests on
+        the same three properties, plus one specific to doing it early: nothing
+        between a layer's conversion and the end of ``__init__`` reads that layer's
+        host arrays again. Placement planning has already run by then -- it profiles
+        the *CPU* engine, before this one exists -- and the decode path reads device
+        tensors exclusively.
+
+        Skipped, not attempted-and-recovered, in the three cases where it would be
+        wrong: when the operator asked to keep the host set, when the device tensors
+        *alias* the host arrays (CPU at FP32, where there is no second copy and
+        dropping the reference would leave the executor pointing at storage nothing
+        owns), and when two entries in the layer list are the same object, where
+        freeing one would empty another that has not been uploaded yet.
+        """
+        layers = list(self.weights.layers)
+        distinct = len({id(layer) for layer in layers}) == len(layers)
+        stream = (
+            distinct
+            and host_weights_reclaimable()
+            and not self.device_tensors_alias_host()
+        )
+        converted: list[Any] = []
+        for layer in layers:
+            converted.append(self._convert_layer(layer))
+            if stream:
+                self.host_bytes_streamed += self._drop_host_layer(layer)
+        return converted
+
+    def _drop_host_layer(self, layer: Any) -> int:
+        """Free one layer's bulk host matrices; return the bytes reclaimed."""
+        freed = 0
+        seen: set[int] = set()
+
+        def drop(owner: Any, name: str) -> None:
+            nonlocal freed
+            value = getattr(owner, name, None)
+            if not isinstance(value, np.ndarray):
+                return
+            if id(value) not in seen:
+                seen.add(id(value))
+                freed += int(value.nbytes)
+            try:
+                setattr(owner, name, None)
+            except (AttributeError, TypeError):  # frozen or slotted container
+                pass
+
+        for name in _BULK_LAYER_ARRAYS:
+            drop(layer, name)
+        for expert in getattr(layer, "experts", None) or []:
+            for name in _BULK_EXPERT_ARRAYS:
+                drop(expert, name)
+        return freed
+
     def device_tensors_alias_host(self) -> bool:
         """Whether the device weights share storage with the host arrays.
 
@@ -1922,13 +2553,22 @@ class TorchAEGEngine:
 
         ``host_weights_released`` records that this happened so a caller that does
         need the host set can detect it rather than meeting a ``None``.
+
+        Most of the per-layer work has usually already happened during the upload
+        (:meth:`_convert_layers`), which is what keeps the load's *peak* down. This
+        sweep is still the thing that frees the model-level matrices and the
+        authority on whether the host set is gone, so it remains the entry point a
+        caller uses.
         """
         if self.host_weights_released:
             return 0
         if self.device_tensors_alias_host():
             # Nothing is duplicated: the "host" arrays *are* the device tensors.
             return 0
-        freed = 0
+        # Layers may already have been freed during the upload itself; see
+        # ``_convert_layers``.  Those bytes are counted here so the number reported
+        # is the host set this load reclaimed, not just the remainder.
+        freed = int(getattr(self, "host_bytes_streamed", 0) or 0)
         seen: set[int] = set()
 
         def drop(owner: Any, name: str) -> None:
@@ -1954,6 +2594,103 @@ class TorchAEGEngine:
                     drop(expert, name)
         self.host_weights_released = True
         return freed
+
+    def memory_census(self) -> dict[str, Any]:
+        """Account for every byte this engine holds, on both sides of the bus.
+
+        Reported rather than inferred, because the two obvious proxies both lie. Host
+        RSS counts mapped artifact pages and never shrinks predictably after a free,
+        and PyTorch's ``memory_allocated`` counts only what the caching allocator
+        currently hands out -- not the segments it is still holding, which is what a
+        capacity check and a peak report actually see. Byte-accounting the tensors
+        directly, deduplicated by storage pointer so an aliased ``lm_head`` is counted
+        once, is the only reading that attributes a load's footprint to its causes.
+
+        Deduplication by ``data_ptr`` is the point of the exercise as much as the
+        total: two entries sharing one pointer is the observable difference between a
+        tied head that was aliased and one that was copied.
+        """
+        torch = self.torch
+        host_seen: set[int] = set()
+        host_bytes = 0
+
+        def host_add(owner: Any, name: str) -> None:
+            nonlocal host_bytes
+            value = getattr(owner, name, None)
+            if isinstance(value, np.ndarray) and id(value) not in host_seen:
+                host_seen.add(id(value))
+                host_bytes += int(value.nbytes)
+
+        weights = getattr(self, "weights", None)
+        if weights is not None:
+            for name in _BULK_MODEL_ARRAYS:
+                host_add(weights, name)
+            for layer in getattr(weights, "layers", None) or []:
+                for name in _BULK_LAYER_ARRAYS:
+                    host_add(layer, name)
+                for expert in getattr(layer, "experts", None) or []:
+                    for name in _BULK_EXPERT_ARRAYS:
+                        host_add(expert, name)
+
+        device_seen: set[int] = set()
+        device_bytes = 0
+
+        def device_add(value: Any) -> None:
+            nonlocal device_bytes
+            if not isinstance(value, torch.Tensor):
+                return
+            try:
+                storage = value.untyped_storage()
+                pointer, size = storage.data_ptr(), int(storage.nbytes())
+            except Exception:  # noqa: BLE001 - a meta or fake tensor has no storage
+                return
+            if pointer in device_seen:
+                return
+            device_seen.add(pointer)
+            device_bytes += size
+
+        def device_walk(value: Any, depth: int = 0) -> None:
+            if isinstance(value, torch.Tensor):
+                device_add(value)
+            elif depth < 4 and isinstance(value, dict):
+                for item in value.values():
+                    device_walk(item, depth + 1)
+            elif depth < 4 and isinstance(value, (list, tuple)):
+                for item in value:
+                    device_walk(item, depth + 1)
+
+        for value in vars(self).values():
+            device_walk(value)
+
+        census: dict[str, Any] = {
+            "device": self.device,
+            "compute_dtype": str(self.compute_dtype),
+            "host_weight_bytes": host_bytes,
+            "host_weights_released": bool(self.host_weights_released),
+            "device_weight_bytes": device_bytes,
+            "device_storages": len(device_seen),
+            "aliased": self.device_tensors_alias_host(),
+        }
+        kind = str(self.device or "").split(":")[0]
+        if kind == "cuda":
+            try:
+                if torch.cuda.is_available():
+                    index = torch.device(self.device).index or 0
+                    census.update(
+                        torch_allocated_bytes=int(torch.cuda.memory_allocated(index)),
+                        torch_reserved_bytes=int(torch.cuda.memory_reserved(index)),
+                        torch_peak_allocated_bytes=int(torch.cuda.max_memory_allocated(index)),
+                        torch_peak_reserved_bytes=int(torch.cuda.max_memory_reserved(index)),
+                    )
+            except Exception as exc:  # noqa: BLE001 - a census must never fail a load
+                census["torch_error"] = str(exc)
+        try:
+            import psutil
+
+            census["host_rss_bytes"] = int(psutil.Process().memory_info().rss)
+        except Exception:  # noqa: BLE001 - psutil is an optional benchmark dependency
+            pass
+        return census
 
     def supports_batch(self, batch_size: int = 1) -> bool:
         """Whether this executor can run ``batch_size`` sequences in one pass.
@@ -2171,6 +2908,9 @@ class TorchHybridAEGEngine:
     model-family name is consulted at runtime.
     """
 
+    _ROPE_HEADROOM = 512
+    """Rows reserved past the current length, so decode does not rebuild per token."""
+
     def __init__(self, hybrid_engine: Any, device: str, devices: list[str] | None = None) -> None:
         try:
             import torch
@@ -2193,7 +2933,7 @@ class TorchHybridAEGEngine:
         self.conv_kernel = int(hybrid_engine._mamba.conv_kernel)
         self.embedding = self._tensor(self.weights.embedding)
         self.final_norm = self._tensor(self.weights.final_norm)
-        self.lm_head = self._tensor(self.weights.lm_head)
+        self.lm_head = self._tied_tensor(self.weights.lm_head, self.weights.embedding, self.embedding)
         self.embedding_norm = self._optional_tensor(self.weights.embedding_norm)
         self.embedding_norm_bias = self._optional_tensor(self.weights.embedding_norm_bias)
         self.final_norm_bias = self._optional_tensor(self.weights.final_norm_bias)
@@ -2239,6 +2979,8 @@ class TorchHybridAEGEngine:
             })
         self._cos: Any | None = None
         self._sin: Any | None = None
+        self._rope_inv_freq: "np.ndarray | None" = None
+        self.rope_attention_scaling = 1.0
 
     def _tensor(self, value: Any, device: Any | None = None) -> Any:
         return self.torch.as_tensor(np.asarray(value, dtype=np.float32), device=device or self.device)
@@ -2246,16 +2988,110 @@ class TorchHybridAEGEngine:
     def _optional_tensor(self, value: Any | None, device: Any | None = None) -> Any | None:
         return None if value is None else self._tensor(value, device)
 
+    def _tied_tensor(self, value: Any, tied_to: Any, resident: Any) -> Any:
+        """Materialize ``value``, reusing ``resident`` when it is the same matrix.
+
+        The hybrid executor is a standalone implementation of the same contract, so
+        it carries its own copy of this rule for the reason
+        :meth:`TorchAEGEngine._tied_tensor` gives: in a tied model the output
+        projection *is* the input embedding, and uploading that matrix twice
+        doubles the largest allocation in a small model to store bytes both sites
+        only read.  Identity is decided on the host array, which the loader aliases
+        only after proving the stored bytes match, so an ``lm_head`` that really is
+        a distinct matrix still gets its own upload.
+        """
+        if value is tied_to and resident is not None:
+            return resident
+        return self._tensor(value)
+
+    def _rope_scaling_spec(self) -> Any:
+        """The parsed rotary transform, or ``None`` for an unscaled checkpoint.
+
+        Parsed once and cached: the mapping is immutable for the life of the engine,
+        and the parse is a handful of dictionary reads that would otherwise land on
+        every attention layer of every step.
+        """
+        cached = getattr(self, "_rope_spec_cache", False)
+        if cached is not False:
+            return cached
+        from aether.runtime.rope_scaling import parse_rope_scaling
+
+        declared = int(getattr(self.weights, "context_length", 0) or 0) or None
+        spec = parse_rope_scaling(
+            getattr(self.weights, "rope_scaling", None),
+            context_length=declared,
+            original_context_length=getattr(
+                self.weights, "original_context_length", None
+            ),
+        )
+        self._rope_spec_cache = spec
+        return spec
+
+    def _rope_is_length_sensitive(self) -> bool:
+        """Whether the frequencies change with the length being evaluated."""
+        spec = self._rope_scaling_spec()
+        return spec is not None and spec.rope_type in {"dynamic", "longrope"}
+
     def _ensure_rope(self, required: int, device: Any | None = None) -> None:
+        """Build rotary tables for ``required`` positions on ``device``.
+
+        The frequencies come from :mod:`aether.runtime.rope_scaling` rather than from
+        ``theta ** -exponent`` computed here.  A hybrid checkpoint declares its
+        rotary transform in the same place a dense one does, and deriving the plain
+        frequencies instead means a context-extended model rotates at the unscaled
+        rate for every attention layer in the schedule — the transform is applied to
+        the *slow* dimensions, so the failure grows with the position and is silent.
+
+        ``required`` is both the table height and the length being evaluated here,
+        because this executor advances one position at a time: the caller passes
+        ``past + 1``, which is the highest position in the step plus one — the same
+        quantity the reference derives from ``max(position_ids) + 1``.  For the two
+        length-sensitive schemes a taller table is therefore not evidence that its
+        frequencies are the right ones, so a scheme that can switch tables re-derives
+        and compares rather than accepting the height.
+        """
+        from aether.runtime.rope_scaling import scaled_inverse_frequencies
+
+        torch = self.torch
         device = device or self.device
-        if self._cos is not None and int(self._cos.shape[0]) >= required and self._cos.device == device:
+        tall_enough = (
+            self._cos is not None
+            and int(self._cos.shape[0]) >= required
+            and self._cos.device == device
+        )
+        if tall_enough and not self._rope_is_length_sensitive():
             return
-        half = self.head_dim // 2
-        positions = self.torch.arange(required, device=device, dtype=self.torch.float32)[:, None]
-        exponent = self.torch.arange(half, device=device, dtype=self.torch.float32) * (2.0 / self.head_dim)
-        inv_freq = float(self.weights.rope_theta) ** (-exponent)
-        angles = positions * inv_freq[None, :]
-        self._cos, self._sin = self.torch.cos(angles), self.torch.sin(angles)
+        inverse, attention = scaled_inverse_frequencies(
+            float(self.weights.rope_theta),
+            self.head_dim,
+            self._rope_scaling_spec(),
+            sequence_length=int(required),
+        )
+        if tall_enough:
+            current = getattr(self, "_rope_inv_freq", None)
+            if current is not None and np.array_equal(current, inverse):
+                return
+        self._rope_inv_freq = inverse
+        self.rope_attention_scaling = float(attention)
+        # Headroom, so a table is not rebuilt once per token.  The old code sized the
+        # table at exactly ``required``, and ``required`` grows by one every step, so
+        # every decode step rebuilt the whole thing.  A slab amortizes that without a
+        # doubling policy's runaway; it is height only, never the derivation length.
+        height = max(
+            int(required) + self._ROPE_HEADROOM,
+            int(self._cos.shape[0]) if tall_enough else 0,
+        )
+        positions = torch.arange(height, device=device, dtype=torch.float64)[:, None]
+        frequencies = torch.as_tensor(inverse, device=device, dtype=torch.float64)
+        angles = positions * frequencies[None, :]
+        cos, sin = torch.cos(angles), torch.sin(angles)
+        if attention != 1.0:
+            # YaRN and LongRoPE correct the attention temperature by scaling the
+            # rotation itself; folding it into the tables keeps the hot path free of
+            # a second multiply.
+            cos, sin = cos * attention, sin * attention
+        self._cos = cos.to(torch.float32)
+        self._sin = sin.to(torch.float32)
 
     def _norm(self, value: Any, weight: Any, bias: Any | None = None) -> Any:
         if str(self.weights.norm_type).lower() == "layernorm":

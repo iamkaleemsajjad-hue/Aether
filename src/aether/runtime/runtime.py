@@ -408,6 +408,11 @@ class Runtime:
             )
         self._loaded_models: dict[str, Any] = {}
         self._loaded_backends: dict[str, Backend] = {}
+        # Artifact paths for models this process has loaded, as
+        # ``{model_id: (aeg_path, resolved_path)}``.  Written only by
+        # :meth:`_load_model` and cleared only by :meth:`remove`, so an entry
+        # exists exactly while the model it describes is loaded.
+        self._aeg_paths: dict[str, tuple[str | None, str | None]] = {}
         self._aeg_packages: dict[str, AEGPackage] = {}
         self._lock = threading.RLock()
         from aether.observability.otel import AetherTracer, MetricsCollector
@@ -602,6 +607,10 @@ class Runtime:
                 execution_devices=self.config.execution_devices,
             )
             self._loaded_backends[model_id] = backend
+            self._aeg_paths[model_id] = (
+                aeg_path,
+                str(Path(aeg_path).resolve()) if aeg_path is not None else None,
+            )
             # Optional v4/v5 layers are initialized at the same reachability
             # boundary as model loading.  They remain feature-gated by the
             # artifact manifest, but no longer exist only in isolated stats
@@ -643,6 +652,27 @@ class Runtime:
         if local and (local / "manifest.json").is_file():
             return str(local)
         return None
+
+    def _loaded_aeg_path(self, model_id: str) -> tuple[str | None, str | None]:
+        """The artifact path for a model this process has already loaded.
+
+        Returns ``(aeg_path, resolved_path)``.  :meth:`_load_model` resolved both
+        and recorded the answer, so a second request for the same model does not
+        walk the cache layouts again: that walk is several ``is_file`` probes plus a
+        ``Path.resolve``, it sits on the critical path *ahead* of the prompt, and its
+        cost belongs to the host filesystem rather than to Aether — an overlay or
+        network mount charges far more for a stat than local disk does.
+
+        On a miss the resolution happens exactly as before.  The memo is filled by
+        loading a model, never consulted in place of resolving one, which keeps
+        discovery a property of the filesystem rather than of process state.
+        """
+        with self._lock:
+            memo = self._aeg_paths.get(model_id)
+        if memo is not None:
+            return memo
+        path = self._resolve_aeg_path(model_id)
+        return path, (str(Path(path).resolve()) if path is not None else None)
 
     def pull(self, model_id: str) -> None:
         """Download and compile a model to a local AEG package.
@@ -712,6 +742,7 @@ class Runtime:
         with self._lock:
             self._loaded_models.pop(model_id, None)
             self._loaded_backends.pop(model_id, None)
+            self._aeg_paths.pop(model_id, None)
         logger.info(f"Removed model {model_id} from cache")
 
     def generate(
@@ -817,10 +848,10 @@ class Runtime:
         if self.ttt_engine is not None:
             request.extra.setdefault("ttt_engine", self.ttt_engine)
             request.extra.setdefault("ttt_request_id", uuid.uuid4().hex)
-        aeg_path_for_request = self._resolve_aeg_path(model_id)
+        aeg_key_for_request = self._loaded_aeg_path(model_id)[1]
         peagle_engine = (
-            self._peagle_engines.get(str(Path(aeg_path_for_request).resolve()))
-            if aeg_path_for_request is not None
+            self._peagle_engines.get(aeg_key_for_request)
+            if aeg_key_for_request is not None
             else self.peagle_engine
         )
         if peagle_engine is not None:
@@ -1121,10 +1152,10 @@ class Runtime:
         task_weights = getattr(self, "_task_weights_by_model", {}).get(model_id)
         if task_weights is not None:
             request_extra.setdefault("task_weights", dict(task_weights))
-        stream_aeg_path = self._resolve_aeg_path(model_id)
+        stream_aeg_key = self._loaded_aeg_path(model_id)[1]
         stream_peagle = (
-            self._peagle_engines.get(str(Path(stream_aeg_path).resolve()))
-            if stream_aeg_path is not None
+            self._peagle_engines.get(stream_aeg_key)
+            if stream_aeg_key is not None
             else self.peagle_engine
         )
         if stream_peagle is not None:

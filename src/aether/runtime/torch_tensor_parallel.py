@@ -639,15 +639,28 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         than duplicated, for the same reason it is shared in the base class.
         """
         torch = self.torch
+        vocabulary = int(self.embedding_vocab_size)
         if isinstance(token_ids, torch.Tensor):
             ids = token_ids if batched else token_ids.reshape(-1)
             if ids.device != self.device or ids.dtype != torch.long:
                 ids = ids.to(device=self.device, dtype=torch.long)
+            if validate_ids and ids.numel():
+                # One readback for both bounds, for the reason given in
+                # :meth:`TorchAEGEngine._forward_device` — and more sharply here: a
+                # stall on this device is a stall its peers spend waiting at the next
+                # collective, so the cost is per device, not per host.
+                low, high = torch.stack((ids.min(), ids.max())).tolist()
+                if low < 0 or high >= vocabulary:
+                    raise ValueError("token id is outside the compiled vocabulary")
         else:
             array = np.asarray(token_ids, dtype=np.int64)
-            ids = torch.as_tensor(
-                array if batched else array.reshape(-1), device=self.device
-            )
+            if not batched:
+                array = array.reshape(-1)
+            if validate_ids and array.size:
+                # Host ids, host question, asked before the upload.
+                if int(array.min()) < 0 or int(array.max()) >= vocabulary:
+                    raise ValueError("token id is outside the compiled vocabulary")
+            ids = torch.as_tensor(array, device=self.device)
         if batched and ids.dim() != 2:
             raise ValueError(
                 "a batched forward pass requires rank-2 (batch, seq) ids, got rank "
@@ -655,8 +668,6 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
             )
         if ids.numel() == 0:
             raise ValueError("forward() requires at least one token")
-        if validate_ids and (int(ids.min()) < 0 or int(ids.max()) >= self.embedding_vocab_size):
-            raise ValueError("token id is outside the compiled vocabulary")
         if cache is None:
             cache = (
                 self._new_batched_cache(batch_size=int(ids.shape[0]), reserve=reserve)
