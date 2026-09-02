@@ -1693,6 +1693,20 @@ class TorchAEGEngine:
         lead = tuple(ids.shape)
         seq_len = int(ids.shape[-1])
         total = past + seq_len
+        # A learned position table has exactly as many rows as the model has
+        # positions, and nothing extends it: the rotary tables below are *derived*
+        # and can be rebuilt taller, but a trained table cannot, so a step past its
+        # last row has no position to read.  The reference and hybrid executors both
+        # refuse here; this one handed the index to ``index_select``, which on an
+        # accelerator is an asynchronous device-side assert -- it poisons the CUDA
+        # context, so the process dies at the next unrelated call (cleanup, an
+        # allocator query) with a stack that points anywhere but here.  One host
+        # integer comparison per pass buys the same refusal the reference gives.
+        if self.position_embedding is not None and total > self.max_positions:
+            raise ValueError(
+                f"sequence end {total} exceeds learned position embedding capacity "
+                f"{self.max_positions}"
+            )
         span = torch.arange(past, total, device=self.device, dtype=torch.long)
         if batched:
             # A row's position is its padded index minus its *own* pad count, so a
@@ -2004,6 +2018,15 @@ class TorchAEGEngine:
         """
         tokens = max(1, int(tokens))
         batch = max(1, int(batch))
+        # This probe is a prefill *and* one decode step on the cache it built, so it
+        # evaluates ``tokens + 1`` positions -- one more than the caller's ceiling.
+        # For a learned-absolute model that ceiling is a trained table height, and
+        # there is no row past it: asked for GPT-Neo's full 2048-position context,
+        # the decode step below would read position 2048 of a 2048-row table.  The
+        # widest *representable* probe is derived from the model rather than trusted
+        # from the caller, so the step the margin is calibrated against is a step the
+        # model can actually take.
+        tokens = min(tokens, max(1, self.max_positions - 1))
         ids = np.zeros(tokens, dtype=np.int64)
         # Reserve as generation does, so the KV cache is allocated at its final size
         # once instead of doubling — the same allocation shape a real request makes.
@@ -3223,6 +3246,15 @@ class TorchHybridAEGEngine:
                 if self.embedding_norm is not None:
                     hidden = self._norm(hidden, self.embedding_norm, self.embedding_norm_bias)
                 if self.position_embedding is not None:
+                    # The reference hybrid executor refuses this by name; a torch
+                    # slice past the last row returns an *empty* tensor instead, so
+                    # without the check the failure surfaces as a broadcast error
+                    # about shapes that names neither the table nor the position.
+                    if past >= int(self.position_embedding.shape[0]):
+                        raise ValueError(
+                            f"sequence end {past + 1} exceeds learned position "
+                            f"embedding capacity {int(self.position_embedding.shape[0])}"
+                        )
                     hidden = hidden + self.position_embedding[past:past + 1]
                 for index, kind in enumerate(self.layer_types):
                     hidden = hidden.to(self.layer_devices[index])

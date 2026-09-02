@@ -7,15 +7,33 @@ Read [What can actually run on 2x T4](#what-can-actually-run-on-2x-t4) first. Al
 engines run here, but not all of them run on the GPU, and the suite says so with the
 device each one reported rather than leaving a slow row to be misread.
 
+[Exact versions](#exact-versions) lists the stack these runs were executed against, which
+of it is pinned and which is inherited from the Kaggle image. [Same environment, same
+input](#same-environment-same-input) is how the suite makes "all four engines, same
+conditions" a checked property rather than a claim.
+
 ## 0. Push to `main` first
 
-The notebook clones the repository, so the code has to be on GitHub before you start:
+The notebook clones the repository, so the code has to be on GitHub before you start —
+**including the four-engine field itself**. The engine list, the per-cell failure
+handling and the position-ceiling fix all live in the working tree; a notebook run against
+an older `main` measures whatever field that commit declared, which is how a run ends up
+reporting more than four engines.
 
 ```bash
 git add -A
-git commit -m "bench: multi-engine benchmark suite"
+git commit -m "bench: four-engine field; refuse positions past a learned table"
 git push origin main
 ```
+
+Confirm the clone got the right field before measuring anything (step 2 must have run):
+
+```python
+!python -c "from benchmark.suite import engines; print(list(engines.KEYS))"
+# ['transformers', 'pytorch_native', 'openvino', 'aether']
+```
+
+If that prints anything else, the notebook is running older code — re-clone.
 
 ## 1. Notebook settings
 
@@ -57,9 +75,40 @@ version, so pinning afterwards would mean the field was not measured against one
 
 ## 4. Confirm the environment
 
+This cell prints every version the report will record, and fails loudly on the two
+constraints that are not negotiable: a CUDA-enabled torch, and a `transformers` inside
+the range `optimum-intel` declares. Everything else is recorded rather than enforced —
+see [Exact versions](#exact-versions).
+
+```python
+import importlib.metadata as md, sys, torch
+print("python      ", sys.version.split()[0])
+print("torch       ", torch.__version__, "| cuda", torch.version.cuda,
+      "| devices", torch.cuda.device_count())
+for name in ("transformers", "accelerate", "openvino", "optimum", "optimum-intel",
+             "numpy", "huggingface-hub"):
+    try:
+        print(f"{name:16s}", md.version(name))
+    except md.PackageNotFoundError:
+        print(f"{name:16s} not installed")
+import aether; print("aether          ", aether.__version__)
+if torch.cuda.is_available():
+    for i in range(torch.cuda.device_count()):
+        major, minor = torch.cuda.get_device_capability(i)
+        print(f"gpu{i}         {torch.cuda.get_device_name(i)} sm_{major}{minor}",
+              f"{torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f} GiB")
+
+assert torch.cuda.is_available(), "no CUDA device: set Accelerator to GPU T4 x2"
+from benchmark.suite.engines.base import requirement_conflicts
+for problem in requirement_conflicts("optimum-intel"):
+    print("CONFLICT:", problem)
+```
+
+`requirement_conflicts` is the same function the report's compatibility table uses, so
+what it prints here is what would appear there an hour later.
+
 ```python
 !nvidia-smi
-!python -c "import torch, transformers; print('torch', torch.__version__, '| transformers', transformers.__version__, '| cuda', torch.cuda.is_available(), torch.cuda.device_count())"
 ```
 
 ## 5. Check which engines the host accepts, before spending an hour
@@ -73,6 +122,24 @@ report. Two to three minutes.
 
 Read the `engine availability` block it prints. Every engine is either `run` or `skip`
 with a reason in full — no truncation. Fix anything surprising there before step 6.
+
+`--smoke` runs the *first* model only (SmolLM2-135M), so it does not touch the other two.
+One of them is worth a cell of its own before an hour-long run: GPT-Neo is the only
+checkpoint in the set with a learned absolute position table, which makes its 2048
+positions a hard ceiling rather than a rotary table that can be rebuilt taller. It is
+also the model that used to take the run down at load time. Two minutes:
+
+```python
+!python benchmark.py \
+    --models SummerSigh/GPTNeo350M-Instruct-SFT \
+    --batch-sizes 1 --prompt-tokens 32 --output-tokens 16 \
+    --primary-prompt-tokens 32 --primary-output-tokens 16 \
+    --warmup-iters 1 --measure-iters 2 --no-charts \
+    --output-dir /kaggle/working/bench_neo
+```
+
+All four engines should reach `MEASURED`. If one does not, the reason is in that run's
+report and the failure is recorded per cell — a failed cell no longer ends the run.
 
 ## 6. The full run
 
@@ -139,6 +206,78 @@ tab. To bring it back into the repository:
 ```
 
 ---
+
+## Exact versions
+
+Two things are pinned, and everything else is inherited from the Kaggle image and
+recorded. That split is deliberate: reinstalling torch on Kaggle is the single most
+reliable way to break a run, because the wheel has to match the driver and the CUDA
+runtime already in the image, and a mismatch surfaces as a CUDA error hours later
+rather than as a failed install.
+
+**Pinned, because the suite's correctness depends on it:**
+
+| Package | Pin | Why |
+| --- | --- | --- |
+| `transformers` | `==4.57.1` | Three engines load through it, and `optimum-intel` declares a hard upper bound. One version for the whole field, chosen before anything is measured |
+| `optimum[openvino]` | latest that satisfies the `transformers` pin | Supplies `openvino` and `optimum-intel`; the OpenVINO engine is absent without it |
+
+**Inherited from the image, recorded in the report, never reinstalled:**
+
+| Component | Observed | Note |
+| --- | --- | --- |
+| Python | `3.12.13` | The image's interpreter |
+| torch | `2.10.0+cu128` / `2.13.0+cu130` | Both images this suite has run on. Any `>=2.5` CUDA build works |
+| CUDA runtime | `12.8` / `13.0` | Whatever the torch wheel was built against |
+| GPU | 2x Tesla T4, `sm_75`, 14.6 GiB each | Fixes precision to fp16; see below |
+| `openvino` | `2026.3.1` | Pulled in by `optimum[openvino]` |
+| `aether-runtime` | `1.2.8a0` | This repository, installed `-e` |
+| Precision | `fp16` | Derived from `sm_75`, not chosen |
+
+The full install, in order, is steps 2 and 3 above and nothing else:
+
+```python
+!pip install -q -e ".[pytorch]"
+!pip install -q -r benchmark/requirements.txt
+!pip install -q "optimum[openvino]"
+!pip install -q "transformers==4.57.1"
+# then: Run -> Restart session
+```
+
+The `transformers` pin goes **last** so it wins over anything `optimum[openvino]` pulled
+in, and the restart is what makes one library set apply to every engine in the run.
+`benchmark/requirements.txt` deliberately declares floors rather than pins, so pip keeps
+the image's own newer torch, matplotlib and psutil instead of downgrading them.
+
+The report records all of this per run under `environment` in `benchmark_results.json`,
+so a comparison between two runs can be checked rather than assumed.
+
+## Same environment, same input
+
+"All four engines, same conditions" is enforced by the harness, not left to the operator:
+
+- **One worker process per (engine, model)**, run one at a time. Two engines measured
+  concurrently would contend for the same GPU, and an engine that claims all of a device
+  cannot share a process with another that does the same.
+- **The prompts are built once**, by the orchestrator, with the model's own tokenizer to
+  an exact token count — then written to a workload file every worker reads. Each worker
+  re-encodes those exact strings with its own engine's tokenizer and verifies the ids
+  match. If each worker built its own prompts, a tokenizer difference would hand two
+  engines different amounts of work while the table claimed they had the same.
+- **One precision for the field**, resolved once from the hardware (`--precision auto`
+  gives fp16 on T4) and applied to every engine.
+- **One device per engine** — `--devices 1` by default, applied by restricting
+  `CUDA_VISIBLE_DEVICES` in each worker before any CUDA context exists.
+- **One thread budget**, pinned in every worker before torch initializes; when it is not
+  set, the report says the budget was inherited rather than pretending it was controlled.
+- **Same weights**: every engine loads the same checkpoint at the same revision, resolved
+  once and recorded.
+
+Where an engine genuinely cannot match the others — OpenVINO having no CUDA plugin, so
+executing on CPU — the difference is labelled on every affected pairing rather than
+averaged into a headline. The one deliberate configuration override in the field is
+Aether's semantic response cache, which is turned off for measured runs so a repeated
+prompt times inference instead of a cache hit; it is disclosed in the engine's notes.
 
 ## What can actually run on 2x T4
 

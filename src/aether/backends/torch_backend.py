@@ -227,7 +227,7 @@ class TorchBackend(Backend):
             self._devices = ["cpu"]
             self._runtime_family = "cpu"
 
-    def _placement_workload(self) -> Any:
+    def _placement_workload(self, engine: Any = None) -> Any:
         """Build the workload envelope the planner will size against.
 
         The backend does not know the request mix at load time, so the envelope is
@@ -235,6 +235,14 @@ class TorchBackend(Backend):
         deployment can meet and a target drawn from the artifact's own declared
         context. Planning against an optimistic guess is how a runtime OOMs on the
         first large request.
+
+        The target is also clamped to what the loaded model can actually represent.
+        A plan is a promise about one request's positions, and a model has no
+        position past its last: GPT-Neo's learned table stops at 2048 rows, so an
+        envelope asking for 2048 context *plus* 256 generated tokens describes a
+        request that cannot be served. Sizing memory for it is the harmless half of
+        the error; the harmful half is that the bootstrap probe then measures at that
+        ceiling and steps off the end of the table.
         """
         from aether.placement import Intent, WorkloadEnvelope
 
@@ -247,6 +255,23 @@ class TorchBackend(Backend):
         batch = value("AETHER_PLAN_BATCH", 1)
         context = value("AETHER_PLAN_CONTEXT", 2048)
         generate = value("AETHER_PLAN_GENERATE", 256)
+        ceiling = 0
+        if engine is not None:
+            try:
+                ceiling = int(getattr(engine, "max_positions", 0) or 0)
+            except (TypeError, ValueError):
+                ceiling = 0
+        if ceiling > 0 and context + generate > ceiling:
+            # Give the generation budget precedence over the prompt budget: a plan
+            # that leaves no room to answer is useless, while a shorter prompt is
+            # still a request. Both stay at least 1 so the envelope is well formed.
+            generate = max(1, min(generate, ceiling - 1))
+            context = max(1, ceiling - generate)
+            logger.info(
+                "workload envelope clamped to the model's %d representable "
+                "positions: context %d, generate %d",
+                ceiling, context, generate,
+            )
         requested = str(os.environ.get("AETHER_PLAN_INTENT", "") or "balanced").lower()
         try:
             intent = Intent(requested)
@@ -296,7 +321,7 @@ class TorchBackend(Backend):
                         ) / 1024 ** 3,
                     )
             planner = ExecutionPlanner(profile, census, ledger)
-            decision = planner.plan(self._placement_workload())
+            decision = planner.plan(self._placement_workload(engine))
             self._placement_planner = planner
         except Exception as exc:  # noqa: BLE001 - planning must never block a load
             from aether.placement.planner import PlacementInfeasible

@@ -489,15 +489,13 @@ class AetherBackend:
     def unload(self) -> None:
         import gc
 
-        import torch
+        from benchmark.gpu_monitor import release_cuda
 
         self._runtime = None
         self._engine = None
         self._tokenizer = None
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        release_cuda()
 
 
 def _to_cpu_float(value: Any) -> Any:

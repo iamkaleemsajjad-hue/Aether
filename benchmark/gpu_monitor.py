@@ -39,17 +39,38 @@ def reset_peak_stats() -> None:
     torch.cuda.synchronize()
 
 
-def empty_cache() -> None:
-    """Release cached blocks so a 'before' reading reflects real occupancy."""
+def release_cuda() -> bool:
+    """Return cached device blocks to the driver; report whether that succeeded.
+
+    Cleanup must never be what ends a run. Once a kernel has failed an assertion
+    the CUDA context is unusable, and every later call against it raises -- so the
+    allocator calls below, which exist only to tidy up, would raise *instead of* the
+    failure that actually happened, at a point where there is no handler left. In a
+    single-process harness that turns one recorded failed cell into a dead run and a
+    traceback pointing at the cleanup rather than at the cause.
+
+    The failure is not swallowed: the caller already holds the real error, and a
+    ``False`` return says the context is gone so nothing downstream trusts a memory
+    reading taken through it.
+    """
     if not cuda_available():
-        return
+        return False
     import gc
 
-    import torch
-
     gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
+    try:
+        import torch
+
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    except Exception:  # a poisoned context must not mask its cause
+        return False
+    return True
+
+
+def empty_cache() -> None:
+    """Release cached blocks so a 'before' reading reflects real occupancy."""
+    release_cuda()
 
 
 def memory_snapshot() -> dict[str, Any]:

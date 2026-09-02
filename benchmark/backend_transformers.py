@@ -278,14 +278,12 @@ class TransformersBackend:
     def unload(self) -> None:
         import gc
 
-        import torch
+        from benchmark.gpu_monitor import release_cuda
 
         self._model = None
         self._tokenizer = None
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        release_cuda()
 
 
 def unsupported(reason: str) -> UnsupportedConfiguration:

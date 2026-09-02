@@ -166,6 +166,20 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         self.position_hidden_size = (
             None if position_embedding is None else int(np.asarray(position_embedding).shape[1])
         )
+        if position_embedding is not None:
+            # Sharding must not lose a hard constraint.  The base class reads its
+            # position ceiling off ``self.weights.position_embedding``, and the
+            # namespace built above deliberately carries no weights at all, so the
+            # ceiling silently became the generous cap meant for rotary models --
+            # a million positions for a table with a few thousand rows.  Restate it
+            # from the source table's own height, which is what a trained table's
+            # ceiling *is*.  Without this the guard in :meth:`_forward_device` never
+            # fires here, and an unrepresentable position reaches
+            # :meth:`_position_lookup`, where no shard range claims it: the row is
+            # left as whatever ``torch.empty`` returned and is added to the hidden
+            # state as though it were a position embedding.  A wrong answer is worse
+            # than a refusal, and it is worse still for being quiet.
+            self.max_positions = int(np.asarray(position_embedding).shape[0])
         self._alibi_slopes = self._tensor_primary(self._source_alibi())
         if self.num_heads % self.num_kv_heads:
             raise ValueError("query heads must be divisible by KV heads")
@@ -678,6 +692,14 @@ class TorchTensorParallelAEGEngine(TorchAEGEngine):
         lead = tuple(ids.shape)
         seq_len = int(ids.shape[-1])
         total = past + seq_len
+        # The same hard ceiling the single-device executor enforces, for the same
+        # reason and with the same wording: a trained position table has no row past
+        # its last, and sharding it across devices does not create one.
+        if self.position_embedding is not None and total > self.max_positions:
+            raise ValueError(
+                f"sequence end {total} exceeds learned position embedding capacity "
+                f"{self.max_positions}"
+            )
         span = torch.arange(past, total, device=self.device, dtype=torch.long)
         if batched:
             # A row's position is its padded index minus its own pad count, so a
