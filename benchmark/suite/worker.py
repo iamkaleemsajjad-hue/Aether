@@ -453,8 +453,7 @@ def _artifact_record(record: dict[str, Any]) -> dict[str, Any]:
         "download_s": load.get("download_s"),
         "total_startup_s": load.get("total_s"),
         "artifact_bytes": size,
-        "artifact_path": describe.get("artifact") or notes.get("gguf_path")
-        or describe.get("exl2_path") or describe.get("mlc_model"),
+        "artifact_path": describe.get("artifact"),
         "built_this_run": bool(
             notes.get("compiled_this_run")
             or notes.get("exported_this_run")

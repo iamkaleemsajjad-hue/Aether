@@ -20,6 +20,7 @@ from benchmark.backends import (
     UnsupportedConfiguration,
     resolve_dtype,
     set_seed,
+    stream_first_token_latency,
 )
 
 
@@ -189,34 +190,17 @@ class TransformersBackend:
         )
 
     def first_token_latency(self, prompt: str, *, max_new_tokens: int, seed: int) -> float:
-        """Time until the first token is decodable, using the library's streamer."""
-        import threading
+        """Time until the first token is decodable, using the library's streamer.
 
-        import torch
-        from transformers import TextIteratorStreamer
-
+        The timed region is :func:`benchmark.backends.stream_first_token_latency`,
+        shared with every other engine measured the same way, so that no row's
+        time-to-first-token comes from its own copy of the stopwatch.
+        """
         set_seed(seed)
-        inputs = self._encode(prompt, 1)
-        streamer = TextIteratorStreamer(self._tokenizer, skip_prompt=True, timeout=120.0)
-
-        def worker() -> None:
-            with torch.no_grad():
-                self._model.generate(
-                    **inputs, max_new_tokens=max_new_tokens, min_new_tokens=max_new_tokens,
-                    do_sample=False, use_cache=True, streamer=streamer,
-                    pad_token_id=self._tokenizer.pad_token_id,
-                )
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        thread = threading.Thread(target=worker, daemon=True)
-        start = time.perf_counter()
-        thread.start()
-        for _ in streamer:
-            break
-        elapsed = time.perf_counter() - start
-        thread.join(timeout=300.0)
-        return elapsed
+        return stream_first_token_latency(
+            self._model, self._tokenizer, self._encode(prompt, 1),
+            max_new_tokens=max_new_tokens,
+        )
 
     def generate_mixed(
         self,

@@ -19,7 +19,26 @@ from typing import Any
 
 from benchmark.reporting import _bytes, _fmt, _table
 from benchmark.suite import status as status_mod
-from benchmark.suite.analysis import SAME_REPRESENTATION
+from benchmark.suite.analysis import (
+    DEVICE_DIFFERENCE,
+    SAME_REPRESENTATION,
+    WORK_DIFFERENCE,
+)
+
+#: How each comparability verdict is rendered in a table cell. Keyed on the verdict
+#: itself so a label added to the analysis module shows up here as a KeyError-free
+#: ``?`` rather than being silently printed as its opposite.
+_COMPARABILITY_CELL: dict[str, str] = {
+    SAME_REPRESENTATION: "like for like",
+    "REPRESENTATION_DIFFERENCE": "format differs",
+    DEVICE_DIFFERENCE: "hardware differs",
+    WORK_DIFFERENCE: "work differs",
+}
+
+
+def _comparable_cell(label: str | None) -> str:
+    """The short reading of one comparability verdict, for a table cell."""
+    return _COMPARABILITY_CELL.get(str(label), str(label or "?").lower())
 
 
 def _pct(value: Any, digits: int = 1) -> str:
@@ -92,7 +111,11 @@ def executive_summary(payload: dict[str, Any], analysis: dict[str, Any]) -> str:
         f"2. **Fastest single cell anywhere in the matrix**: {leader('peak_throughput')}.",
         f"3. **Fastest at batch 1** (the single-user case): {leader('batch_1')}.",
         f"4. **Best batch scaling**: {_scaling_leader(rankings)}.",
-        f"5. **Lowest time to first token**: {leader('ttft')}.",
+        f"5. **Lowest time to first token**: {leader('ttft')}"
+        + (" - measured by more than one method across the field, so read it with the "
+           "per-method note in the rankings section"
+           if (rankings.get("ttft") or {}).get("mixed_methods") else "")
+        + ".",
         f"6. **Lowest single-request latency**: {leader('latency')}.",
         f"7. **Lowest peak memory**: {leader('host_memory')}.",
         f"8. **Fastest cold start**: {leader('cold_start')}.",
@@ -132,11 +155,12 @@ def _standings_table(analysis: dict[str, Any]) -> str:
             _pct(entry["median_improvement_percent"]),
             str(entry["cells_measured"]),
             f"{entry['same_representation']}/{entry['compared']}",
+            f"{entry.get('cross_device', 0)}/{entry['compared']}",
         ])
     return _table(
         ["Rank", "Engine", "% of best (median)", "W/L/T", "Win rate",
          "Median difference vs field", "Cells measured",
-         "Same-representation pairings"],
+         "Same-representation pairings", "Pairings that crossed hardware"],
         rows,
     )
 
@@ -235,7 +259,7 @@ def _best_model(comparisons: list[dict[str, Any]], engine: str) -> str:
                 by_model.setdefault(item["model"], []).append(
                     item["throughput"]["subject_improvement_percent"]
                 )
-        suffix = " (comparisons cross a representation boundary)"
+        suffix = " (no comparison in this set was like for like)"
     if not by_model:
         return "not determined; no comparison was produced by this run"
     scored = {model: statistics.median(values) for model, values in by_model.items()}
@@ -484,6 +508,53 @@ def compatibility_section(analysis: dict[str, Any]) -> str:
             ["Engine", "Model", "Status", "Version", "Cells", "Representation",
              "Tokenizer matches", "Reason"],
             rows,
+        ),
+        "",
+        _execution_parity_table(analysis),
+    ])
+
+
+def _execution_parity_table(analysis: dict[str, Any]) -> str:
+    """What each engine actually executed on, beside what it was asked to.
+
+    The controlled variables are set once for the whole run, but an engine can decline
+    one: a plugin with no driver for the accelerator falls back to the host CPU, and a
+    plugin that cannot execute a precision widens it. Both are properties of the engine
+    rather than of the configuration, and neither is visible in a throughput number - a
+    row that ran on the CPU at fp32 just looks slow. Printing the requested and the
+    reported value side by side is what turns that into a readable fact, and it is the
+    evidence behind every DEVICE_DIFFERENCE label in the comparisons.
+    """
+    seen: dict[str, list[Any]] = {}
+    for entry in analysis["compatibility"]:
+        if entry.get("status") != status_mod.MEASURED:
+            continue
+        engine = str(entry.get("engine"))
+        seen.setdefault(engine, [
+            f"`{engine}`",
+            str(entry.get("execution_device") or "not reported"),
+            str(entry.get("execution_device_class") or "not reported"),
+            str(entry.get("precision_requested") or "not reported"),
+            str(entry.get("precision_executed") or "not reported"),
+            _fmt(entry.get("threads")),
+            str(entry.get("ttft_method") or "not reported").replace("_", " "),
+        ])
+    if not seen:
+        return ""
+    return "\n".join([
+        "**What each engine executed on**",
+        "",
+        "Requested beside reported. A difference in either device class or precision is "
+        "why a comparison involving that engine is labelled rather than quoted: the "
+        "percentage would be describing two machines, or two numerical formats, instead "
+        "of two stacks. The last column is the stopwatch behind that engine's "
+        "time-to-first-token figure, because an engine with no stream to subscribe to "
+        "is not measured by the same instrument as one that has.",
+        "",
+        _table(
+            ["Engine", "Execution device", "Device class", "Precision asked for",
+             "Precision reported", "CPU threads", "TTFT method"],
+            [seen[engine] for engine in sorted(seen)],
         ),
         "",
     ])
@@ -825,6 +896,8 @@ def _engine_head_to_head(analysis: dict[str, Any], engine: str) -> list[str]:
     everything = win_loss.get("all") or {}
     same = win_loss.get("same_representation") or {}
     different = win_loss.get("representation_difference") or {}
+    cross_device = win_loss.get("device_difference") or {}
+    cross_work = win_loss.get("work_difference") or {}
 
     def render(entries: list[dict[str, Any]]) -> str:
         rows = [
@@ -836,7 +909,7 @@ def _engine_head_to_head(analysis: dict[str, Any], engine: str) -> list[str]:
                 _fmt(item["throughput"]["subject"]),
                 _fmt(item["throughput"]["other"]),
                 _pct(item["throughput"]["subject_improvement_percent"]),
-                "same" if item["comparability"] == SAME_REPRESENTATION else "differs",
+                _comparable_cell(item["comparability"]),
             ]
             for item in sorted(
                 entries,
@@ -845,7 +918,7 @@ def _engine_head_to_head(analysis: dict[str, Any], engine: str) -> list[str]:
         ]
         return _table(
             ["Model", "Batch", "Workload", "Opponent", f"{engine} tok/s",
-             "Opponent tok/s", "Difference", "Representation"],
+             "Opponent tok/s", "Difference", "Like for like?"],
             rows,
         )
 
@@ -864,6 +937,12 @@ def _engine_head_to_head(analysis: dict[str, Any], engine: str) -> list[str]:
                 ["Representation differs (does not)", str(different.get("compared", 0)),
                  str(different.get("wins", 0)), str(different.get("losses", 0)),
                  str(different.get("ties", 0))],
+                ["Hardware differs (does not)", str(cross_device.get("compared", 0)),
+                 str(cross_device.get("wins", 0)), str(cross_device.get("losses", 0)),
+                 str(cross_device.get("ties", 0))],
+                ["Work produced differs (does not)", str(cross_work.get("compared", 0)),
+                 str(cross_work.get("wins", 0)), str(cross_work.get("losses", 0)),
+                 str(cross_work.get("ties", 0))],
             ],
         ),
         "",
@@ -915,11 +994,11 @@ def _per_competitor_table(per_competitor: dict[str, Any], engine: str) -> str:
             f"{_pct(entry['min_improvement_percent'])} to "
             f"{_pct(entry['max_improvement_percent'])}",
             f"{entry['wins']}/{entry['losses']}/{entry['ties']}",
-            "same" if entry["comparability"] == SAME_REPRESENTATION else "differs",
+            _comparable_cell(entry["comparability"]),
         ])
     return _table(
         ["Opponent", "Cells", f"Median {engine} difference",
-         "Median, same representation only", "Range", "W/L/T", "Representation"],
+         "Median, same representation only", "Range", "W/L/T", "Like for like?"],
         rows,
     )
 
@@ -1175,6 +1254,20 @@ def rankings_section(analysis: dict[str, Any]) -> str:
                 rendered,
             ])
         parts += [_table(["Rank", "Engine", "Model", "Value"], rows), ""]
+        if ranking.get("mixed_methods"):
+            # Ordering figures taken by different instruments is defensible only if the
+            # table says which instrument produced each one.
+            methods = ranking.get("methods") or {}
+            parts += [
+                "Measured by more than one method, so this ordering is not "
+                "like-for-like: "
+                + ", ".join(
+                    f"`{engine}` by {str(method or 'an unreported method').replace('_', ' ')}"
+                    for engine, method in sorted(methods.items())
+                )
+                + ".",
+                "",
+            ]
         missing = ranking.get("not_measured") or []
         if missing:
             parts += [
@@ -1269,11 +1362,25 @@ LIMITATIONS: tuple[str, ...] = (
     "by timing a one-token generation on others, because not every stack exposes a "
     "stream. Each engine's method is printed; the two are not the same machinery and "
     "TTFT is therefore a weaker comparison than throughput.",
-    "Engines that execute a re-exported or quantized representation (ONNX Runtime, "
-    "OpenVINO, llama.cpp, ExLlamaV2, MLC) are not holding the same weights as the "
-    "framework engines. Their rows are measured and reported because they are how "
-    "people actually deploy, and every percentage derived from them is labelled "
-    "REPRESENTATION_DIFFERENCE.",
+    "OpenVINO executes a re-exported representation: the checkpoint is converted to "
+    "OpenVINO IR and the weights are stored at the run's precision on the way out. It "
+    "is the same numerical width as the framework engines hold, in a different "
+    "container, and every percentage derived from a row whose storage width differs is "
+    "labelled REPRESENTATION_DIFFERENCE rather than quoted as a difference between "
+    "the two stacks.",
+    "OpenVINO ships no CUDA plugin. On an NVIDIA host it can only execute on the CPU, "
+    "while the three torch-based engines execute on the GPU, and no flag changes that: "
+    "it is a property of the runtime, not of this configuration. Its rows are measured "
+    "and it keeps its rank, but every pairing that crosses that boundary is labelled "
+    "DEVICE_DIFFERENCE and counted separately in the standings, because the "
+    "percentage describes two machines rather than two stacks. On an Intel host, where "
+    "OpenVINO has a GPU plugin, --openvino-device GPU removes the caveat and the "
+    "labelling follows the device the plugin reports back.",
+    "The thread budget is applied to every engine by the same mechanism it responds "
+    "to: the torch engines through the environment, OpenVINO through "
+    "INFERENCE_NUM_THREADS, because its scheduler ignores the environment variable the "
+    "others read. Without that, one engine would silently get every core while the "
+    "rest were held to the pinned count.",
     "Comparability is judged on compute precision and on weight storage width. Two "
     "engines at the same compute precision holding the same 16-bit width in different "
     "containers - fp16 tensors against Aether's bf16 artifact, both derived from the "
@@ -1289,22 +1396,23 @@ LIMITATIONS: tuple[str, ...] = (
     "weight-exact configuration; --precision bf16 is, at the cost of those engines.",
     "Every engine sees the same number of accelerators, one by default, enforced by "
     "restricting device visibility in each worker rather than by altering any engine's "
-    "placement logic. A runtime that would shard across several devices therefore runs "
+    "placement logic. Equal visibility is not equal use: an engine with no plugin for "
+    "the device present cannot execute on it, which is what the per-engine execution "
+    "device column reports. A runtime that would shard across several devices therefore runs "
     "single-device here. That is what makes the comparison a comparison of engines; it "
     "is also not a measurement of what that runtime can do with more hardware, which "
     "this run does not test. Raise --devices to measure that deliberately.",
-    "Serving engines reserve device memory by policy rather than by need, so their "
-    "peak-memory rows describe a reservation, not a working set. The reservation "
-    "fraction is recorded with each result.",
-    "Aether's semantic response cache and SGLang's prefix cache are both disabled for "
-    "measurement, through public configuration flags, because the benchmark issues one "
-    "prompt repeatedly and both would return a cached answer instead of running "
-    "inference. Both overrides are recorded per engine; no other default is changed.",
-    "torch.compile is attempted with whole-graph capture first and falls back to "
-    "graph-broken compilation when the model or the generation loop is not capturable "
-    "in one piece. The configuration that compiled is recorded per model; a row that "
-    "fell back is doing less compilation than one that did not, and the two should not "
-    "be read as the same engine.",
+    "Aether's semantic response cache is disabled for measurement, through a public "
+    "configuration flag, because the benchmark issues one prompt repeatedly and the "
+    "cache would return a stored answer instead of running inference. The override is "
+    "recorded per engine; no other default is changed, and no other engine in this "
+    "field has a cache that would fire on a repeated prompt.",
+    "Generation length is pinned rather than trusted: the three engines that expose a "
+    "minimum-new-tokens control are given one, so an early stop cannot shorten a "
+    "measured cell. Aether's public generate has no such control, so a cell where it "
+    "stopped early is detected after the fact from the token count and labelled "
+    "WORK_DIFFERENCE, which keeps it out of every percentage that claims to describe "
+    "execution.",
     "Build costs are measured once per engine per model on this machine. A first-time "
     "compile on a shared host includes filesystem and network variance that a "
     "repeated compile would not, so a single build time is a weaker measurement than "
@@ -1383,7 +1491,8 @@ def build_report(payload: dict[str, Any], analysis: dict[str, Any],
         f"Generated: {payload.get('generated_at', '—')}  ",
         f"Suite version: {payload.get('suite_version')}  ",
         f"Benchmark precision: {plan.get('resolved_precision')}  ",
-        f"Accelerators visible to each engine: {devices if devices else 'unrestricted'}  ",
+        f"Accelerators visible to each engine: {devices if devices else 'unrestricted'} "
+        "(visible; the device each engine actually executed on is reported per engine)  ",
         f"Models: {len(plan.get('models') or [])}  "
         f"Engines attempted: {len(plan.get('engines') or [])}",
         "",
@@ -1560,7 +1669,7 @@ def write_comparison_csv(analysis: dict[str, Any], path: Path) -> str:
         "subject_improvement_percent", "subject_latency_improvement_percent",
         "subject_host_memory_improvement_percent",
         "subject_device_memory_improvement_percent",
-        "subject_ttft_improvement_percent",
+        "subject_ttft_improvement_percent", "ttft_same_method",
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -1589,6 +1698,9 @@ def write_comparison_csv(analysis: dict[str, Any], path: Path) -> str:
                     item["device_memory"].get("subject_improvement_percent"),
                 "subject_ttft_improvement_percent":
                     item["ttft"].get("subject_improvement_percent"),
+                # False where the two rows' first tokens were timed differently, which
+                # a reader filtering this file on TTFT needs before the percentage.
+                "ttft_same_method": item["ttft"].get("same_method"),
             })
     return path.name
 
@@ -1624,7 +1736,8 @@ def terminal_summary(payload: dict[str, Any], analysis: dict[str, Any],
             else f"{float(value):.3f} s" if unit == "s"
             else f"{float(value):,.2f} tok/s"
         )
-        lines.append(f"  {label:22s} {head['engine']}  ({rendered})")
+        mixed = " [mixed methods]" if (rankings.get(key) or {}).get("mixed_methods") else ""
+        lines.append(f"  {label:22s} {head['engine']}  ({rendered}){mixed}")
 
     lines += ["", "  Standings (median share of the fastest engine per cell):", ""]
     if standings:

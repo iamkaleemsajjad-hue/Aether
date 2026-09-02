@@ -31,6 +31,25 @@ SAME_REPRESENTATION = "SAME_REPRESENTATION"
 #: still describes what a user would experience, but it is not a claim about
 #: execution alone.
 REPRESENTATION_DIFFERENCE = "REPRESENTATION_DIFFERENCE"
+#: The two rows ran on different classes of hardware. Checked before anything about
+#: the weights, because it dominates every other difference: a CPU runtime measured
+#: against a GPU runtime is a measurement of two machines, and no amount of matching
+#: precision makes the percentage a statement about either stack. OpenVINO has no
+#: CUDA plugin, so on an NVIDIA host this is not a hypothetical.
+DEVICE_DIFFERENCE = "DEVICE_DIFFERENCE"
+#: The two rows did not produce the same number of tokens. Every engine in the field
+#: is configured to generate exactly the requested count, so a mismatch means one of
+#: them stopped early - and a throughput built from a shorter generation amortizes
+#: prefill over fewer tokens, which moves the number without any execution
+#: difference behind it.
+WORK_DIFFERENCE = "WORK_DIFFERENCE"
+
+#: Every verdict :func:`comparability` can return, in decreasing severity. Consumers
+#: bucket on this list rather than on a pair of names, so a verdict added here cannot
+#: quietly fall out of a summary that only knew about two.
+COMPARABILITY_LABELS: tuple[str, ...] = (
+    DEVICE_DIFFERENCE, WORK_DIFFERENCE, REPRESENTATION_DIFFERENCE, SAME_REPRESENTATION,
+)
 
 #: Below this relative difference the two measurements are called a tie. Set from
 #: the dispersion the suite actually observes rather than picked for roundness: at
@@ -73,7 +92,7 @@ def flatten(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """One row per (engine, model, cell), measured or not.
 
     The unmeasured rows are kept deliberately. They are what lets the report say
-    "vLLM was not applicable on this host" in the same table that says "Aether
+    "OpenVINO was not installed on this host" in the same table that says "Aether
     reached 41 tok/s", instead of leaving a gap the reader has to interpret.
     """
     rows: list[dict[str, Any]] = []
@@ -94,6 +113,8 @@ def flatten(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "representation": describe.get("representation"),
                 "weight_storage_bits": describe.get("weight_storage_bits"),
                 "weight_storage_format": describe.get("weight_storage_format"),
+                "execution_device": describe.get("execution_device"),
+                "execution_device_class": describe.get("execution_device_class"),
             })
             continue
         for cell in cells:
@@ -114,12 +135,22 @@ def flatten(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "representation": describe.get("representation"),
                 "weight_storage_bits": describe.get("weight_storage_bits"),
                 "weight_storage_format": describe.get("weight_storage_format"),
-                "precision": run.get("precision"),
+                "execution_device": describe.get("execution_device"),
+                "execution_device_class": describe.get("execution_device_class"),
+                # What the engine reported it actually computed in, which is not
+                # always what the plan asked for: a plugin can decline a precision
+                # and widen it. The plan's value is the fallback, not the answer.
+                "precision": describe.get("precision") or run.get("precision"),
+                "requested_precision": run.get("precision"),
                 "total_tokens_per_s": derived.get("total_tokens_per_s"),
                 "per_request_tokens_per_s": derived.get("per_request_tokens_per_s"),
                 "decode_tokens_per_s": derived.get("decode_tokens_per_s"),
                 "prompt_tokens_per_s": derived.get("prompt_tokens_per_s"),
                 "ttft_s": derived.get("ttft_s"),
+                # Which stopwatch produced that figure. Two engines can both report a
+                # time to first token and not have measured the same thing, so the
+                # method travels with the number into every ranking that uses it.
+                "ttft_method": describe.get("ttft_method") or spec.get("ttft_method"),
                 "tpot_ms": derived.get("tpot_ms"),
                 "end_to_end_latency_s": derived.get("end_to_end_latency_s"),
                 "cold_latency_s": derived.get("cold_latency_s"),
@@ -173,15 +204,23 @@ def comparability(subject: dict[str, Any], other: dict[str, Any]) -> tuple[str, 
     Judged on what each engine reported it actually loaded, not on what the plan
     asked for, because an engine can export or quantize during its build step.
 
-    Two things are separated here, and conflating them is the mistake this function
-    exists to avoid:
+    Four things are separated here, and conflating any of them with the others is the
+    mistake this function exists to avoid:
 
+    * **execution device** - the class of hardware the row ran on. Checked first and
+      reported on its own, because two runtimes on two kinds of chip are not being
+      compared with each other at all. It is not a representation difference and is
+      not labelled as one.
+    * **work produced** - the number of tokens generated. Every engine is pinned to
+      the requested count, so a mismatch is an event, and throughput derived from
+      generations of different lengths is not a like-for-like rate.
     * **compute precision** - the dtype the arithmetic runs in. If it differs, the two
       engines are not doing the same work, and the comparison is labelled.
     * **weight storage** - the container the values sit in. Every engine here derives
       from the same published bf16 checkpoint, and each renders it into its own 16-bit
       form: the framework engines cast to fp16 tensors, Aether's artifact keeps the
-      bf16 values, an ONNX export widens to fp32. At equal compute precision and equal
+      bf16 values, an OpenVINO export stores whichever width it was asked for. At
+      equal compute precision and equal
       storage width that is one rounding step in different directions, which is a
       *disclosed* detail rather than a different experiment. Below 16 bits it is a
       different experiment, because fewer bits per weight is less memory traffic and
@@ -192,6 +231,29 @@ def comparability(subject: dict[str, Any], other: dict[str, Any]) -> tuple[str, 
     """
     subject_repr = str(subject.get("representation") or "")
     other_repr = str(other.get("representation") or "")
+
+    subject_device = subject.get("execution_device_class")
+    other_device = other.get("execution_device_class")
+    if subject_device and other_device and subject_device != other_device:
+        return DEVICE_DIFFERENCE, (
+            f"the two rows ran on different hardware: {subject_device} "
+            f"({subject.get('execution_device')}) against {other_device} "
+            f"({other.get('execution_device')}). The percentage describes those two "
+            "machines running these two stacks, and cannot be read as a difference "
+            "between the stacks"
+        )
+
+    subject_tokens = subject.get("completion_tokens")
+    other_tokens = other.get("completion_tokens")
+    if (
+        subject_tokens and other_tokens
+        and int(subject_tokens) != int(other_tokens)
+    ):
+        return WORK_DIFFERENCE, (
+            f"the rows generated different amounts: {subject_tokens} tokens against "
+            f"{other_tokens}. Prefill is amortized over a different number of tokens "
+            "on each side, so the rates are not like for like"
+        )
 
     if subject.get("quantized") or other.get("quantized"):
         quantized = "both engines" if (
@@ -288,6 +350,16 @@ def _compare_pair(subject: dict[str, Any], other: dict[str, Any], key: Key,
     """Every metric of one engine against another, in one cell."""
     label, note = comparability(subject, other)
     throughput = compare(subject.get(PRIMARY_METRIC), other.get(PRIMARY_METRIC))
+    # Both engines' stopwatches, attached to the figure that compares them: a
+    # percentage between a streamed first token and a one-token call is a real
+    # percentage, and it is not a like-for-like one.
+    ttft = compare(subject.get("ttft_s"), other.get("ttft_s"), lower_is_better=True)
+    ttft["subject_method"] = subject.get("ttft_method")
+    ttft["competitor_method"] = other.get("ttft_method")
+    ttft["same_method"] = bool(
+        subject.get("ttft_method")
+        and subject.get("ttft_method") == other.get("ttft_method")
+    )
     return {
         "model": key.model,
         "batch_size": key.batch_size,
@@ -303,8 +375,7 @@ def _compare_pair(subject: dict[str, Any], other: dict[str, Any], key: Key,
                           other.get("decode_tokens_per_s")),
         "latency": compare(subject.get("end_to_end_latency_s"),
                            other.get("end_to_end_latency_s"), lower_is_better=True),
-        "ttft": compare(subject.get("ttft_s"), other.get("ttft_s"),
-                        lower_is_better=True),
+        "ttft": ttft,
         "host_memory": compare(subject.get("peak_host_bytes"),
                                other.get("peak_host_bytes"), lower_is_better=True),
         "device_memory": compare(subject.get("peak_device_bytes"),
@@ -351,9 +422,11 @@ def win_loss_summary(comparisons: list[dict[str, Any]]) -> dict[str, Any]:
     """Count and list where the left-hand engine of each comparison wins and loses.
 
     Position-neutral: ``wins`` are the cells where the comparison's subject was
-    faster, whichever engine that happens to be. Same-representation comparisons are
-    counted separately from ones that cross a weight-format boundary, because only the
-    first supports a statement about execution. Both are listed; neither is hidden.
+    faster, whichever engine that happens to be. Comparisons are bucketed by what
+    makes them incomparable - hardware, work produced, representation - because only
+    the clean bucket supports a statement about execution. Every bucket is listed and
+    every comparison lands in exactly one of them; none is hidden, and the buckets
+    sum to ``all``.
     """
     def bucket(entries: list[dict[str, Any]]) -> dict[str, Any]:
         wins = [item for item in entries if item["winner"] == "subject"]
@@ -376,14 +449,17 @@ def win_loss_summary(comparisons: list[dict[str, Any]]) -> dict[str, Any]:
     comparable = [
         item for item in comparisons if item["throughput"].get("comparable")
     ]
-    same = [item for item in comparable if item["comparability"] == SAME_REPRESENTATION]
-    different = [
-        item for item in comparable if item["comparability"] == REPRESENTATION_DIFFERENCE
-    ]
+    by_label = {
+        label: [item for item in comparable if item["comparability"] == label]
+        for label in COMPARABILITY_LABELS
+    }
+    same = by_label[SAME_REPRESENTATION]
     summary = {
         "all": bucket(comparable),
         "same_representation": bucket(same),
-        "representation_difference": bucket(different),
+        "representation_difference": bucket(by_label[REPRESENTATION_DIFFERENCE]),
+        "device_difference": bucket(by_label[DEVICE_DIFFERENCE]),
+        "work_difference": bucket(by_label[WORK_DIFFERENCE]),
         "incomparable": [
             {
                 "model": item["model"], "subject": item["subject"],
@@ -434,6 +510,12 @@ def per_competitor(comparisons: list[dict[str, Any]]) -> dict[str, dict[str, Any
         result[engine] = {
             "cells": len(entries),
             "same_representation_cells": len(same),
+            "device_difference_cells": sum(
+                1 for item in entries if item["comparability"] == DEVICE_DIFFERENCE
+            ),
+            "work_difference_cells": sum(
+                1 for item in entries if item["comparability"] == WORK_DIFFERENCE
+            ),
             "median_improvement_percent": statistics.median(improvements),
             "median_improvement_percent_same_representation": (
                 statistics.median(same_improvements) if same_improvements else None
@@ -443,12 +525,26 @@ def per_competitor(comparisons: list[dict[str, Any]]) -> dict[str, dict[str, Any
             "wins": sum(1 for item in entries if item["winner"] == "subject"),
             "losses": sum(1 for item in entries if item["winner"] == "competitor"),
             "ties": sum(1 for item in entries if item["winner"] == "tie"),
-            "comparability": (
-                SAME_REPRESENTATION if len(same) == len(entries)
-                else REPRESENTATION_DIFFERENCE
+            # The most severe verdict present, not a binary: a set of comparisons
+            # that crosses a device boundary must not be described as merely a
+            # representation difference.
+            "comparability": _dominant_label(
+                [item["comparability"] for item in entries]
             ),
         }
     return result
+
+
+def _dominant_label(labels: list[str]) -> str:
+    """The most severe verdict in ``labels``, or SAME_REPRESENTATION if all are clean.
+
+    Severity order is :data:`COMPARABILITY_LABELS`, so this cannot drift out of step
+    with the set of verdicts :func:`comparability` can return.
+    """
+    for label in COMPARABILITY_LABELS:
+        if label in labels:
+            return label
+    return SAME_REPRESENTATION
 
 
 def standings(comparisons: list[dict[str, Any]],
@@ -458,7 +554,9 @@ def standings(comparisons: list[dict[str, Any]],
     Ordered by win rate over its own comparisons, so an engine that only ran the easy
     cells cannot climb by having fewer hard ones - the count of comparisons is printed
     beside the rate, and an engine that ran fewer of them is visibly not measured on
-    the same amount of work.
+    the same amount of work. ``same_representation`` and ``cross_device`` are printed
+    the same way and for the same reason: a rank earned on other hardware, or on
+    another weight format, is still a rank, so what it was earned on travels with it.
 
     This is the neutral summary. There is no privileged engine in it, and it is the
     table the report leads with.
@@ -470,11 +568,18 @@ def standings(comparisons: list[dict[str, Any]],
         entry = by_engine.setdefault(item["subject"], {
             "engine": item["subject"], "compared": 0, "wins": 0, "losses": 0,
             "ties": 0, "improvements": [], "same_representation": 0,
+            "cross_device": 0,
         })
         entry["compared"] += 1
         entry["improvements"].append(item["throughput"]["subject_improvement_percent"])
         if item["comparability"] == SAME_REPRESENTATION:
             entry["same_representation"] += 1
+        # Counted separately from the representation tally and printed beside it: an
+        # engine whose every pairing crossed a hardware boundary has a rank in this
+        # table, and the reader has to be able to see that the rank is not a
+        # statement about the two stacks.
+        if item["comparability"] == DEVICE_DIFFERENCE:
+            entry["cross_device"] += 1
         if item["winner"] == "subject":
             entry["wins"] += 1
         elif item["winner"] == "competitor":
@@ -603,7 +708,7 @@ def rankings(rows: list[dict[str, Any]], scaling: list[dict[str, Any]]) -> dict[
     an engine appears in it only if it produced that measurement.
     """
     def rank(candidates: list[dict[str, Any]], metric: str, lower_is_better: bool,
-             scope: str) -> dict[str, Any]:
+             scope: str, method_field: str | None = None) -> dict[str, Any]:
         usable = [
             item for item in candidates
             if status_mod.is_measured(item) and item.get(metric)
@@ -611,10 +716,19 @@ def rankings(rows: list[dict[str, Any]], scaling: list[dict[str, Any]]) -> dict[
         ordered = sorted(
             usable, key=lambda item: float(item[metric]), reverse=not lower_is_better
         )
+        # A ranking of figures taken by different instruments is still a ranking, but
+        # the reader has to be told. The methods are collected from the rows that were
+        # actually ordered, and the flag is what the report keys its note on.
+        methods = {
+            item["engine"]: item.get(method_field)
+            for item in usable
+        } if method_field else {}
         return {
             "metric": metric,
             "scope": scope,
             "lower_is_better": lower_is_better,
+            "methods": methods,
+            "mixed_methods": len(set(methods.values())) > 1,
             "order": [
                 {
                     "rank": index,
@@ -647,7 +761,8 @@ def rankings(rows: list[dict[str, Any]], scaling: list[dict[str, Any]]) -> dict[
         "peak_throughput": rank(list(by_engine_best.values()), PRIMARY_METRIC, False,
                                 "each engine's best cell anywhere in the matrix, "
                                 "whatever batch width produced it"),
-        "ttft": rank(primary, "ttft_s", True, "batch 1: time to first token"),
+        "ttft": rank(primary, "ttft_s", True, "batch 1: time to first token",
+                     method_field="ttft_method"),
         "latency": rank(primary, "end_to_end_latency_s", True,
                         "batch 1: end-to-end latency of one request"),
         "host_memory": rank(primary, "peak_host_bytes", True,
@@ -992,7 +1107,7 @@ def statistical_quality(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def engine_compatibility(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """One row per engine per model: did it run, and if not, why not."""
+    """One row per engine per model: did it run, what on, and if not, why not."""
     catalogue = payload.get("engine_catalogue") or {}
     table: list[dict[str, Any]] = []
     for run in payload.get("runs", []):
@@ -1014,6 +1129,17 @@ def engine_compatibility(payload: dict[str, Any]) -> list[dict[str, Any]]:
             "cells_attempted": len(run.get("cells") or []),
             "batch_support": run.get("batch_support") or {},
             "representation": (run.get("describe") or {}).get("representation"),
+            # What the engine reported it actually did, next to what the plan asked
+            # for. The report prints the pair, because a plugin that declines a
+            # precision or cannot reach the accelerator is a fact about the comparison
+            # and not something a reader should have to infer from a slow row.
+            "execution_device": (run.get("describe") or {}).get("execution_device"),
+            "execution_device_class": (run.get("describe") or {}).get(
+                "execution_device_class"
+            ),
+            "precision_executed": (run.get("describe") or {}).get("precision"),
+            "precision_requested": run.get("precision"),
+            "threads": (run.get("describe") or {}).get("threads"),
             "has_build_phase": spec.get("has_build_phase"),
             "artifact_persistence": spec.get("artifact_persistence"),
             "ttft_method": (run.get("describe") or {}).get("ttft_method")

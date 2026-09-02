@@ -9,6 +9,16 @@ anything that carries an :class:`~benchmark.suite.engines.base.EngineSpec`.
 Order matters only for presentation. The reference baseline comes first, Aether
 last, so a table reads from "the stack everyone starts with" to "the stack under
 test" - and so no ordering can be mistaken for a ranking.
+
+The field is four engines, deliberately: the reference framework, the same
+framework's kernels driven by a hand-written loop, one competing ahead-of-time
+compiler, and Aether. Every one of them runs the published checkpoint at the
+run's precision with no weight format of its own, which is what makes the
+comparison a comparison of execution rather than of representations. An engine
+that can only be measured on a quantization it brings with it, or that could not
+be measured on the same cells as the rest of the field, is not in the set: a row
+that ran a different experiment is worse than an absent row, because it still
+takes a rank.
 """
 
 from __future__ import annotations
@@ -19,34 +29,16 @@ from benchmark.suite import status as status_mod
 from benchmark.suite.engines import (
     aether_engine,
     base,
-    deepspeed_engine,
-    exllamav2_engine,
     hf_transformers,
-    llama_cpp_engine,
-    mlc_engine,
-    onnxruntime_engine,
     openvino_engine,
     pytorch_native,
-    sglang_engine,
-    tensorrt_llm_engine,
-    torch_compile,
-    vllm_engine,
 )
 
 #: Every engine module, in report order.
 MODULES: tuple[Any, ...] = (
     hf_transformers,
     pytorch_native,
-    torch_compile,
-    onnxruntime_engine,
     openvino_engine,
-    llama_cpp_engine,
-    vllm_engine,
-    sglang_engine,
-    tensorrt_llm_engine,
-    deepspeed_engine,
-    exllamav2_engine,
-    mlc_engine,
     aether_engine,
 )
 

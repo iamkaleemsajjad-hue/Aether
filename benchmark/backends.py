@@ -126,3 +126,76 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def stream_first_token_latency(model: Any, tokenizer: Any, inputs: Any, *,
+                               max_new_tokens: int) -> float:
+    """Seconds until the first generated token is decodable, through the streamer.
+
+    One implementation, shared by every engine whose ``generate`` accepts a
+    Transformers streamer, so that ``ttft_method="streaming"`` names the same
+    machinery on each row it appears on instead of two copies that could drift.
+    The caller seeds and encodes, because those steps are genuinely the engine's
+    own; the timed region -- streamer, thread, first token out -- is not.
+
+    Timing stops at the streamer's first emission, so whatever the generation was
+    asked to produce after that cannot affect the figure. Nothing is caught and
+    turned into a number: a generation that fails re-raises here, and one that
+    returns no token beyond its prompt is reported as unmeasurable, so the runner
+    records the cell rather than publishing a latency for a token that never came.
+    """
+    import threading
+    import time
+
+    from transformers import TextIteratorStreamer
+
+    from benchmark import metrics
+
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, timeout=120.0)
+    failure: list[BaseException] = []
+    produced: list[Any] = []
+
+    def worker() -> None:
+        try:
+            produced.append(model.generate(
+                **inputs, max_new_tokens=max_new_tokens, min_new_tokens=max_new_tokens,
+                do_sample=False, use_cache=True, streamer=streamer,
+                pad_token_id=tokenizer.pad_token_id,
+            ))
+        except BaseException as exc:  # re-raised on the caller's thread, not swallowed
+            failure.append(exc)
+            streamer.end()
+
+    metrics.synchronize()
+    thread = threading.Thread(target=worker, daemon=True)
+    start = time.perf_counter()
+    thread.start()
+    for _ in streamer:
+        break
+    elapsed = time.perf_counter() - start
+    thread.join(timeout=300.0)
+    if failure:
+        raise failure[0]
+    if not _generation_grew(produced, inputs):
+        raise UnsupportedConfiguration(
+            "the generation returned no token beyond the prompt, so there is no "
+            "time-to-first-token to report"
+        )
+    return elapsed
+
+
+def _generation_grew(produced: list[Any], inputs: Any) -> bool:
+    """Whether the finished generation holds a token the prompt did not.
+
+    The streamer signals the end of a stream with an emission of its own, so the
+    first thing off the queue is not by itself proof that a token was generated.
+    A generation still running when the join times out is not evidence of anything
+    either way, and is left alone: its first token did arrive and was timed.
+    """
+    if not produced or produced[0] is None:
+        return True
+    prompt_ids = inputs.get("input_ids") if hasattr(inputs, "get") else None
+    try:
+        return int(produced[0].shape[-1]) > int(prompt_ids.shape[-1])
+    except (AttributeError, TypeError, IndexError):
+        return True

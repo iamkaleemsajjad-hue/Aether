@@ -65,6 +65,17 @@ class Engine(AetherBackend):
         record.update(
             engine_key=SPEC.key,
             taxonomy=list(SPEC.taxonomy),
+            # The device the artifact executes on, named in the same vocabulary every
+            # other engine reports, so a comparison that crosses a class of hardware
+            # is detectable instead of having to be inferred from a device string.
+            execution_device=(
+                ", ".join(self.execution_devices) if self.execution_devices
+                else self.device
+            ),
+            execution_device_class=base.device_class(
+                self.execution_devices[0] if self.execution_devices else self.device
+            ),
+            threads=base.torch_thread_budget(),
             # The AEG blob stores the checkpoint's bf16 values; the compute dtype is
             # whatever the run's precision is. Both halves are stated because the
             # comparability check keys off the compute dtype and discloses the storage.

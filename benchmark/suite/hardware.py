@@ -123,10 +123,11 @@ def detect() -> Hardware:
         hardware.fp16_native = True
         # bf16 tensor cores start at compute capability 8.0 (Ampere). Newer torch
         # builds answer ``is_bf16_supported()`` True on older cards because they can
-        # emulate the format in software, which is a different claim: several engines
-        # in this field (vLLM among them) refuse bf16 below sm_80 outright, so a
-        # benchmark that believed torch here would silently exclude them. Both
-        # answers are recorded, because a disagreement between them is diagnostic.
+        # emulate the format in software, which is a different claim: an engine can
+        # refuse bf16 below sm_80 outright, so a benchmark that believed torch here
+        # would pick a precision part of its field could not execute and would
+        # silently exclude it. Both answers are recorded, because a disagreement
+        # between them is diagnostic.
         try:
             hardware.torch_reports_bf16 = bool(torch.cuda.is_bf16_supported())
         except Exception:  # noqa: BLE001

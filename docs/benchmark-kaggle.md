@@ -3,9 +3,9 @@
 A start-to-finish runbook for `python benchmark.py` on a Kaggle GPU notebook
 (2x Tesla T4, 4 vCPU, ~31 GiB RAM). Every numbered step is one cell.
 
-Read [What can actually run on 2x T4](#what-can-actually-run-on-2x-t4) first. Four of
-the thirteen engines cannot run on this hardware at all, and the suite says so with the
-capability that decided it rather than pretending otherwise.
+Read [What can actually run on 2x T4](#what-can-actually-run-on-2x-t4) first. All four
+engines run here, but not all of them run on the GPU, and the suite says so with the
+device each one reported rather than leaving a slow row to be misread.
 
 ## 0. Push to `main` first
 
@@ -32,63 +32,28 @@ git push origin main
 !pip install -q -r benchmark/requirements.txt
 ```
 
-## 3. Install the competing engines
+## 3. Install the competing engine
 
-Order matters. vLLM moves `torch` and `transformers`, so it goes first; the version pin
-goes last so it wins.
-
-```python
-# vLLM. Large download, ~5 minutes. Moves torch/transformers, so install it first.
-!pip install -q vllm
-```
+Three of the four engines need nothing beyond step 2: `transformers`, `pytorch_native`
+and `aether` all run on the stack already installed. One needs a package:
 
 ```python
-# ONNX Runtime (CUDA) and OpenVINO, through optimum's exporters.
-!pip install -q "optimum[onnxruntime-gpu]" "optimum[openvino]"
+# OpenVINO, through optimum's exporter. ~2 minutes.
+!pip install -q "optimum[openvino]"
 ```
 
-```python
-# The version pin that makes the ONNX exporter work.
-#
-# Kaggle ships transformers 5.x. optimum's ONNX exporter declares
-# transformers<4.58 and imports a symbol (get_parameter_dtype) that 5.x removed, so on
-# the stock image ONNX Runtime fails at load with an ImportError. Every engine in the
-# run has to share one transformers version, so the fix is to pin it into the range the
-# exporter accepts before measuring - not to upgrade it afterwards.
-!pip install -q "transformers==4.57.1"
-```
-
-```python
-# DeepSpeed's kernel injection. Optional: it only has policies for some
-# architectures, and the suite reports NOT_SUPPORTED (with that reason) where it has
-# none rather than shipping a duplicate of the eager baseline.
-!pip install -q deepspeed
-```
-
-**Restart the session now** (Run → Restart session), so every engine is measured
+**Restart the session now** (Run -> Restart session), so every engine is measured
 against one set of libraries. Then `%cd /kaggle/working/aether` again.
 
-### Optional: llama.cpp
-
-llama.cpp executes GGUF, not the published checkpoint, so it needs a conversion. This
-adds roughly 20 minutes and the pip build is CPU-only unless you build with CUDA.
+`optimum-intel` declares a `transformers` range. If the installed version falls outside
+it the suite says so in the compatibility table, with both versions named, instead of
+failing on a private symbol twenty minutes into the run. Pin into the declared range
+before measuring if that happens - every engine in a run has to share one `transformers`
+version, so pinning afterwards would mean the field was not measured against one stack:
 
 ```python
-!pip install -q llama-cpp-python gguf
-!git clone --depth 1 https://github.com/ggml-org/llama.cpp /kaggle/working/llama.cpp
+!pip install -q "transformers==4.57.1"
 ```
-
-Then add these flags to the benchmark command in step 6:
-
-```
---gguf-convert-script /kaggle/working/llama.cpp/convert_hf_to_gguf.py
-```
-
-The suite converts each checkpoint to an **F16** GGUF — unquantized, so llama.cpp holds
-a 16-bit rendering of the same weights as everything else and the comparison stays
-same-representation. Supply your own quantized GGUF with
-`--gguf-map <model>=<path.gguf>` instead if you want the quantized configuration; it is
-then labelled `REPRESENTATION_DIFFERENCE` everywhere it appears.
 
 ## 4. Confirm the environment
 
@@ -177,33 +142,33 @@ tab. To bring it back into the repository:
 
 ## What can actually run on 2x T4
 
-The suite attempts thirteen engines. On this hardware:
+The suite attempts four engines. On this hardware:
 
-| Engine | On 2x T4 | Why |
-| --- | --- | --- |
-| `transformers` | runs | — |
-| `pytorch_native` | runs | — |
-| `torch_compile` | runs | Whole-graph capture usually fails on `generate`; the suite falls back to graph-broken compilation and records which configuration compiled |
-| `onnxruntime` | runs **with the transformers pin** | The exporter needs transformers<4.58 |
-| `openvino` | runs, on **CPU** | OpenVINO has no CUDA target; the row is labelled with its device |
-| `llama_cpp` | runs if you install it and supply a conversion | Executes GGUF, not the checkpoint |
-| `vllm` | runs **at fp16** | vLLM refuses bf16 below compute capability 8.0 |
-| `deepspeed` | runs only where it has an injection policy | Reports `NOT_SUPPORTED` where it has none, rather than duplicating the eager baseline |
-| `aether` | runs | — |
-| `sglang` | **NOT_APPLICABLE** | Attention kernels need capability 8.0+; T4 is 7.5 |
-| `tensorrt_llm` | **NOT_APPLICABLE** | Published wheels target 8.0+ |
-| `exllamav2` | **NOT_APPLICABLE** | Needs EXL2 weights, which do not exist for these checkpoints |
-| `mlc` | **NOT_APPLICABLE** | Needs a TVM-compiled model, which this harness does not build |
+| Engine | On 2x T4 | Executes on | Why |
+| --- | --- | --- | --- |
+| `transformers` | runs | GPU | — |
+| `pytorch_native` | runs | GPU | — |
+| `aether` | runs | GPU | — |
+| `openvino` | runs | **CPU (2 cores)** | OpenVINO ships no CUDA plugin, so there is no NVIDIA device for it to target. Not a misconfiguration and not fixable with a flag |
 
-Those four are not failures and are not zeros. They appear in the compatibility table
-with the capability or the missing artifact that decided them.
+OpenVINO's row is measured, ranked and disclosed, not dropped and not quietly compared:
+it reports `CPU` as its execution device, every pairing against a GPU engine is labelled
+`DEVICE_DIFFERENCE`, those pairings are counted separately in the standings, and no
+percentage that crosses the boundary is presented as a difference between the two
+stacks. It will be several times slower in wall-clock here, and that number is about
+two T4 cores against a T4, not about OpenVINO against Aether.
+
+On an Intel CPU or iGPU host, where OpenVINO does have a GPU plugin,
+`--openvino-device GPU` targets it and the labelling follows the device the plugin
+reports back. `--openvino-device auto` (the default) picks the fastest device OpenVINO
+can actually see, which is the same courtesy the torch engines get from CUDA.
 
 ## Two things specific to T4 worth knowing
 
 **Precision is fp16, not bf16.** T4 is compute capability 7.5 and has no bf16 tensor
 cores. Recent torch answers `is_bf16_supported() == True` there anyway, because it can
-emulate the format in software — which is why an earlier version of this suite chose
-bf16 and vLLM then refused to start. The suite now derives bf16 support from the
+emulate the format in software — which is why an earlier version of this suite chose a
+precision part of the field could not execute natively. The suite now derives bf16 support from the
 capability, so `--precision auto` resolves to fp16 on T4: the widest format the whole
 field executes natively. The checkpoints are published in bf16, so each engine holds its
 own 16-bit rendering of the same values; that storage difference is printed next to

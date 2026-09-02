@@ -52,6 +52,9 @@ class Engine(TransformersBackend):
         record.update(
             engine_key=SPEC.key,
             taxonomy=list(SPEC.taxonomy),
+            execution_device=self.device,
+            execution_device_class=base.device_class(self.device),
+            threads=base.torch_thread_budget(),
             representation=(
                 f"published checkpoint cast to {self._precision or '?'} tensors"
             ),

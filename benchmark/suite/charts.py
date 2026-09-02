@@ -28,16 +28,7 @@ COLORS: dict[str, str] = {
     "aether": "#0F62FE",
     "transformers": "#6F6F6F",
     "pytorch_native": "#8A3FFC",
-    "torch_compile": "#1192E8",
-    "onnxruntime": "#005D5D",
     "openvino": "#009D9A",
-    "llama_cpp": "#A56EFF",
-    "vllm": "#EE538B",
-    "sglang": "#FA4D56",
-    "tensorrt_llm": "#198038",
-    "deepspeed": "#B28600",
-    "exllamav2": "#9F1853",
-    "mlc": "#570408",
 }
 FALLBACK_COLOR = "#525252"
 

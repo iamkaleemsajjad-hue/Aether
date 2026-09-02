@@ -3,7 +3,7 @@
 > **Two benchmarks live here.** This document describes the controlled two-runtime
 > A/B (`python benchmark/run_benchmark.py`), which measures Aether against
 > Transformers in one process with execution order alternated per cell. The
-> multi-engine competition — Aether against thirteen inference stacks, with
+> multi-engine competition — Aether against three other inference stacks, with
 > per-engine process isolation, engine taxonomy, batch scaling to 16, win/loss
 > matrices and the compile-once probe — is `python benchmark.py`; see
 > [`suite/README.md`](suite/README.md) and, for a step-by-step notebook runbook,
@@ -237,8 +237,11 @@ Aether Runtime was **not modified** for this benchmark.
   is a Transformers-only observation.
 - **Compilation.** Aether pays a one-time compile cost, timed separately as
   `prepare_s` and never amortized into throughput.
-- **TTFT.** Measured through each library's own streaming API. Those are not
-  identical code paths, so TTFT is a weaker comparison than throughput.
+- **TTFT.** Measured through each library's own streaming API - the Transformers side
+  through `benchmark.backends.stream_first_token_latency`, which every engine that
+  accepts a Transformers streamer shares, and Aether through its own stream. Both stop
+  at the first token, but they are not identical code paths, so TTFT is a weaker
+  comparison than throughput.
 
 ## Output
 

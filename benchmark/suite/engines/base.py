@@ -20,8 +20,11 @@ from benchmark.suite import status as status_mod
 
 # ── Taxonomy ────────────────────────────────────────────────────────────────
 # Accurate classifications. An engine carries every label that applies to it, so
-# `torch.compile` is a JIT compiler *and* part of a framework, and vLLM is a
-# serving engine *and* a runtime, without either being called something it is not.
+# OpenVINO is a graph compiler *and* a runtime, and transformers is a framework
+# whose kernels the hand-written loop also uses, without either being called
+# something it is not. The labels are kept general rather than trimmed to the
+# current field: which engines are in the field is a decision, and the vocabulary
+# for describing one should not have to change when that decision does.
 
 FRAMEWORK = "inference framework"
 RUNTIME = "runtime"
@@ -188,7 +191,7 @@ def requirement_conflicts(distribution: str) -> list[str]:
 
     Read from installed metadata, so it costs no imports and cannot itself fail the
     way the real import would. This is how a version skew becomes a sentence in the
-    compatibility table ("optimum-onnx needs transformers<4.58, found 5.16.1") instead
+    compatibility table ("optimum-intel needs transformers<4.58, found 5.16.1") instead
     of an ``ImportError`` on a private symbol twenty minutes into a run.
 
     Only hard version conflicts are reported. A missing optional extra, or a
@@ -228,13 +231,95 @@ def requirement_conflicts(distribution: str) -> list[str]:
     return problems
 
 
+#: What class of hardware a device name denotes. Keyed on the vocabularies the
+#: adapters actually use - torch's lowercase names and OpenVINO's uppercase plugin
+#: names - because a comparison across two classes is not a comparison of runtimes,
+#: and the report can only say so if the two are named in one vocabulary.
+_DEVICE_CLASSES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("cuda", "nvidia"), "nvidia-gpu"),
+    (("rocm", "hip"), "amd-gpu"),
+    (("mps",), "apple-gpu"),
+    # OpenVINO's GPU plugin is Intel-only, and torch's xpu device is Intel too, so
+    # both names mean the same class of hardware.
+    (("gpu", "xpu", "intel-gpu"), "intel-gpu"),
+    (("npu", "vpu"), "npu"),
+    (("cpu",), "cpu"),
+)
+
+
+def torch_thread_budget() -> int | None:
+    """How many CPU threads torch will actually use here, or None if torch is absent.
+
+    Reported by every torch-backed engine so the pinned budget can be read off the
+    report instead of assumed. OpenVINO takes its thread count through a runtime
+    property rather than the environment, so parity between the two is only checkable
+    if both sides state what they ended up with.
+    """
+    try:
+        import torch
+    except Exception:  # pragma: no cover - torch absent is a probe failure, not here
+        return None
+    try:
+        return int(torch.get_num_threads())
+    except Exception:  # pragma: no cover - a build without a thread pool
+        return None
+
+
+def device_class(device: str | None) -> str | None:
+    """The class of hardware ``device`` names, in one vocabulary, or None.
+
+    ``None`` when the name is empty or unrecognised: an unknown device is reported
+    as unknown, never defaulted to the CPU or to the accelerator, because a wrong
+    answer here would let a comparison across two kinds of hardware be presented as
+    a comparison of two runtimes.
+    """
+    if not device:
+        return None
+    text = str(device).strip().lower().split(":")[0].split(".")[0]
+    if not text:
+        return None
+    for names, label in _DEVICE_CLASSES:
+        if text in names:
+            return label
+    for names, label in _DEVICE_CLASSES:
+        if any(name in text for name in names):
+            return label
+    return None
+
+
+def call_with_supported_kwargs(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Call ``function``, dropping keyword arguments this version does not accept.
+
+    Third-party loaders rename and retire keywords between releases. An adapter that
+    passes one unconditionally disappears from the field on the versions that renamed
+    it, which loses a whole engine's rows to a spelling; one that passes none cannot
+    apply the run's configuration at all. This drops exactly the keyword the callee
+    named in its own ``TypeError`` and retries, so a genuine ``TypeError`` from inside
+    the call still propagates.
+    """
+    remaining = dict(kwargs)
+    while True:
+        try:
+            return function(*args, **remaining)
+        except TypeError as exc:
+            message = str(exc)
+            if "unexpected keyword" not in message:
+                raise
+            offending = [name for name in remaining if repr(name) in message
+                         or f"'{name}'" in message]
+            if not offending:
+                raise
+            for name in offending:
+                remaining.pop(name, None)
+
+
 def generic_probe(spec: EngineSpec, hardware: Any) -> Availability:
     """The applicability checks every engine shares.
 
     Returns ``None``-equivalent only by returning an available Availability: a
     caller that needs extra checks runs them after this one passes. Hardware
     applicability is settled before installation, because "this machine has no
-    NVIDIA GPU" is a more informative answer than "TensorRT-LLM is not
+    NVIDIA GPU" is a more informative answer than "this engine is not
     installed" on a machine where it could never have been.
     """
     if spec.requires_cuda and not getattr(hardware, "nvidia", False):

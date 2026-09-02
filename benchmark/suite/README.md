@@ -19,29 +19,27 @@ when Aether wins.
 
 ## What is compared
 
-The field is thirteen stacks, and they are not all the same kind of system. The
-report classifies each one, because a comparison only means what it says if the
-reader knows what is being compared.
+The field is four stacks, and they are not all the same kind of system. The report
+classifies each one, because a comparison only means what it says if the reader knows
+what is being compared.
 
 | Engine | What it is | Build phase | What the build leaves behind |
 | --- | --- | --- | --- |
 | `transformers` | inference framework, runtime (the reference) | no | nothing |
 | `pytorch_native` | runtime, execution engine (hand-written decode loop) | no | nothing |
-| `torch_compile` | JIT + graph compiler, kernel optimizer | yes | machine-local code cache |
-| `onnxruntime` | runtime, graph compiler, kernel optimizer | yes | portable directory |
 | `openvino` | AOT + graph compiler, runtime | yes | portable IR directory |
-| `llama_cpp` | native runtime, quantized engine | yes | portable GGUF file |
-| `vllm` | serving engine, runtime | yes | machine-local code cache |
-| `sglang` | serving engine, runtime | yes | machine-local code cache |
-| `tensorrt_llm` | AOT compiler, kernel optimizer, serving engine | yes | GPU-specific engine plan |
-| `deepspeed` | kernel optimization system | yes | nothing (per process) |
-| `exllamav2` | quantized inference engine | yes | portable EXL2 directory |
-| `mlc` | AOT compiler (TVM), quantized engine | yes | portable compiled library |
 | `aether` | **AOT compiler + runtime (the subject)** | yes | portable `.aeg` artifact |
 
-Nothing is called a compiler that is not one. Transformers and the native PyTorch
-loop interpret the checkpoint on every forward pass; vLLM and SGLang are serving
-systems whose advantage is scheduling, not compilation.
+Four, deliberately: the reference framework, that framework's kernels driven by a
+hand-written loop, one competing ahead-of-time compiler, and Aether. Every one of them
+executes the published checkpoint at the run's precision, so every row is the same
+experiment. An engine that could only be measured on a quantization it brings with it,
+or on a subset of the cells, is not in the set - a row that ran a different experiment
+is worse than an absent row, because it still takes a rank.
+
+Nothing is called a compiler that is not one. Transformers and the native PyTorch loop
+interpret the checkpoint on every forward pass; OpenVINO and Aether both convert it
+once, ahead of time, into something they then execute.
 
 ## Models
 
@@ -76,13 +74,35 @@ test that pins it).
   runtime that shards a model is measured on more hardware than one that does not, which
   compares machines rather than engines. `--devices 2` measures multi-device execution
   deliberately.
+- **Equal visibility is not equal use, and the difference is reported.** Each engine
+  states the device it actually executed on and the precision it actually computed in,
+  and both are printed next to what the plan asked for. OpenVINO ships no CUDA plugin,
+  so on an NVIDIA host it runs on the CPU while the torch engines run on the GPU; every
+  pairing that crosses that boundary is labelled `DEVICE_DIFFERENCE`, counted separately
+  in the standings, and excluded from any percentage presented as a difference between
+  stacks. The row is still measured and still ranked - what it ran on travels with it.
 - **Every engine is asked for a fixed number of tokens** with early stopping
-  suppressed, so none can appear faster by generating less.
-- **Threads are pinned** (OMP, MKL, OpenBLAS, NumExpr and torch) to the physical core
-  count for every engine, and recorded.
+  suppressed, so none can appear faster by generating less. Where an engine exposes no
+  minimum-token control, the token count is checked after the fact and a short cell is
+  labelled `WORK_DIFFERENCE` rather than compared.
+- **Time to first token is taken with one stopwatch** wherever an engine can share
+  it. Transformers and OpenVINO both expose Transformers' `generate`, so both are timed
+  by the same function - one implementation, not two copies - and the figure stops at
+  the first token, so the output length the plan asked for cannot enter it. The
+  hand-written PyTorch loop has no stream to subscribe to and times the work done
+  before its first token exists, and Aether streams through its own runtime because a
+  compiler cannot be driven by another library's `generate`. Those are different
+  instruments, so each engine declares the one it used, the report prints it beside the
+  device and precision it ran at, and every ranking or percentage that mixes two of them
+  says so instead of presenting them as one measurement.
+- **Threads are pinned** to the physical core count for every engine and recorded -
+  through the environment for the torch engines, and through `INFERENCE_NUM_THREADS`
+  for OpenVINO, whose scheduler ignores the environment variables the others read.
+  Each engine reports the budget it ended up with, so the parity is checkable rather
+  than assumed.
 - **Caches that would answer instead of computing are disabled**: Aether's semantic
-  response cache and SGLang's prefix cache, both through public flags, both recorded.
-  The suite issues one prompt repeatedly, so either would time a lookup.
+  response cache, through a public flag, recorded. The suite issues one prompt
+  repeatedly, so it would otherwise time a lookup.
 - **Each engine runs in its own process**, one at a time. Failure isolation, real
   cold starts, and peak memory attributable to exactly one engine.
 - **Engine order rotates per model**, so thermal drift over a long run cannot always
@@ -115,13 +135,13 @@ benchmark_results/
 ```bash
 python benchmark.py                          # everything the host can run
 python benchmark.py --smoke                  # smallest real run; proves the pipeline
-python benchmark.py --engines aether,transformers,vllm
+python benchmark.py --engines aether,transformers
 python benchmark.py --models Qwen/Qwen3-0.6B --batch-sizes 1,2,4
 python benchmark.py --resume                 # reuse raw records already on disk
 python benchmark.py --precision bf16         # weight-exact, on hardware with bf16 cores
-python benchmark.py --devices 2               # measure multi-device execution deliberately
-python benchmark.py --focus vllm              # long-form drill-down for one engine only
-python benchmark.py --gguf-map Qwen/Qwen3-0.6B=/path/model-f16.gguf   # enable llama.cpp
+python benchmark.py --devices 2              # measure multi-device execution deliberately
+python benchmark.py --focus openvino         # long-form drill-down for one engine only
+python benchmark.py --openvino-device GPU    # Intel GPU/NPU; auto by default
 ```
 
 `--help` lists every switch, including the per-engine options.

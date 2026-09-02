@@ -66,8 +66,8 @@ def test_precision_is_the_widest_format_the_whole_field_can_execute() -> None:
     """bf16 only where the hardware has bf16 tensor cores; fp16 otherwise.
 
     A precision only some engines support is not a fair benchmark precision, it is a
-    way of excluding engines - vLLM refuses bf16 below compute capability 8.0. So a
-    pre-Ampere host resolves to fp16 and the reason says why.
+    way of excluding engines - an engine can refuse bf16 below compute capability
+    8.0 outright. So a pre-Ampere host resolves to fp16 and the reason says why.
     """
     native = _hardware(nvidia=True, bf16_native=True, compute_capabilities=["8.0"])
     assert hardware.resolve_precision("auto", native)[0] == "bf16"
@@ -147,6 +147,32 @@ def test_reference_and_subject_are_distinct_registered_engines() -> None:
     assert registry.REFERENCE != registry.SUBJECT
 
 
+def test_the_field_is_the_four_engines_and_none_of_them_is_privileged() -> None:
+    """The set is pinned, and pinned in the order a table reads it.
+
+    Reducing the field and removing an engine are the same edit, so what the field is
+    has to be a stated fact rather than whichever modules happen to import. Every
+    property asserted here is one an engine could fail while still being perfectly
+    installable, and any of them would put a rank in the standings for an experiment
+    the rest of the field did not run.
+    """
+    from benchmark.suite.engines import base
+
+    assert registry.KEYS == ("transformers", "pytorch_native", "openvino", "aether")
+    # Report order, not rank order: the reference first, the subject last.
+    assert registry.KEYS[0] == registry.REFERENCE
+    assert registry.KEYS[-1] == registry.SUBJECT
+    for key in registry.KEYS:
+        spec = registry.spec_for(key)
+        assert not spec.requires_cuda, f"{key} would be excluded by host, not measured"
+        assert not spec.alters_representation, (
+            f"{key} would be measured on weights the rest of the field does not load"
+        )
+        assert base.SERVING_ENGINE not in spec.taxonomy, (
+            f"{key} would be measuring a serving loop against single-process latency"
+        )
+
+
 def test_taxonomy_does_not_call_eager_frameworks_compilers() -> None:
     """The classification has to be accurate, not flattering or convenient."""
     from benchmark.suite.engines import base
@@ -154,31 +180,269 @@ def test_taxonomy_does_not_call_eager_frameworks_compilers() -> None:
     compilers = {base.AOT_COMPILER, base.JIT_COMPILER, base.GRAPH_COMPILER}
     for key in ("transformers", "pytorch_native"):
         assert not (set(registry.spec_for(key).taxonomy) & compilers)
-    for key in ("torch_compile", "aether", "openvino", "tensorrt_llm", "mlc"):
+    for key in ("openvino", "aether"):
         assert set(registry.spec_for(key).taxonomy) & compilers
-    for key in ("vllm", "sglang"):
-        assert base.SERVING_ENGINE in registry.spec_for(key).taxonomy
+    # The subject is described in the same vocabulary as everything else and holds no
+    # label of its own: a term coined for Aether would read as a capability the
+    # competing compiler lacks, when all it would actually mark is who wrote it.
+    others = set().union(*(
+        set(registry.spec_for(key).taxonomy)
+        for key in registry.KEYS if key != registry.SUBJECT
+    ))
+    assert set(registry.spec_for(registry.SUBJECT).taxonomy) <= others
 
 
-def test_cuda_only_engines_report_not_applicable_on_a_cpu_host() -> None:
-    """An engine that could never run here is not a failure and not a zero."""
-    cpu = _hardware()
+def test_no_engine_needs_hardware_or_an_artifact_the_others_are_not_given() -> None:
+    """Four engines, one checkpoint, one host: every probe answers from the model id.
+
+    An engine that can only run from a file it was handed, or only on a card this host
+    may not have, cannot be measured on the same cells as the rest of the field. So the
+    only reason any of the four may decline is that it is not installed - never
+    NOT_APPLICABLE, which is the status the analysis excludes from every percentage.
+    """
     config = plan.SuiteConfig()
-    for key in ("vllm", "sglang", "tensorrt_llm", "deepspeed", "exllamav2"):
-        result = registry.probe(key, cpu, "Qwen/Qwen3-0.6B", "fp32", config)
-        assert result.status == status_mod.NOT_APPLICABLE
-        assert "NVIDIA" in result.reason or "CUDA" in result.reason
+    hosts = {
+        "cpu": (_hardware(), "fp32"),
+        "gpu": (_hardware(nvidia=True, bf16_native=True, compute_capabilities=["8.0"],
+                          gpu_vram_bytes=[16 * 1024 ** 3]), "bf16"),
+    }
+    for name, (host, precision) in hosts.items():
+        for key in registry.KEYS:
+            result = registry.probe(key, host, "Qwen/Qwen3-0.6B", precision, config)
+            assert result.status in {status_mod.MEASURED, status_mod.NOT_INSTALLED}, (
+                f"{key} declined the {name} host as {result.status}: {result.reason}"
+            )
+            if result.status != status_mod.MEASURED:
+                assert result.reason, "a declined engine must say why"
 
 
-def test_engines_needing_a_supplied_artifact_say_so_rather_than_inventing_one() -> None:
-    gpu = _hardware(nvidia=True, gpu_vram_bytes=[16 * 1024 ** 3])
-    config = plan.SuiteConfig()
-    for key in ("exllamav2", "mlc", "llama_cpp"):
-        result = registry.probe(key, gpu, "Qwen/Qwen3-0.6B", "bf16", config)
-        assert result.status in {
-            status_mod.NOT_APPLICABLE, status_mod.NOT_INSTALLED,
-        }
-        assert result.reason
+def test_a_hardware_requirement_is_declined_before_installation_is_considered() -> None:
+    """"This machine could never run it" outranks "it is not installed here".
+
+    Nothing in the four-engine field carries a hardware requirement - that is part of
+    what makes it the field - so the check is exercised against a synthetic spec rather
+    than deleted along with the engines that used to need it. The distinction still has
+    to hold: NOT_APPLICABLE is excluded from the percentages, while NOT_INSTALLED on a
+    host that could have run the engine is a different fact about a different run.
+    """
+    from benchmark.suite.engines import base
+
+    cuda_only = replace(registry.spec_for("aether"), key="synthetic",
+                        requires_cuda=True, requires=())
+    declined = base.generic_probe(cuda_only, _hardware())
+    assert declined.status == status_mod.NOT_APPLICABLE
+    assert "NVIDIA" in declined.reason
+    reachable = base.generic_probe(cuda_only, _hardware(nvidia=True))
+    assert reachable.status == status_mod.MEASURED
+
+    ampere_only = replace(cuda_only, min_capability=(8, 0))
+    turing = base.generic_probe(
+        ampere_only, _hardware(nvidia=True, compute_capabilities=["7.5"])
+    )
+    assert turing.status == status_mod.NOT_APPLICABLE
+    assert "7.5" in turing.reason and "8.0" in turing.reason
+
+
+#: Every hardware class the suite can name, plus the honest answer when a name is not
+#: one of them. Asserted against as a set so a new class of accelerator is added in one
+#: place rather than in each test that happens to touch a device string.
+_DEVICE_CLASS_VOCABULARY = {
+    "nvidia-gpu", "amd-gpu", "apple-gpu", "intel-gpu", "npu", "cpu", None,
+}
+
+
+def test_device_class_names_hardware_in_one_vocabulary_and_never_guesses() -> None:
+    """Two engines on two kinds of chip have to be detectable as exactly that.
+
+    The classes carry more than they look: OpenVINO's ``GPU`` is its Intel plugin, so a
+    row reporting GPU on a host whose accelerator is an NVIDIA card did not run on the
+    accelerator the rest of the field used. An unrecognised name is reported as unknown
+    and never defaulted either way - defaulting to the CPU would invent a hardware
+    difference, and defaulting to the accelerator would hide one.
+    """
+    from benchmark.suite.engines import base
+
+    assert base.device_class("cuda:0") == "nvidia-gpu"
+    assert base.device_class("CPU") == "cpu"
+    assert base.device_class("GPU") == "intel-gpu", "OpenVINO's GPU plugin is Intel's"
+    assert base.device_class("xpu") == "intel-gpu"
+    assert base.device_class("mps") == "apple-gpu"
+    assert base.device_class("hip:1") == "amd-gpu"
+    assert base.device_class("NPU") == "npu"
+    for unknown in (None, "", "   ", "auto", "something-new"):
+        assert base.device_class(unknown) is None
+    assert set(_DEVICE_CLASS_VOCABULARY) >= {
+        label for _, label in base._DEVICE_CLASSES
+    }
+
+
+def test_every_engine_reports_the_device_and_thread_budget_it_actually_used() -> None:
+    """Not what the plan asked for: what the engine says it did.
+
+    A controlled variable an engine can decline is not controlled unless the engine
+    reports what it did instead. An engine that fell back to the host CPU and one that
+    took every core on the machine are both invisible in a throughput number - the
+    first just looks slow and the second just looks fast - so each of the four states
+    the device it ran on, the class of that device and its thread count, in the same
+    vocabulary, and the report prints them beside what was requested.
+    """
+    from benchmark.suite.engines import openvino_engine
+
+    gpu = _hardware(nvidia=True, compute_capabilities=["7.5"],
+                    gpu_vram_bytes=[16 * 1024 ** 3])
+    config = plan.SuiteConfig(threads=2)
+    for key in registry.KEYS:
+        described = registry.build(key, gpu, "Qwen/Qwen3-0.6B", "fp16",
+                                   config).describe()
+        for name in ("execution_device", "execution_device_class", "threads"):
+            assert name in described, f"{key} reports no {name}"
+        assert described["execution_device_class"] in _DEVICE_CLASS_VOCABULARY
+
+    # And the class is derived from the device rather than from the host: OpenVINO
+    # compiled for its own GPU plugin is on Intel hardware, which is not the NVIDIA
+    # card the torch engines were placed on, and the label has to say so.
+    assert openvino_engine.Engine(device="GPU").describe()[
+        "execution_device_class"] == "intel-gpu"
+    assert openvino_engine.Engine(device="CPU").describe()[
+        "execution_device_class"] == "cpu"
+
+
+def test_the_thread_budget_reaches_the_pool_each_engine_schedules_on() -> None:
+    """One budget, two mechanisms, because the two runtimes read different ones.
+
+    torch takes its thread count from the environment, which is where the worker pins
+    it. OpenVINO schedules on TBB and ignores ``OMP_NUM_THREADS`` entirely: pinning
+    through the environment alone holds every torch engine to the budget and leaves
+    OpenVINO the whole machine, which is a difference in resources wearing the clothes
+    of a difference in engines. It has to be handed the count through its own property.
+    """
+    from benchmark.suite.engines import openvino_engine
+
+    assert "OMP_NUM_THREADS" in hardware.THREAD_ENV_VARS
+    pinned = openvino_engine.Engine(threads=2)
+    assert pinned._runtime_config()["INFERENCE_NUM_THREADS"] == 2
+    assert pinned.describe()["threads"] == 2
+    # No budget pinned means no property set: an absent budget must not become a 1.
+    assert "INFERENCE_NUM_THREADS" not in openvino_engine.Engine()._runtime_config()
+
+
+def test_an_unsupported_keyword_costs_the_keyword_not_the_engine() -> None:
+    """A renamed loader argument must not remove a whole engine from the field.
+
+    Third-party loaders rename and retire keywords between releases. Passing one
+    unconditionally turns a spelling into an absent row on every version that renamed
+    it; passing none means the run's configuration is never applied at all. So exactly
+    the keyword the callee named in its own TypeError is dropped and the call retried,
+    while a TypeError raised from inside the call still propagates.
+    """
+    from benchmark.suite.engines import base
+
+    def loader(model: str, *, dtype: str) -> str:
+        return f"{model}:{dtype}"
+
+    assert base.call_with_supported_kwargs(
+        loader, "qwen", dtype="fp16", torch_dtype="fp16", export=True
+    ) == "qwen:fp16"
+
+    def strict(model: str) -> str:
+        raise TypeError("the callee's own complaint, from inside the call")
+
+    with pytest.raises(TypeError, match="own complaint"):
+        base.call_with_supported_kwargs(strict, "qwen")
+
+
+# ── What OpenVINO reports about its own export ───────────────────────────────
+
+class _FakeNode:
+    """One node of an OpenVINO graph, with only what the reader touches."""
+
+    def __init__(self, type_name: str, element: str, shape: tuple[int, ...]) -> None:
+        self._type_name, self._element, self._shape = type_name, element, shape
+
+    def get_type_name(self) -> str:
+        return self._type_name
+
+    def get_element_type(self) -> str:
+        return self._element
+
+    def get_output_shape(self, index: int) -> tuple[int, ...]:
+        return self._shape
+
+
+class _FakeIR:
+    def __init__(self, nodes: list[_FakeNode]) -> None:
+        self.model = type("Graph", (), {"get_ordered_ops": lambda _self: list(nodes)})()
+
+
+def test_the_ir_element_type_comes_from_a_weight_not_from_the_input_ids() -> None:
+    """The stored width is read off a weight, which is the only node that carries it.
+
+    Reading the first graph *parameter* instead reports every export as integer-typed,
+    because the first parameter is ``input_ids`` - an int64 tensor. That is what made
+    the report print an int64 storage format for a float16 export, and with the width
+    unreadable the comparison against a 16-bit engine came out labelled like for like.
+    A scale factor is float and also not the answer, so the largest float constant is
+    what is read: in a decoder graph that is a weight matrix, never a scalar.
+    """
+    from benchmark.suite.engines import openvino_engine
+
+    nodes = [
+        _FakeNode("Parameter", "<Type: 'int64_t'>", (1, 128)),
+        _FakeNode("Constant", "<Type: 'int64_t'>", (1, 128)),
+        _FakeNode("Constant", "<Type: 'float16'>", (1,)),
+        _FakeNode("Constant", "<Type: 'float16'>", (151936, 1024)),
+    ]
+    assert openvino_engine._weight_element_type(_FakeIR(nodes)) == "<Type: 'float16'>"
+    # No float weight to read means unknown, which the report prints as unknown.
+    assert openvino_engine._weight_element_type(_FakeIR(nodes[:2])) is None
+    assert openvino_engine._weight_element_type(object()) is None
+
+
+def test_element_widths_and_precision_names_are_read_longest_first() -> None:
+    """``float32`` is not an ``f32`` prefix match and ``bfloat16`` is not ``f16``.
+
+    OpenVINO renders a type as ``<Type: 'float32'>``, so both readers match substrings.
+    Shortest-first ordering reads that as an f32 *and* would read ``bfloat16`` as f16 -
+    one of those is the right width by luck and the other is the wrong format name.
+    """
+    from benchmark.suite.engines import openvino_engine
+
+    assert openvino_engine._element_bits("<Type: 'float32'>") == 32
+    assert openvino_engine._element_bits("<Type: 'bfloat16'>") == 16
+    assert openvino_engine._element_bits("f16") == 16
+    assert openvino_engine._element_bits("i4") == 4
+    assert openvino_engine._element_bits(None) is None
+    assert openvino_engine._element_bits("something new") is None
+
+    assert openvino_engine._precision_name("<Type: 'float32'>") == "fp32"
+    assert openvino_engine._precision_name("<Type: 'bfloat16'>") == "bf16"
+    assert openvino_engine._precision_name("<Type: 'float16'>") == "fp16"
+    assert openvino_engine._precision_name("f16") == "fp16"
+    assert openvino_engine._precision_name(None) is None
+    assert openvino_engine._precision_name("<Type: 'int64_t'>") is None
+
+
+def test_every_precision_the_suite_can_resolve_has_a_defined_storage_element() -> None:
+    """The export cannot quietly store a width the run did not ask for.
+
+    The requested precision used to be recorded and then dropped, so the IR was written
+    at the exporter's default while the rest of the field executed 16-bit weights - and
+    since the width was never read back, the report called the representations equal.
+    Every precision the suite can resolve to now maps to an explicit element type, and
+    a precision with no defined mapping is declined by the probe instead of converted
+    at whatever the exporter would have picked.
+    """
+    from benchmark.suite.engines import openvino_engine
+
+    resolvable = {choice for choice in plan.PRECISION_CHOICES if choice != "auto"}
+    assert set(openvino_engine._STORAGE_ELEMENT) == resolvable
+    # bf16 stores as f16: the CPU plugin has no bf16 weight container, the width is the
+    # same one, and the difference in kind travels in the label rather than in silence.
+    assert openvino_engine._STORAGE_ELEMENT["bf16"] == "f16"
+    for precision, element in openvino_engine._STORAGE_ELEMENT.items():
+        assert openvino_engine._element_bits(element) == (
+            32 if precision == "fp32" else 16
+        )
 
 
 # ── Plan validation ─────────────────────────────────────────────────────────
@@ -290,11 +554,101 @@ def test_representation_difference_is_labelled_on_both_sides() -> None:
     assert "rounding step" in note
 
 
+#: A row every engine in the field can produce: the published checkpoint, executed on
+#: the accelerator at the run's precision. Each test below changes exactly one field of
+#: it, so the verdict it asserts is attributable to that field alone.
+_LIKE_FOR_LIKE_ROW = {
+    "quantized": False, "representation": "published checkpoint",
+    "precision": "fp16", "weight_storage_bits": 16, "weight_storage_format": "fp16",
+    "execution_device": "cuda:0", "execution_device_class": "nvidia-gpu",
+    "completion_tokens": 128,
+}
+
+
+def test_two_kinds_of_hardware_are_not_a_representation_difference() -> None:
+    """Judged before anything about the weights, and reported as its own kind of gap.
+
+    OpenVINO ships no CUDA plugin, so on an NVIDIA host it executes on the CPU cores
+    while the rest of the field is on the card. The percentage from such a pair is a
+    real measurement of two machines, and filing it under weight formats would put a
+    hardware gap where a reader expects a rounding detail.
+    """
+    on_host = {**_LIKE_FOR_LIKE_ROW, "execution_device": "CPU",
+               "execution_device_class": "cpu"}
+    label, note = analysis.comparability(_LIKE_FOR_LIKE_ROW, on_host)
+    assert label == analysis.DEVICE_DIFFERENCE
+    assert "different hardware" in note and "cpu" in note
+    assert "cannot be read as a difference between the stacks" in note
+    # It outranks every other difference present, including a quantization: two stacks
+    # on two kinds of chip are not being compared with each other at all.
+    heavier = {**on_host, "quantized": True, "weight_storage_bits": 4}
+    assert analysis.comparability(_LIKE_FOR_LIKE_ROW, heavier)[0] == \
+        analysis.DEVICE_DIFFERENCE
+    # A second card of the same class is the same hardware; the index is not a gap.
+    same_class = {**_LIKE_FOR_LIKE_ROW, "execution_device": "cuda:1"}
+    assert analysis.comparability(_LIKE_FOR_LIKE_ROW, same_class)[0] == \
+        analysis.SAME_REPRESENTATION
+
+
+def test_generations_of_different_lengths_are_not_a_like_for_like_rate() -> None:
+    """The same cell is not the same work if one side stopped early.
+
+    Every engine is asked for the same token count and pinned to it wherever the API
+    takes a minimum length. Aether's public generate does not, so a short generation is
+    caught here from the count instead: one prefill amortized over 64 tokens against the
+    same prefill over 128 is a different rate, and it flatters whoever produced fewer.
+    """
+    short = {**_LIKE_FOR_LIKE_ROW, "completion_tokens": 64}
+    label, note = analysis.comparability(_LIKE_FOR_LIKE_ROW, short)
+    assert label == analysis.WORK_DIFFERENCE
+    assert "128 tokens against 64" in note
+    # Both directions, from the same code path: whoever generated fewer, it is labelled.
+    assert analysis.comparability(short, _LIKE_FOR_LIKE_ROW)[0] == \
+        analysis.WORK_DIFFERENCE
+    assert analysis.comparability(_LIKE_FOR_LIKE_ROW, dict(_LIKE_FOR_LIKE_ROW))[0] == \
+        analysis.SAME_REPRESENTATION
+    # And it outranks a weight-format difference, which would otherwise absorb it.
+    quantized_and_short = {**short, "quantized": True, "weight_storage_bits": 4}
+    assert analysis.comparability(_LIKE_FOR_LIKE_ROW, quantized_and_short)[0] == \
+        analysis.WORK_DIFFERENCE
+
+
+def test_the_severest_difference_present_is_the_one_a_summary_reports() -> None:
+    """An aggregate row is summarised by its worst verdict, not by its commonest.
+
+    A set of pairings that crossed a hardware boundary and also differs in weight format
+    must not collapse to "format differs": the collapsed verdict is the whole of what a
+    reader sees on an aggregated row. The order comes from the module's own severity
+    list, so a verdict added to the vocabulary cannot drift out of step with the way
+    sets of verdicts are reduced.
+    """
+    order = analysis.COMPARABILITY_LABELS
+    assert order[0] == analysis.DEVICE_DIFFERENCE
+    assert order.index(analysis.WORK_DIFFERENCE) < \
+        order.index(analysis.REPRESENTATION_DIFFERENCE)
+    assert order[-1] == analysis.SAME_REPRESENTATION, "clean is the least severe"
+
+    assert analysis._dominant_label([]) == analysis.SAME_REPRESENTATION
+    mixed = [analysis.REPRESENTATION_DIFFERENCE, analysis.SAME_REPRESENTATION,
+             analysis.WORK_DIFFERENCE, analysis.DEVICE_DIFFERENCE]
+    assert analysis._dominant_label(mixed) == analysis.DEVICE_DIFFERENCE
+    assert analysis._dominant_label(mixed[:3]) == analysis.WORK_DIFFERENCE
+    assert analysis._dominant_label(mixed[:2]) == analysis.REPRESENTATION_DIFFERENCE
+
+
 # ── End-to-end analysis over a synthetic payload ────────────────────────────
 
 def _cell(batch: int, prompt: int, output: int, throughput: float, latency: float,
           *, primary: bool = False, sweeps: list[str] | None = None,
-          status: str = status_mod.MEASURED, reason: str = "") -> dict[str, Any]:
+          status: str = status_mod.MEASURED, reason: str = "",
+          produced: int | None = None) -> dict[str, Any]:
+    """One planned cell and its measurement.
+
+    ``produced`` is what the engine actually generated when that differs from what the
+    cell asked for: the planned length keys the cell, the produced length is what a
+    rate is derived from, and a run where an engine stopped early is the case the two
+    have to be kept apart for.
+    """
     record: dict[str, Any] = {
         "kind": "primary" if primary else "batch",
         "batch_size": batch, "prompt_tokens": prompt, "output_tokens": output,
@@ -304,7 +658,8 @@ def _cell(batch: int, prompt: int, output: int, throughput: float, latency: floa
     if status != status_mod.MEASURED:
         return record
     record["measurement"] = {
-        "status": "ok", "prompt_tokens": prompt, "completion_tokens": output,
+        "status": "ok", "prompt_tokens": prompt,
+        "completion_tokens": output if produced is None else produced,
         "latency_s": {"n": 10, "median": latency, "mean": latency, "stdev": 0.01,
                       "min": latency, "max": latency, "p95": latency, "p99": latency,
                       "coefficient_of_variation": 0.01},
@@ -328,13 +683,21 @@ def _cell(batch: int, prompt: int, output: int, throughput: float, latency: floa
 def _run(engine: str, cells: list[dict[str, Any]], *, build_s: float | None,
          load_s: float, quantized: bool = False,
          representation: str = "published checkpoint",
-         persistence: str = "none") -> dict[str, Any]:
+         persistence: str = "none",
+         describe_extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """One engine's run record, as the worker writes it.
+
+    ``describe_extra`` carries what the engine reported about its own execution - the
+    device, its class, the precision it ended up in, the thread count - which is the
+    half of the record every parity check is made against.
+    """
     return {
         "engine": engine, "model": "Qwen/Qwen3-0.6B", "precision": "bf16",
         "status": status_mod.MEASURED, "cells": cells,
         "spec": {"has_build_phase": build_s is not None, "taxonomy": ["runtime"],
                  "artifact_persistence": persistence},
-        "describe": {"representation": representation, "quantized": quantized},
+        "describe": {"representation": representation, "quantized": quantized,
+                     **(describe_extra or {})},
         "load": {"status": "ok", "prepare_s": build_s, "load_s": load_s,
                  "total_s": (build_s or 0.0) + load_s, "notes": {}},
         "artifact": {"has_build_phase": build_s is not None, "persistence": persistence,
@@ -658,7 +1021,7 @@ def test_a_crashed_worker_leaves_a_record_with_no_measurement_in_it() -> None:
     from benchmark.suite import orchestrate
 
     record = orchestrate._orphan_record(
-        "vllm", "Qwen/Qwen3-0.6B", "bf16",
+        "openvino", "Qwen/Qwen3-0.6B", "bf16",
         {"returncode": None, "elapsed_s": 900.0, "timed_out": True},
     )
     assert record["status"] == status_mod.FAILED
@@ -742,25 +1105,6 @@ def test_aether_adapter_names_the_single_device_it_was_given() -> None:
     assert two.execution_devices == ["cuda:0", "cuda:1"]
 
 
-# ── torch.compile fallback ──────────────────────────────────────────────────
-
-def test_torch_compile_falls_back_instead_of_reporting_itself_unsupported() -> None:
-    """Whole-graph capture failing does not mean torch.compile cannot run the model.
-
-    Transformers' generate calls functions Dynamo skips, and length-dependent models
-    are data-dependent by construction. Reporting those as "torch.compile unsupported"
-    would be wrong: what is unsupported is fullgraph capture.
-    """
-    from benchmark.suite.engines import torch_compile
-
-    attempts = torch_compile.COMPILE_ATTEMPTS
-    assert attempts[0]["fullgraph"] is True, "the strictest configuration is tried first"
-    assert any(not item["fullgraph"] for item in attempts), (
-        "a graph-broken compilation must remain available"
-    )
-    assert len({(item["mode"], item["fullgraph"]) for item in attempts}) == len(attempts)
-
-
 # ── Neutrality ──────────────────────────────────────────────────────────────
 
 def test_the_pairwise_matrix_holds_every_ordered_pair() -> None:
@@ -838,3 +1182,393 @@ def test_focus_narrows_the_drill_down_without_changing_any_number() -> None:
     assert "#### Cells `aether` won" not in text
     # The standings still cover the whole field.
     assert "`aether`" in text
+
+
+def _field_payload() -> dict[str, Any]:
+    """One model, two cells, three engines: two on the card, one on the host CPU.
+
+    The shape a real run has on an NVIDIA host, in miniature. It is the smallest payload
+    in which the device label, the exhaustive bucketing, the cross-device column of the
+    standings and the report's execution-parity table can all be checked, and in which a
+    short generation coexists with a hardware difference so their order of severity is
+    exercised by the pipeline rather than only by the label function.
+    """
+    on_card = {"execution_device": "cuda:0", "execution_device_class": "nvidia-gpu",
+               "precision": "bf16", "weight_storage_bits": 16,
+               "weight_storage_format": "bf16", "threads": 2,
+               "ttft_method": "streaming"}
+    on_host = {**on_card, "execution_device": "CPU", "execution_device_class": "cpu",
+               "precision": "fp32", "weight_storage_format": "f16"}
+    runs = [
+        _run("transformers", [
+            _cell(1, 256, 128, 40.0, 3.2, primary=True,
+                  sweeps=["batch", "prompt", "output"]),
+            _cell(4, 256, 128, 120.0, 4.3),
+        ], build_s=None, load_s=6.0, describe_extra=on_card),
+        _run("openvino", [
+            _cell(1, 256, 128, 6.0, 21.0, primary=True,
+                  sweeps=["batch", "prompt", "output"]),
+            _cell(4, 256, 128, 18.0, 28.0),
+        ], build_s=30.0, load_s=8.0, persistence="portable-artifact",
+            describe_extra=on_host),
+        _run("aether", [
+            _cell(1, 256, 128, 52.0, 2.5, primary=True,
+                  sweeps=["batch", "prompt", "output"]),
+            # The same cell, stopped early: 100 tokens where the field produced 128.
+            _cell(4, 256, 128, 150.0, 3.4, produced=100),
+        ], build_s=20.0, load_s=4.0, persistence="portable-artifact",
+            describe_extra=on_card),
+    ]
+    return _payload(runs)
+
+
+def test_every_comparison_lands_in_exactly_one_bucket() -> None:
+    """The buckets partition the comparable set, so classifying cannot hide anything.
+
+    A verdict that exists in the analysis but not in the summary drops its comparisons
+    out of the report while every printed count stays internally consistent - the worst
+    kind of omission, because nothing looks wrong. The buckets are built from the
+    module's own label list, and here they are asserted to add up.
+    """
+    analyzed = analysis.analyze(_field_payload())
+    labelled = {
+        item["comparability"] for item in analyzed["pairwise"]
+        if item["throughput"].get("comparable")
+    }
+    assert analysis.DEVICE_DIFFERENCE in labelled, "the CPU-bound engine must be flagged"
+    assert analysis.WORK_DIFFERENCE in labelled, "the short generation must be flagged"
+    assert analysis.SAME_REPRESENTATION in labelled, "and a clean pair must survive"
+
+    for engine, view in analyzed["per_engine"].items():
+        summary = view["win_loss"]
+        parts = ("same_representation", "representation_difference",
+                 "device_difference", "work_difference")
+        assert sum(summary[name]["compared"] for name in parts) == \
+            summary["all"]["compared"], f"{engine}'s buckets do not sum to its total"
+        for name in parts:
+            counted = summary[name]
+            assert counted["wins"] + counted["losses"] + counted["ties"] == \
+                counted["compared"]
+
+
+def test_a_rank_earned_on_other_hardware_travels_with_that_fact() -> None:
+    """An engine that ran on the CPU still has a rank, and the rank says what it is.
+
+    Dropping it from the standings would be the other error: the run happened and the
+    numbers are real. What must not happen is a table where a row measured on two CPU
+    cores sits beside rows measured on a T4 with nothing to distinguish them, because
+    then the reader reads a runtime comparison off a hardware comparison.
+    """
+    analyzed = analysis.analyze(_field_payload())
+    by_engine = {entry["engine"]: entry for entry in analyzed["standings"]}
+    assert set(by_engine) == {"transformers", "openvino", "aether"}
+    host_bound = by_engine["openvino"]
+    assert host_bound["cross_device"] == host_bound["compared"], (
+        "every pairing this engine had crossed a hardware boundary"
+    )
+    assert host_bound["same_representation"] == 0
+    for engine in ("transformers", "aether"):
+        entry = by_engine[engine]
+        assert 0 < entry["cross_device"] < entry["compared"], (
+            f"{engine} was paired both with the CPU-bound engine and against the card"
+        )
+
+    # The aggregated per-opponent verdict collapses to the severest label present, so
+    # the pairing against the CPU-bound engine is never summarised as a format detail.
+    against = analyzed["per_engine"]["aether"]["per_competitor"]
+    assert against["openvino"]["comparability"] == analysis.DEVICE_DIFFERENCE
+    assert against["openvino"]["device_difference_cells"] == \
+        against["openvino"]["cells"]
+    assert against["openvino"]["same_representation_cells"] == 0
+    assert against["openvino"][
+        "median_improvement_percent_same_representation"] is None, (
+        "there is no like-for-like median to quote against an engine on other hardware"
+    )
+    assert against["transformers"]["work_difference_cells"] == 1, (
+        "the cell Aether stopped early in is counted, not averaged away"
+    )
+
+
+def test_the_report_prints_what_each_engine_did_beside_what_it_was_asked_for() -> None:
+    """The controlled variables are only controlled if the report shows who kept them.
+
+    A precision and a device are requested once for the whole run, and an engine can
+    decline either: a plugin with no driver for the accelerator falls back to the host,
+    and one that cannot execute a format widens it. Neither shows up in a throughput
+    number - a row that ran on the CPU at fp32 just looks slow - so both are printed
+    next to the request, which is also the evidence behind the labels in the standings.
+    """
+    payload = _field_payload()
+    analyzed = analysis.analyze(payload)
+    text = report.build_report(payload, analyzed, {"written": [], "skipped": [],
+                                                   "directory": "graphs"})
+    assert "**What each engine executed on**" in text
+    for column in ("Execution device", "Device class", "Precision asked for",
+                   "Precision reported", "CPU threads", "TTFT method"):
+        assert column in text, f"the parity table must print {column!r}"
+    parity = text.split("**What each engine executed on**", 1)[1]
+    host_row = next(line for line in parity.splitlines() if "`openvino`" in line)
+    assert "cpu" in host_row and "fp32" in host_row and "bf16" in host_row, (
+        "the CPU fallback and the widened precision must both be readable in one row"
+    )
+    card_row = next(line for line in parity.splitlines() if "`aether`" in line)
+    assert "nvidia-gpu" in card_row and "cuda:0" in card_row
+    # The instrument behind the one metric an engine can be measured for differently.
+    assert "streaming" in card_row and "streaming" in host_row
+
+    # And the caveat is stated, not left for the reader to deduce from the table.
+    assert "no CUDA plugin" in text
+    assert "hardware differs" in text, "the label has a reading in the tables"
+
+
+# ── One stopwatch for time to first token ───────────────────────────────────
+
+def test_the_first_token_is_timed_by_one_stopwatch_wherever_an_engine_can_share_it() -> None:
+    """A ranked metric must not be measured by a different instrument per engine.
+
+    Time to first token is ranked head-to-head and turned into a percentage against
+    every competitor, so the machinery behind it is part of the comparison. Every
+    engine whose generate accepts a streamer is measured by the same function object -
+    not by its own copy of the same idea - and the one engine that has no stream to
+    subscribe to overrides the method itself, so what its spec declares is what its
+    code does.
+    """
+    from benchmark import backend_transformers, backends
+    from benchmark.suite.engines import base, hf_transformers, openvino_engine, pytorch_native
+
+    assert (backend_transformers.stream_first_token_latency
+            is backends.stream_first_token_latency
+            is openvino_engine.stream_first_token_latency), (
+        "two engines reporting ttft_method='streaming' must share the implementation"
+    )
+    for module in (hf_transformers, openvino_engine, registry.spec_for("aether")):
+        spec = module if isinstance(module, base.EngineSpec) else module.SPEC
+        assert spec.ttft_method == "streaming", f"{spec.key} drifted off the shared method"
+
+    # The exception is declared, and it is declared by an engine that really does
+    # measure something else: the raw loop has no stream, and timing its generate
+    # would make this row Transformers' generate for one metric and not for the rest.
+    assert pytorch_native.SPEC.ttft_method == "single_token_call"
+    assert (pytorch_native.Engine.first_token_latency
+            is not base.BackendAdapterMixin.first_token_latency)
+    for key in registry.KEYS:
+        assert registry.spec_for(key).ttft_method, f"{key} declares no ttft method"
+
+
+def test_each_streaming_engine_reaches_that_stopwatch_with_its_own_model(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sharing the timer is only neutrality if both engines actually route to it.
+
+    Checked without a model: each adapter is handed a stand-in for the model and the
+    tokenizer it would have loaded, and the shared timer is replaced by a recorder. What
+    must match between the two calls is the request - the same token budget, its own
+    model, its own tokenizer - because that is what makes the two figures comparable.
+    """
+    from benchmark import backend_transformers
+    from benchmark.suite.engines import openvino_engine
+
+    class _Encoding(dict):
+        def items(self) -> Any:  # so _encode's device move is exercised
+            return super().items()
+
+    class _Tensor:
+        def to(self, _device: str) -> _Tensor:
+            return self
+
+    class _Tokenizer:
+        pad_token_id = 0
+
+        def __call__(self, prompts: Any, **_: Any) -> Any:
+            return _Encoding(input_ids=_Tensor(), attention_mask=_Tensor())
+
+    calls: list[dict[str, Any]] = []
+
+    def _recorder(model: Any, tokenizer: Any, inputs: Any, *,
+                  max_new_tokens: int) -> float:
+        calls.append({"model": model, "tokenizer": tokenizer,
+                      "inputs": dict(inputs), "max_new_tokens": max_new_tokens})
+        return 0.25
+
+    monkeypatch.setattr(backend_transformers, "stream_first_token_latency", _recorder)
+    monkeypatch.setattr(openvino_engine, "stream_first_token_latency", _recorder)
+
+    reference = backend_transformers.TransformersBackend(device="cpu")
+    reference._model, reference._tokenizer = object(), _Tokenizer()
+    subject = openvino_engine.Engine(device="CPU")
+    subject._model, subject._tokenizer = object(), _Tokenizer()
+
+    for engine in (reference, subject):
+        assert engine.first_token_latency("hi", max_new_tokens=64, seed=7) == 0.25
+
+    assert len(calls) == 2, "both engines must go through the shared timer"
+    assert {call["max_new_tokens"] for call in calls} == {64}
+    assert {tuple(sorted(call["inputs"])) for call in calls} == {
+        ("attention_mask", "input_ids")
+    }, "both engines must hand the same encoded fields to the same timer"
+    assert calls[0]["model"] is not calls[1]["model"], "each times its own model"
+
+
+def test_the_shared_stopwatch_stops_at_the_first_token_and_never_invents_one() -> None:
+    """What the figure includes, and what happens when there is no figure to give.
+
+    Driven with a stand-in model that streams one token, works for a while longer, then
+    finishes: the number returned has to be the wait for the first token and not the cost
+    of the rest, or every engine's time-to-first-token would silently be a function of
+    the output length the plan happened to ask for. A generation that fails must reach
+    the runner as a failure, because a cell recorded as unmeasured is honest and a
+    latency for a token that never arrived is not.
+    """
+    import time
+
+    import torch
+    from benchmark.backends import UnsupportedConfiguration, stream_first_token_latency
+
+    class _Tokenizer:
+        pad_token_id = 0
+
+        def decode(self, ids: Any, **_: Any) -> str:
+            # A trailing space, so the streamer's word-boundary flush releases the token
+            # rather than holding it back for the next one.
+            return " ".join(f"t{int(value)}" for value in ids) + " "
+
+    class _Model:
+        def __init__(self, behaviour: str) -> None:
+            self.behaviour = behaviour
+
+        def generate(self, *, input_ids: Any, streamer: Any, **_: Any) -> Any:
+            streamer.put(input_ids)  # the prompt, which skip_prompt drops
+            if self.behaviour == "raises":
+                raise RuntimeError("CUDA out of memory")
+            if self.behaviour == "silent":
+                # A generation that stopped immediately: the streamer still emits
+                # once when it ends, and the returned sequence is the prompt.
+                streamer.end()
+                return input_ids
+            streamer.put(torch.tensor([[5]]))
+            time.sleep(0.4)  # the tokens after the first must not be in the figure
+            streamer.put(torch.tensor([[6]]))
+            streamer.end()
+            return torch.cat([input_ids, torch.tensor([[5, 6]])], dim=-1)
+
+    inputs = {"input_ids": torch.tensor([[1, 2, 3]])}
+    started = time.perf_counter()
+    elapsed = stream_first_token_latency(
+        _Model("streams"), _Tokenizer(), inputs, max_new_tokens=32
+    )
+    total = time.perf_counter() - started
+    assert total >= 0.4, "the call still waits for the generation it started"
+    assert elapsed < 0.2, (
+        f"time to first token ({elapsed:.3f}s) counted work done after the first token"
+    )
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        stream_first_token_latency(
+            _Model("raises"), _Tokenizer(), inputs, max_new_tokens=32
+        )
+    with pytest.raises(UnsupportedConfiguration, match="no token beyond the prompt"):
+        stream_first_token_latency(
+            _Model("silent"), _Tokenizer(), inputs, max_new_tokens=32
+        )
+
+
+def _timed_field(methods: dict[str, str]) -> dict[str, Any]:
+    """The whole field measured at batch 1, each engine's stopwatch declared.
+
+    Time to first token is the one headline metric an engine can be measured for by a
+    different mechanism than its neighbour, so the payload carries the mechanism per
+    engine and the values are distinct, which makes both the ordering and the caveat
+    checkable from the same run.
+    """
+    seconds = {"transformers": 0.09, "pytorch_native": 0.04,
+               "openvino": 0.62, "aether": 0.03}
+    runs = []
+    for key in registry.KEYS:
+        run = _run(key, [
+            _cell(1, 256, 128, 40.0, 3.2, primary=True,
+                  sweeps=["batch", "prompt", "output"]),
+            _cell(4, 256, 128, 120.0, 4.3),
+        ], build_s=None, load_s=6.0, describe_extra={
+            "execution_device": "cuda:0", "execution_device_class": "nvidia-gpu",
+            "precision": "bf16", "threads": 2, "ttft_method": methods[key],
+        })
+        for cell in run["cells"]:
+            cell["derived"]["ttft_s"] = seconds[key]
+        runs.append(run)
+    return _payload(runs)
+
+
+def test_a_ranking_of_figures_taken_two_ways_says_so_wherever_it_is_printed(
+        tmp_path: Path) -> None:
+    """The field really does mix stopwatches, so the mixing has to be disclosed.
+
+    Three engines expose a stream and are timed by the shared implementation; the raw
+    loop has no stream and times the work before its first token exists. That is a
+    defensible difference and an undisclosed one would not be, so the method travels
+    from each engine's own description into the ranking, the note under it, the summary
+    line that quotes the winner, the terminal output, and the per-pair export - the
+    same discipline the representation and device labels already get.
+    """
+    declared = {key: registry.spec_for(key).ttft_method for key in registry.KEYS}
+    assert len(set(declared.values())) > 1, (
+        "this test exists because the field mixes methods; if it no longer does, "
+        "the disclosure is no longer needed and this test should be the one that fails"
+    )
+    payload = _timed_field(declared)
+    analyzed = analysis.analyze(payload)
+    ranking = analyzed["rankings"]["ttft"]
+
+    assert ranking["mixed_methods"] is True
+    assert ranking["methods"] == declared, "every ranked engine names its own stopwatch"
+    assert [entry["engine"] for entry in ranking["order"]] == [
+        "aether", "pytorch_native", "transformers", "openvino"
+    ], "the ordering itself is by measured value, lowest first"
+
+    # A percentage is only like-for-like when both sides were timed the same way, and
+    # the flag is set from the pair rather than from either engine's identity.
+    pairs = {
+        (item["subject"], item["competitor"]): item["ttft"]
+        for item in analyzed["pairwise"] if item["is_primary"]
+    }
+    assert pairs[("aether", "transformers")]["same_method"] is True
+    assert pairs[("transformers", "aether")]["same_method"] is True
+    assert pairs[("aether", "pytorch_native")]["same_method"] is False
+    assert pairs[("pytorch_native", "aether")]["same_method"] is False
+    assert pairs[("aether", "pytorch_native")]["subject_method"] == "streaming"
+    assert pairs[("aether", "pytorch_native")]["competitor_method"] == "single_token_call"
+
+    text = report.build_report(payload, analyzed, {"written": [], "skipped": [],
+                                                  "directory": "graphs"})
+    section = text.split("### Lowest time to first token", 1)[1]
+    assert "not like-for-like" in section
+    assert "`pytorch_native` by single token call" in section
+    assert "`aether` by streaming" in section
+    assert "measured by more than one method" in text.split("## Executive summary", 1)[1]
+    assert "[mixed methods]" in report.terminal_summary(payload, analyzed, {})
+
+    written = tmp_path / "pairs.csv"
+    report.write_comparison_csv(analyzed, written)
+    exported = written.read_text(encoding="utf-8").splitlines()
+    assert "ttft_same_method" in exported[0]
+    assert any("False" in line for line in exported[1:]), (
+        "a spreadsheet filtered on the TTFT column has to be able to see which "
+        "percentages are between two different measurements"
+    )
+
+
+def test_one_stopwatch_across_the_field_leaves_no_caveat_to_print() -> None:
+    """The disclosure is conditional, not decorative.
+
+    If every engine were measured the same way there would be nothing to warn about,
+    and a warning printed anyway would train a reader to ignore it.
+    """
+    payload = _timed_field(dict.fromkeys(registry.KEYS, "streaming"))
+    analyzed = analysis.analyze(payload)
+    assert analyzed["rankings"]["ttft"]["mixed_methods"] is False
+    assert all(item["ttft"]["same_method"] for item in analyzed["pairwise"])
+
+    text = report.build_report(payload, analyzed, {"written": [], "skipped": [],
+                                                  "directory": "graphs"})
+    assert "not like-for-like" not in text.split(
+        "### Lowest time to first token", 1)[1].split("###", 1)[0]
+    assert "measured by more than one method" not in text
+    assert "[mixed methods]" not in report.terminal_summary(payload, analyzed, {})
