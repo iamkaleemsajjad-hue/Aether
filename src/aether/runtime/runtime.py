@@ -8,6 +8,8 @@ decoding, and serves generation requests.
 
 from __future__ import annotations
 
+import sys
+
 import datetime
 import json
 import copy
@@ -451,6 +453,10 @@ class Runtime:
 
         # Async compilation job registry: {job_id: {status, model, ...}}
         self._compile_jobs: dict[str, dict[str, Any]] = {}
+        # References to active background compile threads (daemon threads).
+        # Kept so shutdown() can join them before the interpreter tears down
+        # stdout, preventing the _enter_buffered_busy SIGABRT on exit.
+        self._compile_threads: list[threading.Thread] = []
 
         logger.info(
             "Aether runtime initialized",
@@ -1826,16 +1832,45 @@ class Runtime:
             except Exception as exc:
                 self._compile_jobs[job_id]["status"] = "failed"  # type: ignore[index]
                 self._compile_jobs[job_id]["error"] = str(exc)  # type: ignore[index]
-                logger.error("Async compilation failed", job_id=job_id, error=str(exc))
+                # Guard: do NOT call structlog (which writes to stdout) if the
+                # Python interpreter is already finalising.  During finalisation
+                # the BufferedWriter stdout lock is torn down and any attempt to
+                # acquire it from a daemon thread triggers a C-level abort
+                # (_enter_buffered_busy) → SIGABRT / exit code 134.
+                if not sys.is_finalizing():
+                    logger.error("Async compilation failed", job_id=job_id, error=str(exc))
             finally:
                 self._compile_jobs[job_id]["completed_at"] = (  # type: ignore[index]
                     datetime.datetime.now(datetime.timezone.utc).isoformat()
                 )
 
         thread = threading.Thread(target=_run_compile, daemon=True, name=f"compile-{job_id[:8]}")
+        self._compile_threads.append(thread)
         thread.start()
         logger.info("Compilation job queued", job_id=job_id, model=model_id, target=target)
         return job_id
+
+    def shutdown(self, timeout: float = 2.0) -> None:
+        """Gracefully wait for all background compile threads to finish.
+
+        Joins each active compile thread up to ``timeout`` seconds.  Call this
+        before the process exits if you want clean log output and no residual
+        daemon threads racing stdout teardown.
+
+        Args:
+            timeout: Per-thread join timeout in seconds.
+        """
+        threads, self._compile_threads = list(self._compile_threads), []
+        for t in threads:
+            if t.is_alive():
+                t.join(timeout=timeout)
+
+    def __del__(self) -> None:
+        """Best-effort cleanup: join compile threads before GC tears down I/O."""
+        try:
+            self.shutdown(timeout=0.5)
+        except Exception:  # noqa: BLE001
+            pass
 
     def get_compile_status(self, job_id: str) -> dict[str, Any]:
         """Get the status of an async compilation job.
@@ -1883,6 +1918,13 @@ class Runtime:
             Task Arithmetic (ICLR 2023), TIES-Merging (NeurIPS 2023),
             DARE-TIES (arXiv 2024), FREE-Merging (arXiv 2026).
         """
+        # Normalise convenience string entries to the canonical dict format.
+        # Callers may pass bare path strings (e.g. task_vectors=[str(path)])
+        # which is a common pattern in scripts and CI smoke tests.
+        task_vectors = [
+            {"path": item} if isinstance(item, str) else item
+            for item in task_vectors
+        ]
         if not task_vectors:
             raise ValueError("at least one task vector source is required")
         if not 0.0 < density <= 1.0:
