@@ -238,6 +238,22 @@ def _tree_size(path: Path) -> int | None:
 _EXPORT_DISTRIBUTIONS = ("optimum-onnx", "optimum")
 
 
+def _cuda_provider_available() -> bool:
+    """True when the installed onnxruntime build exposes CUDAExecutionProvider.
+
+    This is the only reliable GPU check. ``onnxruntime-gpu`` 1.18+ changed its
+    wheel packaging so that ``importlib.metadata.version('onnxruntime-gpu')``
+    returns ``None`` even on a fully-functional CUDA build — the metadata is now
+    registered under the name ``onnxruntime``.  Checking the provider list is
+    definitive regardless of how the package was named or re-named.
+    """
+    try:
+        import onnxruntime as ort
+        return "CUDAExecutionProvider" in ort.get_available_providers()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Availability:
     generic = base.generic_probe(SPEC, hardware)
     if not generic.usable:
@@ -263,7 +279,10 @@ def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Av
             "exporter accepts rather than upgrading it afterwards."
         )
     version = base.package_version("optimum")
-    if hardware.nvidia and base.package_version("onnxruntime-gpu") is None:
+    # onnxruntime-gpu 1.18+ registers its metadata as "onnxruntime", so
+    # package_version("onnxruntime-gpu") returns None even when CUDA providers
+    # are fully available. Check the provider list directly instead.
+    if hardware.nvidia and not _cuda_provider_available():
         return base.available(
             version,
             "only the CPU build of onnxruntime is installed, so this engine will "
@@ -273,8 +292,11 @@ def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Av
 
 
 def build(hardware: Any, model_id: str, precision: str, options: Any) -> Engine:
-    gpu_build = base.package_version("onnxruntime-gpu") is not None
+    # Use the provider-list check rather than the distribution name: onnxruntime-gpu
+    # 1.18+ registers its metadata as "onnxruntime", so the old name-based check
+    # always returned None and forced every engine onto CPU even on GPU hosts.
+    cuda_available = hardware.nvidia and _cuda_provider_available()
     return Engine(
-        device="cuda" if (hardware.nvidia and gpu_build) else "cpu",
+        device="cuda" if cuda_available else "cpu",
         cache_dir=getattr(options, "onnx_cache_dir", None),
     )
