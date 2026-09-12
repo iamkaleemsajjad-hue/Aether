@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import json
 import copy
+import os
 import sys
 import threading
 import time
@@ -1827,17 +1828,36 @@ class Runtime:
             except Exception as exc:
                 self._compile_jobs[job_id]["status"] = "failed"  # type: ignore[index]
                 self._compile_jobs[job_id]["error"] = str(exc)  # type: ignore[index]
-                # Guard against logging during interpreter shutdown: the stdout
-                # buffer lock may already be held by the shutdown machinery, and
-                # writing to it from a daemon thread causes a fatal deadlock
-                # (_enter_buffered_busy → SIGABRT, exit code 134).  Skip the
-                # log call when the interpreter is already tearing down.
-                if not sys.is_finalizing():
-                    logger.error("Async compilation failed", job_id=job_id, error=str(exc))
+                # Do NOT call logger.error() here.  The structlog/logging stack
+                # writes to a BufferedWriter (stdout).  When this daemon thread
+                # is still alive as the interpreter begins shutdown, Python's
+                # atexit machinery acquires the BufferedWriter lock to flush it.
+                # If logger.error() then tries to acquire the same lock we get:
+                #   Fatal Python error: _enter_buffered_busy  →  SIGABRT (134)
+                # sys.is_finalizing() is NOT a reliable guard because the lock
+                # is acquired between is_finalizing() returning False and the
+                # actual write (TOCTOU race).
+                #
+                # os.write(fd, bytes) bypasses all Python buffer locking: it is
+                # a raw syscall, safe to call from any thread at any time.
+                try:
+                    msg = (
+                        f"[aether compile-async] FAILED job_id={job_id} "
+                        f"error={exc!r}\n"
+                    ).encode("utf-8", errors="replace")
+                    os.write(2, msg)  # fd 2 = stderr, unbuffered, lock-free
+                except OSError:
+                    pass  # fd closed during very late shutdown — nothing to do
             finally:
-                self._compile_jobs[job_id]["completed_at"] = (  # type: ignore[index]
-                    datetime.datetime.now(datetime.timezone.utc).isoformat()
-                )
+                # Also guard this block: datetime.now() involves no I/O and is
+                # safe, but the dict assignment could race if the interpreter
+                # has already cleared globals.  Wrap defensively.
+                try:
+                    self._compile_jobs[job_id]["completed_at"] = (  # type: ignore[index]
+                        datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
         thread = threading.Thread(target=_run_compile, daemon=True, name=f"compile-{job_id[:8]}")
         # Store the thread so callers can join() before process exit if needed,
