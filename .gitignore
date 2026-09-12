@@ -71,6 +71,8 @@ site/
 # Jupyter notebooks
 .ipynb_checkpoints/
 *.ipynb_checkpoints
+notebook7ce33da9c5 (1).ipynb
+
 
 # Aether-specific runtime artifacts and cache
 .aether/

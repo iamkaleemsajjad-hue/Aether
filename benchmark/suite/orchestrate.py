@@ -271,8 +271,7 @@ def run(config: SuiteConfig) -> dict[str, Any]:
     # went and how big it was.
     artifacts = root / ARTIFACT_DIR
     for attribute, name in (
-        ("aeg_cache_dir", "aeg"), ("onnx_cache_dir", "onnx"),
-        ("openvino_cache_dir", "openvino"), ("gguf_dir", "gguf"),
+        ("aeg_cache_dir", "aeg"), ("openvino_cache_dir", "openvino"),
     ):
         if getattr(config, attribute) is None:
             setattr(config, attribute, str(artifacts / name))

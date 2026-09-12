@@ -1,4 +1,4 @@
-# Dependencies the benchmark needs beyond Aether Runtime's own install.
+﻿# Dependencies the benchmark needs beyond Aether Runtime's own install.
 # Aether itself is installed with:  pip install -e ".[pytorch]"
 #
 # Kaggle GPU images already ship torch, transformers, psutil and matplotlib;
@@ -13,28 +13,16 @@ matplotlib>=3.7.0        # charts; the benchmark degrades gracefully without it
 huggingface-hub>=0.27.0  # model download and revision resolution
 
 # ── Multi-engine suite (benchmark/suite, entry point: python benchmark.py) ────
-# The measurement dependencies above cover it. The competing engines are all
-# optional and deliberately not pinned here: the suite reports an engine that is
-# absent as NOT_INSTALLED rather than pulling it in, because installing a serving
-# engine changes the environment every other engine is then measured in.
+# The four active engines and their install commands:
 #
-# One transformers version has to serve the whole field, and the ONNX exporter is the
-# component with the narrowest range: optimum's ONNX path declares transformers<4.58 and
-# imports a symbol that transformers 5.x removed. On an image that ships 5.x, pin it
-# *after* installing the engines, or ONNX Runtime fails at load:
+#   hf_transformers  — included in 	ransformers above; nothing extra needed
+#   pytorch_native   — included in 	orch above; nothing extra needed
+#   openvino         — requires optimum-intel:
 #
-#   pip install "transformers==4.57.1"
+#     pip install "optimum[openvino]"
 #
-# Install only what the host can genuinely run:
-#   pip install "optimum[onnxruntime]"        # ONNX Runtime  (CPU or GPU build)
-#   pip install "optimum[openvino]"           # OpenVINO      (Intel CPU / iGPU)
-#   pip install llama-cpp-python              # llama.cpp     (needs a GGUF)
-#   pip install vllm                          # vLLM          (NVIDIA only)
-#   pip install "sglang[all]"                 # SGLang        (NVIDIA, capability 8.0+)
-#   pip install tensorrt-llm                  # TensorRT-LLM  (NVIDIA, capability 8.0+)
-#   pip install deepspeed                     # DeepSpeed     (NVIDIA; policy-dependent)
-#   pip install exllamav2                     # ExLlamaV2     (needs EXL2 weights)
-#   pip install mlc-llm-nightly               # MLC LLM       (needs a compiled model)
+#   aether           — installed via pip install -e ".[pytorch]" (the main package)
 #
-# Engines with a hardware floor report NOT_APPLICABLE with the host's compute
-# capability rather than telling you to install something that could not then run.
+# The benchmark precision is resolved from the device at runtime (auto).
+# On a Kaggle GPU notebook, bf16 is used because the T4/P100 support it;
+# on CPU-only, fp32 is the fallback.

@@ -6,6 +6,12 @@ knows how to measure anything that satisfies
 :class:`benchmark.backends.Backend`, and the report already knows how to print
 anything that carries an :class:`~benchmark.suite.engines.base.EngineSpec`.
 
+Active engines (report order):
+  1. hf_transformers  — HF Transformers on PyTorch eager (reference baseline)
+  2. pytorch_native   — hand-written decode loop, same weights as baseline
+  3. openvino_engine  — OpenVINO AOT compiler + runtime
+  4. aether_engine    — Aether Runtime AOT compiler + runtime (subject)
+
 Order matters only for presentation. The reference baseline comes first, Aether
 last, so a table reads from "the stack everyone starts with" to "the stack under
 test" - and so no ordering can be mistaken for a ranking.
@@ -19,34 +25,16 @@ from benchmark.suite import status as status_mod
 from benchmark.suite.engines import (
     aether_engine,
     base,
-    deepspeed_engine,
-    exllamav2_engine,
     hf_transformers,
-    llama_cpp_engine,
-    mlc_engine,
-    onnxruntime_engine,
     openvino_engine,
     pytorch_native,
-    sglang_engine,
-    tensorrt_llm_engine,
-    torch_compile,
-    vllm_engine,
 )
 
 #: Every engine module, in report order.
 MODULES: tuple[Any, ...] = (
     hf_transformers,
     pytorch_native,
-    torch_compile,
-    onnxruntime_engine,
     openvino_engine,
-    llama_cpp_engine,
-    vllm_engine,
-    sglang_engine,
-    tensorrt_llm_engine,
-    deepspeed_engine,
-    exllamav2_engine,
-    mlc_engine,
     aether_engine,
 )
 

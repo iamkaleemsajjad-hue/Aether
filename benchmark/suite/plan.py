@@ -101,20 +101,8 @@ class SuiteConfig:
     focus: str | None = None
     #: Engine-specific knobs, passed through to the adapters that need them.
     aeg_cache_dir: str | None = None
-    onnx_cache_dir: str | None = None
     openvino_cache_dir: str | None = None
     openvino_device: str = "CPU"
-    gguf_dir: str | None = None
-    gguf_map: dict[str, str] = field(default_factory=dict)
-    gguf_convert_script: str | None = None
-    exl2_map: dict[str, str] = field(default_factory=dict)
-    mlc_map: dict[str, str] = field(default_factory=dict)
-    vllm_gpu_utilization: float | None = None
-    vllm_max_model_len: int | None = None
-    vllm_enforce_eager: bool = False
-    sglang_memory_fraction: float | None = None
-    llama_cpp_context: int | None = None
-    compile_mode: str | None = None
     #: Recorded, not used for control flow: how the run was invoked.
     invocation: str = ""
 
@@ -233,27 +221,9 @@ def add_engine_options(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("engine-specific options")
     group.add_argument("--aeg-cache-dir", default=None,
                        help="Where Aether's compiled .aeg artifacts are kept.")
-    group.add_argument("--onnx-cache-dir", default=None)
-    group.add_argument("--openvino-cache-dir", default=None)
+    group.add_argument("--openvino-cache-dir", default=None,
+                       help="Where OpenVINO IR artifacts are kept.")
     group.add_argument("--openvino-device", default=None, help="CPU, GPU, NPU, ...")
-    group.add_argument("--gguf-dir", default=None,
-                       help="Directory searched for <model>--*.gguf files.")
-    group.add_argument("--gguf-map", action="append", default=None, metavar="MODEL=PATH",
-                       help="Explicit GGUF file for a model; repeatable.")
-    group.add_argument("--gguf-convert-script", default=None,
-                       help="Path to llama.cpp convert_hf_to_gguf.py, to build an F16 GGUF.")
-    group.add_argument("--exl2-map", action="append", default=None, metavar="MODEL=DIR",
-                       help="Pre-quantized EXL2 directory for a model; repeatable.")
-    group.add_argument("--mlc-map", action="append", default=None, metavar="MODEL=SPEC",
-                       help="Pre-compiled MLC model for a model; repeatable.")
-    group.add_argument("--vllm-gpu-utilization", type=float, default=None)
-    group.add_argument("--vllm-max-model-len", type=int, default=None)
-    group.add_argument("--vllm-enforce-eager", action="store_true",
-                       help="Skip vLLM's CUDA-graph capture; useful when capture fails.")
-    group.add_argument("--sglang-memory-fraction", type=float, default=None)
-    group.add_argument("--llama-cpp-context", type=int, default=None)
-    group.add_argument("--compile-mode", default=None,
-                       help="torch.compile mode (default: reduce-overhead).")
 
 
 def parse_args(argv: list[str] | None = None) -> SuiteConfig:
@@ -303,22 +273,14 @@ def parse_args(argv: list[str] | None = None) -> SuiteConfig:
         ("top_k", args.top_k), ("threads", args.threads), ("devices", args.devices),
         ("amortization_runs", args.amortization_runs), ("output_dir", args.output_dir),
         ("worker_timeout_s", args.worker_timeout), ("cooldown_s", args.cooldown),
-        ("aeg_cache_dir", args.aeg_cache_dir), ("onnx_cache_dir", args.onnx_cache_dir),
+        ("aeg_cache_dir", args.aeg_cache_dir),
         ("openvino_cache_dir", args.openvino_cache_dir),
-        ("openvino_device", args.openvino_device), ("gguf_dir", args.gguf_dir),
-        ("gguf_convert_script", args.gguf_convert_script),
-        ("vllm_gpu_utilization", args.vllm_gpu_utilization),
-        ("vllm_max_model_len", args.vllm_max_model_len),
-        ("sglang_memory_fraction", args.sglang_memory_fraction),
-        ("llama_cpp_context", args.llama_cpp_context),
-        ("compile_mode", args.compile_mode), ("focus", args.focus),
+        ("openvino_device", args.openvino_device),
+        ("focus", args.focus),
     ):
         if value is not None:
             setattr(config, name, value)
 
-    config.gguf_map = _mapping(args.gguf_map)
-    config.exl2_map = _mapping(args.exl2_map)
-    config.mlc_map = _mapping(args.mlc_map)
     config.excluded_engines = apply_engine_filter(config, args.exclude_engines)
     if args.no_reuse_probe:
         config.reuse_probe = False
@@ -328,8 +290,6 @@ def parse_args(argv: list[str] | None = None) -> SuiteConfig:
         config.correctness = False
     if args.no_charts:
         config.charts = False
-    if args.vllm_enforce_eager:
-        config.vllm_enforce_eager = True
     if args.no_thread_pinning:
         config.pin_threads = False
         config.threads = None
