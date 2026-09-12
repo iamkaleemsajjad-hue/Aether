@@ -101,10 +101,24 @@ class SuiteConfig:
     focus: str | None = None
     #: Engine-specific knobs, passed through to the adapters that need them.
     aeg_cache_dir: str | None = None
-    openvino_cache_dir: str | None = None
-    openvino_device: str = "CPU"
+    #: ONNX Runtime — directory where exported ONNX graphs are cached.
+    onnx_cache_dir: str | None = None
+    #: llama.cpp — directory where pre-built or auto-converted GGUF files live.
+    gguf_dir: str | None = None
+    #: llama.cpp — path to llama.cpp's convert_hf_to_gguf.py script.
+    #: When set and no GGUF exists for a model, one is created automatically
+    #: as an F16 conversion so the comparison is weight-exact.
+    gguf_convert_script: str | None = None
+    #: llama.cpp — explicit per-model GGUF paths: {"model_id": "/path/to.gguf"}
+    gguf_map: dict = None  # type: ignore[assignment]
+    #: llama.cpp — context window size passed to Llama(n_ctx=...).
+    llama_cpp_context: int = 4096
     #: Recorded, not used for control flow: how the run was invoked.
     invocation: str = ""
+
+    def __post_init__(self) -> None:
+        if self.gguf_map is None:
+            self.gguf_map = {}
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -221,9 +235,22 @@ def add_engine_options(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("engine-specific options")
     group.add_argument("--aeg-cache-dir", default=None,
                        help="Where Aether's compiled .aeg artifacts are kept.")
-    group.add_argument("--openvino-cache-dir", default=None,
-                       help="Where OpenVINO IR artifacts are kept.")
-    group.add_argument("--openvino-device", default=None, help="CPU, GPU, NPU, ...")
+    group.add_argument("--onnx-cache-dir", default=None,
+                       help="Where ONNX Runtime's exported graph directories are cached.")
+    group.add_argument("--gguf-dir", default=None,
+                       help="Directory that contains pre-built GGUF files for llama.cpp. "
+                            "Filenames must follow the pattern "
+                            "<org>--<model>*.gguf (same slug as HuggingFace paths).")
+    group.add_argument("--gguf-convert-script", default=None,
+                       help="Path to llama.cpp's convert_hf_to_gguf.py. When set and no "
+                            "GGUF exists for a model, an F16 GGUF is created automatically "
+                            "so the comparison is weight-exact.")
+    group.add_argument("--gguf-map", dest="gguf_map_items", action="append", default=None,
+                       metavar="MODEL_ID=PATH",
+                       help="Explicit GGUF path for one model, e.g. "
+                            "'Qwen/Qwen3-0.6B=/data/qwen3.gguf'. Repeatable.")
+    group.add_argument("--llama-cpp-context", type=int, default=None,
+                       help="Context window (n_ctx) passed to llama.cpp (default 4096).")
 
 
 def parse_args(argv: list[str] | None = None) -> SuiteConfig:
@@ -274,12 +301,21 @@ def parse_args(argv: list[str] | None = None) -> SuiteConfig:
         ("amortization_runs", args.amortization_runs), ("output_dir", args.output_dir),
         ("worker_timeout_s", args.worker_timeout), ("cooldown_s", args.cooldown),
         ("aeg_cache_dir", args.aeg_cache_dir),
-        ("openvino_cache_dir", args.openvino_cache_dir),
-        ("openvino_device", args.openvino_device),
+        ("onnx_cache_dir", args.onnx_cache_dir),
+        ("gguf_dir", args.gguf_dir),
+        ("gguf_convert_script", args.gguf_convert_script),
+        ("llama_cpp_context", args.llama_cpp_context),
         ("focus", args.focus),
     ):
         if value is not None:
             setattr(config, name, value)
+    # Parse repeated --gguf-map model_id=path arguments into a dict.
+    if args.gguf_map_items:
+        for item in args.gguf_map_items:
+            if "=" not in item:
+                raise SystemExit(f"--gguf-map expects model_id=path, got {item!r}")
+            model_id, path = item.split("=", 1)
+            config.gguf_map[model_id.strip()] = path.strip()
 
     config.excluded_engines = apply_engine_filter(config, args.exclude_engines)
     if args.no_reuse_probe:

@@ -19,29 +19,22 @@ when Aether wins.
 
 ## What is compared
 
-The field is thirteen stacks, and they are not all the same kind of system. The
-report classifies each one, because a comparison only means what it says if the
-reader knows what is being compared.
+Five stacks, in report order. They are not all the same kind of system; the report
+classifies each one, because a comparison only means what it says if the reader knows
+what is being compared.
 
-| Engine | What it is | Build phase | What the build leaves behind |
-| --- | --- | --- | --- |
-| `transformers` | inference framework, runtime (the reference) | no | nothing |
-| `pytorch_native` | runtime, execution engine (hand-written decode loop) | no | nothing |
-| `torch_compile` | JIT + graph compiler, kernel optimizer | yes | machine-local code cache |
-| `onnxruntime` | runtime, graph compiler, kernel optimizer | yes | portable directory |
-| `openvino` | AOT + graph compiler, runtime | yes | portable IR directory |
-| `llama_cpp` | native runtime, quantized engine | yes | portable GGUF file |
-| `vllm` | serving engine, runtime | yes | machine-local code cache |
-| `sglang` | serving engine, runtime | yes | machine-local code cache |
-| `tensorrt_llm` | AOT compiler, kernel optimizer, serving engine | yes | GPU-specific engine plan |
-| `deepspeed` | kernel optimization system | yes | nothing (per process) |
-| `exllamav2` | quantized inference engine | yes | portable EXL2 directory |
-| `mlc` | AOT compiler (TVM), quantized engine | yes | portable compiled library |
-| `aether` | **AOT compiler + runtime (the subject)** | yes | portable `.aeg` artifact |
+| Engine | What it is | Build phase | What the build leaves behind | GPU path |
+| --- | --- | --- | --- | --- |
+| `transformers` | inference framework, runtime (reference baseline) | no | nothing | `model.to("cuda")` |
+| `pytorch_native` | runtime, execution engine (hand-written decode loop) | no | nothing | `model.to("cuda")` |
+| `onnxruntime` | runtime, graph compiler, kernel optimizer | yes | portable ONNX directory | `CUDAExecutionProvider` |
+| `llama_cpp` | native C/C++ runtime, GGUF format | yes | portable GGUF file | `n_gpu_layers=-1` (full offload) |
+| `aether` | **AOT compiler + runtime (the subject under test)** | yes | portable `.aeg` artifact | `cuda_sm*` target |
 
 Nothing is called a compiler that is not one. Transformers and the native PyTorch
-loop interpret the checkpoint on every forward pass; vLLM and SGLang are serving
-systems whose advantage is scheduling, not compilation.
+loop interpret the checkpoint on every forward pass. ONNX Runtime compiles the
+graph once into an optimized execution plan; llama.cpp converts the checkpoint to
+GGUF format and runs it with hand-written SIMD/CUDA kernels.
 
 ## Models
 
@@ -115,13 +108,17 @@ benchmark_results/
 ```bash
 python benchmark.py                          # everything the host can run
 python benchmark.py --smoke                  # smallest real run; proves the pipeline
-python benchmark.py --engines aether,transformers,vllm
+python benchmark.py --engines aether,transformers,onnxruntime,llama_cpp
 python benchmark.py --models Qwen/Qwen3-0.6B --batch-sizes 1,2,4
 python benchmark.py --resume                 # reuse raw records already on disk
 python benchmark.py --precision bf16         # weight-exact, on hardware with bf16 cores
-python benchmark.py --devices 2               # measure multi-device execution deliberately
-python benchmark.py --focus vllm              # long-form drill-down for one engine only
-python benchmark.py --gguf-map Qwen/Qwen3-0.6B=/path/model-f16.gguf   # enable llama.cpp
+python benchmark.py --devices 2             # measure multi-device execution deliberately
+python benchmark.py --focus aether          # long-form drill-down for one engine only
+
+# llama.cpp needs a GGUF -- pass ONE of:
+python benchmark.py --gguf-convert-script /path/to/llama.cpp/convert_hf_to_gguf.py
+python benchmark.py --gguf-dir /data/ggufs/
+python benchmark.py --gguf-map Qwen/Qwen3-0.6B=/path/model-f16.gguf
 ```
 
 `--help` lists every switch, including the per-engine options.

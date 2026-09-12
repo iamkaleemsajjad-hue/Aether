@@ -1,28 +1,32 @@
-﻿# Dependencies the benchmark needs beyond Aether Runtime's own install.
-# Aether itself is installed with:  pip install -e ".[pytorch]"
+﻿# Benchmark engine dependencies
 #
-# Kaggle GPU images already ship torch, transformers, psutil and matplotlib;
-# these pins are the versions the harness is written against, and pip will keep
-# whatever newer version the image already has.
-
-transformers>=4.40.0     # the baseline runtime under test
-accelerate>=0.30.0       # used by transformers for device placement
-psutil>=5.9.0            # process RSS, CPU utilization, core counts
-nvidia-ml-py>=12.535.0   # NVML: GPU utilization, power, temperature, clocks
-matplotlib>=3.7.0        # charts; the benchmark degrades gracefully without it
-huggingface-hub>=0.27.0  # model download and revision resolution
-
-# ── Multi-engine suite (benchmark/suite, entry point: python benchmark.py) ────
-# The four active engines and their install commands:
+# 1. Aether from source: pip install -e ".[pytorch]"
 #
-#   hf_transformers  — included in 	ransformers above; nothing extra needed
-#   pytorch_native   — included in 	orch above; nothing extra needed
-#   openvino         — requires optimum-intel:
+# 2. Core deps
+transformers>=4.40.0
+accelerate>=0.30.0
+psutil>=5.9.0
+nvidia-ml-py>=12.535.0
+matplotlib>=3.7.0
+huggingface-hub>=0.27.0
+packaging>=24.0
 #
-#     pip install "optimum[openvino]"
+# 3. ONNX Runtime + CUDA
+#   pip install onnxruntime-gpu>=1.18.0
+#   pip install "optimum[onnxruntime-gpu]>=1.20.0"
+#   Never install onnxruntime (CPU) and onnxruntime-gpu together -- they conflict.
+#   Pre-check version conflicts:
+#     python -c "from benchmark.suite.engines.base import requirement_conflicts;
+#                print(requirement_conflicts('optimum'))"
+optimum>=1.20.0
 #
-#   aether           — installed via pip install -e ".[pytorch]" (the main package)
+# 4. llama.cpp + CUDA
+#   Pre-built (CUDA 12.x, no compiler needed):
+#     pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+#   Build from source:
+#     PowerShell: $env:CMAKE_ARGS="-DGGML_CUDA=on"
+#     pip install llama-cpp-python --no-binary llama-cpp-python
+#   Verify: python -c "from llama_cpp import Llama; print('OK')"
+#   GGUF: pass --gguf-convert-script / --gguf-dir / --gguf-map to benchmark.py
 #
-# The benchmark precision is resolved from the device at runtime (auto).
-# On a Kaggle GPU notebook, bf16 is used because the T4/P100 support it;
-# on CPU-only, fp32 is the fallback.
+# 5. Aether Runtime: pip install -e ".[pytorch]"  (same as step 1)

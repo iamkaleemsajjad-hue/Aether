@@ -7,14 +7,20 @@ knows how to measure anything that satisfies
 anything that carries an :class:`~benchmark.suite.engines.base.EngineSpec`.
 
 Active engines (report order):
-  1. hf_transformers  — HF Transformers on PyTorch eager (reference baseline)
-  2. pytorch_native   — hand-written decode loop, same weights as baseline
-  3. openvino_engine  — OpenVINO AOT compiler + runtime
-  4. aether_engine    — Aether Runtime AOT compiler + runtime (subject)
+  1. hf_transformers   — HF Transformers on PyTorch eager (reference baseline)
+  2. pytorch_native    — hand-written decode loop, same weights as baseline
+  3. onnxruntime       — ONNX Runtime with CUDAExecutionProvider (GPU accelerated)
+  4. llama_cpp         — llama.cpp GGUF runtime with CUDA kernel offload
+  5. aether_engine     — Aether Runtime AOT compiler + runtime (subject under test)
 
 Order matters only for presentation. The reference baseline comes first, Aether
 last, so a table reads from "the stack everyone starts with" to "the stack under
 test" - and so no ordering can be mistaken for a ranking.
+
+OpenVINO was removed because it targets Intel CPUs/NPUs/iGPUs and cannot use an
+NVIDIA CUDA device. Measuring it on a GPU host would make every row an honest
+failure (NOT_APPLICABLE), which wastes time without producing a result. The
+adapter file (openvino_engine.py) is kept for reference but is not registered.
 """
 
 from __future__ import annotations
@@ -26,7 +32,8 @@ from benchmark.suite.engines import (
     aether_engine,
     base,
     hf_transformers,
-    openvino_engine,
+    llama_cpp_engine,
+    onnxruntime_engine,
     pytorch_native,
 )
 
@@ -34,7 +41,8 @@ from benchmark.suite.engines import (
 MODULES: tuple[Any, ...] = (
     hf_transformers,
     pytorch_native,
-    openvino_engine,
+    onnxruntime_engine,
+    llama_cpp_engine,
     aether_engine,
 )
 
