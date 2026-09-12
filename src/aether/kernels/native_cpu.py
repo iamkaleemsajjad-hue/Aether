@@ -107,24 +107,25 @@ def _open_shared_library(
     ``PATH`` — which is precisely how Aether ends up compiling a library it cannot
     load and silently dropping to the numpy reference path.
 
-    Two search strategies are tried because they cover disjoint cases, and the order
-    matters:
+    The loader registers the library's parent directory and the compiler's bin
+    directory via :func:`os.add_dll_directory` before calling :func:`ctypes.CDLL`
+    with the default Windows search order.  This is the only mode that consults
+    directories registered by :func:`os.add_dll_directory`, so the toolchain's
+    runtime DLLs (libgomp, libstdc++) are found without requiring them to be on
+    the system ``PATH``.
 
-    1. ctypes' default Windows mode, which is ``LOAD_WITH_ALTERED_SEARCH_PATH |
-       LOAD_LIBRARY_SEARCH_DEFAULT_DIRS``.  Only this mode consults the directories
-       registered by :func:`os.add_dll_directory`, so it is the one that can find the
-       toolchain's own runtime DLLs.
-    2. ``winmode=0``, which asks for the legacy search order and therefore *does*
-       consult ``PATH``.  It is the fallback for a host whose dependencies are on
-       ``PATH`` but outside any directory we can name.
-
-    Passing ``winmode=0`` alone — as this loader used to — opts out of
-    ``LOAD_LIBRARY_SEARCH_*`` entirely and thus discards every added directory,
-    which made the ``add_dll_directory`` calls dead code.
+    .. note::
+        A ``winmode=0`` fallback was previously attempted after the default load.
+        On CPython 3.11 / Windows this combination causes a fatal interpreter
+        ``access violation`` crash: ``winmode=0`` bypasses ``LOAD_LIBRARY_SEARCH_*``
+        and conflicts with already-registered ``add_dll_directory`` handles,
+        corrupting internal state instead of raising a clean ``OSError``.
+        The fallback has been removed; the explicit directory registration is
+        sufficient for all supported toolchains.
 
     Raises:
-        OSError: When no strategy could load the library. The first error is
-            re-raised, because it is the one describing the intended path.
+        OSError: When the library cannot be loaded after registering all known
+            search directories.
     """
     if os.name != "nt":
         return ctypes.CDLL(str(path))
@@ -143,15 +144,11 @@ def _open_shared_library(
         except (AttributeError, OSError):  # pragma: no cover - platform dependent
             continue
     try:
-        first_error: OSError | None = None
-        for keywords in ({}, {"winmode": 0}):
-            try:
-                return ctypes.CDLL(str(path), **keywords)
-            except OSError as exc:
-                if first_error is None:
-                    first_error = exc
-        assert first_error is not None
-        raise first_error
+        # Use only the default ctypes load mode so that the os.add_dll_directory
+        # registrations above are honoured.  winmode=0 is intentionally NOT used:
+        # it bypasses LOAD_LIBRARY_SEARCH_* and causes a fatal access violation
+        # on CPython 3.11 / Windows when combined with add_dll_directory handles.
+        return ctypes.CDLL(str(path))
     finally:
         for handle in handles:
             try:
