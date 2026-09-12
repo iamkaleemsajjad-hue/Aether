@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import json
 import copy
+import sys
 import threading
 import time
 import uuid
@@ -1826,13 +1827,22 @@ class Runtime:
             except Exception as exc:
                 self._compile_jobs[job_id]["status"] = "failed"  # type: ignore[index]
                 self._compile_jobs[job_id]["error"] = str(exc)  # type: ignore[index]
-                logger.error("Async compilation failed", job_id=job_id, error=str(exc))
+                # Guard against logging during interpreter shutdown: the stdout
+                # buffer lock may already be held by the shutdown machinery, and
+                # writing to it from a daemon thread causes a fatal deadlock
+                # (_enter_buffered_busy → SIGABRT, exit code 134).  Skip the
+                # log call when the interpreter is already tearing down.
+                if not sys.is_finalizing():
+                    logger.error("Async compilation failed", job_id=job_id, error=str(exc))
             finally:
                 self._compile_jobs[job_id]["completed_at"] = (  # type: ignore[index]
                     datetime.datetime.now(datetime.timezone.utc).isoformat()
                 )
 
         thread = threading.Thread(target=_run_compile, daemon=True, name=f"compile-{job_id[:8]}")
+        # Store the thread so callers can join() before process exit if needed,
+        # preventing the daemon-thread vs interpreter-shutdown race.
+        self._compile_jobs[job_id]["_thread"] = thread
         thread.start()
         logger.info("Compilation job queued", job_id=job_id, model=model_id, target=target)
         return job_id
