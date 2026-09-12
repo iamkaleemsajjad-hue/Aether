@@ -313,6 +313,37 @@ def _quant_from_name(name: str) -> str | None:
     return None
 
 
+def _cuda_build_available() -> bool:
+    """True when the installed llama-cpp-python wheel was compiled with CUDA support.
+
+    The CUDA-enabled wheel is a completely different binary from the CPU-only
+    build.  Both are importable, but only the CUDA build honours
+    ``n_gpu_layers > 0``.  Checking ``hardware.nvidia`` alone is not sufficient:
+    a CPU-only wheel on a GPU host would silently fall back to CPU (or crash)
+    when asked to offload layers.
+
+    The most reliable signal is ``llama_cpp.llama_supports_gpu_offload()``,
+    introduced in llama-cpp-python 0.2.x.  For older wheels we probe the
+    ``LLAMA_SUPPORTS_GPU_OFFLOAD`` constant that the package exports when it was
+    compiled with CUBLAS/CUDA.
+    """
+    try:
+        import llama_cpp
+        # Preferred: explicit API introduced in 0.2.x
+        fn = getattr(llama_cpp, "llama_supports_gpu_offload", None)
+        if callable(fn):
+            return bool(fn())
+        # Fallback: compile-time constant exported since early releases
+        flag = getattr(llama_cpp, "LLAMA_SUPPORTS_GPU_OFFLOAD", None)
+        if flag is not None:
+            return bool(flag)
+        # Last resort: try to import the CUDA backend symbol
+        cuda_sym = getattr(llama_cpp, "llama_backend_cuda", None)
+        return cuda_sym is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Availability:
     generic = base.generic_probe(SPEC, hardware)
     if not generic.usable:
@@ -323,15 +354,27 @@ def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Av
             f"{reason}. llama.cpp executes GGUF, not the published checkpoint, so "
             "without one there is nothing for it to run on this model."
         )
-    return base.available(
-        base.package_version("llama_cpp_python"),
-        "" if path else "a GGUF will be converted from the checkpoint before measuring",
-    )
+    # Warn when the installed wheel was not compiled with CUDA support: the engine
+    # will still run on CPU, but n_gpu_layers=-1 would silently do nothing or crash.
+    note = "" if path else "a GGUF will be converted from the checkpoint before measuring"
+    if hardware.nvidia and not _cuda_build_available():
+        gpu_warn = (
+            "llama-cpp-python is installed but was not compiled with CUDA support; "
+            "inference will run on CPU even on this GPU host. "
+            "Reinstall with: pip install llama-cpp-python "
+            "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124"
+        )
+        note = (note + "; " + gpu_warn) if note else gpu_warn
+    return base.available(base.package_version("llama_cpp_python"), note)
 
 
 def build(hardware: Any, model_id: str, precision: str, options: Any) -> Engine:
+    # Only offload to GPU when the wheel was actually compiled with CUDA support.
+    # A CPU-only llama-cpp-python wheel on a GPU host would crash or silently
+    # ignore n_gpu_layers=-1 without this guard.
+    use_cuda = hardware.nvidia and _cuda_build_available()
     return Engine(
-        device="cuda" if hardware.nvidia else "cpu",
+        device="cuda" if use_cuda else "cpu",
         options=options,
         threads=getattr(options, "threads", None),
         context=getattr(options, "llama_cpp_context", None) or 4096,
