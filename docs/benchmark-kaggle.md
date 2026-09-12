@@ -43,8 +43,23 @@ goes last so it wins.
 ```
 
 ```python
-# ONNX Runtime (CUDA) and OpenVINO, through optimum's exporters.
-!pip install -q "optimum[onnxruntime-gpu]" "optimum[openvino]"
+# ONNX Runtime — GPU build (CUDA).
+#
+# IMPORTANT: The CPU build (plain `onnxruntime`) and the GPU build
+# (`onnxruntime-gpu`) CANNOT coexist. Kaggle ships the CPU build by default,
+# so it must be removed first. Skipping the uninstall step causes pip to mark
+# the onnxruntime dependency as already satisfied and never install the GPU
+# wheel, leaving CUDAExecutionProvider absent and the engine on CPU.
+
+# Step 1 — Remove the CPU build.
+!pip uninstall -q -y onnxruntime
+
+# Step 2 — Install the GPU build. This registers CUDAExecutionProvider.
+!pip install -q "onnxruntime-gpu>=1.18.0"
+
+# Step 3 — Install optimum (separately; NOT through optimum[onnxruntime-gpu]
+# because that extras alias does not install onnxruntime-gpu the package).
+!pip install -q "optimum>=1.20.0"
 ```
 
 ```python
@@ -64,6 +79,20 @@ goes last so it wins.
 # none rather than shipping a duplicate of the eager baseline.
 !pip install -q deepspeed
 ```
+
+```python
+# Verify the GPU build is active. Must print CUDAExecutionProvider in the list.
+import onnxruntime as ort
+print("ORT version:", ort.__version__)
+print("Available providers:", ort.get_available_providers())
+assert "CUDAExecutionProvider" in ort.get_available_providers(), \
+    "CUDAExecutionProvider missing — check that onnxruntime-gpu is installed "\
+    "and the CPU build is uninstalled, then restart the session."
+print("OK — GPU build confirmed.")
+```
+
+> **Note:** If the assertion fails, restart the session (`Run → Restart session`)
+> and rerun this cell. The CPU build must not be present alongside the GPU build.
 
 **Restart the session now** (Run → Restart session), so every engine is measured
 against one set of libraries. Then `%cd /kaggle/working/aether` again.

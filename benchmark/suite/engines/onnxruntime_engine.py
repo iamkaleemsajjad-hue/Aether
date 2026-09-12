@@ -13,9 +13,13 @@ normally a representation difference and is labelled as one.
 
 from __future__ import annotations
 
+import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 from benchmark.backends import (
     GenerationOutcome,
@@ -150,17 +154,38 @@ class Engine(base.BackendAdapterMixin):
         # provider readback works with both optimum 1.x (.model) and 2.x
         # (.model_session or .sessions).
         self._providers = _read_providers(self._model)
+
+        # Post-load provider verification: confirm the session is actually using the
+        # requested provider. ORT can silently fall back to CPUExecutionProvider when
+        # CUDA initialisation fails (e.g. driver/library version mismatch). Catching
+        # this here means the LoadOutcome carries an explicit warning rather than the
+        # mismatch going unnoticed until the throughput numbers look wrong.
+        provider_mismatch: str | None = None
+        if provider not in self._providers:
+            provider_mismatch = (
+                f"requested {provider!r} but the session is running with "
+                f"{self._providers}. Likely cause: the onnxruntime-gpu build is not "
+                "installed, CUDA initialisation failed, or the session fell back to "
+                "CPUExecutionProvider silently. Check 'ort.get_available_providers()' "
+                "and verify the onnxruntime-gpu wheel is installed (not the CPU build)."
+            )
+            _log.warning("ORT provider mismatch: %s", provider_mismatch)
+
+        load_notes: dict[str, Any] = {
+            "exported_this_run": not reuse,
+            "artifact_bytes": _tree_size(artifact),
+            "execution_providers": self._providers,
+            "requested_provider": provider,
+        }
+        if provider_mismatch is not None:
+            load_notes["provider_mismatch"] = provider_mismatch
+
         return LoadOutcome(
             download_s=download_s,
             prepare_s=self._export_s,
             load_s=max(load_s, 0.0),
             total_s=download_s + self._export_s + max(load_s, 0.0),
-            notes={
-                "exported_this_run": not reuse,
-                "artifact_bytes": _tree_size(artifact),
-                "execution_providers": self._providers,
-                "requested_provider": provider,
-            },
+            notes=load_notes,
         )
 
     def tokenizer(self) -> Any:
@@ -180,6 +205,14 @@ class Engine(base.BackendAdapterMixin):
         set_seed(seed)
         encoded = self._tokenizer([prompt] * batch_size, return_tensors="pt")
         prompt_len = int(encoded["input_ids"].shape[1])
+        # Move tokenizer outputs to the execution device so ORT's IO-binding path
+        # receives tensors on the correct device. Without this, optimum passes CPU
+        # tensors to the session even when use_io_binding=True, causing a silent
+        # fallback to CPUExecutionProvider regardless of the configured provider.
+        if self.device == "cuda":
+            import torch
+            encoded = {key: value.to("cuda") for key, value in encoded.items()
+                       if isinstance(value, torch.Tensor)}
         sample = temperature > 0.0
         kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens,
@@ -193,6 +226,9 @@ class Engine(base.BackendAdapterMixin):
             if top_k > 0:
                 kwargs["top_k"] = top_k
         output = self._model.generate(**encoded, **kwargs)
+        # output may be on GPU; move to CPU for decoding.
+        if hasattr(output, "cpu"):
+            output = output.cpu()
         generated = output[0, prompt_len:].tolist()
         return GenerationOutcome(
             text=self._tokenizer.decode(generated, skip_special_tokens=True),
@@ -212,6 +248,11 @@ class Engine(base.BackendAdapterMixin):
         import torch
 
         encoded = self._tokenizer(prompt, return_tensors="pt")
+        # Same device-placement fix as in generate(): the session's IO-binding
+        # path requires tensors already on the execution device.
+        if self.device == "cuda":
+            encoded = {key: value.to("cuda") for key, value in encoded.items()
+                       if isinstance(value, torch.Tensor)}
         with torch.no_grad():
             output = self._model(**encoded)
         return output.logits[0, -1].detach().float().cpu()
@@ -298,10 +339,16 @@ def _load_ort_model(cls: Any, model_id_or_path: Any, provider: str,
     if use_cuda:
         try:
             model = model.to("cuda")
-        except Exception:  # noqa: BLE001
+        except Exception as _move_exc:  # noqa: BLE001
             # .to() is not available on all optimum versions; the provider= kwarg
             # above is the primary mechanism; this is belt-and-suspenders.
-            pass
+            # Log rather than silently swallow: a failure here is diagnostic when
+            # the session later reports an unexpected CPUExecutionProvider.
+            _log.warning(
+                "ORTModelForCausalLM.to('cuda') failed (non-fatal, provider= kwarg "
+                "is the primary mechanism): %s: %s",
+                type(_move_exc).__name__, _move_exc,
+            )
 
     return model
 
@@ -362,10 +409,27 @@ def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Av
     # package_version("onnxruntime-gpu") returns None even when CUDA providers
     # are fully available. Check the provider list directly instead.
     if hardware.nvidia and not _cuda_provider_available():
+        # AETHER_ORT_REQUIRE_GPU=1 opts the operator into a hard fail when
+        # CUDAExecutionProvider is absent on a GPU host. This prevents a CPU-only
+        # onnxruntime build from contaminating a GPU benchmark with CPU results
+        # while appearing under the same engine label as the CUDA path.
+        # Without the variable the old behaviour is preserved: the engine runs on
+        # CPU and the active provider is recorded in every result row.
+        if os.environ.get("AETHER_ORT_REQUIRE_GPU", "").strip() in ("1", "true", "yes"):
+            return base.not_installed(
+                "AETHER_ORT_REQUIRE_GPU is set: CUDAExecutionProvider is required on "
+                "a GPU host but is not available. Install 'onnxruntime-gpu>=1.18.0' "
+                "(and uninstall the CPU 'onnxruntime' build first — they conflict) "
+                "then restart the session. Verify with: "
+                "python -c \"import onnxruntime as ort; "
+                "print(ort.get_available_providers())\""
+            )
         return base.available(
             version,
             "only the CPU build of onnxruntime is installed, so this engine will "
-            "execute on CPU on a GPU host; recorded with its execution provider",
+            "execute on CPU on a GPU host; recorded with its execution provider. "
+            "Set AETHER_ORT_REQUIRE_GPU=1 to treat this as NOT_INSTALLED and "
+            "exclude it from a GPU benchmark run.",
         )
     return base.available(version)
 

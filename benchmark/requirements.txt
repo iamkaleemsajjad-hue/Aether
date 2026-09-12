@@ -1,4 +1,4 @@
-﻿# Benchmark engine dependencies
+# Benchmark engine dependencies
 #
 # 1. Aether from source: pip install -e ".[pytorch]"
 #
@@ -12,12 +12,36 @@ huggingface-hub>=0.27.0
 packaging>=24.0
 #
 # 3. ONNX Runtime + CUDA
-#   pip install onnxruntime-gpu>=1.18.0
-#   pip install "optimum[onnxruntime-gpu]>=1.20.0"
-#   Never install onnxruntime (CPU) and onnxruntime-gpu together -- they conflict.
-#   Pre-check version conflicts:
-#     python -c "from benchmark.suite.engines.base import requirement_conflicts;
+#
+#   !!! GPU BUILD REQUIRED FOR GPU BENCHMARKS !!!
+#
+#   The CPU build (onnxruntime) and the GPU build (onnxruntime-gpu) CANNOT
+#   coexist. On Kaggle and many cloud images the CPU build is pre-installed.
+#   You MUST remove it first or pip will skip the GPU wheel entirely (the
+#   onnxruntime dependency is already satisfied), leaving CUDAExecutionProvider
+#   absent and the engine silently running on CPU.
+#
+#   Correct install sequence:
+#     pip uninstall -y onnxruntime                   # remove CPU build FIRST
+#     pip install "onnxruntime-gpu>=1.18.0"          # install GPU build
+#     pip install "optimum>=1.20.0"                  # install optimum separately
+#
+#   DO NOT use "optimum[onnxruntime-gpu]" as a shortcut: that extras alias does
+#   NOT install onnxruntime-gpu when onnxruntime is already present.
+#
+#   Verify the GPU build is active:
+#     python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+#     # Must print CUDAExecutionProvider in the list
+#
+#   On a GPU host, set AETHER_ORT_REQUIRE_GPU=1 to treat a missing GPU build as
+#   NOT_INSTALLED (excludes the engine rather than running it on CPU):
+#     export AETHER_ORT_REQUIRE_GPU=1
+#     python benchmark.py ...
+#
+#   Pre-check optimum/transformers version conflicts:
+#     python -c "from benchmark.suite.engines.base import requirement_conflicts; \
 #                print(requirement_conflicts('optimum'))"
+#
 optimum>=1.20.0
 #
 # 4. llama.cpp + CUDA
