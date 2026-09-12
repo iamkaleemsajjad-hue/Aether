@@ -257,16 +257,15 @@ def _cuda_provider_available() -> bool:
 
 def _load_ort_model(cls: Any, model_id_or_path: Any, provider: str,
                     export: bool = False) -> Any:
-    """Load or export an ORTModelForCausalLM, handling optimum 1.x and 2.x APIs.
+    """Load or export an ORTModelForCausalLM with the correct execution provider.
 
-    optimum 1.x accepted ``provider=`` (singular string).
-    optimum 2.x silently ignores ``provider=`` and requires ``providers=`` (list)
-    or ``provider_options=`` dict.  Passing the old kwarg in the new API does not
-    raise — it is just discarded — so the model always falls back to
-    ``CPUExecutionProvider`` without any error, making this a silent regression.
+    The optimum API uses ``provider=`` (singular string) in ``from_pretrained``.
+    For CUDA, ``use_io_binding=True`` must also be set — without it, ORT receives
+    CPU tensors and falls back to CPU execution silently.
 
-    Strategy: try the 2.x ``providers=[...]`` API first.  If the class does not
-    accept that keyword (old optimum), fall back to the 1.x ``provider=...`` API.
+    After loading, ``.to(device)`` is called as a final backstop: it calls
+    ``session.set_providers([provider])`` internally, so even if a cached artifact
+    was originally loaded with the wrong provider, this corrects it.
     """
     from benchmark.backends import UnsupportedConfiguration
 
@@ -274,45 +273,58 @@ def _load_ort_model(cls: Any, model_id_or_path: Any, provider: str,
     if export:
         kwargs["export"] = True
 
-    # optimum 2.x: providers= (list)
-    try:
-        return cls.from_pretrained(str(model_id_or_path),
-                                   providers=[provider], **kwargs)
-    except TypeError:
-        pass  # old optimum: keyword not accepted, try 1.x API
-    except Exception as exc:  # noqa: BLE001
-        # providers= was accepted but the load failed for a real reason
-        raise UnsupportedConfiguration(
-            f"ORTModelForCausalLM.from_pretrained failed with providers=[{provider!r}]: "
-            f"{type(exc).__name__}: {exc}"[:400]
-        ) from exc
+    # use_io_binding is required for CUDAExecutionProvider to actually use the GPU.
+    # Without it, optimum passes CPU tensors directly to the ORT session and the
+    # session silently falls back to CPU even when CUDAExecutionProvider is set.
+    use_cuda = provider == "CUDAExecutionProvider"
+    if use_cuda:
+        kwargs["use_io_binding"] = True
 
-    # optimum 1.x fallback: provider= (singular string)
     try:
-        return cls.from_pretrained(str(model_id_or_path),
-                                   provider=provider, **kwargs)
+        model = cls.from_pretrained(
+            str(model_id_or_path),
+            provider=provider,
+            **kwargs,
+        )
     except Exception as exc:  # noqa: BLE001
         raise UnsupportedConfiguration(
             f"ORTModelForCausalLM.from_pretrained failed with provider={provider!r}: "
             f"{type(exc).__name__}: {exc}"[:400]
         ) from exc
 
+    # Call .to() as a final backstop. This calls session.set_providers([provider])
+    # internally, correcting the provider even when a cached artifact was loaded
+    # with a different provider from a previous run.
+    if use_cuda:
+        try:
+            model = model.to("cuda")
+        except Exception:  # noqa: BLE001
+            # .to() is not available on all optimum versions; the provider= kwarg
+            # above is the primary mechanism; this is belt-and-suspenders.
+            pass
+
+    return model
+
 
 def _read_providers(model: Any) -> list[str]:
     """Read the active execution providers from an ORT model wrapper.
 
-    optimum renamed the internal ORT InferenceSession attribute across releases:
-      optimum 1.x  → model.model
-      optimum 2.x  → model.model_session  or  model.sessions  (dict of sessions)
+    In optimum, the ORT InferenceSession is stored as ``model.model`` (confirmed
+    from optimum source: ``self.model.set_providers(...)``).  ``self.providers``
+    is a list attribute that mirrors ``model.get_providers()``.
 
-    Try every known attribute name so the provider is always reported correctly
-    regardless of which optimum version is installed.
+    Try the instance attribute first (cheapest), then fall back to the session.
     """
+    # Fastest: the instance-level providers list that optimum keeps in sync
+    providers_attr = getattr(model, "providers", None)
+    if isinstance(providers_attr, list) and providers_attr:
+        return list(providers_attr)
+    # Session attribute confirmed from optimum source (self.model = ort.InferenceSession)
     for attr in ("model", "model_session"):
         session = getattr(model, attr, None)
         if session is not None and callable(getattr(session, "get_providers", None)):
             return list(session.get_providers())
-    # optimum 2.x ORTModelForCausalLM may expose a dict of sessions
+    # optimum may expose a dict of sessions (decoder / decoder_with_past split)
     sessions = getattr(model, "sessions", None)
     if isinstance(sessions, dict):
         for session in sessions.values():
@@ -367,3 +379,5 @@ def build(hardware: Any, model_id: str, precision: str, options: Any) -> Engine:
         device="cuda" if cuda_available else "cpu",
         cache_dir=getattr(options, "onnx_cache_dir", None),
     )
+
+
