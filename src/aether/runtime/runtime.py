@@ -8,6 +8,7 @@ decoding, and serves generation requests.
 
 from __future__ import annotations
 
+import atexit
 import datetime
 import json
 import copy
@@ -16,6 +17,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterator
@@ -453,6 +455,38 @@ class Runtime:
 
         # Async compilation job registry: {job_id: {status, model, ...}}
         self._compile_jobs: dict[str, dict[str, Any]] = {}
+
+        # Register an atexit handler that joins all pending compile threads
+        # before the interpreter tears down C extension state.
+        #
+        # Root cause of exit-139 (SIGSEGV): compile_async() spawns daemon
+        # threads that call into C extensions (the Aether compiler). Daemon
+        # threads are *not* joined by the interpreter on exit — they are
+        # abandoned at whatever point they have reached. If a thread is in
+        # the middle of a C extension call when the interpreter begins
+        # finalizing (freeing module globals, calling Py_Finalize), the
+        # thread can dereference already-freed memory → SIGSEGV (exit 139).
+        #
+        # atexit handlers run *before* C extension teardown, so joining here
+        # gives in-flight threads a chance to finish cleanly. We use a weakref
+        # so the handler itself does not prevent the Runtime from being
+        # garbage-collected in long-running processes that create many runtimes.
+        _self_ref: weakref.ref[Runtime] = weakref.ref(self)
+
+        def _join_compile_threads() -> None:
+            rt = _self_ref()
+            if rt is None:
+                return
+            for _job in list(rt._compile_jobs.values()):
+                _thread = _job.get("_thread")
+                if isinstance(_thread, threading.Thread) and _thread.is_alive():
+                    # 30 s is generous: a real compile can be slow on first
+                    # run, but for CI smoke-tests the job always fails fast
+                    # (model does not exist) so the join returns almost
+                    # immediately.
+                    _thread.join(timeout=30)
+
+        atexit.register(_join_compile_threads)
 
         logger.info(
             "Aether runtime initialized",
