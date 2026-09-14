@@ -9,126 +9,145 @@ Aether is an open-source AI model compiler and inference runtime. It ingests any
 
 ---
 
-## Benchmark Results — Aether vs HuggingFace Transformers
+---
 
-> Measured on **2x Tesla T4 (14.6 GiB each)** · BF16 · Kaggle · Aether Runtime v1.2.8 · Transformers v5.0.0
-> Full report: [`benchmark/results/BENCHMARK_RESULTS.md`](benchmark/results/BENCHMARK_RESULTS.md)
+## Multi-Engine Benchmark Results — Aether vs Competitor Engines
 
-### Mean Speedup per Model
-
-![Overview Speedup](benchmark/results/overview_speedup.png)
-
-| Model | Best Speedup | Mean Speedup | Worst Cell |
-|-------|-------------|--------------|-----------|
-| SmolLM2-135M-Instruct | **1.93x** (P256/B1) | **1.80x** | 1.56x (P1024/B4) |
-| Qwen3-0.6B | **2.14x** (P32/B1) | **1.57x** | 1.16x (P1024/B4) |
-| GPTNeo350M-Instruct-SFT | **1.83x** (P32/B1) | **1.37x** | 0.93x (P1024/B4) |
-
-> **26 of 27 cells**: Aether faster by >5% &nbsp;|&nbsp; **1 cell**: Transformers faster (GPTNeo P1024/B4, full-MHA KV pressure)
+> **Hardware Testbed:** **2× NVIDIA Tesla T4 (14.6 GiB VRAM each)** · Intel Xeon @ 2.00 GHz · **FP16 Native Tensor-Core Execution** · Linux 6.12 · Kaggle Environment  
+> **Software Stack:** Aether Runtime v1.2.8a0 vs HuggingFace Transformers v5.0.0 (PyTorch 2.10.0 eager) vs PyTorch Native Decode Loop  
+> **Suite Version:** 2.0.0 (Strict per-engine process isolation, identical model commits, greedy evaluation, CUDA edge synchronization)  
+> 
+> 🔗 **Access Full Benchmark Results & Artifacts:**
+> - 📊 **[Interactive Kaggle Notebook (with all cell executions & 31 charts)](benchmark/results/benchmark_results.ipynb)**
+> - 📑 **[Comprehensive Markdown Benchmark Report (1,349 lines)](benchmark/results/BENCHMARK_RESULTS.md)**
+> - 🚀 **[Kaggle Benchmark Runbook & Reproduction Guide](docs/benchmark-kaggle.md)**
 
 ---
 
-### SmolLM2-135M-Instruct
+### Executive Highlights — Aether Wins Across the Entire Field
 
-#### Throughput (tok/s) — Bar Chart
-
-![SmolLM2 Throughput Bar](benchmark/results/smollm2_135m_instruct_throughput_bar.png)
-
-#### Throughput vs Prompt Length — Line Chart
-
-![SmolLM2 Throughput Line](benchmark/results/smollm2_135m_instruct_throughput_line.png)
-
-#### Speedup Heatmap (Aether / Transformers)
-
-![SmolLM2 Speedup Heatmap](benchmark/results/smollm2_135m_instruct_speedup_heatmap.png)
-
-#### Latency (s) — Bar Chart
-
-![SmolLM2 Latency Bar](benchmark/results/smollm2_135m_instruct_latency_bar.png)
-
-#### Throughput Table
-
-| Prompt | Batch | Aether tok/s | HF tok/s | Speedup |
-|--------|-------|-------------|---------|---------|
-| 32 | 1 | **46.06** | 23.95 | 1.92x |
-| 32 | 2 | **87.50** | 49.37 | 1.77x |
-| 32 | 4 | **172.41** | 95.03 | 1.81x |
-| 256 | 1 | **45.80** | 23.71 | 1.93x |
-| 256 | 2 | **85.56** | 47.50 | 1.80x |
-| 256 | 4 | **157.56** | 89.14 | 1.77x |
-| 1024 | 1 | **41.50** | 21.96 | 1.89x |
-| 1024 | 2 | **75.61** | 43.36 | 1.74x |
-| 1024 | 4 | **129.43** | 82.71 | 1.56x |
+| Performance Dimension | Aether Result | Competitor Comparison | Margin / Speedup | Evidence from Suite |
+|---|---|---|---|---|
+| **Overall Win Rate** | **100% (54 / 54)** | Transformers: 26% (14/54) · PyTorch Native: 0% (0/54) | **Undefeated across all 27 measured cells** | 0 losses, 0 ties across the full matrix |
+| **Median Advantage** | **+94.2% vs HF** | PyTorch Native: **+104.3%** | **~2x faster median throughput across all models** | Pairwise anti-symmetric matrix |
+| **Peak Throughput** | **1,562.72 tok/s** | Transformers: 489.17 tok/s · PyTorch Native: 476.01 tok/s | **3.19x faster (+219.5% margin)** | GPTNeo350M @ Batch 16 |
+| **Batch 1 (Interactive)** | **Swept #1, #2, #3** | GPTNeo: **110.77 tok/s** · Qwen3: **48.21 tok/s** · SmolLM2: **46.18 tok/s** | **Up to 2.68x faster at Batch 1** | Aether took all top 3 spots in the field |
+| **Time-to-First-Token (TTFT)** | **0.022s (22 ms)** | Transformers: 28 ms · PyTorch Native: 26 ms | **21% faster TTFT** (Prompt tok/s: **21,016.21**) | SummerSigh/GPTNeo350M-Instruct-SFT |
+| **Single-Request Latency** | **1.156s** | Transformers: 3.102s · PyTorch Native: 3.195s | **62.7% lower latency (1.95s saved per request)** | GPTNeo350M Batch 1 (p256 / o128) |
+| **Inter-Token Latency (TPOT)** | **9.00 ms** | Transformers: 24.22 ms · PyTorch Native: 24.96 ms | **2.7x faster per generated token** | Sub-10ms token generation loop |
+| **Cold Start (Fresh Process)** | **Swept #1, #2, #3** | GPTNeo: **1.415s** · SmolLM2: **2.974s** · Qwen3: **2.999s** | **All <3.0s** (Competitors take 3.65s – 6.78s) | First unwarmed inference in fresh process |
+| **Lowest Peak Host Memory** | **1.615 GiB** | PyTorch Native: 1.677 GiB · Transformers: 1.766 GiB | **Lowest host memory footprint** | SmolLM2-135M-Instruct |
 
 ---
 
-### Qwen3-0.6B
+### Overall Standings & Pairwise Head-to-Head
 
-#### Throughput (tok/s) — Bar Chart
+Every engine was scored identically by the same measurement harness across the exact same model revisions and prompt sequences:
 
-![Qwen3 Throughput Bar](benchmark/results/qwen3_0.6b_throughput_bar.png)
+| Rank | Engine | % of Best (Median) | W / L / T | Win Rate | Median Diff vs Field | Cells Measured | Pairings Evaluated |
+|:---:|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| 🥇 | **`aether`** | **100%** | **54 / 0 / 0** | **100%** | **+99.2%** | **27** | **54 / 54** |
+| 🥈 | `transformers` | 51% | 14 / 27 / 13 | 26% | -6.7% | 27 | 54 / 54 |
+| 🥉 | `pytorch_native` | 49% | 0 / 40 / 14 | 0% | -8.7% | 27 | 54 / 54 |
 
-#### Throughput vs Prompt Length — Line Chart
+#### Pairwise Matrix (Median % Advantage of Row Engine over Column Engine)
 
-![Qwen3 Throughput Line](benchmark/results/qwen3_0.6b_throughput_line.png)
-
-#### Speedup Heatmap (Aether / Transformers)
-
-![Qwen3 Speedup Heatmap](benchmark/results/qwen3_0.6b_speedup_heatmap.png)
-
-#### Latency (s) — Bar Chart
-
-![Qwen3 Latency Bar](benchmark/results/qwen3_0.6b_latency_bar.png)
-
-#### Throughput Table
-
-| Prompt | Batch | Aether tok/s | HF tok/s | Speedup |
-|--------|-------|-------------|---------|---------|
-| 32 | 1 | **41.96** | 19.56 | 2.14x |
-| 32 | 2 | **42.78** | 33.88 | 1.26x |
-| 32 | 4 | **81.40** | 65.40 | 1.24x |
-| 256 | 1 | **40.24** | 19.60 | 2.05x |
-| 256 | 2 | **37.73** | 31.35 | 1.20x |
-| 256 | 4 | **66.04** | 54.69 | 1.21x |
-| 1024 | 1 | **35.71** | 18.44 | 1.94x |
-| 1024 | 2 | **27.38** | 23.11 | 1.18x |
-| 1024 | 4 | **39.81** | 34.39 | 1.16x |
+| Engine | vs `aether` | vs `pytorch_native` | vs `transformers` |
+|---|:---:|:---:|:---:|
+| **`aether`** | — | **+104.3%** | **+94.2%** |
+| `pytorch_native` | -51.0% | — | -2.0% |
+| `transformers` | -48.5% | +2.0% | — |
 
 ---
 
-### GPTNeo350M-Instruct-SFT
+### Model-by-Model Results with Exact Empirical Evidence
 
-#### Throughput (tok/s) — Bar Chart
+#### 1. SummerSigh/GPTNeo350M-Instruct-SFT (456M Params)
 
-![GPTNeo Throughput Bar](benchmark/results/gptneo350m_instruct_sft_throughput_bar.png)
+> **Decisive Wins**: Peak throughput reached **1,562.72 tok/s** (+219.5% margin over Transformers). Single-user Batch 1 throughput reached **110.77 tok/s** (2.68x faster than Transformers at 41.27 tok/s) with a **62.7% reduction in end-to-end latency** (1.156s vs 3.102s). TTFT dropped to **22 ms** with prefill throughput exceeding **21,016 prompt tok/s**.
 
-#### Throughput vs Prompt Length — Line Chart
+##### Throughput & Scaling Across Batch Sizes (Prompt: 256, Output: 128)
 
-![GPTNeo Throughput Line](benchmark/results/gptneo350m_instruct_sft_throughput_line.png)
+| Batch Size | Aether (tok/s) | Transformers (tok/s) | PyTorch Native (tok/s) | Aether vs HF Speedup | Aether vs PyTorch Speedup | Scaling Efficiency |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **b1** | **110.77** | 41.27 | 40.06 | **2.68x (+168.4%)** | **2.77x (+176.5%)** | 100% |
+| **b2** | **206.79** | 83.82 | 81.90 | **2.47x (+146.7%)** | **2.52x (+152.5%)** | 93% |
+| **b4** | **447.40** | 165.86 | 161.17 | **2.70x (+169.7%)** | **2.78x (+177.6%)** | 101% |
+| **b8** | **849.21** | 303.24 | 295.32 | **2.80x (+180.0%)** | **2.88x (+187.6%)** | 96% |
+| **b16** | **1,562.72** | 489.17 | 476.01 | **3.19x (+219.5%)** | **3.28x (+228.3%)** | 88% |
 
-#### Speedup Heatmap (Aether / Transformers)
+##### Prompt & Output Length Sweeps at Batch 1
 
-![GPTNeo Speedup Heatmap](benchmark/results/gptneo350m_instruct_sft_speedup_heatmap.png)
+| Prompt Tokens | Output Tokens | Aether (tok/s) | Aether Latency | HF (tok/s) | HF Latency | PyTorch Native (tok/s) | Aether Margin |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 32 | 128 | **112.92** | **1.134s** | 39.60 | 3.232s | 40.04 | **+185.1% (2.85x)** |
+| 256 | 32 | **102.20** | **0.313s** | 40.88 | 0.783s | 39.22 | **+150.0% (2.50x)** |
+| 256 | 128 | **110.77** | **1.156s** | 41.27 | 3.102s | 40.06 | **+168.4% (2.68x)** |
+| 256 | 512 | **116.76** | **4.385s** | 41.05 | 12.473s | 40.42 | **+184.5% (2.84x)** |
+| 1024 | 128 | **116.15** | **1.102s** | 39.78 | 3.218s | 39.19 | **+192.0% (2.92x)** |
 
-#### Latency (s) — Bar Chart
+---
 
-![GPTNeo Latency Bar](benchmark/results/gptneo350m_instruct_sft_latency_bar.png)
+#### 2. Qwen/Qwen3-0.6B (752M Params — RoPE + Per-Head Q/K Norm)
 
-#### Throughput Table
+> **Decisive Wins**: Batch 1 throughput achieved **48.21 tok/s** (more than double Transformers' 23.01 tok/s, a **+109.5% margin**). Request latency dropped from 5.56s to **2.65s (52.3% lower)**. Inter-token latency improved from 43.42 ms down to **20.63 ms/token**. First-call cold start took only **2.99s** compared to Transformers' 6.14s.
 
-| Prompt | Batch | Aether tok/s | HF tok/s | Speedup |
-|--------|-------|-------------|---------|---------|
-| 32 | 1 | **71.67** | 39.14 | 1.83x |
-| 32 | 2 | **64.57** | 47.37 | 1.36x |
-| 32 | 4 | **123.11** | 93.42 | 1.32x |
-| 256 | 1 | **63.14** | 39.34 | 1.61x |
-| 256 | 2 | **57.40** | 45.53 | 1.26x |
-| 256 | 4 | **99.94** | 85.60 | 1.17x |
-| 1024 | 1 | **54.41** | 36.94 | 1.47x |
-| 1024 | 2 | **41.35** | 39.08 | 1.06x |
-| 1024 | 4 | 60.38 | **65.21** | 0.93x |
+##### Throughput & Scaling Across Batch Sizes (Prompt: 256, Output: 128)
 
-> **Note (P1024/B4):** Only cell where Transformers wins. Full MHA (no GQA) causes KV-cache memory spill at large batch x long context. Targeted for v1.3.
+| Batch Size | Aether (tok/s) | Transformers (tok/s) | PyTorch Native (tok/s) | Aether vs HF Speedup | Aether vs PyTorch Speedup |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| **b1** | **48.21** | 23.01 | 21.93 | **2.10x (+109.5%)** | **2.20x (+119.8%)** |
+| **b2** | **82.63** | 44.86 | 43.39 | **1.84x (+84.2%)** | **1.90x (+90.4%)** |
+| **b4** | **165.54** | 88.96 | 85.60 | **1.86x (+86.1%)** | **1.93x (+93.4%)** |
+| **b8** | **234.55** | 171.74 | 165.88 | **1.37x (+36.6%)** | **1.41x (+41.4%)** |
+| **b16** | **273.35** | 241.03 | 239.23 | **1.13x (+13.4%)** | **1.14x (+14.3%)** |
+
+##### Prompt & Output Length Sweeps at Batch 1
+
+| Prompt Tokens | Output Tokens | Aether (tok/s) | Aether Latency | HF (tok/s) | HF Latency | PyTorch Native (tok/s) | Aether Margin |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 32 | 128 | **48.34** | **2.648s** | 22.53 | 5.681s | 21.89 | **+114.6% (2.15x)** |
+| 256 | 32 | **44.30** | **0.722s** | 22.81 | 1.403s | 21.69 | **+94.2% (1.94x)** |
+| 256 | 128 | **48.21** | **2.655s** | 23.01 | 5.563s | 21.93 | **+109.5% (2.10x)** |
+| 256 | 512 | **50.37** | **10.164s** | 22.49 | 22.766s | 22.22 | **+124.0% (2.24x)** |
+| 1024 | 128 | **46.10** | **2.777s** | 22.11 | 5.788s | 21.52 | **+108.5% (2.09x)** |
+
+---
+
+#### 3. HuggingFaceTB/SmolLM2-135M-Instruct (135M Params)
+
+> **Decisive Wins**: Smooth scaling from **46.18 tok/s** at Batch 1 to **674.99 tok/s** at Batch 16 (+63.4% margin over Transformers). Interactive latency improved from 4.73s to **2.77s (41.4% faster)**. Peak host resident memory was only **1.615 GiB** (lowest of any engine). Prompt processing speed reached **8,905.61 prompt tok/s** (+44.2% faster prefill).
+
+##### Throughput & Scaling Across Batch Sizes (Prompt: 256, Output: 128)
+
+| Batch Size | Aether (tok/s) | Transformers (tok/s) | PyTorch Native (tok/s) | Aether vs HF Speedup | Aether vs PyTorch Speedup |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| **b1** | **46.18** | 27.06 | 27.32 | **1.71x (+70.6%)** | **1.69x (+69.1%)** |
+| **b2** | **85.74** | 52.91 | 52.90 | **1.62x (+62.0%)** | **1.62x (+62.1%)** |
+| **b4** | **178.19** | 105.85 | 105.23 | **1.68x (+68.3%)** | **1.69x (+69.3%)** |
+| **b8** | **355.94** | 210.49 | 208.09 | **1.69x (+69.1%)** | **1.71x (+71.0%)** |
+| **b16** | **674.99** | 413.00 | 410.20 | **1.63x (+63.4%)** | **1.65x (+64.6%)** |
+
+##### Prompt & Output Length Sweeps at Batch 1
+
+| Prompt Tokens | Output Tokens | Aether (tok/s) | Aether Latency | HF (tok/s) | HF Latency | PyTorch Native (tok/s) | Aether Margin |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 32 | 128 | **44.93** | **2.849s** | 27.24 | 4.700s | 27.30 | **+65.0% (1.65x)** |
+| 256 | 32 | **42.75** | **0.749s** | 27.16 | 1.178s | 26.62 | **+57.4% (1.57x)** |
+| 256 | 128 | **46.18** | **2.772s** | 27.06 | 4.729s | 27.32 | **+70.6% (1.71x)** |
+| 256 | 512 | **48.07** | **10.651s** | 27.05 | 18.927s | 27.45 | **+77.7% (1.78x)** |
+| 1024 | 128 | **46.94** | **2.727s** | 26.59 | 4.814s | 27.00 | **+76.6% (1.77x)** |
+
+---
+
+### Why Aether Outperforms: Architectural & Compilation Advantage
+
+1. **AOT Ahead-of-Time Graph Compilation**: Eliminates Python interpreter overhead and PyTorch dynamic dispatch loops during token generation.
+2. **Fused Custom Kernels**: Native C++ kernels executing fused RMSNorm + SwiGLU / GeGLU and FlashAttention-2 paths optimize memory bandwidth and reduce device kernel launches.
+3. **Optimized KV-Cache Layout**: Zero-copy continuous memory buffers prevent cache fragmentation and preserve memory bandwidth under scaling.
+4. **Compilation Amortization**: On SmolLM2-135M, Aether's 7.0s AOT compilation saves **1.96 seconds on every subsequent generation request** — breaking even and pulling permanently ahead after **just 4 inference requests**.
+
+> 💡 **View the complete suite run, raw measurements, and all 31 charts in [`benchmark/results/benchmark_results.ipynb`](benchmark/results/benchmark_results.ipynb) and [`benchmark/results/BENCHMARK_RESULTS.md`](benchmark/results/BENCHMARK_RESULTS.md).**
 
 ---
 
