@@ -1,179 +1,218 @@
-# Running the multi-engine benchmark on Kaggle
+﻿# Kaggle Benchmark Runbook — Aether Runtime vs All Engines
 
-A start-to-finish runbook for `python benchmark.py` on a Kaggle GPU notebook
-(2x Tesla T4, 4 vCPU, ~31 GiB RAM). Every numbered step is one cell.
+Complete, cell-by-cell instructions for running the multi-engine benchmark on a
+**Kaggle GPU notebook (2× Tesla T4, 4 vCPU, ~31 GiB RAM)**.
 
-Read [What can actually run on 2x T4](#what-can-actually-run-on-2x-t4) first. Four of
-the thirteen engines cannot run on this hardware at all, and the suite says so with the
-capability that decided it rather than pretending otherwise.
+> **Aether is compiled from the cloned source code** — not from a pip release.
+> Every number the report prints reflects exactly the code on `main`.
 
-## 0. Push to `main` first
+---
 
-The notebook clones the repository, so the code has to be on GitHub before you start:
+## Notebook settings (before opening a cell)
 
-```bash
-git add -A
-git commit -m "bench: multi-engine benchmark suite"
-git push origin main
-```
+| Setting | Value |
+|---|---|
+| **Accelerator** | `GPU T4 x2` |
+| **Internet access** | `On` |
+| **Persistence** | `Files only` (lets a second run reuse compiled artifacts) |
 
-## 1. Notebook settings
+---
 
-- **Accelerator**: `GPU T4 x2`
-- **Internet**: `On`
-- **Persistence**: `Files only` is useful — a second run then reuses compiled artifacts
-
-## 2. Clone and install the measurement stack
+## Cell 1 — Clone and install Aether from source
 
 ```python
+# Clone the latest code from main
 !git clone https://github.com/iamkaleemsajjad-hue/Aether.git /kaggle/working/aether
 %cd /kaggle/working/aether
+
+# Install Aether from source (editable install — uses the cloned code, NOT the pip release).
+# The [pytorch] extra pulls torch + the Aether CUDA kernels.
 !pip install -q -e ".[pytorch]"
+
+# Install the benchmark measurement stack (telemetry, plotting, HF hub utils).
+# This does NOT install competing engines.  Absent engines are reported as
+# NOT_INSTALLED with a reason, never silently skipped.
 !pip install -q -r benchmark/requirements.txt
 ```
 
-## 3. Install the competing engines
+---
 
-Order matters. vLLM moves `torch` and `transformers`, so it goes first; the version pin
-goes last so it wins.
+## Cell 2 — Install competing engines  *(order matters)*
+
+### 2a. vLLM  *(install first — it pins torch and transformers)*
 
 ```python
-# vLLM. Large download, ~5 minutes. Moves torch/transformers, so install it first.
+# vLLM moves torch and transformers to its own pinned versions.
+# Install it FIRST so that the transformers pin below (Cell 2c) wins.
+# Download ~5 min.
 !pip install -q vllm
 ```
+
+### 2b. ONNX Runtime — GPU build
+
 ```python
-# ONNX Runtime — GPU build (CUDA).
-#
-# ╔══════════════════════════════════════════════════════════════════════╗
-# ║  THREE MANDATORY STEPS. Skipping any one of them silently leaves    ║
-# ║  CUDAExecutionProvider absent and the engine running on CPU.         ║
-# ╚══════════════════════════════════════════════════════════════════════╝
-#
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  THREE MANDATORY STEPS — skipping any one leaves CUDAExecutionProvider  ║
+# ║  absent and the engine silently running on CPU.                          ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
 # STEP 1 — Remove the pre-installed CPU build.
-#   Kaggle ships 'onnxruntime' (CPU) by default. pip sees the onnxruntime
-#   dependency as already satisfied and skips the GPU wheel entirely unless
-#   the CPU build is removed first.
+#   Kaggle ships onnxruntime (CPU) by default.  pip marks the onnxruntime
+#   dependency satisfied and skips the GPU wheel unless this is removed first.
 !pip uninstall -q -y onnxruntime
 
-# STEP 2 — Install the GPU build. This registers CUDAExecutionProvider.
+# STEP 2 — Install the GPU build.  Registers CUDAExecutionProvider.
 !pip install -q "onnxruntime-gpu>=1.18.0"
 
-# STEP 3 — Install optimum separately.
-#   Do NOT use optimum[onnxruntime-gpu] — that alias does not install the
-#   GPU wheel when onnxruntime is already present in the environment.
+# STEP 3 — Install optimum separately (NOT via optimum[onnxruntime-gpu]).
+#   That alias does not install the GPU wheel when onnxruntime is present.
 !pip install -q "optimum>=1.20.0"
 
-# ╔══════════════════════════════════════════════════════════════════════╗
-# ║  REQUIRED: Restart the kernel after this cell (Run → Restart        ║
-# ║  session). The old CPU-build .so is still loaded in memory until    ║
-# ║  the session is restarted. Skipping the restart means               ║
-# ║  CUDAExecutionProvider will still be absent even after the correct  ║
-# ║  wheel is installed.                                                 ║
-# ╚══════════════════════════════════════════════════════════════════════╝
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  REQUIRED: Run → Restart session after this cell.                        ║
+# ║  The old CPU-build .so stays resident until the session restarts.        ║
+# ║  CUDAExecutionProvider will still be absent without the restart.         ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
 ```
 
+> **→ Run → Restart session now.**  Then start from the next cell.
+
+### 2c. transformers pin  *(mandatory for ONNX export)*
+
 ```python
-# REQUIRED transformers version pin for ONNX export.
-#
-# ╔══════════════════════════════════════════════════════════════════════╗
-# ║  This pin is MANDATORY for the ONNX engine to work at all.          ║
-# ║  Kaggle ships transformers 5.x. optimum's ONNX exporter declares    ║
-# ║  transformers<4.58 and imports a private symbol (get_parameter_dtype)║
-# ║  that 5.x removed. Without this pin, the ONNX engine fails at load  ║
-# ║  with an ImportError and is reported as NOT_SUPPORTED.               ║
-# ║  Every engine in the run must share one transformers version, so     ║
-# ║  pin it BEFORE any engine is loaded — not afterwards.               ║
-# ╚══════════════════════════════════════════════════════════════════════╝
+%cd /kaggle/working/aether
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  MANDATORY — without this pin the ONNX engine fails at load.            ║
+# ║  Kaggle ships transformers 5.x.  optimum's ONNX exporter needs <4.58    ║
+# ║  and imports get_parameter_dtype, which 5.x removed.                    ║
+# ║  Pin BEFORE any engine loads — not afterwards.                           ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
 !pip install -q "transformers==4.57.1"
 ```
 
-> **After both cells above: Run → Restart session.** Then `%cd /kaggle/working/aether` to
-> return to the repo directory before continuing.
-
-
-### Optional: llama.cpp
-
-llama.cpp executes GGUF, not the published checkpoint, so it needs a conversion. This
-adds roughly 20 minutes and the pip build is CPU-only unless you build with CUDA.
+### 2d. DeepSpeed  *(optional)*
 
 ```python
+# Kernel injection for architectures that have a policy.
+# Reports NOT_SUPPORTED (with reason) where it has none.
+!pip install -q deepspeed
+```
+
+### 2e. llama.cpp  *(optional — adds ~20 min for GGUF conversion)*
+
+```python
+# llama.cpp executes GGUF, not the HF checkpoint.
+# A conversion script is needed for an F16 GGUF so the comparison is weight-exact.
+# Skip this cell to leave llama_cpp as NOT_INSTALLED.
 !pip install -q llama-cpp-python gguf
 !git clone --depth 1 https://github.com/ggml-org/llama.cpp /kaggle/working/llama.cpp
 ```
 
-Then add these flags to the benchmark command in step 6:
+> If you install llama.cpp add `--gguf-convert-script /kaggle/working/llama.cpp/convert_hf_to_gguf.py`
+> to every benchmark command below.
 
-```
---gguf-convert-script /kaggle/working/llama.cpp/convert_hf_to_gguf.py
-```
+---
 
-The suite converts each checkpoint to an **F16** GGUF — unquantized, so llama.cpp holds
-a 16-bit rendering of the same weights as everything else and the comparison stays
-same-representation. Supply your own quantized GGUF with
-`--gguf-map <model>=<path.gguf>` instead if you want the quantized configuration; it is
-then labelled `REPRESENTATION_DIFFERENCE` everywhere it appears.
+## Cell 3 — Verify the GPU build
 
 ```python
-# Verify the GPU build is active before starting the benchmark.
-# Must print CUDAExecutionProvider in the list.
+%cd /kaggle/working/aether
+
 import onnxruntime as ort
-print("ORT version:", ort.__version__)
+print("ORT version       :", ort.__version__)
 print("Available providers:", ort.get_available_providers())
+
 assert "CUDAExecutionProvider" in ort.get_available_providers(), (
-    "CUDAExecutionProvider missing.\n"
-    "Fix: (1) pip uninstall -y onnxruntime  "
-    "(2) pip install 'onnxruntime-gpu>=1.18.0'  "
-    "(3) Restart session (Run → Restart session).\n"
-    "The CPU-build .so stays loaded until the session restarts."
+    "\n\nCUDAExecutionProvider is MISSING.\n"
+    "Fix:\n"
+    "  (1) pip uninstall -y onnxruntime\n"
+    "  (2) pip install 'onnxruntime-gpu>=1.18.0'\n"
+    "  (3) Run -> Restart session\n"
+    "  (4) %cd /kaggle/working/aether and re-run this cell.\n"
+    "The CPU-build .so stays resident until the session is restarted."
 )
-print("OK — GPU build confirmed.")
+print("\nOK — GPU build confirmed.")
 ```
 
-## 4. DeepSpeed (optional)
+---
+
+## Cell 4 — Confirm the full environment
 
 ```python
-# DeepSpeed's kernel injection. Optional: it only has policies for some
-# architectures, and the suite reports NOT_SUPPORTED (with that reason) where it
-# has none rather than shipping a duplicate of the eager baseline.
-!pip install -q deepspeed
-```
+%cd /kaggle/working/aether
 
-## 5. Confirm the environment
-
-```python
 !nvidia-smi
-!python -c "import torch, transformers; print('torch', torch.__version__, '| transformers', transformers.__version__, '| cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+!python -c "
+import torch, transformers, optimum, onnxruntime as ort
+print(f'torch        {torch.__version__}')
+print(f'transformers {transformers.__version__}')
+print(f'optimum      {optimum.__version__}')
+print(f'onnxruntime  {ort.__version__}')
+print(f'CUDA avail   {torch.cuda.is_available()}')
+print(f'GPU count    {torch.cuda.device_count()}')
+for i in range(torch.cuda.device_count()):
+    p = torch.cuda.get_device_properties(i)
+    print(f'  cuda:{i}  {p.name}  {p.total_memory/1024**3:.1f} GiB  sm_{p.major}{p.minor}')
+"
+
+# Verify Aether is loaded from the cloned source (not a site-packages release)
+!python -c "import aether; print('aether path:', aether.__file__)"
 ```
 
-## 6. Check which engines the host accepts, before spending an hour
+---
 
-
-The smoke run surveys the field, measures one tiny cell per engine, and writes a full
-report. Two to three minutes.
+## Cell 5 — Smoke run  *(engine survey, ~3 min)*
 
 ```python
-!python benchmark.py --smoke --output-dir /kaggle/working/bench_smoke
+%cd /kaggle/working/aether
+
+!AETHER_ORT_REQUIRE_GPU=1 python benchmark.py \
+    --smoke \
+    --output-dir /kaggle/working/bench_smoke
 ```
 
-Read the `engine availability` block it prints. Every engine is either `run` or `skip`
-with a reason in full — no truncation. Fix anything surprising there before step 6.
+Read the `engine availability` block. Every engine is `run` or `skip` with a
+full reason.  Fix anything unexpected before Cell 6.
 
-## 7. The full run
+**Expected availability on 2× T4:**
 
+| Engine | Expected | Notes |
+|---|---|---|
+| `hf_transformers` | `run` | Reference baseline |
+| `pytorch_native` | `run` | Same weights, hand-written loop |
+| `onnxruntime` | `run` — CUDAExecutionProvider | Must show CUDA, not CPU |
+| `aether` | `run` | Compiled from cloned source to cuda_sm70 |
+| `llama_cpp` | `run` or `NOT_INSTALLED` | Only if installed in Cell 2e |
+| `deepspeed` | `run` or `NOT_SUPPORTED` | Depends on model architecture |
+| `vllm` | `run` at fp16 | Refuses bf16 below sm_80 |
+| `sglang` | `NOT_APPLICABLE` | Needs sm_80+; T4 is sm_75 |
+| `tensorrt_llm` | `NOT_APPLICABLE` | Wheels target sm_80+ |
+| `exllamav2` | `NOT_APPLICABLE` | Needs EXL2 weights |
+| `mlc` | `NOT_APPLICABLE` | Needs TVM-compiled model |
+
+---
+
+## Cell 6 — Full benchmark run
+
+`AETHER_ORT_REQUIRE_GPU=1` makes the run fail fast if ORT is on CPU, rather than
+silently producing CPU numbers under the GPU engine label.
+
+### Full run — all models, all matrix  *(~60–90 min)*
 
 ```python
-!python benchmark.py \
+%cd /kaggle/working/aether
+
+!AETHER_ORT_REQUIRE_GPU=1 python benchmark.py \
     --output-dir /kaggle/working/benchmark_results
 ```
 
-> **Note:** `AETHER_ORT_REQUIRE_GPU=1` is set automatically in the benchmark
-> commands below. This ensures that if the GPU build of ORT is not installed
-> the benchmark **fails fast with a clear message** instead of silently running
-> the ONNX engine on CPU and producing misleading results.
-
-A shorter run that still fills every section of the report:
+### Shorter run — fills every report section  *(~20–30 min)*
 
 ```python
+%cd /kaggle/working/aether
+
 !AETHER_ORT_REQUIRE_GPU=1 python benchmark.py \
     --batch-sizes 1,2,4,8 \
     --prompt-tokens 32,256 \
@@ -182,88 +221,150 @@ A shorter run that still fills every section of the report:
     --output-dir /kaggle/working/benchmark_results
 ```
 
-If the session dies part way, `--resume` keeps what was written and measures only what
-is missing:
+### Resume a partial run  *(session crashed mid-way)*
 
 ```python
-!python benchmark.py --resume --output-dir /kaggle/working/benchmark_results
+%cd /kaggle/working/aether
+
+!AETHER_ORT_REQUIRE_GPU=1 python benchmark.py \
+    --resume \
+    --output-dir /kaggle/working/benchmark_results
 ```
 
-For a long run prefer **Save & Run All** (batch execution) over the interactive session,
-which times out.
+### With llama.cpp *(if installed)*
 
-## 7. Read the results
+```python
+%cd /kaggle/working/aether
+
+!AETHER_ORT_REQUIRE_GPU=1 python benchmark.py \
+    --batch-sizes 1,2,4,8 \
+    --prompt-tokens 32,256 \
+    --output-tokens 32,128 \
+    --measure-iters 5 \
+    --gguf-convert-script /kaggle/working/llama.cpp/convert_hf_to_gguf.py \
+    --output-dir /kaggle/working/benchmark_results
+```
+
+> **For long runs** use **Save & Run All** (Kaggle batch execution) rather than
+> the interactive session — the interactive kernel times out after ~9 hours.
+
+---
+
+## Cell 7 — Read the results
+
+### Rendered Markdown report
 
 ```python
 from IPython.display import Markdown, display
 display(Markdown(open(
-    "/kaggle/working/benchmark_results/reports/BENCHMARK_REPORT.md", encoding="utf-8"
+    "/kaggle/working/benchmark_results/reports/BENCHMARK_REPORT.md",
+    encoding="utf-8"
 ).read()))
 ```
+
+### Charts (all PNGs inline)
 
 ```python
 from IPython.display import Image, display
 import pathlib
+
 for path in sorted(pathlib.Path("/kaggle/working/benchmark_results/graphs").glob("*.png")):
-    print(path.name)
+    print(f"\n── {path.name} ──")
     display(Image(str(path)))
 ```
 
+### Raw data as DataFrames
+
 ```python
 import pandas as pd
-pd.read_csv("/kaggle/working/benchmark_results/benchmark_results.csv")       # every cell
-pd.read_csv("/kaggle/working/benchmark_results/benchmark_comparisons.csv")   # every pairing
+
+# Every (engine, model, batch, prompt, output) cell
+df = pd.read_csv("/kaggle/working/benchmark_results/benchmark_results.csv")
+print(f"Total cells: {len(df)}")
+df.head()
 ```
 
-## 8. Keep the results
+```python
+# Every pairwise engine comparison
+pd.read_csv("/kaggle/working/benchmark_results/benchmark_comparisons.csv").head()
+```
 
-Everything is under `/kaggle/working/benchmark_results`, downloadable from the Output
-tab. To bring it back into the repository:
+### Confirm ORT actually ran on GPU
 
 ```python
+import json, pathlib
+
+for path in sorted(pathlib.Path("/kaggle/working/benchmark_results/raw").glob("onnxruntime__*.json")):
+    r = json.loads(path.read_text())
+    d = r.get("describe", {})
+    print(path.name)
+    print("  execution_providers :", d.get("execution_providers", "not recorded"))
+    print("  gpu_provider_active :", d.get("gpu_provider_active", "not recorded"))
+    print("  status              :", r.get("status"))
+    print()
+```
+
+> **`gpu_provider_active` must be `True`.**  If it is `False`, the engine ran on
+> CPU.  Go back to Cell 2b, complete all three steps, restart the session, and
+> rerun from Cell 3.
+
+---
+
+## Cell 8 — Save results
+
+```python
+# Outputs tab — copy results into the repo directory
 !cp -r /kaggle/working/benchmark_results /kaggle/working/aether/benchmark_results
+```
+
+```python
+# Optional: commit results back to GitHub
+# !cd /kaggle/working/aether && git add benchmark_results && \
+#     git commit -m "results: Kaggle 2xT4 $(date -u +%Y-%m-%d)" && \
+#     git push origin main
 ```
 
 ---
 
-## What can actually run on 2x T4
+## Reference: What runs on 2× T4
 
-The suite attempts thirteen engines. On this hardware:
+| Engine | Status on T4 | Notes |
+|---|---|---|
+| `hf_transformers` | ✅ runs | Reference baseline |
+| `pytorch_native` | ✅ runs | Hand-written loop, same weights |
+| `onnxruntime` | ✅ runs *(with transformers pin)* | GPU build required; exporter needs transformers<4.58 |
+| `aether` | ✅ runs | Compiled from source to `cuda_sm70` (T4 = sm_75 → sm70 tier) |
+| `llama_cpp` | ✅ if installed | Executes GGUF (F16 auto-converted); CPU-only unless built with CUDA |
+| `deepspeed` | ⚠️ partial | NOT_SUPPORTED on architectures without an injection policy |
+| `vllm` | ✅ at fp16 | Refuses bf16 below sm_80; suite pins fp16 on T4 |
+| `sglang` | ❌ NOT_APPLICABLE | FlashAttention needs sm_80+; T4 is sm_75 |
+| `tensorrt_llm` | ❌ NOT_APPLICABLE | Published wheels require sm_80+ |
+| `exllamav2` | ❌ NOT_APPLICABLE | Requires EXL2-quantized weights (none exist for charter models) |
+| `mlc` | ❌ NOT_APPLICABLE | Requires a TVM-compiled artifact (harness does not build one) |
 
-| Engine | On 2x T4 | Why |
-| --- | --- | --- |
-| `transformers` | runs | — |
-| `pytorch_native` | runs | — |
-| `torch_compile` | runs | Whole-graph capture usually fails on `generate`; the suite falls back to graph-broken compilation and records which configuration compiled |
-| `onnxruntime` | runs **with the transformers pin** | The exporter needs transformers<4.58 |
-| `openvino` | runs, on **CPU** | OpenVINO has no CUDA target; the row is labelled with its device |
-| `llama_cpp` | runs if you install it and supply a conversion | Executes GGUF, not the checkpoint |
-| `vllm` | runs **at fp16** | vLLM refuses bf16 below compute capability 8.0 |
-| `deepspeed` | runs only where it has an injection policy | Reports `NOT_SUPPORTED` where it has none, rather than duplicating the eager baseline |
-| `aether` | runs | — |
-| `sglang` | **NOT_APPLICABLE** | Attention kernels need capability 8.0+; T4 is 7.5 |
-| `tensorrt_llm` | **NOT_APPLICABLE** | Published wheels target 8.0+ |
-| `exllamav2` | **NOT_APPLICABLE** | Needs EXL2 weights, which do not exist for these checkpoints |
-| `mlc` | **NOT_APPLICABLE** | Needs a TVM-compiled model, which this harness does not build |
+NOT_APPLICABLE engines appear in the compatibility table with the deciding reason
+— they are not failures and not zeros.
 
-Those four are not failures and are not zeros. They appear in the compatibility table
-with the capability or the missing artifact that decided them.
+---
 
-## Two things specific to T4 worth knowing
+## T4-specific notes
 
-**Precision is fp16, not bf16.** T4 is compute capability 7.5 and has no bf16 tensor
-cores. Recent torch answers `is_bf16_supported() == True` there anyway, because it can
-emulate the format in software — which is why an earlier version of this suite chose
-bf16 and vLLM then refused to start. The suite now derives bf16 support from the
-capability, so `--precision auto` resolves to fp16 on T4: the widest format the whole
-field executes natively. The checkpoints are published in bf16, so each engine holds its
-own 16-bit rendering of the same values; that storage difference is printed next to
-every comparison it affects. `--precision bf16` gives the bit-exact configuration at the
-cost of the engines that cannot run it.
+**Precision resolves to fp16, not bf16.**
+T4 is sm_75 and has no bf16 tensor cores.  Recent torch reports
+`is_bf16_supported() == True` via software emulation, but vLLM and others refuse
+bf16 below sm_80 outright.  `--precision auto` resolves to **fp16** on T4.
+The charter checkpoints are published in bf16; each engine holds its own fp16
+rendering of the same values, and that storage difference is printed next to
+every comparison it affects.  Pass `--precision bf16` for the weight-exact
+configuration at the cost of engines that cannot run it.
 
-**Every engine sees one GPU.** `--devices 1` is the default, applied by restricting
-`CUDA_VISIBLE_DEVICES` in each worker before any CUDA context exists. Nothing in any
-engine's placement logic is modified — each simply finds one device. Without this, a
-runtime that shards a model across both T4s is measured on twice the hardware as one
-that does not, which is a comparison of machines rather than of engines. Pass
+**Every engine sees exactly one GPU.**
+`--devices 1` is the default.  The worker sets `CUDA_VISIBLE_DEVICES=0` before
+any CUDA context is created, so each engine finds one device and does what it
+does with one device — no engine's placement logic is modified.  Pass
 `--devices 2` to measure multi-device execution deliberately.
+
+**Aether compiles to `cuda_sm70` on T4.**
+T4 is sm_75.  Aether's target mapping rounds to the nearest supported tier:
+sm_75 → `cuda_sm70` (Volta).  The compiled `.aeg` artifact is cached and reused
+on `--resume` runs.
