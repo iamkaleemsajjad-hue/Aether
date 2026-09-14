@@ -21,13 +21,16 @@ packaging>=24.0
 #   onnxruntime dependency is already satisfied), leaving CUDAExecutionProvider
 #   absent and the engine silently running on CPU.
 #
-#   Correct install sequence:
-#     pip uninstall -y onnxruntime                   # remove CPU build FIRST
-#     pip install "onnxruntime-gpu>=1.18.0"          # install GPU build
-#     pip install "optimum>=1.20.0"                  # install optimum separately
+#   Correct install sequence (no session restart required — probe and workers
+#   run in subprocesses that always see the current disk state):
+#     pip uninstall -y onnxruntime                       # remove CPU build FIRST
+#     pip install "onnxruntime-gpu>=1.18.0"              # install GPU build
+#     pip install "optimum[onnxruntime]>=1.20.0"         # [onnxruntime] extra REQUIRED
 #
-#   DO NOT use "optimum[onnxruntime-gpu]" as a shortcut: that extras alias does
-#   NOT install onnxruntime-gpu when onnxruntime is already present.
+#   The [onnxruntime] extra is required: plain "optimum" does not include the
+#   optimum.onnxruntime subpackage. pip sees onnxruntime as satisfied by the
+#   GPU build (onnxruntime-gpu >=1.18 registers as "onnxruntime") and does NOT
+#   reinstall the CPU build.
 #
 #   Verify the GPU build is active:
 #     python -c "import onnxruntime as ort; print(ort.get_available_providers())"
@@ -42,7 +45,7 @@ packaging>=24.0
 #     python -c "from benchmark.suite.engines.base import requirement_conflicts; \
 #                print(requirement_conflicts('optimum'))"
 #
-optimum>=1.20.0
+optimum[onnxruntime]>=1.20.0
 #
 # 4. llama.cpp + CUDA
 #   Pre-built (CUDA 12.x, no compiler needed):

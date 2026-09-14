@@ -203,15 +203,15 @@ bench-suite = [
 # the ones the host can actually run; the suite records the rest, with the reason.
 # Install: pip install "aether-runtime[bench-engines]"
 bench-engines = [
-    # IMPORTANT: Do NOT use optimum[onnxruntime] here.
-    # That extras alias installs the CPU-only 'onnxruntime' package, which does
-    # not expose CUDAExecutionProvider and makes the onnxruntime benchmark engine
-    # run silently on CPU even on a GPU host. On GPU hosts (Kaggle, Colab, etc.):
+    # The [onnxruntime] extra is REQUIRED — plain "optimum" does not include
+    # the optimum.onnxruntime subpackage. On GPU hosts install onnxruntime-gpu
+    # BEFORE this so pip sees "onnxruntime" as already satisfied (onnxruntime-gpu
+    # >=1.18 registers as "onnxruntime") and does not reinstall the CPU build:
     #   pip uninstall -y onnxruntime
     #   pip install "onnxruntime-gpu>=1.18.0"
-    #   pip install "optimum>=1.20.0"  (separately, not via the [onnxruntime-gpu] alias)
-    # Then restart the Python session before running the benchmark.
-    "optimum>=1.20.0",
+    #   pip install "optimum[onnxruntime]>=1.20.0"
+    # No session restart required — the probe and workers use subprocesses.
+    "optimum[onnxruntime]>=1.20.0",
 ]
 
 # ── Distributed execution extras ──────────────────────────────────────────────

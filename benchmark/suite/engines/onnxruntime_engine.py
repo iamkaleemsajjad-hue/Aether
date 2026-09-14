@@ -296,18 +296,67 @@ def _tree_size(path: Path) -> int | None:
 _EXPORT_DISTRIBUTIONS = ("optimum-onnx", "optimum")
 
 
+def _optimum_ort_importable() -> tuple[bool, str]:
+    """Check whether ``optimum.onnxruntime`` can be imported in a fresh subprocess.
+
+    Using a subprocess rather than ``importlib.util.find_spec`` avoids two
+    failure modes that are common on Kaggle and similar cloud notebook hosts:
+
+    1. **Stale in-process .so**: if the user replaced the CPU ORT build with
+       the GPU build inside the same session (pip uninstall + pip install
+       without restart), ``find_spec('optimum.onnxruntime')`` imports the
+       ``optimum`` parent package which may trigger the stale C extension,
+       causing a spurious failure. A fresh subprocess is unaffected.
+
+    2. **Missing [onnxruntime] extra**: ``optimum.onnxruntime`` may not be
+       discoverable if ``optimum`` was installed without the ``[onnxruntime]``
+       extra (which installs the integration subpackage). A real import attempt
+       surfaces this clearly instead of a confusing find_spec None.
+    """
+    import subprocess
+    import sys
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import optimum.onnxruntime"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            return True, ""
+        stderr = result.stderr.strip()
+        last_line = stderr.split("\n")[-1] if stderr else "import failed"
+        return False, last_line
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
+
 def _cuda_provider_available() -> bool:
     """True when the installed onnxruntime build exposes CUDAExecutionProvider.
 
-    This is the only reliable GPU check. ``onnxruntime-gpu`` 1.18+ changed its
-    wheel packaging so that ``importlib.metadata.version('onnxruntime-gpu')``
-    returns ``None`` even on a fully-functional CUDA build — the metadata is now
-    registered under the name ``onnxruntime``.  Checking the provider list is
-    definitive regardless of how the package was named or re-named.
+    Runs in a **subprocess** rather than importing onnxruntime in-process for
+    two reasons:
+
+    1. ``onnxruntime-gpu`` 1.18+ registers its metadata as ``onnxruntime``, so
+       ``importlib.metadata.version('onnxruntime-gpu')`` returns ``None`` even
+       on a fully-functional CUDA build. Checking the provider list is
+       definitive regardless of how the package was named.
+
+    2. If the user replaced the CPU build with the GPU build inside the same
+       Python session (e.g. ran ``pip uninstall onnxruntime && pip install
+       onnxruntime-gpu`` without restarting), the old CPU-build ``.so`` is
+       still resident in the orchestrator process's address space. A subprocess
+       always starts clean and sees whatever is actually on disk, so the check
+       is accurate even without a session restart.
     """
+    import subprocess
+    import sys
     try:
-        import onnxruntime as ort
-        return "CUDAExecutionProvider" in ort.get_available_providers()
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import onnxruntime as ort; "
+             "print('CUDAExecutionProvider' in ort.get_available_providers())"],
+            capture_output=True, text=True, timeout=30,
+        )
+        return result.returncode == 0 and "True" in result.stdout
     except Exception:  # noqa: BLE001
         return False
 
@@ -412,11 +461,23 @@ def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Av
     generic = base.generic_probe(SPEC, hardware)
     if not generic.usable:
         return generic
-    ok, reason = base.module_importable("optimum.onnxruntime")
+    # Use a subprocess rather than find_spec / in-process import to check
+    # optimum.onnxruntime. In-process checks fail when:
+    #   a) onnxruntime was replaced in the same session without restart (stale .so)
+    #   b) optimum was installed without the [onnxruntime] extra (missing subpackage)
+    # A subprocess always gets a fresh import context and sees the current disk state.
+    ok, reason = _optimum_ort_importable()
     if not ok:
         return base.not_installed(
-            "optimum is installed but optimum.onnxruntime is not importable "
-            f"({reason}); install optimum[onnxruntime] or optimum[onnxruntime-gpu]"
+            "optimum.onnxruntime is not importable. "
+            f"Reason: {reason}. "
+            "Fix: pip install 'optimum[onnxruntime]>=1.20.0' (the [onnxruntime] "
+            "extra is required; plain 'optimum' does not include the integration "
+            "subpackage). On GPU hosts install onnxruntime-gpu FIRST so that pip "
+            "sees onnxruntime as satisfied by the GPU build: "
+            "pip uninstall -y onnxruntime && "
+            "pip install 'onnxruntime-gpu>=1.18.0' && "
+            "pip install 'optimum[onnxruntime]>=1.20.0'"
         )
     conflicts = [
         problem
@@ -450,10 +511,12 @@ def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Av
         _gpu_fix_message = (
             "CUDAExecutionProvider is NOT available on this GPU host. "
             "The CPU build of onnxruntime is installed; it does not expose CUDA. "
-            "Fix (Kaggle / any Linux GPU host): "
+            "Fix (Kaggle / any Linux GPU host, NO session restart required): "
             "(1) pip uninstall -y onnxruntime  "
             "(2) pip install 'onnxruntime-gpu>=1.18.0'  "
-            "(3) RESTART the Python session (the old CPU-build .so is still loaded). "
+            "(3) pip install 'optimum[onnxruntime]>=1.20.0'  "
+            "No restart is needed because the probe and measurement workers run in "
+            "subprocesses that always see the current disk state. "
             "Verify: python -c \"import onnxruntime as ort; "
             "print(ort.get_available_providers())\" "
             "— must print CUDAExecutionProvider. "
