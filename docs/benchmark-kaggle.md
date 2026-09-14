@@ -41,61 +41,55 @@ goes last so it wins.
 # vLLM. Large download, ~5 minutes. Moves torch/transformers, so install it first.
 !pip install -q vllm
 ```
-
 ```python
 # ONNX Runtime — GPU build (CUDA).
 #
-# IMPORTANT: The CPU build (plain `onnxruntime`) and the GPU build
-# (`onnxruntime-gpu`) CANNOT coexist. Kaggle ships the CPU build by default,
-# so it must be removed first. Skipping the uninstall step causes pip to mark
-# the onnxruntime dependency as already satisfied and never install the GPU
-# wheel, leaving CUDAExecutionProvider absent and the engine on CPU.
-
-# Step 1 — Remove the CPU build.
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  THREE MANDATORY STEPS. Skipping any one of them silently leaves    ║
+# ║  CUDAExecutionProvider absent and the engine running on CPU.         ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+#
+# STEP 1 — Remove the pre-installed CPU build.
+#   Kaggle ships 'onnxruntime' (CPU) by default. pip sees the onnxruntime
+#   dependency as already satisfied and skips the GPU wheel entirely unless
+#   the CPU build is removed first.
 !pip uninstall -q -y onnxruntime
 
-# Step 2 — Install the GPU build. This registers CUDAExecutionProvider.
+# STEP 2 — Install the GPU build. This registers CUDAExecutionProvider.
 !pip install -q "onnxruntime-gpu>=1.18.0"
 
-# Step 3 — Install optimum (separately; NOT through optimum[onnxruntime-gpu]
-# because that extras alias does not install onnxruntime-gpu the package).
+# STEP 3 — Install optimum separately.
+#   Do NOT use optimum[onnxruntime-gpu] — that alias does not install the
+#   GPU wheel when onnxruntime is already present in the environment.
 !pip install -q "optimum>=1.20.0"
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  REQUIRED: Restart the kernel after this cell (Run → Restart        ║
+# ║  session). The old CPU-build .so is still loaded in memory until    ║
+# ║  the session is restarted. Skipping the restart means               ║
+# ║  CUDAExecutionProvider will still be absent even after the correct  ║
+# ║  wheel is installed.                                                 ║
+# ╚══════════════════════════════════════════════════════════════════════╝
 ```
 
 ```python
-# The version pin that makes the ONNX exporter work.
+# REQUIRED transformers version pin for ONNX export.
 #
-# Kaggle ships transformers 5.x. optimum's ONNX exporter declares
-# transformers<4.58 and imports a symbol (get_parameter_dtype) that 5.x removed, so on
-# the stock image ONNX Runtime fails at load with an ImportError. Every engine in the
-# run has to share one transformers version, so the fix is to pin it into the range the
-# exporter accepts before measuring - not to upgrade it afterwards.
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  This pin is MANDATORY for the ONNX engine to work at all.          ║
+# ║  Kaggle ships transformers 5.x. optimum's ONNX exporter declares    ║
+# ║  transformers<4.58 and imports a private symbol (get_parameter_dtype)║
+# ║  that 5.x removed. Without this pin, the ONNX engine fails at load  ║
+# ║  with an ImportError and is reported as NOT_SUPPORTED.               ║
+# ║  Every engine in the run must share one transformers version, so     ║
+# ║  pin it BEFORE any engine is loaded — not afterwards.               ║
+# ╚══════════════════════════════════════════════════════════════════════╝
 !pip install -q "transformers==4.57.1"
 ```
 
-```python
-# DeepSpeed's kernel injection. Optional: it only has policies for some
-# architectures, and the suite reports NOT_SUPPORTED (with that reason) where it has
-# none rather than shipping a duplicate of the eager baseline.
-!pip install -q deepspeed
-```
+> **After both cells above: Run → Restart session.** Then `%cd /kaggle/working/aether` to
+> return to the repo directory before continuing.
 
-```python
-# Verify the GPU build is active. Must print CUDAExecutionProvider in the list.
-import onnxruntime as ort
-print("ORT version:", ort.__version__)
-print("Available providers:", ort.get_available_providers())
-assert "CUDAExecutionProvider" in ort.get_available_providers(), \
-    "CUDAExecutionProvider missing — check that onnxruntime-gpu is installed "\
-    "and the CPU build is uninstalled, then restart the session."
-print("OK — GPU build confirmed.")
-```
-
-> **Note:** If the assertion fails, restart the session (`Run → Restart session`)
-> and rerun this cell. The CPU build must not be present alongside the GPU build.
-
-**Restart the session now** (Run → Restart session), so every engine is measured
-against one set of libraries. Then `%cd /kaggle/working/aether` again.
 
 ### Optional: llama.cpp
 
@@ -119,14 +113,40 @@ same-representation. Supply your own quantized GGUF with
 `--gguf-map <model>=<path.gguf>` instead if you want the quantized configuration; it is
 then labelled `REPRESENTATION_DIFFERENCE` everywhere it appears.
 
-## 4. Confirm the environment
+```python
+# Verify the GPU build is active before starting the benchmark.
+# Must print CUDAExecutionProvider in the list.
+import onnxruntime as ort
+print("ORT version:", ort.__version__)
+print("Available providers:", ort.get_available_providers())
+assert "CUDAExecutionProvider" in ort.get_available_providers(), (
+    "CUDAExecutionProvider missing.\n"
+    "Fix: (1) pip uninstall -y onnxruntime  "
+    "(2) pip install 'onnxruntime-gpu>=1.18.0'  "
+    "(3) Restart session (Run → Restart session).\n"
+    "The CPU-build .so stays loaded until the session restarts."
+)
+print("OK — GPU build confirmed.")
+```
+
+## 4. DeepSpeed (optional)
+
+```python
+# DeepSpeed's kernel injection. Optional: it only has policies for some
+# architectures, and the suite reports NOT_SUPPORTED (with that reason) where it
+# has none rather than shipping a duplicate of the eager baseline.
+!pip install -q deepspeed
+```
+
+## 5. Confirm the environment
 
 ```python
 !nvidia-smi
 !python -c "import torch, transformers; print('torch', torch.__version__, '| transformers', transformers.__version__, '| cuda', torch.cuda.is_available(), torch.cuda.device_count())"
 ```
 
-## 5. Check which engines the host accepts, before spending an hour
+## 6. Check which engines the host accepts, before spending an hour
+
 
 The smoke run surveys the field, measures one tiny cell per engine, and writes a full
 report. Two to three minutes.
@@ -138,21 +158,23 @@ report. Two to three minutes.
 Read the `engine availability` block it prints. Every engine is either `run` or `skip`
 with a reason in full — no truncation. Fix anything surprising there before step 6.
 
-## 6. The full run
+## 7. The full run
+
 
 ```python
-!python benchmark.py --output-dir /kaggle/working/benchmark_results
+!python benchmark.py \
+    --output-dir /kaggle/working/benchmark_results
 ```
 
-Three models, every engine the host accepts, batch 1/2/4/8/16, prompts 32/256/1024,
-outputs 32/128/512, correctness validation and the compile-once probe. The largest
-checkpoint in the set is 0.6B, so the run is a fraction of the wall-clock a
-multi-billion-parameter model cost.
+> **Note:** `AETHER_ORT_REQUIRE_GPU=1` is set automatically in the benchmark
+> commands below. This ensures that if the GPU build of ORT is not installed
+> the benchmark **fails fast with a clear message** instead of silently running
+> the ONNX engine on CPU and producing misleading results.
 
 A shorter run that still fills every section of the report:
 
 ```python
-!python benchmark.py \
+!AETHER_ORT_REQUIRE_GPU=1 python benchmark.py \
     --batch-sizes 1,2,4,8 \
     --prompt-tokens 32,256 \
     --output-tokens 32,128 \

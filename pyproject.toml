@@ -134,7 +134,16 @@ mlx = [
     "mlx>=0.16.0; sys_platform == 'darwin'",
 ]
 onnxruntime = [
-    "onnxruntime>=1.18.0",
+    # IMPORTANT: onnxruntime (CPU build) and onnxruntime-gpu CANNOT coexist.
+    # Installing both simultaneously breaks both packages' C-extension imports.
+    # On Linux GPU hosts install ONLY the GPU build:
+    #   pip uninstall -y onnxruntime
+    #   pip install "onnxruntime-gpu>=1.18.0"
+    # On CPU-only hosts install ONLY the CPU build:
+    #   pip install "onnxruntime>=1.18.0"
+    # This extra installs the GPU build on Linux and the CPU build elsewhere.
+    # If onnxruntime is already installed on a Linux host, uninstall it first.
+    "onnxruntime>=1.18.0; sys_platform != 'linux'",
     "onnxruntime-gpu>=1.18.0; sys_platform == 'linux'",
 ]
 triton = [
@@ -194,7 +203,15 @@ bench-suite = [
 # the ones the host can actually run; the suite records the rest, with the reason.
 # Install: pip install "aether-runtime[bench-engines]"
 bench-engines = [
-    "optimum[onnxruntime]>=1.20.0",
+    # IMPORTANT: Do NOT use optimum[onnxruntime] here.
+    # That extras alias installs the CPU-only 'onnxruntime' package, which does
+    # not expose CUDAExecutionProvider and makes the onnxruntime benchmark engine
+    # run silently on CPU even on a GPU host. On GPU hosts (Kaggle, Colab, etc.):
+    #   pip uninstall -y onnxruntime
+    #   pip install "onnxruntime-gpu>=1.18.0"
+    #   pip install "optimum>=1.20.0"  (separately, not via the [onnxruntime-gpu] alias)
+    # Then restart the Python session before running the benchmark.
+    "optimum>=1.20.0",
 ]
 
 # ── Distributed execution extras ──────────────────────────────────────────────

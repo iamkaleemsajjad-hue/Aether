@@ -84,6 +84,9 @@ class Engine(base.BackendAdapterMixin):
             "device": self.device,
             "precision": self._precision,
             "execution_providers": self._providers,
+            # Explicit flag so the report can colour-code CPU-fallback runs without
+            # having to parse the providers list.
+            "gpu_provider_active": "CUDAExecutionProvider" in self._providers,
             "artifact": str(self._artifact) if self._artifact else None,
             "artifact_reused": self._export_reused,
             "export_s": self._export_s,
@@ -209,10 +212,19 @@ class Engine(base.BackendAdapterMixin):
         # receives tensors on the correct device. Without this, optimum passes CPU
         # tensors to the session even when use_io_binding=True, causing a silent
         # fallback to CPUExecutionProvider regardless of the configured provider.
+        #
+        # Important: we iterate all items (not just Tensors) so that non-Tensor
+        # values (e.g. token-type ids stored as Python ints) are preserved in the
+        # mapping. Only torch.Tensor instances are moved; everything else is kept
+        # as-is. We reassign ``encoded`` to a plain dict because BatchEncoding's
+        # constructor signature varies across transformers versions and is not part
+        # of the guaranteed public API.
         if self.device == "cuda":
             import torch
-            encoded = {key: value.to("cuda") for key, value in encoded.items()
-                       if isinstance(value, torch.Tensor)}
+            encoded = {
+                key: (value.to("cuda") if isinstance(value, torch.Tensor) else value)
+                for key, value in encoded.items()
+            }
         sample = temperature > 0.0
         kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens,
@@ -251,8 +263,12 @@ class Engine(base.BackendAdapterMixin):
         # Same device-placement fix as in generate(): the session's IO-binding
         # path requires tensors already on the execution device.
         if self.device == "cuda":
-            encoded = {key: value.to("cuda") for key, value in encoded.items()
-                       if isinstance(value, torch.Tensor)}
+            # Same device-placement logic as generate(): move Tensor values and
+            # preserve all other values so the full dict reaches the session.
+            encoded = {
+                key: (value.to("cuda") if isinstance(value, torch.Tensor) else value)
+                for key, value in encoded.items()
+            }
         with torch.no_grad():
             output = self._model(**encoded)
         return output.logits[0, -1].detach().float().cpu()
@@ -301,8 +317,15 @@ def _load_ort_model(cls: Any, model_id_or_path: Any, provider: str,
     """Load or export an ORTModelForCausalLM with the correct execution provider.
 
     The optimum API uses ``provider=`` (singular string) in ``from_pretrained``.
-    For CUDA, ``use_io_binding=True`` must also be set — without it, ORT receives
-    CPU tensors and falls back to CPU execution silently.
+    For CUDA, two extra flags are required:
+
+    * ``use_io_binding=True`` — without it, ORT receives CPU tensors and falls
+      back to CPU execution silently even when CUDAExecutionProvider is set.
+    * ``provider_options=[{"device_id": 0}]`` — pins the session to device 0,
+      which is always the first *visible* device after the worker restricts
+      ``CUDA_VISIBLE_DEVICES``. Without this pin, ORT may open a context on a
+      different device than the one the rest of the benchmark is using, making
+      GPU memory attribution incorrect.
 
     After loading, ``.to(device)`` is called as a final backstop: it calls
     ``session.set_providers([provider])`` internally, so even if a cached artifact
@@ -317,9 +340,14 @@ def _load_ort_model(cls: Any, model_id_or_path: Any, provider: str,
     # use_io_binding is required for CUDAExecutionProvider to actually use the GPU.
     # Without it, optimum passes CPU tensors directly to the ORT session and the
     # session silently falls back to CPU even when CUDAExecutionProvider is set.
+    #
+    # provider_options pins the session to device 0 — the first device visible
+    # after the worker sets CUDA_VISIBLE_DEVICES. This ensures benchmark GPU memory
+    # attribution is correct even when the host has multiple GPUs.
     use_cuda = provider == "CUDAExecutionProvider"
     if use_cuda:
         kwargs["use_io_binding"] = True
+        kwargs["provider_options"] = [{"device_id": 0}]
 
     try:
         model = cls.from_pretrained(
@@ -409,28 +437,35 @@ def probe(hardware: Any, model_id: str, precision: str, options: Any) -> base.Av
     # package_version("onnxruntime-gpu") returns None even when CUDA providers
     # are fully available. Check the provider list directly instead.
     if hardware.nvidia and not _cuda_provider_available():
-        # AETHER_ORT_REQUIRE_GPU=1 opts the operator into a hard fail when
-        # CUDAExecutionProvider is absent on a GPU host. This prevents a CPU-only
-        # onnxruntime build from contaminating a GPU benchmark with CPU results
-        # while appearing under the same engine label as the CUDA path.
-        # Without the variable the old behaviour is preserved: the engine runs on
-        # CPU and the active provider is recorded in every result row.
-        if os.environ.get("AETHER_ORT_REQUIRE_GPU", "").strip() in ("1", "true", "yes"):
-            return base.not_installed(
-                "AETHER_ORT_REQUIRE_GPU is set: CUDAExecutionProvider is required on "
-                "a GPU host but is not available. Install 'onnxruntime-gpu>=1.18.0' "
-                "(and uninstall the CPU 'onnxruntime' build first — they conflict) "
-                "then restart the session. Verify with: "
-                "python -c \"import onnxruntime as ort; "
-                "print(ort.get_available_providers())\""
-            )
-        return base.available(
-            version,
-            "only the CPU build of onnxruntime is installed, so this engine will "
-            "execute on CPU on a GPU host; recorded with its execution provider. "
-            "Set AETHER_ORT_REQUIRE_GPU=1 to treat this as NOT_INSTALLED and "
-            "exclude it from a GPU benchmark run.",
+        # CUDAExecutionProvider is absent — the CPU build of onnxruntime is
+        # installed instead of the GPU build. The most common cause on Kaggle and
+        # cloud notebook environments: the pre-installed CPU build satisfies the
+        # "onnxruntime" dependency, so pip never installs onnxruntime-gpu.
+        #
+        # AETHER_ORT_REQUIRE_GPU=1 opts the operator into a hard fail (NOT_INSTALLED)
+        # that excludes this engine entirely, preventing CPU results from appearing
+        # under the onnxruntime label in a GPU benchmark. Without the variable the
+        # engine is allowed to run on CPU and its active provider is recorded in
+        # every result row — the data is honest, but the comparison is unfair.
+        _gpu_fix_message = (
+            "CUDAExecutionProvider is NOT available on this GPU host. "
+            "The CPU build of onnxruntime is installed; it does not expose CUDA. "
+            "Fix (Kaggle / any Linux GPU host): "
+            "(1) pip uninstall -y onnxruntime  "
+            "(2) pip install 'onnxruntime-gpu>=1.18.0'  "
+            "(3) RESTART the Python session (the old CPU-build .so is still loaded). "
+            "Verify: python -c \"import onnxruntime as ort; "
+            "print(ort.get_available_providers())\" "
+            "— must print CUDAExecutionProvider. "
+            "Set AETHER_ORT_REQUIRE_GPU=1 to treat this as NOT_INSTALLED "
+            "and exclude the engine from a GPU benchmark run."
         )
+        if os.environ.get("AETHER_ORT_REQUIRE_GPU", "").strip() in ("1", "true", "yes"):
+            return base.not_installed(_gpu_fix_message)
+        avail = base.available(version, _gpu_fix_message)
+        avail.detail["gpu_provider_available"] = False
+        avail.detail["cuda_provider_check"] = "ort.get_available_providers() did not include CUDAExecutionProvider"
+        return avail
     return base.available(version)
 
 
