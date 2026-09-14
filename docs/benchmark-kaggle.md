@@ -46,6 +46,15 @@ Confirm that CUDA is available, Tesla T4 GPUs are detected, and Aether is runnin
 ```python
 %cd /kaggle/working/aether
 
+import sys
+# Ensure the cloned source 'src' is first in sys.path in the Jupyter kernel
+if "/kaggle/working/aether/src" not in sys.path:
+    sys.path.insert(0, "/kaggle/working/aether/src")
+
+# Clear namespace package cache if aether was imported before sys.path was set
+if "aether" in sys.modules and getattr(sys.modules["aether"], "__file__", None) is None:
+    del sys.modules["aether"]
+
 import torch
 import aether
 
@@ -57,7 +66,7 @@ for i in range(torch.cuda.device_count()):
     print(f"  cuda:{i}: {p.name} | VRAM: {p.total_memory/1024**3:.1f} GiB | Compute: sm_{p.major}{p.minor}")
 
 print(f"Aether path     : {aether.__file__}")
-assert "/kaggle/working/aether" in aether.__file__, "Aether must be loaded from cloned source!"
+assert aether.__file__ and "/kaggle/working/aether" in aether.__file__, "Aether must be loaded from cloned source!"
 print("\n[OK] Environment verified.")
 ```
 
