@@ -14,7 +14,7 @@ Aether is an open-source AI model compiler and inference runtime. It ingests any
 ## Multi-Engine Benchmark Results — Aether vs Competitor Engines
 
 > **Hardware Testbed:** **2× NVIDIA Tesla T4 (14.6 GiB VRAM each)** · Intel Xeon @ 2.00 GHz · **FP16 Native Tensor-Core Execution** · Linux 6.12 · Kaggle Environment  
-> **Software Stack:** Aether Runtime v1.2.8a0 vs HuggingFace Transformers v5.0.0 (PyTorch 2.10.0 eager) vs PyTorch Native Decode Loop  
+> **Software Stack:** Aether Runtime v1.3.0 vs HuggingFace Transformers v5.0.0 (PyTorch 2.10.0 eager) vs PyTorch Native Decode Loop  
 > **Suite Version:** 2.0.0 (Strict per-engine process isolation, identical model commits, greedy evaluation, CUDA edge synchronization)  
 > 
 > 🔗 **Access Full Benchmark Results & Artifacts:**

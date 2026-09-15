@@ -5,6 +5,29 @@ All notable changes to Aether Runtime will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-09-15 -- Visual Benchmark Telemetry & Documentation Release
+
+### Added
+
+- Added publication-grade multi-engine, multi-model benchmark charts to README.md,
+  comparing Aether Runtime against HuggingFace Transformers and PyTorch Native across
+  three architectures (SmolLM2-135M-Instruct, GPTNeo350M-Instruct-SFT, Qwen3-0.6B).
+- Added `benchmark/results/generate_readme_charts.py` — a reproducible 300 DPI chart
+  generator using the GitHub dark theme (`#0D1117` canvas, `#7C65FF` Aether violet).
+- Added `cross_engine_throughput_comparison.png`: dual-panel throughput chart showing
+  Batch 1 interactive (up to +168.4% speedup) and Batch 16 peak (1,562.72 tok/s).
+- Added `cross_engine_latency_comparison.png`: end-to-end single-request latency
+  comparison showing 41–63% latency reduction vs HF Transformers and PyTorch Native.
+
+### Changed
+
+- Updated `AETHER_VERSION` to `1.3.0` across all metadata files:
+  `pyproject.toml`, `src/aether/core/constants.py`, `docs/conf.py`, `README.md`.
+- Removed 13 legacy per-model benchmark PNGs from `benchmark/results/` in favour of
+  the new unified cross-engine comparison charts.
+- Updated `.gitignore` to explicitly track `benchmark/results/*.png` and
+  `benchmark/results/generate_readme_charts.py`.
+
 ## [1.2.8] - 2026-08-25 -- Portable Decoder Numerics Stable Release
 
 ### Changed
@@ -564,7 +587,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OpenAI-compatible REST API.
 - Research-backed optimizer passes and runtime intelligence.
 
-[Unreleased]: https://github.com/iamkaleemsajjad-hue/Aether/compare/v1.2.8...HEAD
+[Unreleased]: https://github.com/iamkaleemsajjad-hue/Aether/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.3.0
 [1.2.8]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.8
 [1.2.7.alpha]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.7.alpha
 [1.2.7]: https://github.com/iamkaleemsajjad-hue/Aether/releases/tag/v1.2.7

@@ -51,8 +51,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --retries 5 -e ".[test]"
       - name: Run unit tests
         run: |
           pytest tests/unit/test_native_cpu_kernels.py -v -m "not slow" --no-cov
@@ -98,8 +98,8 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --retries 5 -e ".[test]"
       - name: Verify v3.1 package artifacts
         run: pytest tests/unit/test_v31_features.py::test_compiled_package_contains_v31_artifacts --no-cov -v || true
 
@@ -113,7 +113,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install test dependencies
-        run: pip install -e ".[test]"
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --retries 5 -e ".[test]"
       - name: Validate v3.1 runtime layers
         run: pytest tests/unit/test_v31_runtime_layers.py --no-cov -v || true
 
@@ -128,8 +130,8 @@ jobs:
           python-version: "3.12"
       - name: Install test dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --retries 5 -e ".[test]"
       - name: Run PRD v4.0+v5.0 optimizer pass tests
         run: |
           pytest tests/test_passes_v2.py -v --tb=short --no-cov \
@@ -153,8 +155,8 @@ jobs:
           python-version: "3.12"
       - name: Install test dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --retries 5 -e ".[test]"
       - name: Run PRD v4.0+v5.0 runtime layer tests
         run: |
           pytest tests/test_runtime_v2.py -v --tb=short --no-cov \
@@ -178,8 +180,8 @@ jobs:
           python-version: "3.12"
       - name: Install test dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --retries 5 -e ".[test]"
       - name: Verify 22 passes registered in OptimizerPipeline
         run: |
           python -c "
@@ -214,8 +216,8 @@ jobs:
           python-version: "3.12"
       - name: Install test dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --retries 5 -e ".[test]"
       - name: Run algorithm-specific tests
         run: |
           pytest \
@@ -244,8 +246,8 @@ jobs:
           python-version: "3.12"
       - name: Install test dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --retries 5 -e ".[test]"
       - name: Run AEG Format 2.0 tests
         run: |
           pytest tests/unit/test_aeg_format_v2.py \
@@ -296,8 +298,8 @@ jobs:
           python-version: "3.12"
       - name: Install test dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --retries 5 -e ".[test]"
       - name: Run RISC-V backend and hardware profile tests
         run: |
           pytest tests/unit/test_riscv_and_hardware.py \
@@ -346,7 +348,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install test dependencies
-        run: pip install -e ".[test]"
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --retries 5 -e ".[test]"
       - name: Verify v4.0 HardwareProfile fields
         run: |
           python -c "
@@ -380,8 +384,8 @@ jobs:
           python-version: "3.12"
       - name: Install test dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --retries 5 -e ".[test]"
       - name: Run Runtime v4.0 extension tests
         run: |
           pytest tests/unit/test_runtime_v4_extensions.py \
