@@ -163,6 +163,8 @@ qwen*/
 # compiled .aeg artifacts are large build products.
 benchmark/results/*
 !benchmark/results/.gitkeep
+!benchmark/results/*.png
+!benchmark/results/generate_readme_charts.py
 
 # Multi-engine suite outputs (python benchmark.py). Same reasoning: the raw
 # records, figures and report belong to one host at one moment, and the compiled

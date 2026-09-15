@@ -60,6 +60,24 @@ Every engine was scored identically by the same measurement harness across the e
 
 ---
 
+### Visual Benchmark Comparisons — 3 Engines across 3 Architectures
+
+The charts below illustrate empirical measurements extracted directly from the comprehensive benchmark suite across all three architectures (`SmolLM2-135M`, `GPTNeo-350M`, `Qwen3-0.6B`) executed under strictly identical conditions on 2× NVIDIA Tesla T4 GPUs (FP16 Native Tensor-Core Execution).
+
+#### 1. Output Tokens Per Second (Throughput) — 3 Engines across 3 Models
+
+![Output Tokens Per Second Comparison](benchmark/results/cross_engine_throughput_comparison.png)
+
+*Comparison of output tokens per second across all 3 evaluated models: **Single-Request Interactive Throughput** (Batch 1, prompt=256, output=128, left panel) and **Peak Batched Serving Throughput** (Batch 16, prompt=256, output=128, right panel). Aether delivers **1.71x to 2.68x** (+70.7% to +168.4%) higher single-stream throughput and scales up to **1,562.72 tok/s** at Batch 16.*
+
+#### 2. End-to-End Single-Request Latency (Not TTFT) — 3 Engines across 3 Models
+
+![End-to-End Latency Comparison](benchmark/results/cross_engine_latency_comparison.png)
+
+*Single-request end-to-end latency (seconds per request for 128 generated tokens; **▼ lower is better**). This measures full decode request completion time—distinct from Time-To-First-Token (TTFT)—where Aether decisively outperforms the field across all three architectures, cutting latency by **41.4% to 62.7%** and saving **1.95s to 2.91s per request** compared to HuggingFace Transformers and PyTorch Native.*
+
+---
+
 ### Model-by-Model Results with Exact Empirical Evidence
 
 #### 1. SummerSigh/GPTNeo350M-Instruct-SFT (456M Params)
