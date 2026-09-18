@@ -43,11 +43,107 @@ from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-__all__ = ["AEGLoadError", "load_engine_from_package", "load_engine_from_path", "package_is_runnable"]
+__all__ = [
+    "AEGLoadError",
+    "build_paged_kv_pool_for_engine",
+    "load_engine_from_package",
+    "load_engine_from_path",
+    "package_is_runnable",
+]
 
 
 class AEGLoadError(AEGFormatError):
     """Raised when a package cannot be turned into an executable engine."""
+
+
+def build_paged_kv_pool_for_engine(
+    package: "Any",
+    engine: "CPUExecutionEngine",
+    *,
+    max_seqs: int = 64,
+    max_pages: int = 1024,
+    device: str = "cpu",
+) -> "Any":
+    """
+    Build a :class:`~aether.runtime.paged_kv_cache.PagedKVPool` from the
+    compiled KV cache plan stored in *package*.
+
+    :class:`~aether.compiler.stage2_optimizer.optimizer.KVCacheStructuringPass`
+    writes ``block_size``, ``num_heads``, and ``head_dim`` into KV-cache graph
+    nodes.  This function reads those values, falls back to the engine's own
+    attributes when the graph is absent, and constructs a live pool ready to
+    be passed to :meth:`~aether.runtime.cpu_engine.CPUExecutionEngine.forward_paged`.
+
+    Args:
+        package: A loaded :class:`~aether.core.aeg_format.AEGPackage`.
+        engine: The :class:`~aether.runtime.cpu_engine.CPUExecutionEngine`
+            that will use this pool.
+        max_seqs: Maximum number of simultaneously active sequences.
+        max_pages: Total page budget for the pool.
+        device: ``"cpu"`` (GPU pools are not yet supported).
+
+    Returns:
+        A configured :class:`~aether.runtime.paged_kv_cache.PagedKVPool`
+        with the block size and head geometry matching the compiled plan.
+    """
+    from aether.runtime.paged_kv_cache import PagedKVPool
+
+    # Defaults from the engine in case the graph has no KV metadata
+    num_layers = len(engine.weights.layers)
+    num_kv_heads = engine.num_kv_heads
+    head_dim = engine.head_dim
+    block_size = 16  # KVCacheStructuringPass default
+
+    # Try to read from the compiled graph metadata
+    try:
+        metadata = getattr(package, "metadata", None) or {}
+        if callable(metadata):
+            metadata = {}
+        # KVCacheStructuringPass writes kv_cache nodes into the graph; the
+        # pass report is persisted in graph/metadata.json under "pass_reports"
+        pass_reports = metadata.get("pass_reports", {})
+        kv_report = pass_reports.get("kv_cache_structuring", {})
+        kv_details = kv_report.get("details", {})
+        if kv_details.get("kv_cache_nodes_added", 0) > 0:
+            # Block size was fixed at 16 in KVCacheStructuringPass
+            block_size = int(kv_details.get("block_size", block_size))
+        # Also check the compiled graph nodes directly
+        graph_path = getattr(package, "root", None)
+        if graph_path is not None:
+            import json
+            meta_path = graph_path / "graph" / "metadata.json"
+            if meta_path.is_file():
+                graph_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                kv_nodes = [
+                    v for v in graph_meta.get("nodes", {}).values()
+                    if isinstance(v, dict) and v.get("node_type") == "kv_cache"
+                ]
+                if kv_nodes:
+                    first = kv_nodes[0]
+                    attrs = first.get("attributes", {})
+                    block_size = int(attrs.get("block_size", block_size))
+                    num_kv_heads = int(attrs.get("num_heads", num_kv_heads))
+                    head_dim = int(attrs.get("head_dim", head_dim))
+    except Exception as _meta_err:  # noqa: BLE001
+        logger.debug(
+            "Could not read KV cache plan from graph metadata (%s); using engine defaults",
+            _meta_err,
+        )
+
+    pool = PagedKVPool(
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=block_size,
+        max_pages=max_pages,
+        device=device,
+    )
+    logger.info(
+        "Built PagedKVPool: %d layers × %d kv_heads × %d head_dim, "
+        "block_size=%d, max_pages=%d",
+        num_layers, num_kv_heads, head_dim, block_size, max_pages,
+    )
+    return pool
 
 
 #: Graph-node component names required for each transformer layer, mapped to the
@@ -168,6 +264,14 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
     num_kv_heads = int(architecture.get("num_kv_heads") or num_heads)
 
     tensors = _dequantized_by_key(package)
+    # Also load raw quantized tensors for non-FP32 projections.
+    # These will be injected into LayerWeights.quant_meta so that
+    # _linear() can dispatch to quantized GEMM kernels.
+    try:
+        raw_quant = _quantized_tensors_by_key(package)
+    except Exception as _qerr:  # noqa: BLE001
+        logger.debug("Quantized tensor loading failed (%s); all layers will run FP32", _qerr)
+        raw_quant = {}
     embedding = _require(tensors, (None, "embedding"), "token embedding")
     hidden_size = int(embedding.shape[1])
 
@@ -200,35 +304,49 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
 
     layers: list[LayerWeights] = []
     for index in range(num_layers):
-        layers.append(
-            _build_layer(
-                tensors,
-                index,
-                hidden_size,
-                num_heads,
-                num_kv_heads,
-                ffn_type=str(architecture.get("ffn_type", "SwiGLU") or "SwiGLU"),
-                num_experts=int(architecture.get("num_experts", 0) or 0),
-                num_activated_experts=int(
-                    architecture.get("num_activated_experts", 0) or 0
-                ),
-                parallel_residual=bool(architecture.get("parallel_residual", False)),
-                norm_placement=(
-                    "sandwich"
-                    if str(architecture.get("norm_placement", "pre")).lower() == "sandwich_glm"
-                    else str(architecture.get("norm_placement", "pre") or "pre")
-                ),
-                qk_norm_scope=str(architecture.get("qk_norm_scope", "head") or "head"),
-                num_kv_heads_for_norm=num_kv_heads,
-                is_moe_layer=(
-                    bool(architecture.get("is_moe", False))
-                    and (
-                        architecture.get("moe_layer_indices") is None
-                        or index in architecture.get("moe_layer_indices", [])
-                    )
-                ),
-            )
+        layer = _build_layer(
+            tensors,
+            index,
+            hidden_size,
+            num_heads,
+            num_kv_heads,
+            ffn_type=str(architecture.get("ffn_type", "SwiGLU") or "SwiGLU"),
+            num_experts=int(architecture.get("num_experts", 0) or 0),
+            num_activated_experts=int(
+                architecture.get("num_activated_experts", 0) or 0
+            ),
+            parallel_residual=bool(architecture.get("parallel_residual", False)),
+            norm_placement=(
+                "sandwich"
+                if str(architecture.get("norm_placement", "pre")).lower() == "sandwich_glm"
+                else str(architecture.get("norm_placement", "pre") or "pre")
+            ),
+            qk_norm_scope=str(architecture.get("qk_norm_scope", "head") or "head"),
+            num_kv_heads_for_norm=num_kv_heads,
+            is_moe_layer=(
+                bool(architecture.get("is_moe", False))
+                and (
+                    architecture.get("moe_layer_indices") is None
+                    or index in architecture.get("moe_layer_indices", [])
+                )
+            ),
         )
+        # Inject per-projection quantization metadata for non-FP32 weights.
+        # _linear() will use this to auto-dispatch to quantized GEMM kernels.
+        layer_quant: dict[str, tuple[str, Any, Any]] = {}
+        for proj_name in _QUANTIZABLE_PROJECTIONS:
+            qt = raw_quant.get((index, proj_name))
+            if qt is not None:
+                scales = np.asarray(qt.scales, dtype=np.float32) if qt.scales is not None else None
+                zeros = np.asarray(qt.zero_points, dtype=np.float32) if qt.zero_points is not None else None
+                layer_quant[proj_name] = (qt.precision, scales, zeros)
+        if layer_quant:
+            layer.quant_meta = layer_quant
+            logger.debug(
+                "Layer %d: quantized dispatch for %s",
+                index, ", ".join(sorted(layer_quant.keys()))
+            )
+        layers.append(layer)
     if len(layers) != num_layers:  # defensive: loop above always satisfies this
         raise AEGLoadError(
             f"Layer count invariant violated: built {len(layers)} layers, "
@@ -1294,6 +1412,69 @@ def _dequantized_by_key(package: Any) -> dict[tuple[int | None, str | None], np.
         result.setdefault(key, dequantize_tensor(store.load_tensor(name)))
     if alias_lm_head and (None, "embedding") in result:
         result[(None, "lm_head")] = result[(None, "embedding")]
+    return result
+
+
+# Projection names that participate in quantized dispatch (norm/bias tensors stay FP32)
+_QUANTIZABLE_PROJECTIONS: frozenset[str] = frozenset({
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+    "q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj",
+})
+_FLOAT_PRECISIONS: frozenset[str] = frozenset({
+    "fp32", "float32", "fp16", "float16", "bf16", "bfloat16",
+})
+
+
+def _quantized_tensors_by_key(
+    package: Any,
+) -> dict[tuple[int | None, str | None], "Any"]:
+    """
+    Return raw :class:`~aether.quantization.formats.QuantizedTensor` objects
+    keyed by ``(layer_index, component)`` for projections that are stored in a
+    non-FP32 quantized format.
+
+    Norm vectors, biases, embeddings, and float-precision tensors are omitted
+    (they are loaded by :func:`_dequantized_by_key` and always used as FP32).
+
+    Used by :func:`load_engine_from_package` to populate
+    :attr:`LayerWeights.quant_meta` so that
+    :meth:`~aether.runtime.cpu_engine.CPUExecutionEngine._linear` can
+    automatically dispatch to quantized GEMM kernels without the caller
+    needing to pass ``precision=`` explicitly.
+    """
+    from aether.compiler.stage1_ingestion.ingestion import IngestionPipeline
+    from aether.quantization.formats import QuantizedTensor
+
+    try:
+        store = package.weight_store()
+    except Exception:  # noqa: BLE001
+        return {}
+
+    result: dict[tuple[int | None, str | None], "QuantizedTensor"] = {}
+    _LAYER_RE = re.compile(
+        r"^layer_(\d+)_(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|"
+        r"q_a_proj|q_b_proj|kv_a_proj|kv_b_proj)$"
+    )
+    for name in store.entries:
+        if name.endswith("_bias"):
+            continue
+        m = _LAYER_RE.match(name)
+        if not m:
+            continue
+        layer_idx = int(m.group(1))
+        proj_name = m.group(2)
+        try:
+            qt = store.load_tensor(name)  # type: Any
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(qt, QuantizedTensor):
+            continue
+        prec = str(getattr(qt, "precision", "") or "").lower()
+        if prec in _FLOAT_PRECISIONS or not prec:
+            continue  # FP16/BF16/FP32 — no quantized dispatch needed
+        result.setdefault((layer_idx, proj_name), qt)
+
     return result
 
 

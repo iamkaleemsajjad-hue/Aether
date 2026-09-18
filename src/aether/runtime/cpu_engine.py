@@ -133,6 +133,14 @@ class LayerWeights:
     router: np.ndarray | None = None
     experts: list[ExpertWeights] = field(default_factory=list)
     num_activated_experts: int = 1
+    #: Per-projection quantization metadata: maps projection name
+    #: (e.g. ``"q_proj"``) to a tuple of ``(precision, scales, zeros)``.
+    #: Populated by :func:`~aether.runtime.aeg_loader.load_engine_from_package`
+    #: when the AEG artifact stores quantized weights.  When present,
+    #: :meth:`~CPUExecutionEngine._linear` uses the stored precision/scales to
+    #: dispatch to :class:`~aether.kernels.quantized_linear.QuantizedLinear`
+    #: without the caller needing to specify precision explicitly.
+    quant_meta: "dict[str, tuple[str, Any, Any]] | None" = None
 
     def validate(self, layer_index: int, hidden_size: int) -> None:
         """Check that the projections compose into a valid layer."""
@@ -1020,9 +1028,78 @@ class CPUExecutionEngine:
         weight: np.ndarray,
         target: tuple[int, str] | None = None,
         bias: np.ndarray | None = None,
+        precision: str | None = None,
+        weight_scale: "np.ndarray | None" = None,
+        weight_zero: "np.ndarray | None" = None,
     ) -> np.ndarray:
-        """Apply a base linear projection and the selected real LoRA delta."""
+        """Apply a base linear projection with quantized dispatch and LoRA delta.
+
+        When ``precision`` is provided and the weight is a quantized integer
+        format, dispatches to :class:`~aether.kernels.quantized_linear.QuantizedLinear`
+        which selects the best available backend:
+        - CUDA sm89+: ``torch._scaled_mm`` for FP8
+        - CUDA sm80+: ``torch._int_mm`` for INT8
+        - bitsandbytes: W4A16 for NF4
+        - NumPy dequant fallback for all others / CPU
+
+        FP32/BF16/FP16 weights skip quantized dispatch and go directly to
+        the native SGEMM kernel.
+        """
         x32 = np.ascontiguousarray(x, dtype=np.float32)
+
+        # ── Auto-resolve quantization from LayerWeights.quant_meta ───────────
+        # When precision is not passed explicitly, check if the active layer has
+        # per-projection quantization metadata from the AEG compile plan.
+        # target is (layer_index, proj_name) — used to locate the right layer.
+        if precision is None and target is not None and len(target) == 2:
+            layer_idx, proj_name = target[0], target[1]
+            # Walk stored layers to find matching quant_meta
+            if (
+                isinstance(layer_idx, int)
+                and 0 <= layer_idx < len(self.weights.layers)
+            ):
+                qm = self.weights.layers[layer_idx].quant_meta
+                if qm is not None and proj_name in qm:
+                    precision, weight_scale, weight_zero = qm[proj_name]
+
+        # ── Quantized dispatch ────────────────────────────────────────────────
+        _QUANT_PRECISIONS = {"int8", "fp8", "fp8_e4m3", "nf4", "int4", "w4a16", "w8a16"}
+        if precision is not None and str(precision).lower() in _QUANT_PRECISIONS:
+            try:
+                from aether.kernels.quantized_linear import QuantizedLinear
+                ql = QuantizedLinear(
+                    weight=weight,
+                    fmt=str(precision).lower(),
+                    scale=weight_scale,
+                    zero_point=weight_zero,
+                )
+                output = ql(x32)
+                # QL returns (batch, out_features); ensure float32 numpy
+                output = np.ascontiguousarray(output, dtype=np.float32)
+                if bias is not None:
+                    bias_array = np.asarray(bias, dtype=np.float32).reshape(-1)
+                    if bias_array.size != output.shape[-1]:
+                        raise ValueError(
+                            f"linear bias has {bias_array.size} elements but output has "
+                            f"{output.shape[-1]} features"
+                        )
+                    output = output + bias_array
+                if self.active_lora_adapter is None or target is None:
+                    return output
+                adapter = self.lora_adapters.get(self.active_lora_adapter)
+                if adapter is None or target not in adapter:
+                    return output
+                A, B, scale = adapter[target]
+                delta = self.kernels.sgemm(
+                    self.kernels.sgemm(x32, np.asarray(A, dtype=np.float32).T),
+                    np.asarray(B, dtype=np.float32).T,
+                )
+                return np.ascontiguousarray(output + delta * np.float32(scale), dtype=np.float32)
+            except Exception as _exc:  # noqa: BLE001
+                # Fall through to FP32 sgemm on any quantized dispatch failure.
+                logger.debug("quantized dispatch failed (%s); falling back to sgemm", _exc)
+
+        # ── FP32 sgemm path (default) ─────────────────────────────────────────
         matrix = np.asarray(weight, dtype=np.float32)
         if matrix.ndim != 2:
             raise ValueError(
@@ -1678,6 +1755,269 @@ class CPUExecutionEngine:
         cache.advance(seq_len)
         cache.last_logits = np.asarray(logits[-1], dtype=np.float32).copy()
         return logits, cache
+
+    def forward_step(
+        self,
+        token_ids: "list[int] | np.ndarray",
+        kv_cache: "KVCache | None" = None,
+        return_all_logits: bool = False,
+    ) -> "tuple[np.ndarray, KVCache]":
+        """
+        Single forward step satisfying the ``ForwardStepEngine`` protocol.
+
+        Used by :class:`~aether.runtime.speculative_engine.DraftTargetSpecDecoder`
+        and :class:`~aether.runtime.continuous_batcher.ContinuousBatcher` so
+        that they can drive any engine without knowing its internal API.
+
+        Args:
+            token_ids: 1-D integer array or list of token IDs.
+            kv_cache: Existing :class:`KVCache`, or ``None`` for fresh prefill.
+            return_all_logits: If ``True`` return ``(seq_len, vocab)`` logits;
+                otherwise return only the last position ``(vocab,)``.
+
+        Returns:
+            ``(logits, updated_kv_cache)`` where logits shape is
+            ``(seq_len, vocab)`` or ``(vocab,)`` depending on
+            ``return_all_logits``.
+        """
+        ids = np.ascontiguousarray(token_ids, dtype=np.int64).reshape(-1)
+        logits, new_cache = self.forward(ids, cache=kv_cache)
+        if not return_all_logits:
+            logits = logits[-1]  # last-position logits for decode step
+        return logits, new_cache
+
+    # ------------------------------------------------------------------
+    # Paged KV forward pass — uses PagedKVPool for storage + attention
+    # ------------------------------------------------------------------
+
+    def forward_paged(
+        self,
+        token_ids: "np.ndarray",
+        pool: "Any",
+        seq_id: str,
+        causal_offset: int = 0,
+        ttt_slots: "list[dict[str, Any]] | None" = None,
+        adapter_id: "str | None" = None,
+    ) -> "np.ndarray":
+        """
+        Transformer forward pass using paged KV storage.
+
+        Unlike :meth:`forward`, this method writes new K/V vectors into a
+        :class:`~aether.runtime.paged_kv_cache.PagedKVPool` and reads all
+        previous K/V from pool blocks via the paged attention kernel.  No
+        contiguous ``(seq, total_kv)`` intermediate tensor is ever created.
+
+        Args:
+            token_ids: 1-D token id array for this step.
+            pool: A live :class:`~aether.runtime.paged_kv_cache.PagedKVPool`.
+            seq_id: Sequence identifier registered in *pool*.
+            causal_offset: Absolute position of the first ``token_ids`` token.
+            ttt_slots: Optional TTT fast-weight slots (per-layer).
+            adapter_id: Verified LoRA adapter id (or ``None``).
+
+        Returns:
+            Logits array of shape ``(seq_len, vocab_size)``.
+        """
+        from aether.runtime.paged_attention import paged_attention_cpu
+
+        if adapter_id is not None and adapter_id != self.active_lora_adapter:
+            raise ValueError("adapter_id must match the request-local engine selection")
+
+        ids = np.ascontiguousarray(token_ids, dtype=np.int64).reshape(-1)
+        seq_len = int(ids.size)
+
+        uses_rope = str(self.weights.position_type or "RoPE").lower() in {
+            "rope", "rotary", "rotary_embedding"
+        }
+        if uses_rope:
+            self._ensure_rope_capacity(causal_offset + seq_len)
+
+        hidden = self.weights.embedding[ids].astype(np.float32)
+        if self.weights.embedding_scale is not None:
+            hidden = hidden * np.float32(self.weights.embedding_scale)
+        if self.weights.embedding_norm is not None:
+            hidden = self._norm(hidden, self.weights.embedding_norm, self.weights.embedding_norm_bias)
+
+        alibi_slopes = getattr(self, "_alibi_slopes", None)
+        pos_type = str(self.weights.position_type or "rope").lower()
+        use_alibi = pos_type in {"alibi", "alibi_bias"}
+
+        for index, layer in enumerate(self.weights.layers):
+            attention_layers = getattr(self.weights, "attention_layers", None)
+            attention_kind = (
+                str(attention_layers[index]).lower()
+                if isinstance(attention_layers, list) and index < len(attention_layers)
+                else "global"
+            )
+            local_attention = attention_kind in {"local", "sliding_window", "window"}
+            attention_window = (
+                int(getattr(self.weights, "attention_window", 0) or 0)
+                if local_attention else None
+            )
+            layer_uses_rope = uses_rope and self._layer_uses_rope(index)
+            attention_scale = float(
+                getattr(layer, "attention_scale", None)
+                or getattr(self.weights, "attention_scale", None)
+                or (1.0 / np.sqrt(self.head_dim))
+            )
+
+            past = causal_offset
+
+            # ── Pre-norm / QKV projection ──────────────────────────────
+            post_norm = getattr(self.weights, "post_norm", False)
+            if post_norm:
+                normed = hidden
+            else:
+                normed = self._norm(hidden, layer.attention_norm, layer.attention_norm_bias)
+
+            if ttt_slots is not None:
+                normed = self._apply_ttt_slot(
+                    normed, ttt_slots[index] if index < len(ttt_slots) else None
+                )
+
+            q = self._linear(normed, layer.q_proj, (index, "q_proj"), layer.q_proj_bias)
+            q = q.reshape(seq_len, self.num_heads, self.head_dim)
+            if layer_uses_rope:
+                q = self._apply_rope(q, past, local=local_attention)
+
+            k = self._linear(normed, layer.k_proj, (index, "k_proj"), layer.k_proj_bias)
+            k = k.reshape(seq_len, self.num_kv_heads, self.head_dim)
+            v = self._linear(normed, layer.v_proj, (index, "v_proj"), layer.v_proj_bias).reshape(
+                seq_len, self.num_kv_heads, self.head_dim
+            )
+            if layer_uses_rope:
+                k = self._apply_rope(k, past, local=local_attention)
+
+            # ── Write new K/V into pool ────────────────────────────────
+            for t in range(seq_len):
+                pool.append_kv(seq_id, layer_idx=index, k=k[t], v=v[t])
+
+            # ── Paged attention (reads directly from pool blocks) ──────
+            context = paged_attention_cpu(
+                query=q,
+                pool=pool,
+                seq_id=seq_id,
+                layer_idx=index,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                causal_offset=past,
+                scale=attention_scale,
+                position_type=pos_type,
+                alibi_slopes=alibi_slopes if use_alibi else None,
+                window_size=attention_window,
+            )
+            # context: (seq, num_heads, head_dim)
+
+            # ── Output projection ─────────────────────────────────────
+            attention_out = self._linear(
+                context.reshape(seq_len, self.num_heads * self.head_dim),
+                layer.o_proj, (index, "o_proj"), layer.o_proj_bias,
+            )
+            if layer.post_attention_norm is not None:
+                attention_out = self._norm(
+                    attention_out, layer.post_attention_norm, layer.post_attention_norm_bias
+                )
+            elif post_norm:
+                attention_out = self._norm(
+                    attention_out, layer.attention_norm, layer.attention_norm_bias
+                )
+            attention_out = self._scale_residual(attention_out)
+
+            # ── Residual + FFN ────────────────────────────────────────
+            hidden = hidden + attention_out
+
+            if not post_norm:
+                ffn_normed = self._norm(hidden, layer.ffn_norm, layer.ffn_norm_bias)
+            else:
+                ffn_normed = hidden
+
+            # FFN block (mirrors forward() exactly)
+            if layer.experts:
+                ffn_out = self._moe_ffn(ffn_normed, layer)
+            else:
+                if layer.gate_proj is None or layer.down_proj is None:
+                    raise ValueError(f"layer {index} has incomplete dense FFN weights")
+                gate = self._linear(ffn_normed, layer.gate_proj, (index, "gate_proj"), layer.gate_proj_bias)
+                up = (
+                    self._linear(ffn_normed, layer.up_proj, (index, "up_proj"), layer.up_proj_bias)
+                    if layer.up_proj is not None
+                    else None
+                )
+                ffn_out = self._linear(
+                    self._ffn_activation(gate, up), layer.down_proj, (index, "down_proj"), layer.down_proj_bias
+                )
+
+            if layer.post_ffn_norm is not None:
+                ffn_out = self._norm(ffn_out, layer.post_ffn_norm, layer.post_ffn_norm_bias)
+            elif post_norm:
+                ffn_out = self._norm(ffn_out, layer.ffn_norm, layer.ffn_norm_bias)
+
+            hidden = hidden + self._scale_residual(ffn_out)
+
+        # ── Final norm + LM head ──────────────────────────────────────
+        hidden = self._norm(hidden, self.weights.final_norm, self.weights.final_norm_bias)
+        logits = self._finalize_logits(self._linear(hidden, self.weights.lm_head))
+        return logits
+
+    def generate_paged(
+        self,
+        prompt_ids: "np.ndarray",
+        pool: "Any",
+        seq_id: str,
+        max_tokens: int = 16,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        eos_token_id: "int | None" = None,
+        seed: "int | None" = None,
+    ) -> "list[int]":
+        """
+        Autoregressively generate tokens using paged KV attention.
+
+        Writes all KV into *pool* under *seq_id* and calls
+        :meth:`forward_paged` for every decode step.  The pool is
+        **not** freed after generation — call ``pool.free_sequence(seq_id)``
+        when done.
+
+        Args:
+            prompt_ids: Prompt token ids.
+            pool: Live :class:`~aether.runtime.paged_kv_cache.PagedKVPool`.
+            seq_id: Unique sequence identifier (must already be allocated in pool).
+            max_tokens: Maximum new tokens.
+            temperature: 0 = greedy; higher = more random.
+            top_k: Sampling top-k (0 = off).
+            top_p: Nucleus sampling probability (1.0 = off).
+            eos_token_id: Early stop on this token id.
+            seed: RNG seed for reproducible sampling.
+
+        Returns:
+            Generated token id list (excluding prompt).
+        """
+        rng = np.random.default_rng(seed)
+        ids = np.ascontiguousarray(prompt_ids, dtype=np.int64).reshape(-1)
+        causal_offset = 0
+
+        # Prefill
+        logits = self.forward_paged(ids, pool=pool, seq_id=seq_id, causal_offset=0)
+        causal_offset = int(ids.size)
+
+        generated: list[int] = []
+        next_logits = logits[-1]  # last position
+
+        for _ in range(max_tokens):
+            next_id = int(self._sample(next_logits, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng))
+            generated.append(next_id)
+            if eos_token_id is not None and next_id == eos_token_id:
+                break
+            next_arr = np.array([next_id], dtype=np.int64)
+            next_logits_all = self.forward_paged(
+                next_arr, pool=pool, seq_id=seq_id, causal_offset=causal_offset
+            )
+            next_logits = next_logits_all[-1]
+            causal_offset += 1
+
+        return generated
 
     def generate(
         self,

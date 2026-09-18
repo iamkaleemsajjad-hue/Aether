@@ -33,17 +33,19 @@ class BackendRegistry:
         builtin_backends = [
             # 1. Always available — pure numpy + compiled C++ (no PyTorch needed)
             "aether.backends.native_cpu_backend:NativeCPUBackend",
-            # 2. ONNX Runtime — fast CPU/GPU inference without PyTorch
+            # 2. Native CUDA — Aether's own JIT-compiled CUDA kernels, no PyTorch
+            "aether.backends.native_cuda_backend:NativeCUDABackend",
+            # 3. ONNX Runtime — fast CPU/GPU inference without PyTorch
             "aether.backends.onnx_backend:ONNXBackend",
-            # 3. llama.cpp — optimised native CPU inference with GGUF models
+            # 4. llama.cpp — optimised native CPU inference with GGUF models
             "aether.backends.llamacpp_backend:LlamaCppBackend",
-            # 4. Apple MLX — Apple Silicon (Metal) without PyTorch
+            # 5. Apple MLX — Apple Silicon (Metal) without PyTorch
             "aether.backends.mlx_backend:MLXBackend",
-            # 5. vLLM — high-throughput GPU serving
+            # 6. vLLM — high-throughput GPU serving
             "aether.backends.vllm_backend:vLLMBackend",
-            # 6. TensorRT-LLM — NVIDIA optimised GPU serving
+            # 7. TensorRT-LLM — NVIDIA optimised GPU serving
             "aether.backends.trtllm_backend:TensorRTLLMBackend",
-            # 7. PyTorch — LAST RESORT; requires torch + transformers installed
+            # 8. PyTorch — LAST RESORT; requires torch + transformers installed
             "aether.backends.torch_backend:TorchBackend",
         ]
 

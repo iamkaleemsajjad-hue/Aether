@@ -46,7 +46,7 @@ Every engine was scored identically by the same measurement harness across the e
 
 | Rank | Engine | % of Best (Median) | W / L / T | Win Rate | Median Diff vs Field | Cells Measured | Pairings Evaluated |
 |:---:|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| 🥇 | **`aether`** | **100%** | **54 / 0 / 0** | **100%** | **+99.2%** | **27** | **54 / 54** |
+| 🥇 | **`aether`** | **100%** | **54 / 0 / 0** | **100%** | **+99.2%** | 27 | 54 / 54 |
 | 🥈 | `transformers` | 51% | 14 / 27 / 13 | 26% | -6.7% | 27 | 54 / 54 |
 | 🥉 | `pytorch_native` | 49% | 0 / 40 / 14 | 0% | -8.7% | 27 | 54 / 54 |
 

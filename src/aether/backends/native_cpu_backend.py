@@ -358,6 +358,8 @@ class NativeCPUBackend(Backend):
         self._tokenizers: dict[str, PackagedTokenizer] = {}
         self._device = "cpu"
         self._allow_remote_code = False
+        # Per-model ContinuousBatcher instances (created lazily on first use)
+        self._batchers: dict[str, Any] = {}
 
     def is_available(self) -> bool:
         """The backend is available whenever the base NumPy runtime is usable."""
@@ -624,6 +626,32 @@ class NativeCPUBackend(Backend):
         if state is not None:
             state[0].end_request(state[1])
 
+    def _get_or_create_batcher(
+        self,
+        model_id: str,
+        handle: "CompiledAEGHandle",
+        eos_token_ids: "list[int] | None" = None,
+        max_batch_size: int = 8,
+        max_seq_len: int = 2048,
+    ) -> "Any":
+        """Return a :class:`~aether.runtime.continuous_batcher.ContinuousBatcher`
+        for *model_id*, creating it lazily on first call."""
+        from aether.runtime.continuous_batcher import BatcherConfig, ContinuousBatcher
+
+        if model_id in self._batchers:
+            return self._batchers[model_id]
+        config = BatcherConfig(
+            max_decode_seqs=max_batch_size,
+            eos_token_ids=list(eos_token_ids or []),
+        )
+        batcher = ContinuousBatcher(engine=handle.engine, config=config)
+        self._batchers[model_id] = batcher
+        return batcher
+
+    def get_batcher(self, model_id: str) -> "Any | None":
+        """Return the active ContinuousBatcher for *model_id*, or ``None``."""
+        return self._batchers.get(model_id)
+
     def generate(self, request: GenerationRequest) -> GenerationResult:
         """Generate from an executable AEG without importing a model framework."""
         if request.model_id not in self._models:
@@ -632,6 +660,53 @@ class NativeCPUBackend(Backend):
         if handle.engine is None or handle.tokenizer is None:
             raise BackendError("loaded AEG has no native tokenizer-backed engine", backend_name=self.name)
         import time
+
+        # ── ContinuousBatcher path ────────────────────────────────────────────
+        # When ``use_continuous_batching=True`` is set in request.extra, route
+        # through ContinuousBatcher.generate_sync() so multiple concurrent
+        # requests share one decode loop rather than serialising on the GIL.
+        if request.extra.get("use_continuous_batching"):
+            try:
+                text = self._request_text(request, handle.tokenizer)
+                encoded = handle.tokenizer(text, return_tensors="np")
+                prompt_ids_list: list[int] = encoded["input_ids"][0].tolist()
+                eos_ids = _stop_ids(handle.tokenizer)
+                eos_list = [eos_ids] if isinstance(eos_ids, int) else list(eos_ids or [])
+                batcher = self._get_or_create_batcher(
+                    request.model_id, handle,
+                    eos_token_ids=eos_list,
+                    max_batch_size=int(request.extra.get("batch_max_size", 8)),
+                    max_seq_len=int(request.extra.get("batch_max_seq_len", 2048)),
+                )
+                _start = time.perf_counter()
+                generated_ids = batcher.generate_sync(
+                    token_ids=prompt_ids_list,
+                    max_new_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    stop_token_ids=eos_list,
+                )
+                _elapsed = time.perf_counter() - _start
+                _text = handle.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                _ct = len(generated_ids)
+                return GenerationResult(
+                    text=_text,
+                    prompt_tokens=len(prompt_ids_list),
+                    completion_tokens=_ct,
+                    finish_reason="stop" if _ct < request.max_tokens else "length",
+                    backend_name=self.name,
+                    metrics={
+                        "ttft_ms": _elapsed * 1000.0,
+                        "throughput_tps": _ct / max(_elapsed, 1e-9),
+                        "device": self._device,
+                        "framework_free": True,
+                        "scheduler": "continuous_batching",
+                    },
+                )
+            except Exception as _cb_exc:  # noqa: BLE001
+                logger.warning(
+                    "ContinuousBatcher path failed (%s); falling back to standard generate",
+                    _cb_exc,
+                )
 
         text = self._request_text(request, handle.tokenizer)
         encoded = self._encode_prompt(text, request, handle.tokenizer)
@@ -686,8 +761,58 @@ class NativeCPUBackend(Backend):
                 handle.clear_session_cache(session_id)
 
         start = time.perf_counter()
+        spec_draft_engine = request.extra.get("spec_draft_engine")
+        spec_gamma = int(request.extra.get("spec_gamma", 4))
         try:
-            if hasattr(engine, "generate_with_cache"):
+            # ── Speculative decoding path ─────────────────────────────────────
+            if spec_draft_engine is not None:
+                from aether.runtime.speculative_engine import (
+                    DraftTargetSpecDecoder, SpeculativeConfig,
+                )
+                spec_config = SpeculativeConfig(
+                    gamma=spec_gamma,
+                    draft_temperature=max(float(request.temperature), 1e-7),
+                    greedy_acceptance=(request.temperature == 0.0),
+                )
+                spec_decoder = DraftTargetSpecDecoder(
+                    draft_engine=spec_draft_engine,
+                    target_engine=engine,
+                    config=spec_config,
+                )
+                generated: list[int] = []
+                max_new = request.max_tokens
+                current_ids = list(np.asarray(suffix, dtype=np.int64))
+                draft_cache = None
+                target_cache = cache  # May be None (no KV reuse) or warmed cache
+                eos_ids = _stop_ids(handle.tokenizer)
+                eos_set: set[int] = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids or [])
+                while len(generated) < max_new:
+                    accepted, draft_cache, target_cache, _step_stats = spec_decoder.generate_step(
+                        current_ids,
+                        draft_cache=draft_cache,
+                        target_cache=target_cache,
+                    )
+                    for tok in accepted:
+                        generated.append(tok)
+                        if eos_set and tok in eos_set:
+                            break
+                    if eos_set and any(t in eos_set for t in accepted):
+                        # Trim at first EOS
+                        for stop_i, tok in enumerate(generated):
+                            if tok in eos_set:
+                                generated = generated[:stop_i]
+                                break
+                        break
+                    current_ids = current_ids + accepted
+                updated_cache = target_cache
+
+                def speculative_stats() -> dict:
+                    s = spec_decoder.stats
+                    return s.report()
+
+                engine.speculative_stats = speculative_stats  # type: ignore[attr-defined]
+            # ── Standard single-request path ──────────────────────────────────
+            elif hasattr(engine, "generate_with_cache"):
                 generated, updated_cache = engine.generate_with_cache(
                     suffix,
                     max_tokens=request.max_tokens,

@@ -1498,6 +1498,57 @@ class TorchAEGEngine:
         # materializing repeated KV heads on supported PyTorch versions.
         # SDPA has no soft-capping stage, so architectures that declare one
         # (Gemma-2) must take the exact path below.
+        #
+        # ALiBi via SDPA: build the additive bias as a float attn_mask and
+        # pass it directly to scaled_dot_product_attention.  PyTorch 2.x SDPA
+        # accepts arbitrary float bias as attn_mask and can dispatch to a fused
+        # FlashAttention kernel even with it.  This is ~2–4× faster than the
+        # einsum fallback for GPT-Neo / BLOOM decode steps.
+        if is_alibi and not softcap:
+            try:
+                if batched:
+                    q4 = q.transpose(1, 2)
+                    k4 = k.transpose(1, 2)
+                    v4 = v.transpose(1, 2)
+                else:
+                    q4 = q.transpose(0, 1).unsqueeze(0)
+                    k4 = k.transpose(0, 1).unsqueeze(0)
+                    v4 = v.transpose(0, 1).unsqueeze(0)
+                # Build ALiBi bias: shape (1, num_heads, query_len, key_len)
+                # distance[q, k] = key_pos[k] - query_pos[q]  (non-positive for causal)
+                distance = (key_pos - query_pos).to(dtype=self.compute_dtype)
+                # slopes: shape (num_heads,) → (1, num_heads, 1, 1) → broadcast
+                alibi_bias = self._alibi_slopes.to(dtype=self.compute_dtype).reshape(1, -1, 1, 1) * distance.unsqueeze(0).unsqueeze(0)
+                # alibi_bias shape: (1, num_heads, query_len, key_len)
+                # Combine with causal + live mask into a single float mask
+                allowed = allowed_mask()
+                if not batched:
+                    allowed = allowed.unsqueeze(0)
+                # float: -inf for disallowed, 0 for allowed
+                causal_float = torch.zeros(allowed.shape, dtype=self.compute_dtype, device=q.device)
+                causal_float = causal_float.masked_fill(~allowed.unsqueeze(1), float("-inf"))
+                combined_mask = alibi_bias + causal_float
+                sdpa_kwargs = {
+                    "attn_mask": combined_mask,
+                    "dropout_p": 0.0,
+                    "is_causal": False,
+                    "scale": scale,
+                }
+                if self.num_kv_heads != self.num_heads:
+                    # Repeat KV for SDPA (it may not support GQA + float attn_mask together)
+                    k4_full = k4.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+                    v4_full = v4.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+                else:
+                    k4_full, v4_full = k4, v4
+                context = torch.nn.functional.scaled_dot_product_attention(
+                    q4, k4_full, v4_full, **sdpa_kwargs,
+                )
+                if batched:
+                    return context.transpose(1, 2)
+                return context.squeeze(0).transpose(0, 1)
+            except Exception:
+                pass  # Fall through to einsum path on failure
+
         if not is_alibi and not softcap:
             if batched:
                 q4 = q.transpose(1, 2)
@@ -2706,6 +2757,70 @@ class TorchAEGEngine:
     def max_batch_size(self) -> int | None:
         """``None``: no compiled-in bound, device memory is the only limit."""
         return None
+
+    # ------------------------------------------------------------------
+    # ForwardStepEngine protocol (used by ContinuousBatcher + SpecDecoder)
+    # ------------------------------------------------------------------
+
+    def init_kv_cache(self) -> "TorchKVCache":
+        """Return a fresh, empty KV cache for use with forward_step().
+
+        This satisfies the ContinuousBatcher / speculative engine protocol.
+        The returned cache is engine-typed (TorchKVCache) and compatible with
+        _forward_device().
+        """
+        return TorchKVCache(
+            keys=[None] * self.num_layers,
+            values=[None] * self.num_layers,
+        )
+
+    def forward_step(
+        self,
+        token_ids: "list[int] | Any",
+        kv_cache: "TorchKVCache | None",
+        return_all_logits: bool = False,
+    ) -> "tuple[Any, TorchKVCache]":
+        """Single forward pass satisfying the ForwardStepEngine protocol.
+
+        Args:
+            token_ids:        Input token IDs (list[int] or np.ndarray).
+            kv_cache:         KV cache from init_kv_cache() or a previous call.
+                              Pass None to start a fresh sequence.
+            return_all_logits: If True, return logits for ALL sequence positions
+                               (shape: seq_len × vocab_size); if False, return
+                               only the last position (shape: vocab_size).
+
+        Returns:
+            (logits_numpy, updated_kv_cache)
+
+            logits_numpy is a numpy float32 array on CPU, regardless of the
+            engine's compute device — so ContinuousBatcher and SpecDecoder can
+            sample tokens without device-awareness.
+        """
+        import numpy as np
+
+        if kv_cache is None:
+            kv_cache = self.init_kv_cache()
+
+        ids_np = np.asarray(token_ids, dtype=np.int64).reshape(-1)
+        logit_mode = "all" if return_all_logits else "last"
+
+        device_logits, new_cache = self._forward_device(
+            ids_np,
+            kv_cache,
+            validate_ids=False,
+            logits=logit_mode,
+        )
+
+        # Bring logits to CPU numpy for protocol consumers
+        if hasattr(device_logits, "cpu"):
+            logits_np = device_logits.cpu().float().numpy()
+        elif hasattr(device_logits, "numpy"):
+            logits_np = device_logits.float().numpy()
+        else:
+            logits_np = np.asarray(device_logits, dtype=np.float32)
+
+        return logits_np, new_cache
 
     def _new_batched_cache(
         self,
