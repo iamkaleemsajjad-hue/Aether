@@ -1,13 +1,42 @@
-# Aether Runtime
+<p align="center">
+  <a href="https://github.com/iamkaleemsajjad-hue/Aether">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="logo/logo_dark.png">
+      <source media="(prefers-color-scheme: light)" srcset="logo/logo_light.png">
+      <img alt="Aether Runtime Logo" src="logo/logo.png" width="380" style="max-width: 100%;">
+    </picture>
+  </a>
+</p>
 
-**Compile once. Run on any hardware, forever.**
+<h1 align="center">Aether Runtime</h1>
 
-Aether is an open-source AI model compiler and inference runtime. It ingests any open-source model (HuggingFace, GGUF, SafeTensors, ONNX) and produces a portable **Aether Execution Graph (AEG)** artifact that runs on any detected hardware — CPU, GPU, NPU, FPGA — with zero framework dependency and zero re-compilation.
+<p align="center">
+  <strong>Compile once. Run on any hardware, forever.</strong>
+</p>
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
+<p align="center">
+  Aether is an open-source AI model compiler and high-performance inference runtime.<br>
+  It ingests any open-source model (HuggingFace, GGUF, SafeTensors, ONNX) and produces a portable<br>
+  <strong>Aether Execution Graph (AEG)</strong> artifact that runs on any detected hardware — CPU, GPU, NPU, FPGA —<br>
+  with zero framework dependency and zero re-compilation.
+</p>
 
----
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=flat-square" alt="License: Apache 2.0"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+"></a>
+  <a href="benchmark/results/BENCHMARK_RESULTS.md"><img src="https://img.shields.io/badge/Peak_Throughput-1%2C562_tok%2Fs-orange?style=flat-square&logo=speedtest&logoColor=white" alt="Peak Throughput"></a>
+  <a href="benchmark/results/BENCHMARK_RESULTS.md"><img src="https://img.shields.io/badge/vs_Transformers-3.2x_Faster-brightgreen?style=flat-square" alt="vs Transformers"></a>
+  <a href="hardware_validation_matrix.json"><img src="https://img.shields.io/badge/Hardware-NVIDIA_%7C_AMD_%7C_Apple_%7C_CPU-purple?style=flat-square" alt="Hardware"></a>
+</p>
+
+<p align="center">
+  <a href="#multi-engine-benchmark-results--aether-vs-competitor-engines">📊 <b>Benchmark Results</b></a> &bull;
+  <a href="#quick-start">⚡ <b>Quick Start</b></a> &bull;
+  <a href="#5-stage-compiler-pipeline">⚙️ <b>Architecture</b></a> &bull;
+  <a href="#supported-hardware-targets">🖥️ <b>Hardware Targets</b></a> &bull;
+  <a href="#installation">📦 <b>Installation</b></a> &bull;
+  <a href="docs/">📚 <b>Documentation</b></a>
+</p>
 
 ---
 
