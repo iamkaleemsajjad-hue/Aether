@@ -482,6 +482,43 @@ def test_merge_info_reads_package_metadata(minimal_aeg_package):
     assert json.loads(result.stdout)["merge"]["method"] == "linear"
 
 
+@pytest.mark.parametrize(
+    "source_reference",
+    ["--alias", "/tmp/ci-checkpoint", "/private/var/folders/" + "long-path/" * 15 + "checkpoint"],
+)
+def test_option_looking_cache_alias_requires_argument_separator(tmp_path, source_reference):
+    """Literal cache names use standard Click escaping on every host OS."""
+    from aether.core.aeg_format import AEGPackage
+    from aether.utils.file_io import aeg_cache_path
+
+    cache = tmp_path / "cache"
+    package = AEGPackage.create(
+        aeg_cache_path(source_reference, cache), model_id="cached-dash-alias", aether_version="0.1.0",
+    )
+    package.save()
+    alias = package.root.name
+    assert alias.startswith("--")
+    prefix = ["--cache-dir", str(cache)]
+    runner = _runner()
+
+    unescaped = runner.invoke(cli, prefix + ["info", alias])
+    assert unescaped.exit_code == 2 and "No such option" in unescaped.stderr
+
+    info = runner.invoke(cli, prefix + ["info", "--", alias])
+    assert info.exit_code == 0, info.output
+    assert json.loads(info.stdout)["model_id"] == package.manifest.model_id
+
+    inspected = runner.invoke(cli, prefix + ["inspect", "--json", "--", alias])
+    assert inspected.exit_code == 0, inspected.output
+    payload = json.loads(inspected.stdout)
+    assert payload["path"] == str(package.root.resolve())
+    assert payload["model_id"] == package.manifest.model_id
+
+    for args in (["info", "--typo", "--", alias], ["inspect", "--jsno", "--", alias]):
+        unknown = runner.invoke(cli, prefix + args)
+        assert unknown.exit_code == 2 and "No such option" in unknown.stderr
+
+
 def test_real_offline_cpu_command_workflow(tiny_local_safetensors_model, tmp_path, monkeypatch):
     """Exercise the public commands against real serialized weights and signing."""
     from aether.utils.file_io import aeg_cache_path
@@ -503,12 +540,14 @@ def test_real_offline_cpu_command_workflow(tiny_local_safetensors_model, tmp_pat
         assert artifacts, "a working compiler must embed its native library even for a long source path"
         assert all((artifact / item["path"]).is_file() for item in artifacts)
     model = artifact.name
+    # POSIX absolute-source cache names can start with '--'. Command options
+    # precede the separator; the exact listed cache alias remains positional.
     for args in (
-        ["info", model], ["inspect", model, "--json"], ["mla-stats", model],
-        ["safety", model], ["status", model],
-        ["bench", model, "--max-tokens", "2", "--json"],
-        ["benchmark", model, "--max-tokens", "2", "--runs", "1", "--warmup", "0", "--json"],
-        ["trace", model, "--prompt", "hello"],
+        ["info", "--", model], ["inspect", "--json", "--", model], ["mla-stats", "--", model],
+        ["safety", "--", model], ["status", "--", model],
+        ["bench", "--max-tokens", "2", "--json", "--", model],
+        ["benchmark", "--max-tokens", "2", "--runs", "1", "--warmup", "0", "--json", "--", model],
+        ["trace", "--prompt", "hello", "--", model],
     ):
         result = runner.invoke(cli, prefix + args)
         assert result.exit_code == 0, (args, result.output)
@@ -521,7 +560,7 @@ def test_real_offline_cpu_command_workflow(tiny_local_safetensors_model, tmp_pat
         if args[0] == "bench":
             assert payload["backend"] == "aether_cpu"
             assert payload["completion_tokens"] == 2
-    for args in (["graph", model], ["list"], ["run", model, "--prompt", "hello", "--max-tokens", "2", "--non-interactive"], ["run", model, "--prompt", "hello", "--max-tokens", "2", "--stream"]):
+    for args in (["graph", "--", model], ["list"], ["run", "--prompt", "hello", "--max-tokens", "2", "--non-interactive", "--", model], ["run", "--prompt", "hello", "--max-tokens", "2", "--stream", "--", model]):
         result = runner.invoke(cli, prefix + args)
         assert result.exit_code == 0, (args, result.output)
     signed = runner.invoke(cli, ["sign", str(artifact), "--key", str(tmp_path / "signing.seed"), "--json"])
@@ -530,6 +569,6 @@ def test_real_offline_cpu_command_workflow(tiny_local_safetensors_model, tmp_pat
     verified = runner.invoke(cli, ["verify", str(artifact), "--json"])
     assert verified.exit_code == 0, verified.output
     assert json.loads(verified.stdout)["integrity_valid"]
-    removed = runner.invoke(cli, prefix + ["rm", model, "--yes"])
+    removed = runner.invoke(cli, prefix + ["rm", "--yes", "--", model])
     assert removed.exit_code == 0, removed.output
     assert not artifact.exists()

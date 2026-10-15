@@ -24,6 +24,13 @@ last while canonical policy places it first for five CPU targets. The updated
 test verifies exact native-first selection without importing optional
 frameworks, and separately verifies the ordered AVX2 native fallback.
 
+The next GitHub matrix confirmed those original product failures were gone and
+exposed one later CLI workflow assertion on POSIX: an encoded cache basename
+started with `--` and the test passed it as an option. The workflow now places
+command options before the standard `--` boundary and the literal cache alias
+after it. Portable literal-name regressions retain unknown-option rejection;
+cache naming and production option parsing remain compatible.
+
 ## Workflow corrections
 
 - Python syntax/undefined-name checks and public API stub checks are blocking.
@@ -64,9 +71,16 @@ PowerShell wrapper status of 1 described native stderr handling, not a failing
 Python/test process. Actionlint 1.7.7 validated the changed workflow with exit 0
 (workflow syntax and expressions; external shellcheck/pyflakes disabled).
 
-The KV storage/session/lifecycle/Hub bundle passed 121 tests on Python 3.10,
-exit 0, including all 12 bounded-read regressions and the actual session restore
-that previously raised `MemoryError`.
+The KV storage/session/lifecycle/Hub bundle passed 121 tests on Python 3.10 and
+104 tests with 17 optional Torch skips on clean Python 3.12, both exit 0. This
+includes all 12 bounded-read regressions and the actual session restore that
+previously raised `MemoryError`.
+
+The complete core selection on Windows/clean Python 3.12 at runtime-fix commit
+`7b784f6` passed **4,349 tests**, with 357 optional/environment skips and 19
+marker deselections, in 763.32 seconds, native exit 0. The later CLI correction
+changes test arguments and documentation, with its own focused and GitHub
+matrix checks.
 
 Reproduce the core CI selection after `python -m pip install -e ".[test]"`:
 
@@ -85,7 +99,7 @@ hardening and native-kernel tests that failed in the original run.
 
 Local evidence, including original GitHub logs, before-change reproductions,
 test logs and JUnit XML, is saved under ignored `build/ci-checks/`. Complete
-core-suite runs use `build/cif310/` and `build/cif312/`.
+core-suite runs use `build/cif310/`, `build/cif312/` and `build/cif312-final/`.
 
 The updated GitHub matrix provides Linux/macOS and Python 3.11 verification;
 local Windows results alone cannot establish those outcomes. Hardware
