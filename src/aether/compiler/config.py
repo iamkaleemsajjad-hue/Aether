@@ -9,6 +9,7 @@ quality reporting.
 from __future__ import annotations
 
 from copy import deepcopy
+import os
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -44,7 +45,15 @@ from aether.core.constants import (
     DEFAULT_RLVR_VERIFIER_PASS,
 )
 from aether.core.exceptions import CompilerConfigError
-from aether.core.types import HardwareTarget
+from aether.core.types import HardwareTarget, Precision
+from aether.quantization.codecs import supported_precisions
+
+
+SUPPORTED_COMPILATION_PRECISIONS = tuple(
+    precision.value for precision in Precision
+    if precision.value in supported_precisions()
+    and precision not in {Precision.TERNARY, Precision.BINARY, Precision.NANOQ}
+)
 
 
 @dataclass
@@ -324,7 +333,7 @@ class CompilerConfig:
     upload_kernels: bool = False
     """Opt-in to upload compiled kernels to Aether Hub after compilation."""
 
-    cache_dir: str = DEFAULT_CACHE_DIR
+    cache_dir: str = field(default_factory=lambda: os.environ.get("AETHER_CACHE_DIR") or DEFAULT_CACHE_DIR)
     """Directory for Aether's local cache."""
 
     hub_url: str | None = None
@@ -338,6 +347,13 @@ class CompilerConfig:
 
     precision_assignment_mode: str = "sensitivity"
     """How to assign precision: 'sensitivity', 'uniform', 'manual'."""
+
+    precision: str | None = None
+    """Explicit uniform layer precision. None preserves automatic assignment.
+
+    Embeddings and the output head retain BF16. Lossy formats are an explicit
+    request; they do not establish a measured model-quality guarantee.
+    """
 
     manual_precision_map: dict[str, str] = field(default_factory=dict)
     """If mode='manual', per-layer precision overrides."""
@@ -492,6 +508,21 @@ class CompilerConfig:
         if self.precision_assignment_mode not in ("sensitivity", "uniform", "manual"):
             msg = f"Unknown precision_assignment_mode: {self.precision_assignment_mode}"
             raise CompilerConfigError(msg)
+        if self.precision is not None:
+            try:
+                self.precision = Precision.from_string(self.precision).value
+            except ValueError as exc:
+                raise CompilerConfigError(str(exc)) from exc
+            if self.precision not in SUPPORTED_COMPILATION_PRECISIONS:
+                raise CompilerConfigError(
+                    f"Unsupported compilation precision {self.precision!r}; "
+                    f"choose from {SUPPORTED_COMPILATION_PRECISIONS}"
+                )
+            if not self.enable_precision_assignment:
+                raise CompilerConfigError("explicit precision requires precision assignment to be enabled")
+            if self.precision_assignment_mode == "manual":
+                raise CompilerConfigError("explicit uniform precision cannot be combined with manual assignment")
+            self.precision_assignment_mode = "uniform"
         if self.kv_cache_dtype not in ("fp8", "fp16", "bf16"):
             msg = f"Unknown kv_cache_dtype: {self.kv_cache_dtype}"
             raise CompilerConfigError(msg)

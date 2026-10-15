@@ -258,8 +258,8 @@ def test_model_merge_does_not_accept_unreadable_sources() -> None:
         CompilerConfig(enable_model_merging=True, model_merging_sources=["missing-model.aeg"]),
     )
     assert report_graph is not None
-    assert report.status == "skipped"
-    assert report.details["reason"] == "all_sources_failed_to_load"
+    assert report.status == "failed"
+    assert "Every requested merge source must load" in report.details["error"]
 
 
 def test_peft_does_not_emit_empty_adapter(tmp_path: Path) -> None:
@@ -1010,7 +1010,7 @@ def test_compiled_cpu_backend_applies_stop_sequences_to_decoded_tokens() -> None
 
 
 def test_pytorch_loader_rejects_unsafe_pickle_instead_of_falling_back(tmp_path) -> None:
-    import torch
+    torch = pytest.importorskip("torch")
 
     from aether.compiler.stage1_ingestion.pytorch_loader import PyTorchLoader
     from aether.core.exceptions import IngestionError

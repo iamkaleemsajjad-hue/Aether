@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 
 from aether.core.exceptions import AEGFormatError
-from aether.kernels.native_cpu import get_native_kernels
+from aether.kernels.native_cpu import NativeCPUKernels, get_native_kernels
 from aether.runtime.cpu_engine import (
     CPUExecutionEngine,
     ExpertWeights,
@@ -200,20 +200,25 @@ def package_is_runnable(package: Any) -> bool:
     return any(name.endswith("embedding") or "embed" in name for name in names)
 
 
-def load_engine_from_path(aeg_path: Path | str) -> CPUExecutionEngine:
-    """Open an ``.aeg`` package and build an engine from it."""
+def load_engine_from_path(
+    aeg_path: Path | str, *, prepare_native_kernels: bool = True
+) -> CPUExecutionEngine:
+    """Open an authenticated AEG; optional accelerator bootstrap skips CPU builds."""
     from aether.core.aeg_format import AEGPackage
 
     package = AEGPackage(Path(aeg_path))
     package.load()
-    return load_engine_from_package(package)
+    return load_engine_from_package(package, prepare_native_kernels=prepare_native_kernels)
 
 
-def load_engine_from_package(package: Any) -> CPUExecutionEngine:
+def load_engine_from_package(package: Any, *, prepare_native_kernels: bool = True) -> CPUExecutionEngine:
     """Build a :class:`CPUExecutionEngine` from a loaded AEG package.
 
     Args:
         package: A loaded :class:`~aether.core.aeg_format.AEGPackage`.
+        prepare_native_kernels: Prepare native CPU execution when true. False
+            deserializes the identical authenticated model with an independent
+            NumPy provider, for wrapping in an accelerator executor.
 
     Returns:
         An engine ready to run :meth:`~CPUExecutionEngine.generate`.
@@ -248,7 +253,9 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
     if architecture.get("ssm_variant") == "selective_scan":
         return _load_mamba_engine_from_package(package, architecture)
     if architecture.get("ssm_variant") == "hybrid_selective_scan":
-        return _load_hybrid_engine_from_package(package, architecture)
+        return _load_hybrid_engine_from_package(
+            package, architecture, prepare_native_kernels=prepare_native_kernels
+        )
     if architecture.get("ssm_variant") == "ssd":
         return _load_mamba2_engine_from_package(package, architecture)
     if architecture.get("ssm_variant") == "rwkv_time_mix":
@@ -264,9 +271,9 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
     num_kv_heads = int(architecture.get("num_kv_heads") or num_heads)
 
     tensors = _dequantized_by_key(package)
-    # Also load raw quantized tensors for non-FP32 projections.
-    # These will be injected into LayerWeights.quant_meta so that
-    # _linear() can dispatch to quantized GEMM kernels.
+    # Retain source quantization provenance separately from execution storage.
+    # _dequantized_by_key already decoded every projection to FP32; attaching
+    # active encoded-weight dispatch metadata would apply scaling/packing twice.
     try:
         raw_quant = _quantized_tensors_by_key(package)
     except Exception as _qerr:  # noqa: BLE001
@@ -331,8 +338,9 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
                 )
             ),
         )
-        # Inject per-projection quantization metadata for non-FP32 weights.
-        # _linear() will use this to auto-dispatch to quantized GEMM kernels.
+        # Record source storage metadata without activating encoded dispatch.
+        # These projections have already been decoded through their full codec,
+        # including block sizes, codebooks, biased codes and padded tails.
         layer_quant: dict[str, tuple[str, Any, Any]] = {}
         for proj_name in _QUANTIZABLE_PROJECTIONS:
             qt = raw_quant.get((index, proj_name))
@@ -341,9 +349,9 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
                 zeros = np.asarray(qt.zero_points, dtype=np.float32) if qt.zero_points is not None else None
                 layer_quant[proj_name] = (qt.precision, scales, zeros)
         if layer_quant:
-            layer.quant_meta = layer_quant
+            layer.storage_quant_meta = layer_quant
             logger.debug(
-                "Layer %d: quantized dispatch for %s",
+                "Layer %d: decoded source quantization for %s",
                 index, ", ".join(sorted(layer_quant.keys()))
             )
         layers.append(layer)
@@ -424,8 +432,7 @@ def load_engine_from_package(package: Any) -> CPUExecutionEngine:
         ),
         **_execution_numerics(architecture),
     )
-    kernels = get_native_kernels()
-    _load_packaged_native_kernels(package, kernels)
+    kernels = _prepare_native_kernels(package) if prepare_native_kernels else NativeCPUKernels.reference()
     engine = CPUExecutionEngine(
         weights,
         num_heads=num_heads,
@@ -586,7 +593,7 @@ def _load_mamba_engine_from_package(
 
 
 def _load_hybrid_engine_from_package(
-    package: Any, architecture: dict[str, Any]
+    package: Any, architecture: dict[str, Any], *, prepare_native_kernels: bool = True
 ) -> HybridExecutionEngine:
     """Load a Jamba-style mixed attention/selective-scan artifact.
 
@@ -713,6 +720,7 @@ def _load_hybrid_engine_from_package(
         inner_size=inner,
         dt_rank=dt_rank,
         conv_kernel=conv_kernel,
+        kernels=None if prepare_native_kernels else NativeCPUKernels.reference(),
     )
 
 
@@ -1045,6 +1053,12 @@ def _runtime_cross_layer_kv_plan(metadata: Any, num_layers: int) -> dict[str, An
     return plan
 
 
+def _prepare_native_kernels(package: Any) -> NativeCPUKernels:
+    kernels = get_native_kernels()
+    _load_packaged_native_kernels(package, kernels)
+    return kernels
+
+
 def _load_packaged_native_kernels(package: Any, kernels: Any) -> None:
     """Load the authenticated native CPU library embedded in an AEG, if any.
 
@@ -1098,7 +1112,17 @@ def _load_packaged_native_kernels(package: Any, kernels: Any) -> None:
                     relative_path,
                 )
                 break  # fall through to Tier 2
-            if kernels.load_library(path, expected_sha256=expected):
+            from aether.kernels.native_cpu import library_compatibility_error
+
+            identity = descriptor.get("build_identity")
+            incompatibility = library_compatibility_error(identity)
+            if incompatibility:
+                logger.warning(
+                    "Bundled native kernel %r is incompatible (%s); trying host compilation/reference execution",
+                    relative_path, incompatibility,
+                )
+                continue
+            if kernels.load_library(path, expected_sha256=expected, build_identity=identity):
                 logger.info(
                     "Loaded bundled native CPU kernel from AEG package (%s) — "
                     "no host compiler required",
@@ -1130,9 +1154,10 @@ def _load_packaged_native_kernels(package: Any, kernels: Any) -> None:
 
     # ── Tier 3: NumPy reference path (always available) ───────────────────
     logger.warning(
-        "Native CPU kernels unavailable (no bundled library and no host compiler). "
-        "Running on NumPy reference path. Performance will be lower. "
-        "Install a C++ compiler (GCC/Clang/MSVC) to enable AVX2/OpenMP acceleration."
+        "Native CPU kernels unavailable (%s). Running on the NumPy reference path; "
+        "performance depends on the NumPy/BLAS implementation. A C++ compiler "
+        "(GCC/Clang/MSVC) is optional and enables locally compiled kernels.",
+        getattr(kernels, "build_error", None) or "no compatible packaged or locally compiled library",
     )
     # kernels.is_native == False → engine uses kernels.rmsnorm_ref etc. automatically
 
@@ -1437,11 +1462,10 @@ def _quantized_tensors_by_key(
     Norm vectors, biases, embeddings, and float-precision tensors are omitted
     (they are loaded by :func:`_dequantized_by_key` and always used as FP32).
 
-    Used by :func:`load_engine_from_package` to populate
-    :attr:`LayerWeights.quant_meta` so that
-    :meth:`~aether.runtime.cpu_engine.CPUExecutionEngine._linear` can
-    automatically dispatch to quantized GEMM kernels without the caller
-    needing to pass ``precision=`` explicitly.
+    Used by :func:`load_engine_from_package` to retain source provenance in
+    :attr:`LayerWeights.storage_quant_meta`. It must not populate active
+    ``quant_meta``: the portable loader materializes decoded FP32 arrays, not
+    encoded values consumed by quantized linear kernels.
     """
     from aether.compiler.stage1_ingestion.ingestion import IngestionPipeline
     from aether.quantization.formats import QuantizedTensor

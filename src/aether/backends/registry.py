@@ -1,15 +1,12 @@
-"""
-Backend registry — discovers and loads backend plugins.
-
-Backends are registered via entry points (`aether.backends`) or can be loaded
-dynamically. The registry provides a stable lookup by name.
-"""
+"""Discover backend plugins and construct only the execution engine requested."""
 
 from __future__ import annotations
 
 import importlib
 import importlib.metadata
-from typing import Any
+import threading
+from functools import partial
+from typing import Any, Callable
 
 from aether.backends.base import Backend
 from aether.utils.logging import get_logger
@@ -17,103 +14,105 @@ from aether.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _load_backend(reference: str) -> Backend:
+    module_name, class_name = reference.split(":")
+    return getattr(importlib.import_module(module_name), class_name)()
+
+
+def _load_entry_point(entry_point: Any) -> Backend:
+    return entry_point.load()()
+
+
 class BackendRegistry:
-    """Registry of available Aether backends."""
+    """Lazy registry: CPU artifact startup never initializes optional backends."""
 
     def __init__(self) -> None:
         self._backends: dict[str, Backend] = {}
+        self._factories: dict[str, Callable[[], Backend]] = {}
+        self._failed: set[str] = set()
+        self._lock = threading.RLock()
         self._discover_backends()
 
-    def _discover_backends(self) -> None:
-        """Discover backends from built-in list and entry points."""
-        # PRD §3: Aether is PyTorch-independent at runtime. The priority order
-        # ensures that the native CPU engine is always tried first (no external
-        # dependencies), followed by optional accelerator runtimes, with the
-        # PyTorch backend reserved as a last-resort fallback.
-        builtin_backends = [
-            # 1. Always available — pure numpy + compiled C++ (no PyTorch needed)
-            "aether.backends.native_cpu_backend:NativeCPUBackend",
-            # 2. Native CUDA — Aether's own JIT-compiled CUDA kernels, no PyTorch
-            "aether.backends.native_cuda_backend:NativeCUDABackend",
-            # 3. ONNX Runtime — fast CPU/GPU inference without PyTorch
-            "aether.backends.onnx_backend:ONNXBackend",
-            # 4. llama.cpp — optimised native CPU inference with GGUF models
-            "aether.backends.llamacpp_backend:LlamaCppBackend",
-            # 5. Apple MLX — Apple Silicon (Metal) without PyTorch
-            "aether.backends.mlx_backend:MLXBackend",
-            # 6. vLLM — high-throughput GPU serving
-            "aether.backends.vllm_backend:vLLMBackend",
-            # 7. TensorRT-LLM — NVIDIA optimised GPU serving
-            "aether.backends.trtllm_backend:TensorRTLLMBackend",
-            # 8. PyTorch — LAST RESORT; requires torch + transformers installed
-            "aether.backends.torch_backend:TorchBackend",
-        ]
-
-        for backend_ref in builtin_backends:
-            try:
-                module_name, class_name = backend_ref.split(":")
-                module = importlib.import_module(module_name)
-                backend_class = getattr(module, class_name)
-                backend = backend_class()
-                self._backends[backend.name] = backend
-                logger.debug(f"Discovered backend: {backend.name}")
-            except Exception as exc:
-                logger.debug(f"Could not load backend {backend_ref}: {exc}")
-
-        # Try entry points
-        try:
-            eps = importlib.metadata.entry_points()
-            if hasattr(eps, "select"):
-                backend_eps = eps.select(group="aether.backends")
-            else:
-                backend_eps = eps.get("aether.backends", [])
-            for ep in backend_eps:
-                try:
-                    backend_class = ep.load()
-                    backend = backend_class()
-                    self._backends[backend.name] = backend
-                    logger.debug(f"Loaded backend from entry point: {backend.name}")
-                except Exception as exc:
-                    logger.debug(f"Could not load entry point backend {ep.name}: {exc}")
-        except Exception as exc:
-            logger.debug(f"Entry point discovery skipped: {exc}")
-
-    @property
-    def backend_names(self) -> list[str]:
-        """Return all registered backend names."""
-        return sorted(self._backends.keys())
-
-    def get_backend(self, name: str) -> Backend | None:
-        """Look up a backend by name.
-
-        Args:
-            name: Backend name (e.g., 'pytorch', 'vllm').
-
-        Returns:
-            Backend instance or None if not found.
-        """
-        # Normalize aliases
+    @staticmethod
+    def _normalize_name(name: str) -> str:
         aliases = {
+            "torch": "pytorch",
             "llama.cpp": "llamacpp",
             "tensorrt-llm": "trtllm",
             "tensorrt_llm": "trtllm",
             "onnxruntime": "onnx",
         }
-        name = aliases.get(name, name)
-        return self._backends.get(name)
+        return aliases.get(name, name)
+
+    def _discover_backends(self) -> None:
+        # Keep the framework-free native engines first in explicit inventory.
+        builtin = {
+            "aether_cpu": "aether.backends.native_cpu_backend:NativeCPUBackend",
+            "aether_cuda": "aether.backends.native_cuda_backend:NativeCUDABackend",
+            "onnx": "aether.backends.onnx_backend:ONNXBackend",
+            "llamacpp": "aether.backends.llamacpp_backend:LlamaCppBackend",
+            "mlx": "aether.backends.mlx_backend:MLXBackend",
+            "vllm": "aether.backends.vllm_backend:vLLMBackend",
+            "trtllm": "aether.backends.trtllm_backend:TensorRTLLMBackend",
+            "pytorch": "aether.backends.torch_backend:TorchBackend",
+        }
+        for name, reference in builtin.items():
+            self._factories[name] = partial(_load_backend, reference)
+        try:
+            eps = importlib.metadata.entry_points()
+            backend_eps = (
+                eps.select(group="aether.backends")
+                if hasattr(eps, "select")
+                else eps.get("aether.backends", [])
+            )
+            for ep in backend_eps:
+                self._factories[self._normalize_name(ep.name)] = partial(_load_entry_point, ep)
+        except Exception as exc:
+            logger.debug("Entry point discovery skipped: %s", exc)
+
+    def get_backend(self, name: str) -> Backend | None:
+        """Resolve a backend by name or alias, constructing it at most once."""
+        name = self._normalize_name(name)
+        with self._lock:
+            if name not in self._backends and name not in self._failed:
+                factory = self._factories.get(name)
+                if factory is not None:
+                    try:
+                        backend = factory()
+                        self._backends[name] = backend
+                        self._backends[backend.name] = backend
+                    except Exception as exc:
+                        self._failed.add(name)
+                        logger.debug("Could not load backend %s: %s", name, exc)
+            return self._backends.get(name)
+
+    def _materialize_all(self) -> None:
+        """Explicit inventory may initialize optional backends."""
+        for name in self._factories:
+            self.get_backend(name)
+
+    @property
+    def backend_names(self) -> list[str]:
+        """Return canonical names of discoverable backends."""
+        self._materialize_all()
+        return sorted({backend.name for backend in self._backends.values()})
 
     def get_available_backends(self) -> list[Backend]:
-        """Return all backends that are currently available (installed)."""
-        return [b for b in self._backends.values() if b.is_available()]
+        """Return installed backends, deduplicating entry-point aliases."""
+        self._materialize_all()
+        by_name = {backend.name: backend for backend in self._backends.values()}
+        return [backend for backend in by_name.values() if backend.is_available()]
 
     def get_available_backend_names(self) -> list[str]:
-        """Return names of available backends."""
-        return sorted([b.name for b in self._backends.values() if b.is_available()])
+        """Return canonical names of installed backends."""
+        return sorted(backend.name for backend in self.get_available_backends())
 
     def register_backend(self, backend: Backend) -> None:
-        """Register a backend instance manually."""
-        self._backends[backend.name] = backend
+        """Register or replace an application's backend instance."""
+        with self._lock:
+            self._backends[backend.name] = backend
+            self._failed.discard(backend.name)
 
     def __repr__(self) -> str:
         available = len(self.get_available_backends())
-        return f"BackendRegistry({len(self._backends)} backends, {available} available)"
+        return f"BackendRegistry({len(self.backend_names)} backends, {available} available)"

@@ -364,7 +364,7 @@ def test_aether_runtime_config_still_defaults_the_cache_on() -> None:
 
 def test_default_target_cuda_capability_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
     """CUDA sm_75 (e.g. Tesla T4) must resolve to nearest supported target cuda_sm70."""
-    import torch
+    torch = pytest.importorskip("torch")
     from benchmark.backend_aether import _default_target
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)

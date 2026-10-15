@@ -8,6 +8,7 @@ and safely handling file paths across platforms.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import tempfile
 from pathlib import Path
@@ -192,8 +193,20 @@ _MODEL_ID_SEPARATOR = "--"
 AEG_SUFFIX = ".aeg"
 
 
+def _unbounded_aeg_artifact_name(model_id: str) -> str:
+    """Preserve the original naming convention for legacy cache discovery."""
+    name = str(model_id).strip()
+    for unsafe, replacement in (
+        ("/", _MODEL_ID_SEPARATOR), ("\\", _MODEL_ID_SEPARATOR),
+        (":", "_"), (" ", "_"),
+    ):
+        name = name.replace(unsafe, replacement)
+    name = name.strip(".") or "unnamed_model"
+    return f"{name}{AEG_SUFFIX}"
+
+
 def aeg_artifact_name(model_id: str) -> str:
-    """Return the canonical cache directory name for ``model_id``.
+    """Return a portable canonical cache name for ``model_id``.
 
     One definition, used by the compiler when it writes and by the runtime when it
     looks up. Having two conventions in two modules is what made a compiled model
@@ -202,24 +215,22 @@ def aeg_artifact_name(model_id: str) -> str:
     ``microsoft_Phi-3.5-mini-instruct``, so no Hugging Face ID containing ``/``
     could ever resolve.
 
+    Ordinary IDs retain their existing names. Long local paths and IDs are
+    compacted with a stable hash, leaving space for nested native kernels on
+    Windows and staying below filesystem component limits on every platform.
+    Original long names remain candidates during discovery.
+
     Only characters that are unsafe in a path component are substituted. Dots and
     single dashes are left alone, because they are ordinary in Hugging Face repo
     names (``Phi-3.5-mini-instruct``) and mangling them would make the name harder
     to recognize for no benefit.
     """
-    name = str(model_id).strip()
-    for unsafe, replacement in (
-        ("/", _MODEL_ID_SEPARATOR),
-        ("\\", _MODEL_ID_SEPARATOR),
-        (":", "_"),
-        (" ", "_"),
-    ):
-        name = name.replace(unsafe, replacement)
-    # A leading dot would hide the directory; a trailing one is invalid on Windows.
-    name = name.strip(".")
-    if not name:
-        name = "unnamed_model"
-    return f"{name}{AEG_SUFFIX}"
+    original = _unbounded_aeg_artifact_name(model_id)
+    if len(original.encode("utf-8")) <= 96:
+        return original
+    prefix = original[:-len(AEG_SUFFIX)].encode("utf-8")[:38].decode("utf-8", errors="ignore").rstrip(".-")
+    digest = hashlib.sha256(str(model_id).strip().encode("utf-8")).hexdigest()[:20]
+    return f"{prefix}--{digest}{AEG_SUFFIX}"
 
 
 def aeg_cache_path(model_id: str, cache_dir: str | Path | None = None) -> Path:
@@ -239,6 +250,7 @@ def aeg_cache_candidates(
     """
     models = aether_cache_dir(cache_dir) / "models"
     canonical = aeg_artifact_name(model_id)
+    original = _unbounded_aeg_artifact_name(model_id)
     legacy = {
         # The reader's old convention: underscores, no suffix.
         safe_model_id_path(model_id),
@@ -246,6 +258,8 @@ def aeg_cache_candidates(
         f"{safe_model_id_path(model_id)}{AEG_SUFFIX}",
         # The writer's old convention without the suffix.
         canonical[: -len(AEG_SUFFIX)],
+        original,
+        original[: -len(AEG_SUFFIX)],
     }
     ordered = [canonical] + sorted(name for name in legacy if name != canonical)
     return [models / name for name in ordered]
@@ -267,21 +281,40 @@ def glob_models(cache_dir: str | Path | None = None) -> list[Path]:
     return sorted(model_cache.iterdir())
 
 
-def delete_model(model_id: str, cache_dir: str | Path | None = None) -> None:
+def cached_model_paths(model_id: str, cache_dir: str | Path | None = None) -> list[Path]:
+    """Resolve existing canonical/legacy cache entries, without leaving the cache."""
+    models_root = (aether_cache_dir(cache_dir) / "models").resolve()
+    candidates = aeg_cache_candidates(model_id, cache_dir)
+    # Runtime.list returns literal cache entry names. A path containing a
+    # separator is a model identifier, never permission to delete a local path.
+    if model_id and Path(model_id).name == model_id and model_id not in {".", ".."}:
+        candidates.insert(0, models_root / model_id)
+    result: list[Path] = []
+    for candidate in candidates:
+        path = candidate.resolve()
+        if path == models_root or not path.is_relative_to(models_root):
+            raise ValueError("model identifier resolves outside the Aether cache")
+        if path.exists() and path not in result:
+            result.append(path)
+    return result
+
+
+def delete_model(model_id: str, cache_dir: str | Path | None = None) -> bool:
     """Delete a cached model from the Aether cache.
 
     Args:
         model_id: Model identifier.
         cache_dir: Custom cache directory.
     """
-    cache = aether_cache_dir(cache_dir)
-    model_path = (cache / "models" / safe_model_id_path(model_id)).resolve()
-    models_root = (cache / "models").resolve()
-    if not model_path.is_relative_to(models_root):
-        raise ValueError("model identifier resolves outside the Aether cache")
-    if model_path.exists():
-        import shutil
-        shutil.rmtree(model_path)
+    import shutil
+
+    paths = cached_model_paths(model_id, cache_dir)
+    for model_path in paths:
+        if model_path.is_dir():
+            shutil.rmtree(model_path)
+        else:
+            model_path.unlink()
+    return bool(paths)
 
 
 def format_size_gb(size_bytes: int) -> str:

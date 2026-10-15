@@ -14,6 +14,7 @@ import os
 import socket
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,13 @@ from aether.core.hash_utils import compute_file_hash
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _ModelExecutionState:
+    devices: tuple[str, ...]
+    input_device: str
+    runtime_family: str
 
 
 def _stop_ids(tokenizer: Any) -> Any:
@@ -173,13 +181,16 @@ def _release_load_reservations(device: str | None) -> None:
 class TorchBackend(Backend):
     """PyTorch-based backend for model inference."""
 
+    model_formats = frozenset({"aeg", "source"})
+
     def __init__(self) -> None:
         info = BackendInfo(
             name="pytorch",
             version=AETHER_VERSION,
             supported_targets=[
                 "cuda_sm70", "cuda_sm80", "cuda_sm89", "cuda_sm90", "cuda_sm100",
-                "cpu_avx512", "cpu_neon", "rocm_rdna3", "rocm_cdna3", "metal_m1", "metal_m3",
+                "cpu_generic", "cpu_avx2", "cpu_avx512", "cpu_neon",
+                "rocm_rdna3", "rocm_cdna3", "amd_mi350x", "rocm_cdna5_mi455x", "metal", "metal_m1", "metal_m3",
             ],
             capabilities=[
                 "generate", "chat", "embed", "rerank", "vision", "transcribe",
@@ -193,6 +204,7 @@ class TorchBackend(Backend):
         self._device: str = "cpu"
         self._devices: list[str] = ["cpu"]
         self._runtime_family: str = "cpu"
+        self._model_execution: dict[str, _ModelExecutionState] = {}
         self._allow_remote_code = False
         # Placement state, populated once per model load by the execution planner.
         self._placement: Any = None
@@ -487,6 +499,9 @@ class TorchBackend(Backend):
             raw = os.environ.get("AETHER_EXECUTION_DEVICES", "").strip()
             values = [item.strip() for item in raw.split(",") if item.strip()] or None
         if values is None:
+            # A previous model may have selected CPU explicitly. An automatic
+            # mesh for the next model must be resolved from physical devices.
+            self._try_detect_device()
             return
         normalized = ["cpu" if item == "cpu:0" else item for item in values]
         if len(set(normalized)) != len(normalized):
@@ -543,20 +558,92 @@ class TorchBackend(Backend):
         if not self.is_available():
             return False
         if target_id.startswith("cpu_"):
-            return self._runtime_family == "cpu"
+            # PyTorch always supports CPU, even when its automatic default is
+            # an accelerator. Runtime passes an explicit CPU mesh for CPU AEGs.
+            return True
+        import torch
+
         if target_id.startswith("cuda_"):
-            return self._runtime_family in {"cuda", "heterogeneous"} and any(
-                device.startswith("cuda:") for device in self._devices
-            )
-        if target_id.startswith("rocm_"):
-            return self._runtime_family in {"rocm", "heterogeneous"} and any(
-                device.startswith("cuda:") for device in self._devices
-            )
-        if target_id.startswith("metal_"):
-            return self._runtime_family in {"metal", "heterogeneous"} and any(
-                device == "mps" for device in self._devices
-            )
+            return bool(torch.cuda.is_available() and not getattr(torch.version, "hip", None))
+        if target_id.startswith(("rocm_", "amd_mi")):
+            return bool(torch.cuda.is_available() and getattr(torch.version, "hip", None))
+        if target_id == "metal" or target_id.startswith("metal_"):
+            return bool(torch.backends.mps.is_available())
         return target_id in self.info.supported_targets
+
+    def available_for_model(self, model_id: str, aeg_path: str | None = None) -> bool:
+        """AEGs need Torch alone; raw checkpoints also need their frontend."""
+        from aether.backends.model_contract import model_format
+
+        format_name = model_format(model_id, aeg_path)
+        if format_name not in self.model_formats or not self.is_available():
+            return False
+        if format_name == "source":
+            try:
+                from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: F401
+            except ImportError:
+                return False
+        return True
+
+    @staticmethod
+    def _device_name(value: Any) -> str | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return f"cuda:{value}" if value >= 0 else None
+        name = str(value)
+        if name in {"cpu", "cpu:0"}:
+            return "cpu"
+        if name in {"mps", "mps:0"}:
+            return "mps"
+        if name == "cuda" or name.startswith("cuda:") and name[5:].isdigit():
+            return name
+        return None
+
+    def _input_device(self, model_id: str, model: Any | None = None) -> str:
+        state = getattr(self, "_model_execution", {}).get(model_id)
+        if state is not None:
+            return state.input_device
+        model = self._models.get(model_id) if model is None else model
+        if isinstance(model, CompiledAEGHandle):
+            # NumPy AEG executors are CPU even when a later model selected GPU.
+            return self._device_name(getattr(model.engine, "device", None)) or "cpu"
+        get_embeddings = getattr(model, "get_input_embeddings", None)
+        if callable(get_embeddings):
+            try:
+                embeddings = get_embeddings()
+            except (AttributeError, NotImplementedError):
+                embeddings = None
+            execution_hook = getattr(embeddings, "_hf_hook", None)
+            for value in (
+                getattr(execution_hook, "execution_device", None),
+                getattr(getattr(embeddings, "weight", None), "device", None),
+            ):
+                device = self._device_name(value)
+                if device is not None:
+                    return device
+        device = self._device_name(getattr(model, "device", None))
+        if device is not None:
+            return device
+        mapping = getattr(model, "hf_device_map", {})
+        if isinstance(mapping, dict) and "" in mapping:
+            device = self._device_name(mapping[""])
+            if device is not None:
+                return device
+        return self._device
+
+    def _remember_execution(self, model_id: str, model: Any) -> None:
+        if not hasattr(self, "_model_execution"):
+            self._model_execution = {}
+        self._model_execution[model_id] = _ModelExecutionState(
+            tuple(self._devices), self._input_device(model_id, model), self._runtime_family,
+        )
+
+    def _execution_family(self, model_id: str) -> str:
+        state = getattr(self, "_model_execution", {}).get(model_id)
+        return state.runtime_family if state is not None else (
+            "cpu" if self._input_device(model_id) == "cpu" else self._runtime_family
+        )
 
     def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
         """Load a model and tokenizer from HuggingFace or local path.
@@ -570,21 +657,95 @@ class TorchBackend(Backend):
             The loaded model instance.
         """
         if model_id in self._models:
+            requested = kwargs.get("execution_devices")
+            if requested is None:
+                requested = [
+                    item.strip() for item in os.environ.get("AETHER_EXECUTION_DEVICES", "").split(",")
+                    if item.strip()
+                ] or None
+            if requested is not None:
+                mesh = tuple(self._device_name(device) for device in requested)
+                state = getattr(self, "_model_execution", {}).get(model_id)
+                existing = state.devices if state is not None else (self._input_device(model_id),)
+                cached = self._models[model_id]
+                if isinstance(cached, CompiledAEGHandle):
+                    actual = getattr(cached.engine, "devices", None) or [self._input_device(model_id, cached)]
+                else:
+                    actual_map = getattr(cached, "hf_device_map", {})
+                    actual = actual_map.values() if isinstance(actual_map, dict) and actual_map else [self._input_device(model_id, cached)]
+                actual_devices = {
+                    self._input_device(model_id, cached) if str(value) == "cuda"
+                    else self._device_name(value) or str(value)
+                    for value in actual
+                }
+                if not mesh or None in mesh or mesh != existing or actual_devices - set(mesh):
+                    raise BackendError(
+                        "Model is already loaded on another execution mesh; unload it first",
+                        backend_name=self.name,
+                    )
             return self._models[model_id]
 
         self._configure_devices(kwargs.get("execution_devices"))
 
-        compiled_handle = self._try_load_compiled_aeg(model_id, aeg_path)
+        compiled_handle = self._try_load_compiled_aeg(model_id, aeg_path, retain_host_weights=True) if kwargs.get("retain_host_weights") else self._try_load_compiled_aeg(model_id, aeg_path)
         if compiled_handle is not None:
             self._models[model_id] = compiled_handle
+            self._remember_execution(model_id, compiled_handle)
             return compiled_handle
 
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        # A single-device mesh is a placement constraint. Transformers' "auto"
+        # map can choose a different GPU or CPU, including when CPU was requested.
+        # Give it a concrete map and check caller overrides before materialization.
+        requested_mesh = kwargs.get("execution_devices")
+        if requested_mesh is None and os.environ.get("AETHER_EXECUTION_DEVICES", "").strip():
+            requested_mesh = self._devices
+        default_map: Any = {"": self._device} if len(self._devices) == 1 else "auto"
+        placement_map = kwargs.get("device_map", default_map)
+        if requested_mesh is not None:
+            allowed = set(self._devices)
+            if isinstance(placement_map, dict):
+                mapped_devices = {
+                    f"cuda:{value}" if isinstance(value, int) else str(value)
+                    for value in placement_map.values()
+                }
+            elif placement_map in {"auto", "balanced", "balanced_low_0", "sequential"}:
+                if len(allowed) == 1:
+                    raise BackendError(
+                        "device_map must respect the explicit execution_devices mesh",
+                        backend_name=self.name,
+                    )
+                # Restrict automatic partitioning to this mesh; no unrelated GPU
+                # or CPU budget may enter the placement algorithm.
+                budgets = {}
+                for device in self._devices:
+                    if device in {"cpu", "mps"}:
+                        from aether.backends.capabilities import _host_memory_bytes
+
+                        budgets[device] = _host_memory_bytes()
+                    else:
+                        index = int(device.split(":", 1)[1])
+                        budgets[index] = int(torch.cuda.mem_get_info(index)[0])
+                requested_budgets = kwargs.get("max_memory", budgets)
+                if not isinstance(requested_budgets, dict) or set(requested_budgets) - set(budgets):
+                    raise BackendError(
+                        "max_memory must be restricted to execution_devices",
+                        backend_name=self.name,
+                    )
+                kwargs = {**kwargs, "max_memory": requested_budgets}
+                mapped_devices = allowed
+            else:
+                mapped_devices = {str(placement_map)}
+            if mapped_devices - allowed:
+                raise BackendError(
+                    "device_map must respect the explicit execution_devices mesh",
+                    backend_name=self.name,
+                )
         load_kwargs: dict[str, Any] = {
-            "torch_dtype": kwargs.get("torch_dtype", torch.float16 if self._device == "cuda" else torch.float32),
-            "device_map": kwargs.get("device_map", "auto"),
+            "torch_dtype": kwargs.get("torch_dtype", torch.float16 if self._device.split(":", 1)[0] == "cuda" else torch.float32),
+            "device_map": placement_map,
             "trust_remote_code": bool(kwargs.get("trust_remote_code", False)),
         }
         self._allow_remote_code = bool(kwargs.get("trust_remote_code", False))
@@ -596,7 +757,7 @@ class TorchBackend(Backend):
         # particular, passing ``offline`` or ``download_timeout_s`` through to
         # Transformers can make otherwise valid local/HF loads fail or be
         # interpreted by custom config classes.
-        control_keys = {"offline", "download_timeout_s", "trust_remote_code", "execution_devices"}
+        control_keys = {"offline", "download_timeout_s", "trust_remote_code", "execution_devices", "target_id", "retain_host_weights"}
         load_kwargs.update(
             {key: value for key, value in kwargs.items() if key not in control_keys}
         )
@@ -611,6 +772,17 @@ class TorchBackend(Backend):
                 local_files_only=bool(kwargs.get("offline", False)),
             )
             model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+            if requested_mesh is not None:
+                actual_map = getattr(model, "hf_device_map", {})
+                actual_devices = {
+                    f"cuda:{value}" if isinstance(value, int) else str(value)
+                    for value in actual_map.values()
+                }
+                if actual_devices - set(self._devices):
+                    raise BackendError(
+                        f"frontend placed model outside execution_devices: {sorted(actual_devices)}",
+                        backend_name=self.name,
+                    )
         except Exception as exc:
             raise BackendError(
                 f"Unable to load model {model_id!r}; no model was loaded and no synthetic fallback is permitted: {exc}",
@@ -621,9 +793,10 @@ class TorchBackend(Backend):
         load_time = time.perf_counter() - start
         self._models[model_id] = model
         self._tokenizers[model_id] = tokenizer
+        self._remember_execution(model_id, model)
         return model
 
-    def _try_load_compiled_aeg(self, model_id: str, aeg_path: str | None) -> CompiledAEGHandle | None:
+    def _try_load_compiled_aeg(self, model_id: str, aeg_path: str | None, *, retain_host_weights: bool = False) -> CompiledAEGHandle | None:
         """Load local AEG metadata without contacting a model registry."""
         if aeg_path is None:
             return None
@@ -634,16 +807,6 @@ class TorchBackend(Backend):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         metadata_path = root / "graph" / "metadata.json"
         metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
-        eval_report_path = root / "observability" / "eval_report.json"
-        if eval_report_path.is_file():
-            eval_report = json.loads(eval_report_path.read_text(encoding="utf-8"))
-            gate = eval_report.get("gate", {})
-            if gate.get("passed") is False:
-                raise BackendError(
-                    "AEG artifact is rejected by its persisted evaluation gate: "
-                    + ", ".join(gate.get("failing_benchmarks", [])),
-                    backend_name=self.name,
-                )
         precision_path = root / "weights" / "quantized" / "precision_map.json"
         precision_map = {}
         if precision_path.exists():
@@ -651,6 +814,8 @@ class TorchBackend(Backend):
         engine = None
         tokenizer = None
         lora_adapters: dict[str, dict[tuple[int, str], tuple[Any, Any, float]]] = {}
+        from aether.backends.artifact_validation import ArtifactValidationError, validate_aeg_evaluation, verify_aeg_integrity
+
         try:
             from aether.runtime.aeg_loader import load_engine_from_path, package_is_runnable
             from aether.adapters.lora import load_compiled_lora_adapters
@@ -661,10 +826,13 @@ class TorchBackend(Backend):
             package.load()
             # Verify every declared artifact before decoding adapter bytes.
             # Adapter parsing is part of the untrusted AEG boundary.
-            package.verify_integrity()
+            verify_aeg_integrity(package, backend_name=self.name)
+            validate_aeg_evaluation(package, backend_name=self.name)
             lora_adapters = load_compiled_lora_adapters(root)
             if package_is_runnable(package):
-                engine = load_engine_from_path(root)
+                engine = load_engine_from_path(
+                    root, prepare_native_kernels=self._device == "cpu",
+                )
                 if self._device != "cpu":
                     if not package.supports_portable_backend("pytorch"):
                         raise BackendError(
@@ -718,7 +886,8 @@ class TorchBackend(Backend):
                     elif engine_kind == "RWKVExecutionEngine":
                         engine = TorchRWKVAEGEngine(engine, self._device, self._devices)
                     else:
-                        engine = TorchAEGEngine(engine, self._device)
+                        engine = TorchAEGEngine(engine, self._device,
+                            retain_host_weights=retain_host_weights)
                     # The loader's host FP32 arrays and the executor's device
                     # tensors are two full copies of the same weights, and only the
                     # device copy is read again.  Reclaiming the host set is a no-op
@@ -729,7 +898,7 @@ class TorchBackend(Backend):
                     # large-model requirement rather than a tidy-up.
                     _log_memory_census(engine, "device weights materialized")
                     reclaim = getattr(engine, "release_host_weights", None)
-                    if callable(reclaim) and _release_host_weights_enabled():
+                    if callable(reclaim) and _release_host_weights_enabled() and not retain_host_weights:
                         freed = reclaim()
                         if freed:
                             logger.info(
@@ -767,6 +936,8 @@ class TorchBackend(Backend):
                     from aether.backends.native_cpu_backend import PackagedTokenizer
 
                     tokenizer = PackagedTokenizer(tokenizer_root / "tokenizer.json")
+        except ArtifactValidationError:
+            raise
         except Exception as exc:
             raise BackendError(
                 f"AEG artifact {root} failed integrity/load validation before execution: {exc}",
@@ -782,6 +953,26 @@ class TorchBackend(Backend):
             tokenizer=tokenizer,
             lora_adapters=lora_adapters,
         )
+
+    def unload_model(self, model_id: str) -> None:
+        """Release this backend's model and request-local cache references."""
+        model = self._models.pop(model_id, None)
+        self._tokenizers.pop(model_id, None)
+        getattr(self, "_model_execution", {}).pop(model_id, None)
+        if isinstance(model, CompiledAEGHandle):
+            model.clear_session_caches()
+            model.batched_engine = None
+        if not self._models:
+            self._placement = None
+            self._placement_planner = None
+            self._placement_devices = None
+            self._placement_failed = False
+            self._placement_forced = False
+
+    def unload(self) -> None:
+        """Release all model references owned by this backend."""
+        for model_id in tuple(self._models):
+            self.unload_model(model_id)
 
     def get_capabilities(self) -> list[str]:
         return self.info.capabilities
@@ -820,8 +1011,8 @@ class TorchBackend(Backend):
             raise ValueError(msg)
 
         inputs = tokenizer(text, return_tensors="pt")
-        if self._device != "cpu":
-            inputs = {k: v.to(self._device) for k, v in inputs.items()}
+        input_device = self._input_device(request.model_id, model)
+        inputs = {key: value.to(input_device) for key, value in inputs.items()}
 
         input_tokens = inputs["input_ids"].shape[1]
         generate_kwargs: dict[str, Any] = {
@@ -913,7 +1104,8 @@ class TorchBackend(Backend):
             metrics={
                 "ttft_ms": ttft_ms,
                 "throughput_tps": tps,
-                "device": self._device,
+                "device": input_device,
+                "runtime_family": self._execution_family(request.model_id),
             },
         )
 
@@ -931,9 +1123,27 @@ class TorchBackend(Backend):
             execution_engine, adapter_metrics = self._engine_for_lora(
                 handle, execution_engine, adapter_id
             )
+            from aether.runtime.session_contract import session_execution_contract, shared_cache_contract
+
+            selected_engine = execution_engine
+            session_contract = None
+            if isinstance(request.extra.get("aether_kv_session_id"), str) or request.extra.get("multi_agent_kv_coordinator") is not None:
+                session_contract = session_execution_contract(
+                    handle, adapter_id=adapter_id, task_weights=request.extra.get("task_weights"),
+                    engine=selected_engine,
+                )
             ttt_state = self._begin_ttt(handle, prompt_ids, request, execution_engine)
             ttt_slots = ttt_state[2] if ttt_state is not None else None
+            features = request.extra.get("_execution_features")
+            if features is not None:
+                try:
+                    execution_engine = features.wrap_engine(request.model_id, handle, execution_engine, request)
+                except BaseException:
+                    self._end_ttt(ttt_state)
+                    raise
             session_id = request.extra.get("aether_kv_session_id")
+            if ttt_state is not None and isinstance(session_id, str):
+                handle.clear_session_cache(session_id)
             cache_session_id = None if ttt_state is not None else session_id
             reused_tokens = 0
             multi_agent_reused_tokens = 0
@@ -974,13 +1184,16 @@ class TorchBackend(Backend):
                         "R2 multi-agent prefix is not an exact token prefix of the request",
                         backend_name=self.name,
                     )
-                shared_cache, shared_length = coordinator.get_shared_kv(prefix_hash)
+                shared_cache, shared_length = coordinator.get_shared_kv(
+                    prefix_hash, execution_contract=shared_cache_contract(session_contract, engine=selected_engine)
+                )
                 if shared_cache is None:
                     _prefix_logits, shared_cache = execution_engine.forward(prefix_ids)
                     coordinator.update_shared_kv(
                         prefix_hash,
                         shared_cache,
                         seq_len=int(prefix_ids.size),
+                        execution_contract=shared_cache_contract(session_contract, engine=selected_engine),
                     )
                     shared_length = int(prefix_ids.size)
                 else:
@@ -994,7 +1207,7 @@ class TorchBackend(Backend):
                 suffix = candidate[prefix_ids.size :]
 
             cached_state = (
-                handle.session_caches.get(cache_session_id)
+                handle.get_session_cache(cache_session_id, contract=session_contract)
                 if cache is None and isinstance(cache_session_id, str)
                 else None
             )
@@ -1005,7 +1218,7 @@ class TorchBackend(Backend):
                 cached_ids = np.asarray(cached_ids, dtype=np.int64)
                 candidate = np.asarray(prompt_ids, dtype=np.int64)
                 if candidate.size >= cached_ids.size and np.array_equal(candidate[: cached_ids.size], cached_ids):
-                    cache = cached_cache
+                    cache = handle.cache_for_engine(cached_cache, execution_engine)
                     suffix = candidate[cached_ids.size :]
                     reused_tokens = int(cached_ids.size)
                 else:
@@ -1028,6 +1241,8 @@ class TorchBackend(Backend):
                         ttt_slots=ttt_slots,
                         adapter_id=adapter_id,
                         peagle_engine=peagle_engine,
+                        **({"cached_prefix_ids": prompt_ids[:cache.length]} if cache is not None
+                           and request.extra.get("_explicit_draft_engine") is not None else {}),
                     )
                 else:
                     generated_ids = execution_engine.generate(
@@ -1053,7 +1268,8 @@ class TorchBackend(Backend):
                     [np.asarray(prompt_ids, dtype=np.int64), np.asarray(generated_ids, dtype=np.int64)]
                 )
                 if updated_cache is not None:
-                    handle.session_caches[cache_session_id] = (full_ids, updated_cache)
+                    handle.save_session_cache(cache_session_id, full_ids, updated_cache,
+                                              contract=session_contract, target_engine=selected_engine)
             generated_text = handle.tokenizer.decode(generated_ids, skip_special_tokens=True)
             completion_tokens = len(generated_ids)
             finish_reason = "length" if len(generated_ids) >= request.max_tokens else "stop"
@@ -1079,11 +1295,14 @@ class TorchBackend(Backend):
                 metrics={
                     "ttft_ms": elapsed * 1000.0,
                     "throughput_tps": len(generated_ids) / max(elapsed, 1e-9),
-                    "device": str(getattr(execution_engine, "device", self._device)),
+                    "device": str(getattr(execution_engine, "device", self._input_device(handle.model_id, handle))),
+                    "runtime_family": self._execution_family(handle.model_id),
                     "kv_reuse": reused_tokens > 0,
                     "kv_reused_tokens": reused_tokens,
                     "multi_agent_kv_reuse": multi_agent_reused_tokens > 0,
                     "multi_agent_kv_reused_tokens": multi_agent_reused_tokens,
+                    **({"disaggregated": execution_engine.generation_stats()} if features is not None
+                       and hasattr(execution_engine, "generation_stats") else {}),
                     **(
                         {"ttt_adaptation_loss": ttt_state[3]}
                         if ttt_state is not None
@@ -1149,7 +1368,7 @@ class TorchBackend(Backend):
             backend_name=self.name,
             request_text=self._request_text,
             truncate_stop_text=self._truncate_stop_text,
-            default_device=self._device,
+            default_device=self._input_device(model_id, handle),
         )
 
     @staticmethod
@@ -1238,24 +1457,23 @@ class TorchBackend(Backend):
         task_weights: Any,
     ) -> tuple[Any, dict[str, Any] | None]:
         """Load authenticated task deltas into a request-local CPU engine."""
-        if not task_weights:
-            return handle.engine, None
-        if not isinstance(task_weights, dict):
-            raise BackendError("task_weights must be a mapping", backend_name=self.name)
         metadata = handle.metadata.get("task_vectors", {})
         vectors = metadata.get("vectors", []) if isinstance(metadata, dict) else []
+        from aether.runtime.session_contract import validate_task_weights
+
+        available = {str(vector.get("name")) for vector in vectors if isinstance(vector, dict)} if isinstance(vectors, list) else set()
+        try:
+            task_weights = validate_task_weights(task_weights, available=available)
+        except ValueError as exc:
+            raise BackendError(str(exc), backend_name=self.name) from exc
+        if not task_weights:
+            return handle.engine, None
         if not isinstance(vectors, list) or not vectors:
             raise BackendError(
                 "the AEG does not contain executable task-vector payloads",
                 backend_name=self.name,
             )
         manifest_artifacts = handle.manifest.get("artifacts", {})
-        available = {str(vector.get("name")) for vector in vectors if isinstance(vector, dict)}
-        unknown = sorted(set(task_weights) - available)
-        if unknown:
-            raise BackendError(
-                f"task_weights reference unknown vectors {unknown}", backend_name=self.name
-            )
         import numpy as np
 
         deltas: dict[str, np.ndarray] = {}
@@ -1266,8 +1484,6 @@ class TorchBackend(Backend):
                 raise BackendError("malformed task-vector descriptor", backend_name=self.name)
             name = str(vector.get("name", ""))
             coefficient = task_weights.get(name, 0.0)
-            if not isinstance(coefficient, (int, float)) or coefficient < 0:
-                raise BackendError(f"invalid task weight for {name!r}", backend_name=self.name)
             if coefficient == 0:
                 continue
             relative_path = vector.get("path")
@@ -1312,13 +1528,20 @@ class TorchBackend(Backend):
                             f"task-vector tensor shape mismatch for {tensor_name!r}",
                             backend_name=self.name,
                         )
-                    contribution = np.ascontiguousarray(
-                        array.reshape(shape), dtype=np.float32
-                    ) * np.float32(coefficient)
-                    if tensor_name in deltas:
-                        deltas[tensor_name] += contribution
-                    else:
-                        deltas[tensor_name] = contribution
+                    try:
+                        with np.errstate(over="raise", invalid="raise"):
+                            contribution = np.ascontiguousarray(
+                                array.reshape(shape), dtype=np.float32
+                            ) * np.float32(coefficient)
+                            contribution = deltas.get(tensor_name, 0.0) + contribution
+                        if not np.isfinite(contribution).all():
+                            raise FloatingPointError("task-vector values are not finite")
+                    except (FloatingPointError, OverflowError) as exc:
+                        raise BackendError(
+                            f"task-vector contribution overflowed or is not finite: {tensor_name}",
+                            backend_name=self.name,
+                        ) from exc
+                    deltas[tensor_name] = contribution
                     tensor_count += 1
             applied.append(name)
         if not applied:
@@ -1383,8 +1606,8 @@ class TorchBackend(Backend):
 
         text = self._apply_chat_template(request.messages, tokenizer) if request.messages else (request.prompt or "")
         inputs = tokenizer(text, return_tensors="pt")
-        if self._device != "cpu":
-            inputs = {k: v.to(self._device) for k, v in inputs.items()}
+        input_device = self._input_device(request.model_id, model)
+        inputs = {key: value.to(input_device) for key, value in inputs.items()}
 
         try:
             from transformers import TextIteratorStreamer
@@ -1449,12 +1672,30 @@ class TorchBackend(Backend):
         execution_engine, _adapter_metrics = self._engine_for_lora(
             handle, execution_engine, adapter_id
         )
+        from aether.runtime.session_contract import session_execution_contract
+
+        selected_engine = execution_engine
+        session_contract = None
+        if isinstance(request.extra.get("aether_kv_session_id"), str):
+            session_contract = session_execution_contract(
+                handle, adapter_id=adapter_id, task_weights=request.extra.get("task_weights"),
+                engine=selected_engine,
+            )
         ttt_state = self._begin_ttt(handle, prompt_ids, request, execution_engine)
         ttt_slots = ttt_state[2] if ttt_state is not None else None
+        features = request.extra.get("_execution_features")
+        if features is not None:
+            try:
+                execution_engine = features.wrap_engine(request.model_id, handle, execution_engine, request)
+            except BaseException:
+                self._end_ttt(ttt_state)
+                raise
         session_id = request.extra.get("aether_kv_session_id")
+        if ttt_state is not None and isinstance(session_id, str):
+            handle.clear_session_cache(session_id)
         cache_session_id = None if ttt_state is not None else session_id
         cached_state = (
-            handle.session_caches.get(cache_session_id)
+            handle.get_session_cache(cache_session_id, contract=session_contract)
             if isinstance(cache_session_id, str)
             else None
         )
@@ -1464,7 +1705,7 @@ class TorchBackend(Backend):
             cached_ids, cached_cache = cached_state
             cached_ids = np.asarray(cached_ids, dtype=np.int64)
             if prompt_ids.size >= cached_ids.size and np.array_equal(prompt_ids[: cached_ids.size], cached_ids):
-                cache = cached_cache
+                cache = handle.cache_for_engine(cached_cache, execution_engine)
                 suffix = prompt_ids[cached_ids.size :]
             else:
                 handle.clear_session_cache(cache_session_id)
@@ -1490,6 +1731,8 @@ class TorchBackend(Backend):
                 cache_callback=remember,
                 ttt_slots=ttt_slots,
                 adapter_id=adapter_id,
+                **({"cached_prefix_ids": prompt_ids[:cache.length]} if cache is not None
+                   and request.extra.get("_explicit_draft_engine") is not None else {}),
             )
             for token_id in iterator:
                 token_ids.append(int(token_id))
@@ -1511,7 +1754,8 @@ class TorchBackend(Backend):
 
         if isinstance(cache_session_id, str) and updated_cache[0] is not None:
             full_ids = np.concatenate([prompt_ids, np.asarray(token_ids, dtype=np.int64)])
-            handle.session_caches[cache_session_id] = (full_ids, updated_cache[0])
+            handle.save_session_cache(cache_session_id, full_ids, updated_cache[0],
+                                      contract=session_contract, target_engine=selected_engine)
         if not emitted:
             yield ""
 

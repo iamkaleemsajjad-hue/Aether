@@ -9,9 +9,13 @@ Tests for Phase 2 runtime components:
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
+
+if TYPE_CHECKING:
+    from aether.runtime.eagle import EAGLE3Engine
 
 
 # ---------------------------------------------------------------------------

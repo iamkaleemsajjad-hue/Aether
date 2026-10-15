@@ -135,6 +135,9 @@ class GenerationResult:
 class Backend(ABC):
     """Abstract base class for all Aether execution backends."""
 
+    model_formats: frozenset[str] | None = None
+    """Accepted loader contracts; None preserves existing custom plugins."""
+
     def __init__(self, info: BackendInfo) -> None:
         self.info = info
 
@@ -166,6 +169,20 @@ class Backend(ABC):
                 or target_id in self.info.supported_targets
             )
         )
+
+    def available_for_model(self, model_id: str, aeg_path: str | None = None) -> bool:
+        """Check loader applicability separately from installed device support."""
+        from aether.backends.model_contract import model_format
+
+        return self.model_formats is None or model_format(model_id, aeg_path) in self.model_formats
+
+    def automatic_execution_devices(self, target_id: str) -> list[str] | None:
+        """Optional adapter-specific mesh for an automatically selected target.
+
+        None leaves device enumeration to the framework. Explicit user meshes
+        bypass this hook and retain their original constraints.
+        """
+        return ["cpu"] if target_id.startswith("cpu_") else None
 
     @abstractmethod
     def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:

@@ -50,7 +50,7 @@ def create_router(runtime: Runtime) -> Any:
     try:
         from fastapi import APIRouter, HTTPException
         from starlette.responses import StreamingResponse
-        from pydantic import BaseModel, Field
+        from pydantic import BaseModel, Field, field_validator
     except ImportError:
         msg = "fastapi and pydantic are required for the server"
         raise ImportError(msg)
@@ -186,7 +186,25 @@ def create_router(runtime: Runtime) -> Any:
 
     class ReweightRequest(BaseModel):
         model: str
-        weights: dict[str, float]
+        weights: dict[str, float] = Field(
+            description="Finite nonnegative numeric coordinates with at least one positive value; booleans and strings are invalid.",
+        )
+
+        @field_validator("weights", mode="before")
+        @classmethod
+        def validate_raw_weights(cls, value: Any) -> dict[str, float]:
+            """Reject invalid coordinates before JSON booleans/strings can be coerced."""
+            from aether.runtime.session_contract import validate_task_weights
+
+            try:
+                result = validate_task_weights(value)
+                if not result:
+                    raise ValueError("task weights must contain a positive coordinate")
+                return result
+            except ValueError as exc:
+                # Do not echo nonfinite raw JSON into FastAPI's validation
+                # response: strict JSON serialization cannot encode it.
+                raise HTTPException(status_code=422, detail=f"Invalid task weights: {exc}") from exc
 
     class MultiAgentRequest(BaseModel):
         agent_count: int = 4
@@ -871,7 +889,7 @@ def create_router(runtime: Runtime) -> Any:
     @router.post("/merge/reweight", tags=["Model Management"])
     async def reweight(req: ReweightRequest):
         try:
-            return {"model": req.model, "weights": runtime.set_task_weights(req.model, **req.weights)}
+            return {"model": req.model, "weights": runtime.set_model_task_weights(req.model, req.weights)}
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 

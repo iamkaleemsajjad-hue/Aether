@@ -28,10 +28,13 @@ import json
 import struct
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
+
+if TYPE_CHECKING:
+    from aether.core.types import ModelArchitecture
 
 # ---------------------------------------------------------------------------
 # Shared helpers

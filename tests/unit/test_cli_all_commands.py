@@ -26,7 +26,7 @@ from aether.core.aeg_format import load_aeg_package
         ["kv", "cxl-pool-status"],
         ["trace"],
         ["mcp"],
-        ["train", "verify", "local.aeg", "--domain", "math", "--example", "2+2=4"],
+        ["train", "verify", "local.aeg", "--domain", "math", "--example", "2+2=4", "--ground-truth", "4"],
         ["compile", "Qwen/Qwen3-0.6B", "--dry-run", "--target", "cpu_avx512"],
     ],
 )
@@ -126,7 +126,7 @@ def test_multi_agent_prd_test_requires_a_real_aeg() -> None:
 
 def test_mcp_prd_subcommands_fail_closed_for_missing_artifact() -> None:
     listed = CliRunner().invoke(cli, ["mcp", "list", "missing.aeg"])
-    assert listed.exit_code == 0
+    assert listed.exit_code != 0
     assert "not found" in listed.output.lower()
 
     added = CliRunner().invoke(

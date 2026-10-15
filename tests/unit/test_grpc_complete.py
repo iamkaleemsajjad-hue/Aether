@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch, PropertyMock
 
@@ -475,6 +476,58 @@ class TestStartGrpcServer:
                 require_client_auth=True,
                 # No client_ca supplied
             )
+
+
+@pytest.mark.parametrize("failure", ["factory", "bind", "start", "cleanup"])
+def test_startup_failure_releases_owned_executor_threads(monkeypatch, failure):
+    from aether.server import grpc_service as service
+    threads = []
+    class Server:
+        def add_insecure_port(self, address):
+            return 0 if failure in {"bind", "cleanup"} else 12345
+        def start(self):
+            if failure == "start":
+                raise OSError("start failed")
+        def stop(self, grace):
+            if failure == "cleanup":
+                raise OSError("stop cleanup failed")
+            done = threading.Event()
+            done.set()
+            return done
+    def factory(executor):
+        threads.append(executor.submit(threading.current_thread).result(timeout=5))
+        if failure == "factory":
+            raise OSError("server factory failed")
+        return Server()
+    monkeypatch.setattr(service, "_require_grpc", lambda: None)
+    monkeypatch.setattr(service, "add_grpc_service", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "grpc", type("Grpc", (), {"server": staticmethod(factory)})())
+    with pytest.raises((OSError, RuntimeError)) as error:
+        service.start_grpc_server(object(), port=0)
+    if failure == "cleanup":
+        assert "could not bind" in str(error.value) and "cleanup failed" in str(error.value)
+    assert threads and all(not thread.is_alive() for thread in threads)
+
+
+@grpc_required
+def test_actual_rpc_shutdown_joins_executor_without_closing_shared_runtime():
+    from aether.server.grpc_service import AetherGrpcClient, start_grpc_server, shutdown_grpc_server
+    if not __import__("aether.server.grpc_service", fromlist=["aether_pb2"]).aether_pb2:
+        pytest.skip("typed protobuf bindings unavailable")
+    runtime = MagicMock()
+    server = start_grpc_server(runtime, port=0, auth_token="local-test-token")
+    client = AetherGrpcClient(f"127.0.0.1:{server.aether_port}", auth_token="local-test-token")
+    try:
+        assert client.health()["status"] == "ok"
+        workers = [thread for thread in threading.enumerate() if thread.name.startswith("aether-grpc")]
+        assert workers, "real Health RPC must execute on the owned executor"
+        shutdown_grpc_server(server)
+        shutdown_grpc_server(server)  # Public shutdown is idempotent.
+        assert all(not thread.is_alive() for thread in workers)
+        runtime.close.assert_not_called()
+    finally:
+        client.close()
+        shutdown_grpc_server(server)
 
 
 # ---------------------------------------------------------------------------

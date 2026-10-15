@@ -174,7 +174,7 @@ def _build_aeg_graph(arch: ModelArchitecture, weights: ModelWeights) -> AEGGraph
 
 def test_cpu_engine_wires_real_peagle_drafts_through_exact_target_verification() -> None:
     """MTP proposals must be verified by target logits before cache advance."""
-    import torch
+    torch = pytest.importorskip("torch")
 
     engine = CPUExecutionEngine(_make_model_weights(), num_heads=HEADS, num_kv_heads=KV_HEADS)
     peagle = PEAGLEEngine(draft_K=2, mode="mtp")

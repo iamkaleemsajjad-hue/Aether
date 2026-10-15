@@ -115,11 +115,8 @@ class TestCUDABackend:
 
     def test_availability_matches_torch(self):
         backend = CUDABackend()
-        try:
-            import torch
-            expected = torch.cuda.is_available()
-        except ImportError:
-            expected = False
+        from aether.backends.torch_backend import TorchBackend
+        expected = backend._cuda_available and TorchBackend().available_for_target(backend.target_id)
         assert backend.is_available() == expected
 
     def test_load_raises_when_unavailable(self):
@@ -146,22 +143,22 @@ class TestCUDABackend:
     def test_fp8_support_sm89(self):
         backend = CUDABackend(target_id="cuda_sm89")
         caps = backend.get_capabilities()
-        assert caps.get("supports_fp8") is True
+        assert caps["target_profile_capabilities"]["fp8"] is True
 
     def test_fp4_support_sm100(self):
         backend = CUDABackend(target_id="cuda_sm100")
         caps = backend.get_capabilities()
-        assert caps.get("supports_fp4") is True
+        assert caps["target_profile_capabilities"]["fp4"] is True
 
     def test_no_fp4_for_sm80(self):
         backend = CUDABackend(target_id="cuda_sm80")
         caps = backend.get_capabilities()
-        assert caps.get("supports_fp4") is False
+        assert caps["target_profile_capabilities"]["fp4"] is False
 
     def test_tee_support_sm100_tee(self):
         backend = CUDABackend(target_id="cuda_sm100_tee")
         caps = backend.get_capabilities()
-        assert caps.get("supports_tee") is True
+        assert caps["target_profile_capabilities"]["tee"] is True
 
     def test_info_capabilities(self):
         backend = CUDABackend(target_id="cuda_sm90")

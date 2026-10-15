@@ -114,6 +114,7 @@ class TestPass10MTPHead:
         assert (tmp_path / "speculation" / "mtp_head_0.bin").is_file()
 
     def test_compiled_blob_reloads_into_real_peagle_projection(self, tmp_path):
+        pytest.importorskip("torch")
         p = self._import()
 
         class Node:

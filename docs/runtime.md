@@ -8,122 +8,225 @@ When you run `aether run` or `aether serve`:
 
 1. Detect hardware fingerprint (GPU, VRAM, driver, compute capability).
 2. Load the AEG manifest.
-3. Select the best backend for the detected hardware.
+3. Intersect executable artifact variants with host devices and installed backends.
 4. Load the model into the selected backend.
-5. Allocate KV cache across tiers.
-6. Start the disaggregated prefill/decode scheduler.
-7. Enable tree-speculative decoding if configured.
+5. Initialize the backend's KV state and runtime cache accounting.
+6. Initialize applicable scheduling and control components.
+7. Enable speculative execution only with its required payload/backend contract.
 8. Serve requests.
 
 ## Hardware Detection
 
-The runtime detects the current platform and maps it to a hardware target:
+The runtime derives targets from queried device and usable instruction evidence:
 
-- NVIDIA → `cuda_sm70/80/89/90/100`
-- Apple Silicon → `metal_m1` or `metal_m3`
-- AMD → `rocm_rdna3` or `rocm_cdna3`
-- Intel NPU / CPU → `openvino_npu` or `cpu_avx512`
-- ARM CPU → `cpu_neon`
+- NVIDIA → queried compute capability, such as `cuda_sm89`.
+- Apple Silicon → identified Metal device/chip, such as `metal_m1` or `metal_m3`.
+- AMD → detected HIP architecture, such as `rocm_rdna3` or `rocm_cdna3`.
+- Intel GPU/NPU → `openvino_gpu` or `openvino_npu` device evidence. Supported
+  dense portable AEG graphs can use the ONNX Runtime OpenVINO provider contract;
+  the separate planning-only vendor adapter is not an executed generation path.
+- CPU → `cpu_avx512`, `cpu_avx2`, `cpu_neon`, or `cpu_generic`, according to process-usable features.
+
+Unknown architectures retain their detected identity; they are not assigned a
+known profile merely from a vendor name. A detected target does not itself
+authorize artifact execution.
 
 You can inspect the detected hardware with:
 
 ```bash
 aether hw
+aether hardware detect --json
+aether hardware validate cpu_generic --execute --json
+aether hardware validate cuda_sm89 --backend pytorch --device-index 0 --execute --json
 ```
+
+Detection does not run inference. `implemented` describes an inference adapter,
+`available` requires hardware and a usable vendor runtime, and
+`backend_available` records execution dependency readiness separately. Unknown
+stages are `null`; `execution_tested` remains false until an explicit workload
+succeeds. CPU and PyTorch AEG `--execute` validation compiles and reloads an
+offline tiny AEG, runs prefill and cached decode on the requested device, and
+compares logits with an independent NumPy reference. DirectML uses a raw ONNX
+workload as described below. These functional tests never imply production validation.
+
+Read `precision_scope` and `precision_semantics` with the precision flags:
+device-arithmetic evidence is separate from queried vendor runtime formats.
+Metal/OpenVINO runtime format support does not prove native arithmetic or
+successful Aether execution. Generic AVX-512 does not
+confirm FP16 or BF16 extensions. Aether can still execute supported FP16/BF16 or
+packed quantized weights through FP32 conversion and accumulation. Unknown
+memory is reported as unknown, with measurement source fields; a CUDA Driver API
+version is recorded separately from the NVIDIA driver release.
+
+A Windows C++ compiler is optional for CPU execution. MSVC, clang-cl, GCC/MinGW,
+and Clang are discovered and checked; failed compilation produces a visible
+warning and the real NumPy reference path remains available. Native libraries
+carry platform and ISA identities and are recompiled or bypassed when incompatible.
+
+DirectML supports raw ONNX models through the optional ONNX Runtime adapter.
+DLL presence or a registered provider does not prove a usable GPU. In a separate
+Windows environment, install the local source with `pip install -e ".[directml]"`
+and run `aether hardware validate directml --execute --json`. This checks an
+actual FP32 ONNX workload and requires DirectML node attribution. An AEG with
+the portable `onnx` contract can also export supported dense decoder operators
+to real prefill and cached-decode graphs. Unsupported operator plans fail
+explicitly. See [runtime feature integration](runtime-feature-integration.md)
+for actual Intel DirectML generation/streaming evidence and export boundaries.
 
 ## Backend Selection
 
-The runtime selects the best available backend for the target:
+Automatic selection prefers a ready accelerator authorized by the artifact's
+executable variants or portable graph contract. It otherwise uses an authorized
+CPU path. A CPU artifact without an accelerator contract stays on CPU; a
+portable PyTorch contract can authorize CUDA, ROCm or MPS execution even if its
+emitted native variant is CPU. `plan_only` entries alone do not authorize execution.
+Explicit backend and device requests are strict constraints.
 
-- NVIDIA → vLLM, TensorRT-LLM, PyTorch
-- Apple Silicon → MLX, PyTorch
-- AMD → PyTorch, llama.cpp
-- Intel/CPU → ONNX Runtime, llama.cpp, PyTorch
+Hardware inventory is independent of installed inference packages. Windows
+DXGI, Linux PCI/DRM and macOS native Metal/profiler probes retain visible GPUs
+even when the compute SDK is missing. Stable PCI, UUID, LUID or Metal registry
+identities join matching provider records; ambiguous counts remain qualified.
+Dedicated video memory and shared system memory limits are separate values.
+Non-Apple Metal devices use the generic `metal` contract, with no Apple ISA or
+precision assumptions. PyTorch MPS only exposes its default adapter.
 
-You can force a backend with the `AETHER_BACKEND` environment variable or `RuntimeConfig.backend_name`.
+- CPU execution path / CPU-only AEG → framework-free `aether_cpu` (native library or NumPy reference).
+- Portable CUDA/ROCm/MPS AEG → optional PyTorch graph executor.
+- Other executable variants → a backend compatible with that target.
+- Local `.onnx` → a compatible registered accelerator provider, then CPU if
+  automatic accelerator initialization fails. Explicit provider requests disable
+  CPU fallback. A successful session alone does not establish execution evidence.
+- Source checkpoints → an installed source frontend with compatible device
+  support; CPU fallback works when optional accelerator dependencies are absent.
+- Local GGUF → llama.cpp with verified local GGML device enumeration. GPU
+  selection passes GPU layers and a concrete ordinal; CPU requests use zero
+  GPU layers. Builds without a usable device enumeration remain CPU-capable.
+
+MLX requires `mlx-lm` as well as a usable Metal runtime. Its stream uses the
+frontend's actual event counts and sampler. Synchronous vLLM returns a buffered
+completion; incremental serving requires its separate asynchronous API. Runtime
+options are translated before invoking vendor constructors rather than passed
+through as unsupported vendor keywords.
+
+The llama.cpp subprocess adapter launches a dedicated loopback server on an
+unused port and verifies a unique model alias before routing requests. An
+occupied explicitly requested port is rejected. A health response from an
+unrelated server is insufficient to establish that the requested model loaded.
+
+The CLI reads `AETHER_BACKEND`. Python callers can use
+`RuntimeConfig.from_env()` or set `RuntimeConfig.backend_name` explicitly;
+plain `Runtime()` does not import that backend environment setting.
+Device constraints come from `AETHER_EXECUTION_DEVICES` or
+`RuntimeConfig.execution_devices`.
+Explicit accelerator requests fail if their execution contract or backend is
+unavailable. `kernel_target` reports the selected target for each loaded model;
+`hardware()` continues to describe the host.
+
+See [research-backed execution contracts](research-backed-runtime.md) for the
+distinction between portable graphs and target-specific execution.
 
 ## Disaggregated Prefill/Decode
 
-Aether separates compute-bound prefill from memory-bandwidth-bound decode:
-
-- **Prefill scheduler**: processes all input tokens in parallel, chunked to maintain TTFT SLO.
-- **Decode scheduler**: generates one token at a time with continuous batching.
-- **KV transfer**: shared memory or RDMA between prefill and decode pools.
-
-Enable with:
+Aether executes separate, owned prefill and decode workers when enabled. Workers
+transfer typed, lossless model state through bounded in-process queues, with
+measured phase/queue/handoff latency, cancellation and explicit shutdown.
+CPU decoder families and supported nonsharded Torch/ONNX adapters have concrete
+cache contracts. Placement uses explicit adapter factories; it does not enable
+RDMA or establish a speedup on a single laptop:
 
 ```python
-RuntimeConfig(disaggregate_prefill_decode=True)
+RuntimeConfig(disaggregate_prefill_decode=True, prefill_devices=["cpu"], decode_devices=["cpu"])
 ```
 
 ## Tree-Speculative Decoding
 
-A draft model proposes a branching tree of candidate tokens. The target model verifies the entire tree in one forward pass using tree-masked attention.
+An explicitly loaded draft model proposes tokens and the target engine verifies
+their probabilities. Exact greedy and corrected stochastic rejection paths
+preserve the target sampler, roll back rejected state, and respect output bounds.
+The tree-planning components are separate from this executing draft/target path.
 
 Configuration:
 
 ```python
 RuntimeConfig(
-    speculative_decoding=True,
-    speculative_tree_depth=4,
+    draft_model_id="./compatible-draft.aeg",
+    speculative_gamma=4,
 )
 ```
 
-The draft model is auto-selected for common model families (e.g., Qwen3-72B uses Qwen3-1.5B as draft). If the acceptance rate drops below 70%, Aether falls back to standard decoding.
+The runtime does not select a draft checkpoint from the target's family name.
+Tree speculation requires an explicitly supplied compatible draft/backend;
+packaged MTP/draft-head paths have their own payload and executor contracts.
+Acceptance monitoring can disable speculation, but configuration alone does
+not establish that a draft model is loaded or that a speedup occurs.
 
 ## Global KV Cache Manager
 
-The KV cache is tiered across four storage levels:
+Backend engines own active inference tensors. The global manager can attach
+real typed snapshots, commit bytes to bounded local disk storage, reload after
+restart, and upload/download private authenticated Hub snapshots. Descriptor-only
+accounting remains available and is reported separately from tensor transfers:
 
 | Tier | Storage | Use |
 |------|---------|-----|
 | L1 | GPU HBM | Active request blocks |
 | L2 | CPU DRAM | Prefix cache, recently evicted blocks |
-| L3 | NVMe SSD | Long system prompts, RAG documents |
-| L4 | Aether Hub | Globally shared system prompts |
+| L3 | Configured local disk | Committed, checksummed snapshots |
+| L4 | Explicit authenticated Hub | Private, namespaced snapshots |
 
-Prefix cache hits are tracked by a RadixTree over KV block hashes. Common system prompts and RAG documents are stored once and reused across sessions.
+`Runtime.persist_session()` and `restore_session()` connect this storage to
+actual execution caches. Local disk is not assumed to be physical NVMe or
+GPU-direct storage. Hub I/O requires explicit client and namespace configuration.
 
 ## Dynamic Precision Adjustment
 
-Under memory pressure, the runtime downgrades the lowest-sensitivity layers to a lower precision in place, then restores them when pressure eases. This is automatic, transparent, and reversible.
+`Runtime.adjust_precision()` changes real execution tensors transactionally.
+It measures supplied calibration inputs and accepts only candidates within
+configured output-error and latency limits. Original tensors have exact disk
+restoration data. Automatic pressure-based adjustment requires real calibration
+token sequences; a fixed precision label or estimated PPL penalty is not proof
+of execution or quality. Lossy changes require explicit permission:
 
 ```python
-RuntimeConfig(dynamic_precision=True)
+RuntimeConfig(dynamic_precision=True, precision_calibration_tokens=[[1, 2, 3]], precision_allow_lossy=False)
 ```
 
 ## Continuous Batching
 
-The decode scheduler uses iteration-level admission (similar to vLLM/Orca) to maximize throughput while meeting latency SLOs.
+See [runtime feature integration](runtime-feature-integration.md) for supported
+cache families, configuration examples, measured evidence and combinations that
+require a separate adapter. Global CLI `--runtime-config runtime.json` accepts
+the same validated RuntimeConfig fields for generation and serving commands.
+
+Scheduling components support iteration-level admission. Actual batching and
+latency behavior depend on the selected backend and serving integration;
+their presence does not guarantee throughput or an SLO on every device.
 
 ## Configuration
 
 ```python
-from aether import RuntimeConfig
+from aether import Runtime, RuntimeConfig
 
 config = RuntimeConfig(
-    optimize_for="latency",
-    speculative_decoding=True,
-    prefill_chunk_size=2048,
-    max_batch_size=256,
-    kv_cache_dtype="fp8",
-    kv_cache_cpu_gb=32,
-    kv_cache_nvme_gb=200,
-    dynamic_precision=True,
+    backend_name="auto",
+    hf_offline=True,
+    speculative_decoding=False,
 )
 rt = Runtime(config)
 ```
 
 ## Metrics
 
-The runtime exposes Prometheus-compatible metrics at `/v1/metrics`:
+`/v1/metrics` currently returns a JSON object with these counters:
 
 - `runtime_up`
 - `loaded_models`
 - `kv_cache_blocks`
 - `kv_cache_hit_rate`
-- `throughput_tps`
-- `ttft_ms`
+
+Per-request `InferenceMetrics` carries measured throughput and first-token
+latency when the selected backend supplies them. The endpoint above is not a
+Prometheus text exposition or a complete request-performance time series.
 
 
 ## v3.1 Runtime Controls

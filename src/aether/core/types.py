@@ -381,6 +381,7 @@ class HardwareTarget(enum.Enum):
     CUDA_SM90 = "cuda_sm90"
     CUDA_SM100 = "cuda_sm100"
     CUDA_SM120 = "cuda_sm120"
+    METAL = "metal"
     METAL_M1 = "metal_m1"
     METAL_M3 = "metal_m3"
     ROCM_RDNA3 = "rocm_rdna3"
@@ -388,6 +389,7 @@ class HardwareTarget(enum.Enum):
     OPENVINO_NPU = "openvino_npu"
     OPENVINO_GPU = "openvino_gpu"
     QUALCOMM_QNN = "qualcomm_qnn"
+    CPU_GENERIC = "cpu_generic"
     CPU_AVX512 = "cpu_avx512"
     CPU_AVX2 = "cpu_avx2"
     CPU_NEON = "cpu_neon"
@@ -448,6 +450,7 @@ class HardwareTarget(enum.Enum):
             HardwareTarget.QUALCOMM_QNN: "Qualcomm",
             HardwareTarget.QUALCOMM_CLOUD_AI100: "Qualcomm",
             HardwareTarget.CPU_AVX512: "CPU",
+            HardwareTarget.CPU_GENERIC: "CPU",
             HardwareTarget.CPU_AVX2: "CPU",
             HardwareTarget.CPU_NEON: "CPU",
             HardwareTarget.CPU_AVX512_TERNARY: "CPU",
@@ -485,6 +488,7 @@ class HardwareTarget(enum.Enum):
             HardwareTarget.QUALCOMM_QNN: "Qualcomm Snapdragon NPU (QNN)",
             HardwareTarget.QUALCOMM_CLOUD_AI100: "Qualcomm Cloud AI 100 Ultra",
             HardwareTarget.CPU_AVX512: "x86_64 (AVX-512)",
+            HardwareTarget.CPU_GENERIC: "CPU (portable baseline)",
             HardwareTarget.CPU_AVX2: "x86_64 (AVX2)",
             HardwareTarget.CPU_NEON: "ARM (NEON SIMD)",
             HardwareTarget.CPU_AVX512_TERNARY: "x86_64 AVX2 Ternary (BitNet b1.58)",
@@ -522,6 +526,7 @@ class HardwareTarget(enum.Enum):
             HardwareTarget.QUALCOMM_QNN: ["onnxruntime", "pytorch"],
             HardwareTarget.QUALCOMM_CLOUD_AI100: ["onnxruntime", "pytorch"],
             HardwareTarget.CPU_AVX512: ["llama.cpp", "onnxruntime", "aether_cpu"],
+            HardwareTarget.CPU_GENERIC: ["aether_cpu", "onnxruntime", "pytorch"],
             HardwareTarget.CPU_AVX2: ["llama.cpp", "onnxruntime", "aether_cpu"],
             HardwareTarget.CPU_NEON: ["llama.cpp", "onnxruntime", "aether_cpu"],
             HardwareTarget.CPU_AVX512_TERNARY: ["bitnet.cpp", "llama.cpp", "aether_cpu"],
@@ -587,130 +592,28 @@ class HardwareTarget(enum.Enum):
 
     @staticmethod
     def auto() -> HardwareTarget:
-        """Detect the current hardware platform and return the best target.
+        """Select an implemented, available target from canonical host evidence.
 
-        Uses native vendor APIs (NVML for CUDA, platform APIs for Metal/ROCm)
-        rather than PyTorch. This method does NOT require torch to be installed.
-
-        Detection order:
-          1. CUDA via pynvml (preferred, already installed as transitive dep)
-          2. CUDA via CUDA Driver API ctypes (fallback, no pynvml)
-          3. ROCm via /dev/kfd on Linux
-          4. Metal/MPS via platform + system_profiler on macOS
-          5. MLX on Apple Silicon
-          6. CPU fallback (always succeeds)
+        Detection describes physical/runtime presence, never execution success.
+        CPU artifacts are dispatched separately according to their manifest;
+        this host preference does not override an artifact's execution contract.
         """
-        import sys
+        from aether.backends.hardware_detector import detect_all_capabilities
 
-        # ── 1. CUDA via pynvml ────────────────────────────────────────────────
-        try:
-            import pynvml  # noqa: PLC0415
-            pynvml.nvmlInit()
-            device_count = pynvml.nvmlDeviceGetCount()
-            if device_count > 0:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
-                pynvml.nvmlShutdown()
-                if (major, minor) >= (10, 0):
-                    return HardwareTarget.CUDA_SM100
-                if (major, minor) >= (9, 0):
-                    return HardwareTarget.CUDA_SM90
-                if (major, minor) >= (8, 9):
-                    return HardwareTarget.CUDA_SM89
-                if (major, minor) >= (8, 0):
-                    return HardwareTarget.CUDA_SM80
-                return HardwareTarget.CUDA_SM70
-            pynvml.nvmlShutdown()
-        except Exception:  # noqa: BLE001
-            pass
-
-        # ── 2. CUDA Driver API ctypes fallback ────────────────────────────────
-        try:
-            import ctypes  # noqa: PLC0415
-            _lib_name = "nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1"
-            _cuda = ctypes.CDLL(_lib_name)
-            _init_result = _cuda.cuInit(0)
-            if _init_result == 0:  # CUDA_SUCCESS
-                count = ctypes.c_int(0)
-                _cuda.cuDeviceGetCount(ctypes.byref(count))
-                if count.value > 0:
-                    major = ctypes.c_int(0)
-                    minor = ctypes.c_int(0)
-                    # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
-                    _cuda.cuDeviceGetAttribute(ctypes.byref(major), 75, 0)
-                    # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
-                    _cuda.cuDeviceGetAttribute(ctypes.byref(minor), 76, 0)
-                    cap = (major.value, minor.value)
-                    if cap >= (10, 0):
-                        return HardwareTarget.CUDA_SM100
-                    if cap >= (9, 0):
-                        return HardwareTarget.CUDA_SM90
-                    if cap >= (8, 9):
-                        return HardwareTarget.CUDA_SM89
-                    if cap >= (8, 0):
-                        return HardwareTarget.CUDA_SM80
-                    return HardwareTarget.CUDA_SM70
-        except Exception:  # noqa: BLE001
-            pass
-
-        # ── 3. ROCm/HIP via /dev/kfd on Linux ────────────────────────────────
-        if sys.platform == "linux":
+        detected = detect_all_capabilities()
+        candidates = []
+        for capability in detected:
+            if not (capability.available and capability.implemented):
+                continue
             try:
-                import pathlib  # noqa: PLC0415
-                if pathlib.Path("/dev/kfd").exists():
-                    return HardwareTarget.ROCM_CDNA3
-            except Exception:  # noqa: BLE001
-                pass
-
-        # ── 4. Apple Metal via platform APIs ─────────────────────────────────
-        # OpenVINO is the framework-independent probe for Intel integrated
-        # and discrete GPUs. Require the plugin to enumerate the device;
-        # package presence alone is not evidence of usable hardware.
-        try:
-            import openvino  # type: ignore[import]  # noqa: PLC0415
-            devices = list(openvino.Core().available_devices)
-            if "GPU" in devices:
-                return HardwareTarget.OPENVINO_GPU
-            if "NPU" in devices:
-                return HardwareTarget.OPENVINO_NPU
-        except Exception:  # noqa: BLE001
-            pass
-
-        if sys.platform == "darwin":
-            try:
-                import subprocess  # noqa: PLC0415
-                result = subprocess.run(
-                    ["system_profiler", "SPDisplaysDataType"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                if "Metal" in result.stdout or "Apple" in result.stdout:
-                    return HardwareTarget.METAL_M3
-            except Exception:  # noqa: BLE001
-                pass
-            # MLX as secondary Metal indicator
-            try:
-                import mlx.core  # noqa: F401,PLC0415
-                return HardwareTarget.METAL_M3
-            except ImportError:
-                pass
-
-        # ── 5. CPU fallback — always available ────────────────────────────────
-        # CPU fallback: report the actual instruction-set floor rather than
-        # labeling every x86 host as AVX-512.
-        import platform
-
-        machine = platform.machine().lower()
-        if machine in {"arm64", "aarch64"}:
-            return HardwareTarget.CPU_NEON
-        try:
-            from numpy.core import _multiarray_umath
-
-            features = getattr(_multiarray_umath, "__cpu_features__", {})
-            if bool(features.get("AVX512F")):
-                return HardwareTarget.CPU_AVX512
-        except (ImportError, AttributeError):
-            pass
-        return HardwareTarget.CPU_AVX2
+                target = HardwareTarget.from_string(capability.target_id)
+            except ValueError:
+                continue
+            candidates.append(target)
+        return next(
+            (target for target in candidates if target.vendor != "CPU"),
+            next((target for target in candidates if target.vendor == "CPU"), HardwareTarget.CPU_GENERIC),
+        )
 
 
 @dataclass(frozen=True)

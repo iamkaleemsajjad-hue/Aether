@@ -6,6 +6,7 @@ Defines the `RuntimeConfig` class controlling the Aether execution engine.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -63,10 +64,34 @@ class RuntimeConfig:
     """NVMe SSD budget for KV cache (GB)."""
 
     dynamic_precision: bool = DEFAULT_DYNAMIC_PRECISION
-    """Allow precision downgrade/upgrade under memory pressure."""
+    """Enable measured, reversible precision adjustment under memory pressure."""
+
+    precision_storage_dtype: str = "float16"
+    precision_allow_lossy: bool = False
+    precision_max_logit_error: float = 0.0
+    precision_max_slowdown: float = 0.05
+    precision_calibration_tokens: list[list[int]] = field(default_factory=list)
+    precision_cooldown_seconds: float = 30.0
+    """Real calibration inputs and acceptance bounds; lossy changes are opt-in."""
 
     disaggregate_prefill_decode: bool = DEFAULT_DISAGGREGATE_SERVE
-    """Enable for multi-GPU cluster mode with separate prefill/decode pools."""
+    """Execute with separate prefill/decode workers and typed cache handoff."""
+
+    prefill_devices: list[str] | None = None
+    decode_devices: list[str] | None = None
+    disaggregate_prefill_workers: int = 1
+    disaggregate_decode_workers: int = 1
+    disaggregate_queue_capacity: int = 32
+    """Pool placement and bounded admission; omitted devices use the loaded target."""
+
+    draft_model_id: str | None = None
+    draft_backend_name: str | None = None
+    draft_execution_devices: list[str] | None = None
+    speculative_gamma: int = 4
+    """Explicit compatible draft model; no model-family guessing."""
+
+    kv_cache_path: str | None = None
+    """Persistent lossless cache store; filesystem technology is not inferred."""
 
     server_port: int = DEFAULT_SERVER_PORT
     """REST server port."""
@@ -187,13 +212,47 @@ class RuntimeConfig:
 
     def validate(self) -> None:
         """Validate configuration values."""
+        for name, descriptor in self.__dataclass_fields__.items():
+            annotation = str(descriptor.type)
+            value = getattr(self, name)
+            valid = True
+            if annotation == "bool":
+                valid = type(value) is bool
+            elif annotation == "int":
+                valid = type(value) is int
+            elif annotation == "float":
+                valid = type(value) in (int, float) and math.isfinite(value)
+            elif annotation == "str":
+                valid = isinstance(value, str)
+            elif annotation == "str | None":
+                valid = value is None or isinstance(value, str)
+            elif annotation.startswith("list["):
+                valid = isinstance(value, list) or (value is None and annotation.endswith("| None"))
+            elif annotation.startswith("dict["):
+                valid = isinstance(value, dict)
+            if not valid:
+                raise RuntimeConfigError(
+                    f"{name} must have type {annotation}; got {type(value).__name__}"
+                )
+        if type(self.speculative_decoding) is not bool and not isinstance(
+            self.speculative_decoding, str
+        ):
+            raise RuntimeConfigError(
+                "speculative_decoding must be boolean or a supported mode string"
+            )
         if self.optimize_for not in ("latency", "throughput", "quality"):
             msg = f"optimize_for must be 'latency', 'throughput', or 'quality', got '{self.optimize_for}'"
             raise RuntimeConfigError(msg)
         if isinstance(self.speculative_decoding, str) and self.speculative_decoding not in {
-            "eagle3", "p_eagle", "saguaro", "none", "off"
+            "eagle3",
+            "p_eagle",
+            "saguaro",
+            "none",
+            "off",
         }:
-            raise RuntimeConfigError(f"unsupported speculative_decoding mode: {self.speculative_decoding}")
+            raise RuntimeConfigError(
+                f"unsupported speculative_decoding mode: {self.speculative_decoding}"
+            )
         if self.speculative_tree_depth < 1 or self.speculative_tree_depth > 10:
             msg = f"speculative_tree_depth must be between 1 and 10, got {self.speculative_tree_depth}"
             raise RuntimeConfigError(msg)
@@ -203,12 +262,56 @@ class RuntimeConfig:
         if self.max_batch_size < 1:
             msg = f"max_batch_size must be >= 1, got {self.max_batch_size}"
             raise RuntimeConfigError(msg)
+        from aether.runtime.execution_precision import PrecisionPolicy
+
+        try:
+            PrecisionPolicy(
+                storage_dtype=self.precision_storage_dtype,
+                allow_lossy=self.precision_allow_lossy,
+                max_logit_error=self.precision_max_logit_error,
+                max_slowdown=self.precision_max_slowdown,
+            )
+        except ValueError as exc:
+            raise RuntimeConfigError(str(exc)) from exc
+        if self.precision_cooldown_seconds < 0:
+            raise RuntimeConfigError("precision_cooldown_seconds must be non-negative")
+        if any(
+            not isinstance(ids, list)
+            or not ids
+            or any(type(token) is not int or token < 0 for token in ids)
+            for ids in self.precision_calibration_tokens
+        ):
+            raise RuntimeConfigError(
+                "precision calibration must contain nonempty sequences of non-negative token IDs"
+            )
+        if (
+            min(
+                self.disaggregate_prefill_workers,
+                self.disaggregate_decode_workers,
+                self.disaggregate_queue_capacity,
+                self.speculative_gamma,
+            )
+            < 1
+        ):
+            raise RuntimeConfigError(
+                "worker counts, queue capacity and speculative_gamma must be positive"
+            )
+        for name in ("prefill_devices", "decode_devices", "draft_execution_devices"):
+            mesh = getattr(self, name)
+            if mesh is not None and (
+                not mesh
+                or any(not isinstance(device, str) or not device.strip() for device in mesh)
+                or len(set(mesh)) != len(mesh)
+            ):
+                raise RuntimeConfigError(f"{name} must be a nonempty list of unique device IDs")
         if self.kv_cache_dtype not in ("fp8", "fp16", "bf16"):
             msg = f"kv_cache_dtype must be 'fp8', 'fp16', or 'bf16', got '{self.kv_cache_dtype}'"
             raise RuntimeConfigError(msg)
         if self.model_download_timeout_s <= 0:
             msg = f"model_download_timeout_s must be positive, got {self.model_download_timeout_s}"
             raise RuntimeConfigError(msg)
+        if self.kv_cache_cpu_gb < 0 or self.kv_cache_nvme_gb < 0:
+            raise RuntimeConfigError("cache memory budgets must be non-negative")
         if self.reasoning_budget < 0:
             raise RuntimeConfigError("reasoning_budget must be non-negative")
         if not 0.0 <= self.semantic_cache_threshold <= 1.0:
@@ -218,14 +321,19 @@ class RuntimeConfig:
         if self.scheduler not in ("continuous_batching", "slo_aware"):
             raise RuntimeConfigError("scheduler must be 'continuous_batching' or 'slo_aware'")
         if self.multi_agent_kv_mode not in ("relay", "kvcomm", "droidspeak", "swarm"):
-            raise RuntimeConfigError("multi_agent_kv_mode must be relay, kvcomm, droidspeak, or swarm")
+            raise RuntimeConfigError(
+                "multi_agent_kv_mode must be relay, kvcomm, droidspeak, or swarm"
+            )
         if self.mcp_timeout_ms <= 0:
             raise RuntimeConfigError("mcp_timeout_ms must be positive")
         if self.execution_devices is not None:
-            if not self.execution_devices or len(set(self.execution_devices)) != len(self.execution_devices):
+            if not self.execution_devices or any(
+                not isinstance(device, str) or not device.strip()
+                for device in self.execution_devices
+            ):
                 raise RuntimeConfigError("execution_devices must be a non-empty list of unique IDs")
-            if any(not isinstance(device, str) or not device.strip() for device in self.execution_devices):
-                raise RuntimeConfigError("execution_devices must contain non-empty strings")
+            if len(set(self.execution_devices)) != len(self.execution_devices):
+                raise RuntimeConfigError("execution_devices must contain unique IDs")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -238,14 +346,34 @@ class RuntimeConfig:
             "kv_cache_cpu_gb": self.kv_cache_cpu_gb,
             "kv_cache_nvme_gb": self.kv_cache_nvme_gb,
             "dynamic_precision": self.dynamic_precision,
+            "precision_storage_dtype": self.precision_storage_dtype,
+            "precision_allow_lossy": self.precision_allow_lossy,
+            "precision_max_logit_error": self.precision_max_logit_error,
+            "precision_max_slowdown": self.precision_max_slowdown,
+            "precision_calibration_tokens": [
+                list(ids) for ids in self.precision_calibration_tokens
+            ],
+            "precision_cooldown_seconds": self.precision_cooldown_seconds,
             "disaggregate_prefill_decode": self.disaggregate_prefill_decode,
+            "prefill_devices": self.prefill_devices,
+            "decode_devices": self.decode_devices,
+            "disaggregate_prefill_workers": self.disaggregate_prefill_workers,
+            "disaggregate_decode_workers": self.disaggregate_decode_workers,
+            "disaggregate_queue_capacity": self.disaggregate_queue_capacity,
+            "draft_model_id": self.draft_model_id,
+            "draft_backend_name": self.draft_backend_name,
+            "draft_execution_devices": self.draft_execution_devices,
+            "speculative_gamma": self.speculative_gamma,
+            "kv_cache_path": self.kv_cache_path,
             "server_port": self.server_port,
             "server_host": self.server_host,
             "default_temperature": self.default_temperature,
             "default_max_tokens": self.default_max_tokens,
             "default_top_p": self.default_top_p,
             "backend_name": self.backend_name,
-            "execution_devices": list(self.execution_devices) if self.execution_devices is not None else None,
+            "execution_devices": list(self.execution_devices)
+            if self.execution_devices is not None
+            else None,
             "model_cache_dir": self.model_cache_dir,
             "model_download_timeout_s": self.model_download_timeout_s,
             "hf_offline": self.hf_offline,
@@ -286,14 +414,34 @@ class RuntimeConfig:
         return RuntimeConfig(
             optimize_for=data.get("optimize_for", DEFAULT_OPTIMIZE_FOR),
             speculative_decoding=data.get("speculative_decoding", DEFAULT_SPECULATIVE_DECODING),
-            speculative_tree_depth=data.get("speculative_tree_depth", DEFAULT_SPECULATIVE_TREE_DEPTH),
+            speculative_tree_depth=data.get(
+                "speculative_tree_depth", DEFAULT_SPECULATIVE_TREE_DEPTH
+            ),
             prefill_chunk_size=data.get("prefill_chunk_size", DEFAULT_PREFILL_CHUNK_SIZE),
             max_batch_size=data.get("max_batch_size", DEFAULT_MAX_BATCH_SIZE),
             kv_cache_dtype=data.get("kv_cache_dtype", DEFAULT_KV_CACHE_DTYPE),
             kv_cache_cpu_gb=data.get("kv_cache_cpu_gb", DEFAULT_KV_CACHE_CPU_GB),
             kv_cache_nvme_gb=data.get("kv_cache_nvme_gb", DEFAULT_KV_CACHE_NVME_GB),
             dynamic_precision=data.get("dynamic_precision", DEFAULT_DYNAMIC_PRECISION),
-            disaggregate_prefill_decode=data.get("disaggregate_prefill_decode", DEFAULT_DISAGGREGATE_SERVE),
+            precision_storage_dtype=data.get("precision_storage_dtype", "float16"),
+            precision_allow_lossy=data.get("precision_allow_lossy", False),
+            precision_max_logit_error=data.get("precision_max_logit_error", 0.0),
+            precision_max_slowdown=data.get("precision_max_slowdown", 0.05),
+            precision_calibration_tokens=data.get("precision_calibration_tokens", []),
+            precision_cooldown_seconds=data.get("precision_cooldown_seconds", 30.0),
+            disaggregate_prefill_decode=data.get(
+                "disaggregate_prefill_decode", DEFAULT_DISAGGREGATE_SERVE
+            ),
+            prefill_devices=data.get("prefill_devices"),
+            decode_devices=data.get("decode_devices"),
+            disaggregate_prefill_workers=data.get("disaggregate_prefill_workers", 1),
+            disaggregate_decode_workers=data.get("disaggregate_decode_workers", 1),
+            disaggregate_queue_capacity=data.get("disaggregate_queue_capacity", 32),
+            draft_model_id=data.get("draft_model_id"),
+            draft_backend_name=data.get("draft_backend_name"),
+            draft_execution_devices=data.get("draft_execution_devices"),
+            speculative_gamma=data.get("speculative_gamma", 4),
+            kv_cache_path=data.get("kv_cache_path"),
             server_port=data.get("server_port", DEFAULT_SERVER_PORT),
             server_host=data.get("server_host", DEFAULT_SERVER_HOST),
             default_temperature=data.get("default_temperature", DEFAULT_TEMPERATURE),
@@ -302,7 +450,8 @@ class RuntimeConfig:
             backend_name=data.get("backend_name"),
             execution_devices=(
                 list(data["execution_devices"])
-                if data.get("execution_devices") is not None else None
+                if data.get("execution_devices") is not None
+                else None
             ),
             model_cache_dir=data.get("model_cache_dir"),
             model_download_timeout_s=data.get("model_download_timeout_s", 30.0),

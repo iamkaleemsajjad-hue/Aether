@@ -26,6 +26,15 @@ from aether.core.constants import AETHER_VERSION
 from aether.core.exceptions import BackendError
 from aether.core.hash_utils import compute_file_hash
 from aether.runtime.aeg_loader import load_engine_from_path, package_is_runnable
+from aether.runtime.session_contract import (
+    session_execution_contract,
+    shared_cache_contract,
+    validate_task_weights,
+)
+from aether.utils.logging import get_logger
+
+
+logger = get_logger(__name__)
 
 
 def _stop_ids(tokenizer: Any) -> Any:
@@ -337,6 +346,8 @@ class PackagedTokenizer:
 class NativeCPUBackend(Backend):
     """Aether-native CPU backend for self-contained AEG execution."""
 
+    model_formats = frozenset({"aeg"})
+
     def __init__(self) -> None:
         Backend.__init__(
             self,
@@ -344,7 +355,7 @@ class NativeCPUBackend(Backend):
                 name="aether_cpu",
                 version=AETHER_VERSION,
                 supported_targets=[
-                    "cpu_avx2", "cpu_avx512", "cpu_neon",
+                    "cpu_generic", "cpu_avx2", "cpu_avx512", "cpu_neon",
                     "cpu_avx512_ternary", "cpu_neon_ternary",
                 ],
                 capabilities=[
@@ -381,18 +392,10 @@ class NativeCPUBackend(Backend):
             from aether.adapters.lora import load_compiled_lora_adapters
 
             package = AEGPackage(root).load()
-            package.verify_integrity()
-            eval_report_path = root / "observability" / "eval_report.json"
-            if eval_report_path.is_file():
-                eval_report = json.loads(eval_report_path.read_text(encoding="utf-8"))
-                gate = eval_report.get("gate", {})
-                if gate.get("passed") is False:
-                    failing = gate.get("failing_benchmarks", [])
-                    raise BackendError(
-                        "AEG artifact is rejected by its persisted evaluation gate: "
-                        + ", ".join(str(item) for item in failing),
-                        backend_name=self.name,
-                    )
+            from aether.backends.artifact_validation import validate_aeg_evaluation, verify_aeg_integrity
+
+            verify_aeg_integrity(package, backend_name=self.name)
+            validate_aeg_evaluation(package, backend_name=self.name)
             if not package_is_runnable(package):
                 raise BackendError(f"AEG artifact {root} is not executable", backend_name=self.name)
             engine = load_engine_from_path(root)
@@ -422,6 +425,12 @@ class NativeCPUBackend(Backend):
         self._models[model_id] = handle
         self._tokenizers[model_id] = tokenizer
         return handle
+
+    def unload_model(self, model_id: str) -> None:
+        """Release cached execution state before an artifact is removed/rebuilt."""
+        self._batchers.pop(model_id, None)
+        self._tokenizers.pop(model_id, None)
+        self._models.pop(model_id, None)
 
     def get_capabilities(self) -> list[str]:
         """Return capabilities of the framework-free packaged-AEG path."""
@@ -542,19 +551,21 @@ class NativeCPUBackend(Backend):
         self, handle: CompiledAEGHandle, task_weights: Any,
     ) -> tuple[Any, dict[str, Any] | None]:
         """Load authenticated task-vector payloads into a request-local engine."""
-        if not task_weights:
-            return handle.engine, None
-        if not isinstance(task_weights, dict):
-            raise BackendError("task_weights must be a mapping", backend_name=self.name)
         metadata = handle.metadata.get("task_vectors", {})
         vectors = metadata.get("vectors", []) if isinstance(metadata, dict) else []
+        available = (
+            {str(item.get("name")) for item in vectors if isinstance(item, dict)}
+            if isinstance(vectors, list) else set()
+        )
+        try:
+            task_weights = validate_task_weights(task_weights, available=available)
+        except ValueError as exc:
+            raise BackendError(str(exc), backend_name=self.name) from exc
+        if not task_weights:
+            return handle.engine, None
         if not isinstance(vectors, list) or not vectors:
             raise BackendError("the AEG does not contain executable task-vector payloads", backend_name=self.name)
         artifacts = handle.manifest.get("artifacts", {})
-        available = {str(item.get("name")) for item in vectors if isinstance(item, dict)}
-        unknown = sorted(set(task_weights) - available)
-        if unknown:
-            raise BackendError(f"task_weights reference unknown vectors {unknown}", backend_name=self.name)
         deltas: dict[str, np.ndarray] = {}
         applied: list[str] = []
         tensor_count = 0
@@ -563,8 +574,6 @@ class NativeCPUBackend(Backend):
                 raise BackendError("malformed task-vector descriptor", backend_name=self.name)
             name = str(vector.get("name", ""))
             coefficient = task_weights.get(name, 0.0)
-            if not isinstance(coefficient, (int, float)) or coefficient < 0:
-                raise BackendError(f"invalid task weight for {name!r}", backend_name=self.name)
             if coefficient == 0:
                 continue
             relative = vector.get("path")
@@ -587,8 +596,15 @@ class NativeCPUBackend(Backend):
                     array = np.asarray(archive[key], dtype=np.float32)
                     if int(np.prod(shape)) != array.size:
                         raise BackendError(f"task-vector tensor shape mismatch for {tensor_name!r}", backend_name=self.name)
-                    contribution = np.ascontiguousarray(array.reshape(shape), dtype=np.float32) * np.float32(coefficient)
-                    deltas[tensor_name] = deltas.get(tensor_name, 0.0) + contribution
+                    try:
+                        with np.errstate(over="raise", invalid="raise"):
+                            contribution = np.ascontiguousarray(array.reshape(shape), dtype=np.float32) * np.float32(coefficient)
+                            combined = deltas.get(tensor_name, 0.0) + contribution
+                    except FloatingPointError as exc:
+                        raise BackendError(f"task-vector arithmetic overflow for {tensor_name!r}", backend_name=self.name) from exc
+                    if not np.all(np.isfinite(combined)):
+                        raise BackendError(f"task-vector payload is not finite for {tensor_name!r}", backend_name=self.name)
+                    deltas[tensor_name] = combined
                     tensor_count += 1
             applied.append(name)
         if not applied:
@@ -603,6 +619,11 @@ class NativeCPUBackend(Backend):
     ) -> tuple[Any, str, list[dict[str, Any]], float] | None:
         """Adapt persisted R5 slots using the portable engine's embeddings."""
         ttt_engine = request.extra.get("ttt_engine")
+        if ttt_engine is not None and request.extra.get("spec_draft_engine") is not None:
+            raise BackendError(
+                "legacy speculative draft execution does not support active TTT fast-weight slots",
+                backend_name=self.name,
+            )
         if ttt_engine is None or not hasattr(engine.weights, "embedding"):
             return None
         request_id = str(request.extra.get("ttt_request_id") or uuid.uuid4().hex)
@@ -617,7 +638,7 @@ class NativeCPUBackend(Backend):
                     raise BackendError(f"R5 TTT slot {layer_index} was not available after adaptation", backend_name=self.name)
                 slots.append(slot)
             return ttt_engine, request_id, slots, loss
-        except Exception:
+        except BaseException:
             ttt_engine.end_request(request_id)
             raise
 
@@ -665,7 +686,11 @@ class NativeCPUBackend(Backend):
         # When ``use_continuous_batching=True`` is set in request.extra, route
         # through ContinuousBatcher.generate_sync() so multiple concurrent
         # requests share one decode loop rather than serialising on the GIL.
-        if request.extra.get("use_continuous_batching"):
+        adapted_request = any(
+            request.extra.get(key) is not None
+            for key in ("task_weights", "adapter_id", "adapter_name", "ttt_engine")
+        )
+        if request.extra.get("use_continuous_batching") and not adapted_request:
             try:
                 text = self._request_text(request, handle.tokenizer)
                 encoded = handle.tokenizer(text, return_tensors="np")
@@ -716,103 +741,117 @@ class NativeCPUBackend(Backend):
         engine, task_metrics = self._engine_for_task_weights(handle, request.extra.get("task_weights"))
         adapter_id = request.extra.get("adapter_id", request.extra.get("adapter_name"))
         engine, adapter_metrics = self._engine_for_lora(handle, engine, adapter_id)
+        selected_engine = engine
+        session_id = request.extra.get("aether_kv_session_id")
+        execution_contract = None
+        if isinstance(session_id, str) or request.extra.get("multi_agent_kv_coordinator") is not None:
+            execution_contract = session_execution_contract(
+                handle, adapter_id=adapter_id,
+                task_weights=request.extra.get("task_weights"), engine=selected_engine,
+            )
         ttt_state = self._begin_ttt(handle, prompt_ids, request, engine)
         ttt_slots = ttt_state[2] if ttt_state is not None else None
-
-        session_id = request.extra.get("aether_kv_session_id")
-        cached = handle.session_caches.get(session_id) if isinstance(session_id, str) else None
-        cache = None
-        suffix = prompt_ids
-        reused_tokens = 0
-        multi_agent_reused_tokens = 0
-        coordinator = request.extra.get("multi_agent_kv_coordinator")
-        prefix_text = request.extra.get("multi_agent_prefix")
-        prefix_hash = request.extra.get("multi_agent_prefix_hash")
-        if (
-            ttt_state is None and coordinator is not None and isinstance(prefix_text, str)
-            and prefix_text and isinstance(prefix_hash, str) and prefix_hash
-        ):
-            if coordinator.hash_prefix(prefix_text) != prefix_hash:
-                raise BackendError("R2 multi-agent prefix hash does not match its text", backend_name=self.name)
-            prefix_ids = np.asarray(handle.tokenizer(prefix_text, return_tensors="np")["input_ids"][0], dtype=np.int64)
-            if prompt_ids.size < prefix_ids.size or not np.array_equal(prompt_ids[:prefix_ids.size], prefix_ids):
-                raise BackendError("R2 multi-agent prefix is not an exact token prefix of the request", backend_name=self.name)
-            shared_cache, shared_length = coordinator.get_shared_kv(prefix_hash)
-            if shared_cache is None:
-                _, shared_cache = engine.generate_with_cache(prefix_ids, max_tokens=0, cache=None)
-                coordinator.update_shared_kv(prefix_hash, shared_cache, seq_len=int(prefix_ids.size))
-                shared_length = int(prefix_ids.size)
-            else:
-                multi_agent_reused_tokens = int(shared_length)
-            if int(shared_length) != int(prefix_ids.size):
-                raise BackendError("R2 shared KV length does not match the tokenized prefix", backend_name=self.name)
-            cache = shared_cache.clone()
-            suffix = prompt_ids[prefix_ids.size:]
-        if cached is not None and cache is None:
-            cached_ids, cached_cache = cached
-            cached_ids = np.asarray(cached_ids, dtype=np.int64)
-            if prompt_ids.size >= cached_ids.size and np.array_equal(
-                prompt_ids[: cached_ids.size], cached_ids
-            ):
-                cache = cached_cache
-                suffix = prompt_ids[cached_ids.size :]
-                reused_tokens = int(cached_ids.size)
-            else:
-                handle.clear_session_cache(session_id)
-
-        start = time.perf_counter()
-        spec_draft_engine = request.extra.get("spec_draft_engine")
-        spec_gamma = int(request.extra.get("spec_gamma", 4))
         try:
-            # ── Speculative decoding path ─────────────────────────────────────
-            if spec_draft_engine is not None:
-                from aether.runtime.speculative_engine import (
-                    DraftTargetSpecDecoder, SpeculativeConfig,
-                )
-                spec_config = SpeculativeConfig(
-                    gamma=spec_gamma,
-                    draft_temperature=max(float(request.temperature), 1e-7),
-                    greedy_acceptance=(request.temperature == 0.0),
-                )
-                spec_decoder = DraftTargetSpecDecoder(
-                    draft_engine=spec_draft_engine,
-                    target_engine=engine,
-                    config=spec_config,
-                )
-                generated: list[int] = []
-                max_new = request.max_tokens
-                current_ids = list(np.asarray(suffix, dtype=np.int64))
-                draft_cache = None
-                target_cache = cache  # May be None (no KV reuse) or warmed cache
-                eos_ids = _stop_ids(handle.tokenizer)
-                eos_set: set[int] = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids or [])
-                while len(generated) < max_new:
-                    accepted, draft_cache, target_cache, _step_stats = spec_decoder.generate_step(
-                        current_ids,
-                        draft_cache=draft_cache,
-                        target_cache=target_cache,
+            if ttt_state is not None and isinstance(session_id, str):
+                handle.clear_session_cache(session_id)
+            features = request.extra.get("_execution_features")
+            if features is not None:
+                engine = features.wrap_engine(request.model_id, handle, engine, request)
+
+            cache_session_id = None if ttt_state is not None else session_id
+            cached = handle.get_session_cache(cache_session_id, contract=execution_contract) if isinstance(cache_session_id, str) else None
+            cache = None
+            suffix = prompt_ids
+            reused_tokens = 0
+            multi_agent_reused_tokens = 0
+            coordinator = request.extra.get("multi_agent_kv_coordinator")
+            prefix_text = request.extra.get("multi_agent_prefix")
+            prefix_hash = request.extra.get("multi_agent_prefix_hash")
+            if (
+                ttt_state is None and coordinator is not None and isinstance(prefix_text, str)
+                and prefix_text and isinstance(prefix_hash, str) and prefix_hash
+            ):
+                if coordinator.hash_prefix(prefix_text) != prefix_hash:
+                    raise BackendError("R2 multi-agent prefix hash does not match its text", backend_name=self.name)
+                prefix_ids = np.asarray(handle.tokenizer(prefix_text, return_tensors="np")["input_ids"][0], dtype=np.int64)
+                if prompt_ids.size < prefix_ids.size or not np.array_equal(prompt_ids[:prefix_ids.size], prefix_ids):
+                    raise BackendError("R2 multi-agent prefix is not an exact token prefix of the request", backend_name=self.name)
+                shared_execution_contract = shared_cache_contract(execution_contract, engine=selected_engine)
+                shared_cache, shared_length = coordinator.get_shared_kv(prefix_hash, execution_contract=shared_execution_contract)
+                if shared_cache is None:
+                    _, shared_cache = engine.generate_with_cache(prefix_ids, max_tokens=0, cache=None)
+                    coordinator.update_shared_kv(prefix_hash, shared_cache, seq_len=int(prefix_ids.size), execution_contract=shared_execution_contract)
+                    shared_length = int(prefix_ids.size)
+                else:
+                    multi_agent_reused_tokens = int(shared_length)
+                if int(shared_length) != int(prefix_ids.size):
+                    raise BackendError("R2 shared KV length does not match the tokenized prefix", backend_name=self.name)
+                cache = handle.cache_for_engine(shared_cache.clone(), engine)
+                suffix = prompt_ids[prefix_ids.size:]
+            if cached is not None and cache is None:
+                cached_ids, cached_cache = cached
+                cached_ids = np.asarray(cached_ids, dtype=np.int64)
+                if prompt_ids.size >= cached_ids.size and np.array_equal(
+                    prompt_ids[: cached_ids.size], cached_ids
+                ):
+                    cache = handle.cache_for_engine(cached_cache, engine)
+                    suffix = prompt_ids[cached_ids.size :]
+                    reused_tokens = int(cached_ids.size)
+                else:
+                    handle.clear_session_cache(cache_session_id)
+
+            start = time.perf_counter()
+            spec_draft_engine = request.extra.get("spec_draft_engine")
+            spec_gamma = int(request.extra.get("spec_gamma", 4))
+            try:
+                # ── Speculative decoding path ─────────────────────────────────────
+                if spec_draft_engine is not None:
+                    from aether.runtime.speculative_engine import SpeculativeGenerationAdapter
+
+                    engine = SpeculativeGenerationAdapter(engine, spec_draft_engine, gamma=spec_gamma)
+                    generated, updated_cache = engine.generate_with_cache(
+                        suffix, max_tokens=request.max_tokens, temperature=request.temperature,
+                        top_k=request.top_k, top_p=request.top_p,
+                        eos_token_id=_stop_ids(handle.tokenizer), grammar_session=request.extra.get("grammar_session"),
+                        cache=cache, cached_prefix_ids=prompt_ids[:cache.length] if cache is not None else None,
                     )
-                    for tok in accepted:
-                        generated.append(tok)
-                        if eos_set and tok in eos_set:
-                            break
-                    if eos_set and any(t in eos_set for t in accepted):
-                        # Trim at first EOS
-                        for stop_i, tok in enumerate(generated):
-                            if tok in eos_set:
-                                generated = generated[:stop_i]
-                                break
-                        break
-                    current_ids = current_ids + accepted
-                updated_cache = target_cache
-
-                def speculative_stats() -> dict:
-                    s = spec_decoder.stats
-                    return s.report()
-
-                engine.speculative_stats = speculative_stats  # type: ignore[attr-defined]
-            # ── Standard single-request path ──────────────────────────────────
-            elif hasattr(engine, "generate_with_cache"):
+                # ── Standard single-request path ──────────────────────────────────
+                elif hasattr(engine, "generate_with_cache"):
+                    generated, updated_cache = engine.generate_with_cache(
+                        suffix,
+                        max_tokens=request.max_tokens,
+                        temperature=request.temperature,
+                        top_k=request.top_k,
+                        top_p=request.top_p,
+                        eos_token_id=_stop_ids(handle.tokenizer),
+                        grammar_session=request.extra.get("grammar_session"),
+                        cache=cache,
+                        ttt_slots=ttt_slots,
+                        adapter_id=str(adapter_id) if adapter_id is not None else None,
+                        peagle_engine=request.extra.get("peagle_engine"),
+                        **({"cached_prefix_ids": prompt_ids[:cache.length]} if cache is not None
+                           and request.extra.get("_explicit_draft_engine") is not None else {}),
+                    )
+                else:
+                    generated = engine.generate(
+                        prompt_ids,
+                        max_tokens=request.max_tokens,
+                        temperature=request.temperature,
+                        top_k=request.top_k,
+                        top_p=request.top_p,
+                        eos_token_id=_stop_ids(handle.tokenizer),
+                        ttt_slots=ttt_slots,
+                        peagle_engine=request.extra.get("peagle_engine"),
+                    )
+                    updated_cache = None
+            except TypeError:
+                # Specialised engines can expose a narrower generation signature.
+                # Retry only after removing optional orchestration hooks; never
+                # fabricate output or silently switch to another backend.
+                if ttt_slots is not None or not any(value is not None for value in (
+                    request.extra.get("ttt_slots"), request.extra.get("peagle_engine"),
+                )):
+                    raise
                 generated, updated_cache = engine.generate_with_cache(
                     suffix,
                     max_tokens=request.max_tokens,
@@ -822,45 +861,12 @@ class NativeCPUBackend(Backend):
                     eos_token_id=_stop_ids(handle.tokenizer),
                     grammar_session=request.extra.get("grammar_session"),
                     cache=cache,
-                    ttt_slots=ttt_slots,
-                    adapter_id=str(adapter_id) if adapter_id is not None else None,
-                    peagle_engine=request.extra.get("peagle_engine"),
                 )
-            else:
-                generated = engine.generate(
-                    prompt_ids,
-                    max_tokens=request.max_tokens,
-                    temperature=request.temperature,
-                    top_k=request.top_k,
-                    top_p=request.top_p,
-                    eos_token_id=_stop_ids(handle.tokenizer),
-                    ttt_slots=ttt_slots,
-                    peagle_engine=request.extra.get("peagle_engine"),
-                )
-                updated_cache = None
-        except TypeError:
-            # Specialised engines can expose a narrower generation signature.
-            # Retry only after removing optional orchestration hooks; never
-            # fabricate output or silently switch to another backend.
-            if not any(value is not None for value in (
-                request.extra.get("ttt_slots"), request.extra.get("peagle_engine"),
-            )):
-                raise
-            generated, updated_cache = engine.generate_with_cache(
-                suffix,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-                top_k=request.top_k,
-                top_p=request.top_p,
-                eos_token_id=_stop_ids(handle.tokenizer),
-                grammar_session=request.extra.get("grammar_session"),
-                cache=cache,
-            )
         finally:
             self._end_ttt(ttt_state)
-        if isinstance(session_id, str):
+        if isinstance(cache_session_id, str):
             full_ids = np.concatenate([prompt_ids, np.asarray(generated, dtype=np.int64)])
-            handle.session_caches[session_id] = (full_ids, updated_cache)
+            handle.save_session_cache(cache_session_id, full_ids, updated_cache, contract=execution_contract, target_engine=selected_engine)
         elapsed = time.perf_counter() - start
         generated_text = handle.tokenizer.decode(generated, skip_special_tokens=True)
         completion_tokens = len(generated)
@@ -885,6 +891,8 @@ class NativeCPUBackend(Backend):
                 "kv_reused_tokens": reused_tokens,
                 "multi_agent_kv_reuse": multi_agent_reused_tokens > 0,
                 "multi_agent_kv_reused_tokens": multi_agent_reused_tokens,
+                **({"disaggregated": engine.generation_stats()} if features is not None
+                   and hasattr(engine, "generation_stats") else {}),
                 **({"ttt_adaptation_loss": ttt_state[3]} if ttt_state is not None else {}),
                 **({"task_reweighting": task_metrics} if task_metrics is not None else {}),
                 **({"lora_adapter": adapter_metrics} if adapter_metrics is not None else {}),
@@ -908,55 +916,82 @@ class NativeCPUBackend(Backend):
         encoded = self._encode_prompt(text, request, handle.tokenizer)
         self._augment_stops(request, handle.tokenizer)
         prompt_ids = np.asarray(encoded["input_ids"][0], dtype=np.int64)
-        engine = handle.engine
+        engine, _task_metrics = self._engine_for_task_weights(handle, request.extra.get("task_weights"))
         adapter_id = request.extra.get("adapter_id", request.extra.get("adapter_name"))
-        if adapter_id is not None and hasattr(engine, "with_lora_adapter"):
-            engine = engine.with_lora_adapter(handle.lora_adapters, str(adapter_id))
+        engine, _adapter_metrics = self._engine_for_lora(handle, engine, adapter_id)
+        selected_engine = engine
         session_id = request.extra.get("aether_kv_session_id")
-        cached = handle.session_caches.get(session_id) if isinstance(session_id, str) else None
-        cache = None
-        suffix = prompt_ids
-        if cached is not None:
-            cached_ids, cached_cache = cached
-            cached_ids = np.asarray(cached_ids, dtype=np.int64)
-            if prompt_ids.size >= cached_ids.size and np.array_equal(
-                prompt_ids[: cached_ids.size], cached_ids
-            ):
-                cache = cached_cache
-                suffix = prompt_ids[cached_ids.size :]
-            else:
-                handle.clear_session_cache(session_id)
-
-        token_ids: list[int] = []
-        previous = ""
-        updated_cache: list[Any] = [None]
-
-        def remember(value: Any) -> None:
-            updated_cache[0] = value
-
-        iterator = engine.generate_iter(
-            suffix,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_k=request.top_k,
-            top_p=request.top_p,
-            eos_token_id=_stop_ids(handle.tokenizer),
-            grammar_session=request.extra.get("grammar_session"),
-            cache=cache,
-            cache_callback=remember,
-            adapter_id=str(adapter_id) if adapter_id is not None else None,
-        )
-        for token_id in iterator:
-            token_ids.append(int(token_id))
-            decoded = handle.tokenizer.decode(
-                token_ids,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
+        execution_contract = None
+        if isinstance(session_id, str):
+            execution_contract = session_execution_contract(
+                handle, adapter_id=adapter_id,
+                task_weights=request.extra.get("task_weights"), engine=selected_engine,
             )
-            delta = decoded[len(previous):] if decoded.startswith(previous) else decoded
-            previous = decoded
-            if delta:
-                yield delta
-        if isinstance(session_id, str) and updated_cache[0] is not None:
+        ttt_state = self._begin_ttt(handle, prompt_ids, request, engine)
+        ttt_slots = ttt_state[2] if ttt_state is not None else None
+        iterator = None
+        try:
+            if ttt_state is not None and isinstance(session_id, str):
+                handle.clear_session_cache(session_id)
+            features = request.extra.get("_execution_features")
+            if features is not None:
+                engine = features.wrap_engine(request.model_id, handle, engine, request)
+            cache_session_id = None if ttt_state is not None else session_id
+            cached = handle.get_session_cache(cache_session_id, contract=execution_contract) if isinstance(cache_session_id, str) else None
+            cache = None
+            suffix = prompt_ids
+            if cached is not None:
+                cached_ids, cached_cache = cached
+                cached_ids = np.asarray(cached_ids, dtype=np.int64)
+                if prompt_ids.size >= cached_ids.size and np.array_equal(
+                    prompt_ids[: cached_ids.size], cached_ids
+                ):
+                    cache = handle.cache_for_engine(cached_cache, engine)
+                    suffix = prompt_ids[cached_ids.size :]
+                else:
+                    handle.clear_session_cache(cache_session_id)
+
+            token_ids: list[int] = []
+            previous = ""
+            updated_cache: list[Any] = [None]
+
+            def remember(value: Any) -> None:
+                updated_cache[0] = value
+
+            iterator = engine.generate_iter(
+                suffix,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_k=request.top_k,
+                top_p=request.top_p,
+                eos_token_id=_stop_ids(handle.tokenizer),
+                grammar_session=request.extra.get("grammar_session"),
+                cache=cache,
+                cache_callback=remember,
+                ttt_slots=ttt_slots,
+                adapter_id=str(adapter_id) if adapter_id is not None else None,
+                peagle_engine=request.extra.get("peagle_engine"),
+                **({"cached_prefix_ids": prompt_ids[:cache.length]} if cache is not None
+                   and request.extra.get("_explicit_draft_engine") is not None else {}),
+            )
+            for token_id in iterator:
+                token_ids.append(int(token_id))
+                decoded = handle.tokenizer.decode(
+                    token_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+                delta = decoded[len(previous):] if decoded.startswith(previous) else decoded
+                previous = decoded
+                if delta:
+                    yield delta
+        finally:
+            try:
+                close = getattr(iterator, "close", None)
+                if callable(close):
+                    close()
+            finally:
+                self._end_ttt(ttt_state)
+        if isinstance(cache_session_id, str) and updated_cache[0] is not None:
             full_ids = np.concatenate([prompt_ids, np.asarray(token_ids, dtype=np.int64)])
-            handle.session_caches[session_id] = (full_ids, updated_cache[0])
+            handle.save_session_cache(cache_session_id, full_ids, updated_cache[0], contract=execution_contract, target_engine=selected_engine)

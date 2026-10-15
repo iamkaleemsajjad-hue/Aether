@@ -3,9 +3,9 @@ Aether Hub client — real HTTP with retry/backoff + local cache simulation.
 
 Two operational modes:
   1. **Real HTTP** — when ``hub_url`` resolves to a reachable server.
-  2. **Local simulation** — when the server is unreachable or not deployed.
-     The client transparently falls back to the in-memory local cache so
-     upload/download/search work during development without a live Hub.
+  2. **Explicit local-cache fallback** — ``allow_local_cache=True`` preserves
+     development workflows in this client instance. It is memory-only and is
+     never evidence that an artifact was published remotely.
 
 All HTTP calls use only stdlib ``urllib`` (no requests dependency).
 """
@@ -16,6 +16,7 @@ import hashlib
 import io
 import json
 import math
+import stat
 import tarfile
 import time
 import urllib.error
@@ -90,6 +91,8 @@ class HubManifest:
     content_hash: str = ""
     uploaded_at: str = ""
     downloads: int = 0
+    source: str = "unknown"
+    persistence: str = "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -102,6 +105,8 @@ class HubManifest:
             "content_hash": self.content_hash,
             "uploaded_at": self.uploaded_at,
             "downloads": self.downloads,
+            "source": self.source,
+            "persistence": self.persistence,
         }
 
     @staticmethod
@@ -116,6 +121,8 @@ class HubManifest:
             content_hash=data.get("content_hash", ""),
             uploaded_at=data.get("uploaded_at", ""),
             downloads=data.get("downloads", 0),
+            source=data.get("source", "unknown"),
+            persistence=data.get("persistence", "unknown"),
         )
 
 
@@ -140,6 +147,7 @@ class HubClient:
         self.allow_local_cache = allow_local_cache
         self._local_cache: dict[str, HubManifest] = {}
         self._local_packages: dict[str, bytes] = {}
+        self.last_operation: dict[str, Any] = {}
         logger.info("Hub client initialized", hub_url=self.hub_url, auth=auth_token is not None)
 
     # ------------------------------------------------------------------
@@ -188,9 +196,12 @@ class HubClient:
                         )
                     if not raw:
                         return {}
-                    return json.loads(raw.decode("utf-8"))
+                    result = json.loads(raw.decode("utf-8"))
+                    if not isinstance(result, dict):
+                        raise HubError(f"Hub response for {path!r} must be a JSON object", url=url)
+                    return result
             except urllib.error.HTTPError as exc:
-                if exc.code == 401:
+                if exc.code in (401, 403):
                     msg = "Hub authentication failed: invalid or missing token"
                     raise AuthenticationError(msg) from exc
                 if exc.code == 404:
@@ -214,6 +225,8 @@ class HubClient:
                     continue
                 last_exc = exc
                 break
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise HubError(f"invalid Hub JSON response for {path!r}: {exc}", url=url) from exc
 
         # All retries exhausted — return None to trigger local fallback
         logger.warning("Hub unreachable after %d attempts: %s", HUB_RETRY_ATTEMPTS, last_exc)
@@ -249,17 +262,28 @@ class HubClient:
         When Hub is reachable, validates the token against /auth/validate.
         Otherwise stores the token locally.
         """
+        previous_token = self.auth_token
         self.auth_token = token
-        if self._is_hub_available():
+        if not self.allow_local_cache or self._is_hub_available():
             try:
                 result = self._request("POST", "/auth/validate", body=json.dumps({"token": token}).encode())
+                if result.get("status") in {"failed", "error", "denied"} or result.get("authentication_validated") is not True:
+                    raise AuthenticationError("Hub did not explicitly validate the authentication token")
                 logger.info("Hub login validated by server")
-                return result or {"status": "ok", "source": "server"}
-            except Exception as exc:
+                self.last_operation = {"source": "server", "authentication_validated": True}
+                return {**result, "status": "ok", **self.last_operation}
+            except AuthenticationError:
+                self.auth_token = previous_token
+                raise
+            except HubError as exc:
+                if not self.allow_local_cache:
+                    self.auth_token = previous_token
+                    raise
                 logger.debug("Hub login validation failed: %s", exc)
         if self.allow_local_cache:
             logger.info("Hub login stored locally (Hub offline)")
-            return {"status": "ok", "message": "Token stored locally", "source": "local_cache"}
+            self.last_operation = {"source": "local_cache", "persistence": "client_instance_memory", "authentication_validated": False}
+            return {"status": "ok", "message": "Token stored in this client only; remote authentication was not validated", **self.last_operation}
         raise HubError("Hub is unavailable; token was not validated", url=self.hub_url)
 
     def logout(self) -> dict[str, Any]:
@@ -277,20 +301,24 @@ class HubClient:
 
         Tries remote API first; falls back to local cache search.
         """
-        if self._is_hub_available():
+        if not self.allow_local_cache or self._is_hub_available():
             try:
                 params = urllib.parse.urlencode({"q": query, "limit": limit})
                 data = self._request("GET", f"/v1/models/search?{params}")
-                if data.get("models"):
-                    return [HubManifest.from_dict(m) for m in data["models"]]
+                rows = data.get("models", [])
+                if not isinstance(rows, list) or not all(isinstance(row, dict) and "model_id" in row for row in rows):
+                    raise HubError("Hub search response has malformed models")
+                self.last_operation = {"source": "server", "persistence": "remote_service"}
+                return [HubManifest.from_dict({**m, **self.last_operation}) for m in rows]
+            except AuthenticationError:
+                raise
             except HubError:
-                pass
-
-        if not self.allow_local_cache:
-            return []
+                if not self.allow_local_cache:
+                    raise
 
         # Explicit local cache mode.
         query_lower = query.lower()
+        self.last_operation = {"source": "local_cache", "persistence": "client_instance_memory"}
         results = [
             m for m in self._local_cache.values()
             if query_lower in m.model_id.lower()
@@ -358,7 +386,7 @@ class HubClient:
         )
 
         # Try remote upload
-        if self._is_hub_available():
+        if not self.allow_local_cache or self._is_hub_available():
             try:
                 upload_headers = {
                     "Content-Type": "application/octet-stream",
@@ -371,12 +399,35 @@ class HubClient:
                     body=data,
                     extra_headers=upload_headers,
                 )
-                if resp.get("manifest"):
-                    manifest = HubManifest.from_dict(resp["manifest"])
+                if resp.get("status") in {"failed", "error", "denied"}:
+                    raise HubError("Hub rejected the artifact upload")
+                response_manifest = resp.get("manifest")
+                if (
+                    not isinstance(response_manifest, dict)
+                    or response_manifest.get("model_id") != model_id
+                    or response_manifest.get("content_hash") != content_hash
+                    or type(response_manifest.get("file_size_bytes")) is not int
+                    or response_manifest["file_size_bytes"] != len(data)
+                ):
+                    raise HubError("Hub upload did not acknowledge the exact model ID, content hash and byte count")
+                manifest = HubManifest.from_dict(response_manifest)
+                manifest.source = "server"
+                manifest.persistence = "remote_service"
+                self.last_operation = {"source": manifest.source, "persistence": manifest.persistence}
+                self._local_cache[model_id] = manifest
+                self._local_packages[model_id] = data
                 logger.info("Uploaded model to Hub (remote)", model_id=model_id)
+                return manifest
+            except AuthenticationError:
+                raise
             except HubError as exc:
+                if not self.allow_local_cache:
+                    raise
                 logger.warning("Remote Hub upload failed: %s — stored locally", exc)
 
+        manifest.source = "local_cache"
+        manifest.persistence = "client_instance_memory"
+        self.last_operation = {"source": manifest.source, "persistence": manifest.persistence}
         self._local_cache[model_id] = manifest
         self._local_packages[model_id] = data
         logger.info("Model cached locally", model_id=model_id, size_bytes=len(data))
@@ -384,12 +435,30 @@ class HubClient:
 
     def _zip_directory(self, directory: Path) -> bytes:
         """Create a ZIP archive of an AEG package directory in memory."""
+        root = directory.resolve()
+        files: list[Path] = []
+        pending = [directory]
+        while pending:
+            path = pending.pop()
+            attributes = path.lstat()
+            reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            if (
+                path.is_symlink()
+                or getattr(attributes, "st_file_attributes", 0) & reparse_flag
+                or not path.resolve().is_relative_to(root)
+            ):
+                raise HubError(f"Package archive cannot include symlinks, junctions or paths outside its root: {path}")
+            if stat.S_ISDIR(attributes.st_mode):
+                pending.extend(path.iterdir())
+            elif stat.S_ISREG(attributes.st_mode):
+                files.append(path)
+            else:
+                raise HubError(f"Package archive cannot include special files: {path}")
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for file_path in sorted(directory.rglob("*")):
-                if file_path.is_file():
-                    arcname = file_path.relative_to(directory)
-                    zf.write(file_path, arcname)
+            for file_path in sorted(files):
+                arcname = file_path.relative_to(directory)
+                zf.write(file_path, arcname)
         return buf.getvalue()
 
     # ------------------------------------------------------------------
@@ -408,7 +477,7 @@ class HubClient:
         safe_id = safe_model_id_path(model_id)
         dest_dir = output_path / safe_id
 
-        if self._is_hub_available():
+        if not self.allow_local_cache or self._is_hub_available():
             try:
                 encoded_id = urllib.parse.quote(model_id, safe="")
                 req = urllib.request.Request(
@@ -418,20 +487,31 @@ class HubClient:
                 )
                 with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
                     raw = resp.read()
+                    expected_hash = resp.headers.get("X-Content-Hash")
+                    if expected_hash and self._content_hash(raw) != expected_hash:
+                        raise HubError(f"Hub artifact hash mismatch for {model_id!r}")
                     # Try to unzip; otherwise write as a raw file
                     try:
                         dest_dir.mkdir(parents=True, exist_ok=True)
                         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
                             _safe_extract_zip(zf, dest_dir)
                         logger.info("Downloaded & extracted AEG from Hub", model_id=model_id, dst=str(dest_dir))
+                        self.last_operation = {"source": "server", "persistence": "local_filesystem", "path": str(dest_dir)}
                         return dest_dir
                     except zipfile.BadZipFile:
                         # Write raw bytes
                         raw_path = output_path / f"{safe_id}.aeg"
                         raw_path.write_bytes(raw)
                         logger.info("Downloaded AEG from Hub (raw)", model_id=model_id, dst=str(raw_path))
+                        self.last_operation = {"source": "server", "persistence": "local_filesystem", "path": str(raw_path)}
                         return raw_path
             except Exception as exc:
+                if isinstance(exc, urllib.error.HTTPError) and exc.code in (401, 403):
+                    raise AuthenticationError("Hub authentication failed: invalid or missing token") from exc
+                if not self.allow_local_cache:
+                    if isinstance(exc, HubError):
+                        raise
+                    raise HubError(f"Hub download failed: {exc}", url=self.hub_url) from exc
                 logger.warning("Hub download failed: %s — falling back to local cache", exc)
 
         # Local cache fallback.  Metadata alone is not a model artifact: only
@@ -450,6 +530,7 @@ class HubClient:
         except (zipfile.BadZipFile, OSError) as exc:
             raise HubError(f"local Hub payload for {model_id!r} is not a valid AEG archive") from exc
         logger.info("Downloaded model package from local cache", model_id=model_id, dst=str(dest_dir))
+        self.last_operation = {"source": "local_cache", "persistence": "local_filesystem", "path": str(dest_dir)}
         return dest_dir
 
     # ------------------------------------------------------------------
@@ -458,25 +539,36 @@ class HubClient:
 
     def list_models(self) -> list[HubManifest]:
         """List all models available on the Hub (remote first, then local)."""
-        if self._is_hub_available():
+        if not self.allow_local_cache or self._is_hub_available():
             try:
                 data = self._request("GET", "/v1/models")
-                if data.get("models"):
-                    return [HubManifest.from_dict(m) for m in data["models"]]
+                rows = data.get("models", [])
+                if not isinstance(rows, list) or not all(isinstance(row, dict) and "model_id" in row for row in rows):
+                    raise HubError("Hub model listing has malformed models")
+                self.last_operation = {"source": "server", "persistence": "remote_service"}
+                return [HubManifest.from_dict({**m, **self.last_operation}) for m in rows]
+            except AuthenticationError:
+                raise
             except HubError:
-                pass
+                if not self.allow_local_cache:
+                    raise
         return list(self._local_cache.values()) if self.allow_local_cache else []
 
     def get_manifest(self, model_id: str) -> HubManifest | None:
         """Get the manifest for a specific model (remote then local)."""
-        if self._is_hub_available():
+        if not self.allow_local_cache or self._is_hub_available():
             try:
                 encoded_id = urllib.parse.quote(model_id, safe="")
                 data = self._request("GET", f"/v1/models/{encoded_id}")
                 if data.get("model_id"):
-                    return HubManifest.from_dict(data)
+                    self.last_operation = {"source": "server", "persistence": "remote_service"}
+                    return HubManifest.from_dict({**data, **self.last_operation})
+                raise HubError("Hub model metadata lacks model_id")
+            except AuthenticationError:
+                raise
             except HubError:
-                pass
+                if not self.allow_local_cache:
+                    raise
         return self._local_cache.get(model_id) if self.allow_local_cache else None
 
     def delete(self, model_id: str) -> dict[str, Any]:
@@ -484,19 +576,108 @@ class HubClient:
         if not self.auth_token:
             msg = "Authentication required to delete from Hub"
             raise AuthenticationError(msg)
-        self._local_cache.pop(model_id, None)
-        self._local_packages.pop(model_id, None)
-        if self._is_hub_available():
+        if not self.allow_local_cache or self._is_hub_available():
             try:
                 encoded_id = urllib.parse.quote(model_id, safe="")
-                return self._request("DELETE", f"/v1/models/{encoded_id}")
+                result = self._request("DELETE", f"/v1/models/{encoded_id}")
+                self._local_cache.pop(model_id, None)
+                self._local_packages.pop(model_id, None)
+                self.last_operation = {"source": "server", "persistence": "remote_service"}
+                return {**result, **self.last_operation}
+            except AuthenticationError:
+                raise
             except HubError as exc:
+                if not self.allow_local_cache:
+                    raise
                 logger.warning("Remote Hub delete failed: %s", exc)
-        return {"status": "ok", "model": model_id}
+        self._local_cache.pop(model_id, None)
+        self._local_packages.pop(model_id, None)
+        self.last_operation = {"source": "local_cache", "persistence": "client_instance_memory"}
+        return {"status": "ok", "model": model_id, **self.last_operation}
 
     # ------------------------------------------------------------------
     # Statistics
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _kv_path(namespace: str, key: str) -> str:
+        import re
+        if not all(isinstance(part, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", part)
+                   for part in (namespace, key)):
+            raise ValueError("Cache namespace/key require bounded letters, digits, dots, underscores or hyphens")
+        return f"/v1/kv/{namespace}/{key}"
+
+    def put_kv(self, namespace: str, key: str, payload: Any) -> dict[str, Any]:
+        """Explicitly upload real cache bytes; never use the model-cache fallback."""
+        from aether.runtime.kv_payload import CachePayload
+        if not self.auth_token:
+            raise AuthenticationError("Authentication required for private Hub cache snapshots")
+        if not isinstance(payload, CachePayload):
+            raise TypeError("put_kv requires a CachePayload")
+        data = payload.serialize()
+        digest = self._content_hash(data)
+        result = self._request("PUT", self._kv_path(namespace, key), data,
+                               {"Content-Type": "application/vnd.aether.cache", "X-Content-Hash": digest})
+        expected = {"namespace": namespace, "key": key, "content_hash": digest, "size_bytes": len(data),
+                    "tensor_bytes": payload.byte_size, "model_fingerprint": payload.model_fingerprint,
+                    "cache_kind": payload.cache_kind, "logical_length": payload.logical_length}
+        if any(result.get(field) != value or (isinstance(value, int) and type(result.get(field)) is not int)
+               for field, value in expected.items()):
+            raise HubError("Hub cache acknowledgement does not match the uploaded snapshot")
+        self.last_operation = {"source": "server", "persistence": "remote_service", "transport": "http",
+                               "uploaded_bytes": len(data), "tensor_bytes": payload.byte_size}
+        return {**result, **self.last_operation}
+
+    def get_kv(self, namespace: str, key: str, *, expected_model_fingerprint: str | None = None,
+               expected_cache_kind: str | None = None, max_bytes: int = 2 * 1024**3) -> Any:
+        """Download and verify a private typed snapshot, bounded before allocation."""
+        from aether.runtime.kv_payload import CachePayload, MAX_PAYLOAD_BYTES
+        if not self.auth_token:
+            raise AuthenticationError("Authentication required for private Hub cache snapshots")
+        if type(max_bytes) is not int or not 0 < max_bytes <= MAX_PAYLOAD_BYTES:
+            raise ValueError("max_bytes must be a positive bounded integer")
+        path = self._kv_path(namespace, key)
+        try:
+            request = urllib.request.Request(f"{self.hub_url}{path}", headers=self._headers(), method="GET")
+            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+                length = response.headers.get("Content-Length")
+                if length is not None and (int(length) < 0 or int(length) > max_bytes):
+                    raise HubError("Hub cache response exceeds the configured read bound")
+                data = response.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    raise HubError("Hub cache response exceeds the configured read bound")
+                digest = response.headers.get("X-Content-Hash")
+                if digest is None or self._content_hash(data) != digest:
+                    raise HubError("Hub cache response checksum is missing or invalid")
+            payload = CachePayload.deserialize(data, expected_model_fingerprint=expected_model_fingerprint,
+                                                expected_cache_kind=expected_cache_kind, max_bytes=max_bytes)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise AuthenticationError("Hub cache authentication failed") from exc
+            raise HubError(f"Hub cache download failed: HTTP {exc.code}") from exc
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise HubError(f"Hub cache download/integrity validation failed: {exc}") from exc
+        self.last_operation = {"source": "server", "persistence": "remote_service", "transport": "http",
+                               "downloaded_bytes": len(data), "tensor_bytes": payload.byte_size}
+        return payload
+
+    def delete_kv(self, namespace: str, key: str) -> bool:
+        if not self.auth_token:
+            raise AuthenticationError("Authentication required for private Hub cache snapshots")
+        result = self._request("DELETE", self._kv_path(namespace, key))
+        if result.get("namespace") != namespace or result.get("key") != key or type(result.get("deleted")) is not bool:
+            raise HubError("Hub cache deletion acknowledgement is malformed")
+        return result["deleted"]
+
+    def list_kv(self, namespace: str) -> list[dict[str, Any]]:
+        if not self.auth_token:
+            raise AuthenticationError("Authentication required for private Hub cache snapshots")
+        path = self._kv_path(namespace, "listing").rsplit("/", 1)[0]
+        result = self._request("GET", path)
+        entries = result.get("entries")
+        if result.get("namespace") != namespace or not isinstance(entries, list) or not all(isinstance(row, dict) for row in entries):
+            raise HubError("Hub cache listing is malformed")
+        return entries
 
     def stats(self) -> dict[str, Any]:
         """Return Hub client statistics."""
@@ -505,6 +686,9 @@ class HubClient:
             "auth_configured": self.auth_token is not None,
             "local_cache_count": len(self._local_cache),
             "hub_available": self._is_hub_available(),
+            "local_cache_persistence": "client_instance_memory",
+            "allow_local_cache": self.allow_local_cache,
+            "last_operation": dict(self.last_operation),
         }
 
     def __repr__(self) -> str:

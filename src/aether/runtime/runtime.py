@@ -23,16 +23,21 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterator
 
 from aether.backends.base import Backend, GenerationRequest, GenerationResult
+from aether.backends.artifact_validation import ArtifactValidationError, validate_aeg_evaluation
 from aether.backends.registry import BackendRegistry
 from aether.compiler.stage3_targeting.hardware_profile import HardwareProfile
 from aether.compiler.stage3_targeting.target_registry import TargetRegistry
 from aether.core.aeg_format import AEGPackage, load_aeg_package
 from aether.core.constants import DEFAULT_SERVER_PORT
-from aether.core.exceptions import BackendNotAvailableError, ModelNotFoundError, RuntimeError as AetherRuntimeError
+from aether.core.exceptions import BackendError, BackendNotAvailableError, ModelNotFoundError, RuntimeError as AetherRuntimeError
 from aether.core.types import HardwareTarget
 from aether.runtime.config import RuntimeConfig
 from aether.runtime.hardware import HardwareDetector
 from aether.runtime.kv_cache import KVCacheManager
+from aether.runtime.lifecycle import (
+    RuntimeLifecycle, runtime_lifecycle, runtime_operation, runtime_exclusive, runtime_stream,
+    runtime_session_operation,
+)
 from aether.runtime.scheduler import DisaggregatedScheduler, ScheduledRequest
 from aether.runtime.speculative import TreeSpeculativeEngine
 from aether.utils.file_io import aether_cache_dir, resolve_model_path, safe_model_id_path
@@ -58,7 +63,7 @@ class InferenceMetrics:
     """Active hardware target (e.g., 'cuda_sm90')."""
 
     active_precision: str | None = None
-    """Active precision string (e.g., 'mixed_fp8_q4')."""
+    """Observed arithmetic dtype; None when the backend has no measured dtype contract."""
 
     spec_accept_rate: float | None = None
     """Speculative decoding acceptance rate."""
@@ -66,8 +71,8 @@ class InferenceMetrics:
     kv_cache_hit_rate: float | None = None
     """KV cache prefix hit rate."""
 
-    memory_pressure: float = 0.0
-    """Current VRAM utilization (0.0 - 1.0)."""
+    memory_pressure: float | None = None
+    """Measured memory pressure; extra.memory_pressure_scope identifies device memory or system RAM."""
 
     backend_name: str | None = None
     """Backend plugin that executed the request."""
@@ -393,10 +398,17 @@ class Runtime:
         self.fingerprint = self.hardware_detector.detect()
         self.backend_registry = BackendRegistry()
         self.target_registry = TargetRegistry()
+        payload_store = None
+        if self.config.kv_cache_path:
+            from aether.runtime.kv_storage import KVPayloadStore
+
+            payload_store = KVPayloadStore(self.config.kv_cache_path,
+                max_bytes=int(self.config.kv_cache_nvme_gb * 1024**3))
         self.kv_cache = KVCacheManager(
             dtype=self.config.kv_cache_dtype,
             cpu_budget_gb=self.config.kv_cache_cpu_gb,
             nvme_budget_gb=self.config.kv_cache_nvme_gb,
+            payload_store=payload_store,
         )
         self.scheduler = DisaggregatedScheduler(
             max_batch_size=self.config.max_batch_size,
@@ -412,6 +424,7 @@ class Runtime:
             )
         self._loaded_models: dict[str, Any] = {}
         self._loaded_backends: dict[str, Backend] = {}
+        self._model_targets: dict[str, str] = {}
         # Artifact paths for models this process has loaded, as
         # ``{model_id: (aeg_path, resolved_path)}``.  Written only by
         # :meth:`_load_model` and cleared only by :meth:`remove`, so an entry
@@ -419,6 +432,14 @@ class Runtime:
         self._aeg_paths: dict[str, tuple[str | None, str | None]] = {}
         self._aeg_packages: dict[str, AEGPackage] = {}
         self._lock = threading.RLock()
+        self._lifecycle = RuntimeLifecycle()
+        from aether.runtime.execution_features import RuntimeExecutionFeatures
+
+        feature_root = Path(self.config.model_cache_dir) if self.config.model_cache_dir else aether_cache_dir()
+        self._execution_features = RuntimeExecutionFeatures(self.config, feature_root)
+        self._draft_runtime: Runtime | None = None
+        self._draft_pairs: set[tuple[int, int, int, int]] = set()
+        self._stored_sessions: dict[tuple[str, str], str] = {}
         from aether.observability.otel import AetherTracer, MetricsCollector
 
         self.tracer = AetherTracer()
@@ -477,6 +498,10 @@ class Runtime:
             rt = _self_ref()
             if rt is None:
                 return
+            try:
+                rt.close(timeout=30)
+            except Exception as exc:
+                logger.warning("Runtime exit cleanup did not complete", error=str(exc))
             for _job in list(rt._compile_jobs.values()):
                 _thread = _job.get("_thread")
                 if isinstance(_thread, threading.Thread) and _thread.is_alive():
@@ -503,18 +528,23 @@ class Runtime:
         self,
         target_id: str | None = None,
         model_id: str | None = None,
+        aeg_path: str | None = None,
     ) -> Backend:
-        """Resolve and return the best available backend for the target."""
+        """Resolve a compatible backend; automatic selection may use CPU."""
+        if target_id is None:
+            return self._resolve_model_backend(model_id)[0]
         with self._lock:
-            target = target_id or self.fingerprint.target_id
-            profile = HardwareProfile.from_target_id(target) or HardwareProfile.auto()
+            target = target_id
+            profile = HardwareProfile.from_target_id(target)
+            if profile is None:
+                raise BackendNotAvailableError(f"Unknown execution target {target!r}", target_id=target)
             explicit_backend = self.config.backend_name is not None
             is_onnx_model = bool(
                 model_id and Path(model_id).suffix.lower() == ".onnx"
             )
             if self.config.backend_name:
                 backend = self.backend_registry.get_backend(self.config.backend_name)
-                if backend is not None and backend.available_for_target(profile.target_id):
+                if self._backend_accepts_model(backend, profile.target_id, model_id, aeg_path):
                     return backend
                 msg = (
                     f"Configured backend '{self.config.backend_name}' is not available "
@@ -524,7 +554,10 @@ class Runtime:
             # Prefer cached backend
             if profile.target_id in self._loaded_backends:
                 cached = self._loaded_backends[profile.target_id]
-                if cached.name != "onnx" or is_onnx_model or explicit_backend:
+                if (
+                    (cached.name != "onnx" or is_onnx_model or explicit_backend)
+                    and self._backend_accepts_model(cached, profile.target_id, model_id, aeg_path)
+                ):
                     return cached
 
             candidates = profile.backend_candidates
@@ -532,20 +565,294 @@ class Runtime:
                 if backend_name in {"onnx", "onnxruntime"} and not is_onnx_model:
                     continue
                 backend = self.backend_registry.get_backend(backend_name)
-                if backend is not None and backend.available_for_target(profile.target_id):
+                if self._backend_accepts_model(backend, profile.target_id, model_id, aeg_path):
                     self._loaded_backends[profile.target_id] = backend
                     return backend
             # A backend for another device is not a valid fallback.
             for backend in self.backend_registry.get_available_backends():
                 if backend.name == "onnx" and not is_onnx_model:
                     continue
-                if backend.available_for_target(profile.target_id):
+                if self._backend_accepts_model(backend, profile.target_id, model_id, aeg_path):
                     self._loaded_backends[profile.target_id] = backend
                     return backend
 
             msg = f"No backend available for target {target}"
             raise BackendNotAvailableError(msg, target_id=target)
 
+    @staticmethod
+    def _backend_accepts_model(
+        backend: Backend | None, target: str, model_id: str | None, aeg_path: str | None = None,
+    ) -> bool:
+        if backend is None or not backend.available_for_target(target):
+            return False
+        accepts = getattr(backend, "available_for_model", None)
+        if model_id is None or not callable(accepts):
+            return True
+        return bool(accepts(model_id, aeg_path=aeg_path)) if aeg_path else bool(accepts(model_id))
+
+    def _execution_candidates(
+        self, *, allow_portable_accelerators: bool = False,
+    ) -> tuple[list[str], list[str] | None]:
+        """Intersect detected targets with an explicit execution mesh, once at load.
+
+        Hardware discovery is cached in the fingerprint. It is neither a backend
+        readiness test nor evidence of execution. Accelerator preference is applied
+        only after an artifact or model adapter authorizes that target.
+        """
+        capabilities = list(self.fingerprint.capabilities)
+        if allow_portable_accelerators and any(
+            item.get("target_id") == "rocm_unknown"
+            and item.get("runtime_available") and item.get("hardware_present")
+            for item in capabilities
+        ):
+            # Stable HIP C APIs may expose a real device without its GFX
+            # identifier. A ready, authorized Torch runtime can supply that
+            # missing architecture from actual device properties. Never infer
+            # CDNA/RDNA from a marketing name or alter detector validation flags.
+            torch_backend = self.backend_registry.get_backend("pytorch")
+            if torch_backend is not None and torch_backend.is_available():
+                import torch
+                from aether.backends.hardware_detector import inspect_torch_hip_devices
+
+                capabilities.extend(
+                    item.to_dict() for item in inspect_torch_hip_devices(torch)
+                    if item.implemented and item.available
+                )
+        available = list(dict.fromkeys([
+            self.fingerprint.target_id,
+            *self.fingerprint.attributes.get("available_targets", []),
+            *[
+                item["target_id"] for item in capabilities
+                if item.get("available") and item.get("target_id")
+            ],
+        ]))
+        if not any(target.startswith("cpu_") for target in available):
+            from aether.backends.hardware_detector import detect_cpu
+
+            available.append(detect_cpu().target_id)
+        devices = self.config.execution_devices
+        if devices is None:
+            devices = [
+                item.strip() for item in os.environ.get("AETHER_EXECUTION_DEVICES", "").split(",")
+                if item.strip()
+            ] or None
+        if devices is not None:
+            devices = ["cpu" if device == "cpu:0" else device for device in devices]
+            if any(device.startswith("directml:") for device in devices):
+                from aether.backends.hardware_inventory import probe_gpu_inventory
+
+                onnx_backend = self.backend_registry.get_backend("onnx")
+                adapters = probe_gpu_inventory().get("devices", [])
+                ordinals = {record["directml_device_index"] for record in adapters if "directml_device_index" in record}
+                requested = [device for device in devices if device.startswith("directml:")]
+                if (onnx_backend is None or "DmlExecutionProvider" not in onnx_backend.available_providers()
+                    or any(not device[9:].isdigit() or int(device[9:]) not in ordinals for device in requested)):
+                    raise BackendNotAvailableError(f"Requested DirectML adapters {requested} are not enumerated with a registered execution provider")
+                if "directml" not in available:
+                    available.append("directml")
+            prefixes = {
+                "cpu": ("cpu_",), "cuda": ("cuda_", "rocm_", "amd_mi"), "mps": ("metal",),
+                "directml": ("directml",),
+            }
+            kinds = {device.split(":", 1)[0] for device in devices}
+            malformed = any(
+                device != "cpu" and device != "mps" and not (
+                    device.startswith("cuda:") and device[5:].isdigit()
+                    or device.startswith("directml:") and device[9:].isdigit()
+                )
+                for device in devices
+            )
+            if not devices or len(set(devices)) != len(devices) or malformed or not kinds.issubset(prefixes):
+                raise BackendNotAvailableError(f"Invalid execution devices {devices!r}")
+            if any(
+                not any(target.startswith(prefixes[kind]) for target in available)
+                for kind in kinds
+            ):
+                raise BackendNotAvailableError(
+                    f"Requested execution devices {devices} are unavailable; host targets: {available}"
+                )
+            # An ordinal belongs to the executing runtime, not NVML's physical
+            # order. Where detectors provide that mapping, use its architecture.
+            indexed = [
+                item for item in capabilities
+                if item.get("available")
+                and str(item.get("extra", {}).get("execution_device") or "").split(":", 1)[0] in kinds - {"cpu"}
+            ]
+            accelerators = [device for device in devices if device != "cpu"]
+            if accelerators and indexed:
+                known_devices = {item["extra"]["execution_device"] for item in indexed}
+                missing = [device for device in accelerators if device not in known_devices]
+                if missing:
+                    raise BackendNotAvailableError(f"Requested execution devices {missing} are unavailable")
+                selected_targets = {
+                    item["target_id"] for item in indexed
+                    if item["extra"]["execution_device"] in accelerators
+                }
+                available = [target for target in available if target in selected_targets]
+            else:
+                # CPU accompanying an accelerator is an offload participant;
+                # it must not override the requested accelerator execution.
+                execution_kinds = kinds - {"cpu"} or {"cpu"}
+                available = [
+                    target for target in available
+                    if any(target.startswith(prefixes[kind]) for kind in execution_kinds)
+                ]
+        return sorted(available, key=lambda target: target.startswith("cpu_")), devices
+
+    def _resolve_model_backend(self, model_id: str | None) -> tuple[Backend, str, list[str] | None]:
+        from aether.backends.model_contract import model_format
+
+        targets, devices = self._execution_candidates(
+            allow_portable_accelerators=model_id is not None and model_format(model_id) == "source",
+        )
+        failures = []
+        for target in targets:
+            try:
+                backend = self._resolve_backend(target_id=target, model_id=model_id)
+            except BackendNotAvailableError as exc:
+                failures.append(str(exc))
+                continue
+            automatic = getattr(type(backend), "automatic_execution_devices", None)
+            selected_devices = devices
+            if selected_devices is None:
+                selected_devices = automatic(backend, target) if callable(automatic) else (["cpu"] if target.startswith("cpu_") else None)
+            return backend, target, selected_devices
+        raise BackendNotAvailableError(
+            "No compatible model execution backend is available; " + "; ".join(failures),
+            backend_name=self.config.backend_name,
+            target_id=self.fingerprint.target_id,
+        )
+
+    def _resolve_aeg_backend(
+        self, package: AEGPackage, model_id: str, excluded_targets: set[str] | None = None,
+    ) -> tuple[Backend, str, list[str] | None]:
+        """Intersect artifact contracts, host devices, and installed backends.
+
+        Prefer a ready compatible accelerator, including an explicitly authorized
+        portable graph, and otherwise use the artifact's CPU execution contract.
+        Explicit backend and device requests are constraints, not preferences.
+        """
+        available, devices = self._execution_candidates(
+            allow_portable_accelerators=package.supports_portable_backend("pytorch"),
+        )
+        if package.supports_portable_backend("onnx") and devices is None:
+            onnx_backend = self.backend_registry.get_backend("onnx")
+            if onnx_backend is not None and "DmlExecutionProvider" in onnx_backend.available_providers():
+                cpu_position = next((i for i, target in enumerate(available) if target.startswith("cpu_")), len(available))
+                if "directml" not in available:
+                    available.insert(cpu_position, "directml")
+        candidates = [target for target in available if package.supports_runtime_target(target)
+                      and target not in (excluded_targets or set())]
+        failures = []
+        for target in candidates:
+            if (
+                not self.config.backend_name
+                and not target.startswith("cpu_")
+                and package.manifest is not None
+                and package.manifest.kernels.variant_status.get(target) == "executable"
+            ):
+                plan_backend = package.get_backend_plan(target)
+                native = self.backend_registry.get_backend(plan_backend) if plan_backend else None
+                if self._backend_accepts_model(native, target, model_id, str(package.root)):
+                    return native, target, devices
+            if self.config.backend_name:
+                name = self.config.backend_name
+            elif target.startswith("cpu_"):
+                name = "aether_cpu"
+            elif target in {"directml", "openvino_gpu", "openvino_npu"} and package.supports_portable_backend("onnx"):
+                name = "onnx"
+            elif package.supports_portable_backend("pytorch"):
+                name = "pytorch"
+            else:
+                try:
+                    backend = self._resolve_backend(
+                        target_id=target, model_id=model_id, aeg_path=str(package.root),
+                    )
+                except BackendNotAvailableError as exc:
+                    failures.append(str(exc))
+                    continue
+                return backend, target, devices
+            backend = self.backend_registry.get_backend(name)
+            if self._backend_accepts_model(backend, target, model_id, str(package.root)):
+                return backend, target, devices or (["cpu"] if target.startswith("cpu_") else None)
+            failures.append(f"backend {name!r} is not installed or available for {target!r}")
+        compiled = package.manifest.kernels.targets if package.manifest else []
+        raise BackendNotAvailableError(
+            f"AEG artifact has no executable variant with an available backend for this request; "
+            f"compiled variants: {compiled}; host targets: {available}; "
+            + ("; ".join(failures) if failures else "compile a compatible executable target"),
+            backend_name=self.config.backend_name,
+            target_id=self.fingerprint.target_id,
+        )
+
+    def _load_onnx_model(
+        self, model_id: str, load_options: dict[str, Any],
+    ) -> tuple[Backend, Any, str]:
+        """Initialize the requested ONNX provider without hidden CPU fallback.
+
+        Registration only creates a candidate. A failed automatic accelerator
+        initialization can try CPU; an explicit accelerator request must fail.
+        Session initialization is not recorded as hardware execution validation.
+        """
+        configured_backend = self.config.backend_name
+        if configured_backend and BackendRegistry._normalize_name(configured_backend) != "onnx":
+            raise BackendNotAvailableError(
+                f"Configured backend {configured_backend!r} cannot execute a raw .onnx model",
+                backend_name=configured_backend,
+            )
+        backend = self.backend_registry.get_backend("onnx")
+        if backend is None or not backend.is_available():
+            raise BackendNotAvailableError(
+                "ONNX Runtime is required to execute .onnx models", backend_name="onnx",
+            )
+        targets, devices = self._execution_candidates()
+        if devices and len([device for device in devices if device != "cpu"]) > 1:
+            raise BackendNotAvailableError("ONNX provider execution supports one accelerator device per session")
+        registered = set(backend.available_providers())
+        # DirectML has its own adapter ordinal and a raw ONNX contract. It can
+        # be considered even before detection has proven a functioning session.
+        if devices is None and "DmlExecutionProvider" in registered and "directml" not in targets:
+            cpu_position = next((index for index, target in enumerate(targets) if target.startswith("cpu_")), len(targets))
+            targets.insert(cpu_position, "directml")
+        attempts = []
+        for target in targets:
+            if target.startswith("cpu_"):
+                providers = ["CPUExecutionProvider"]
+            elif target.startswith("cuda_"):
+                index = next((int(device.split(":", 1)[1]) for device in devices or [] if device.startswith("cuda:")), 0)
+                providers = [("CUDAExecutionProvider", {"device_id": index})]
+            elif target.startswith(("rocm_", "amd_mi")):
+                index = next((int(device.split(":", 1)[1]) for device in devices or [] if device.startswith("cuda:")), 0)
+                provider = "MIGraphXExecutionProvider" if "MIGraphXExecutionProvider" in registered else "ROCMExecutionProvider"
+                providers = [(provider, {"device_id": index})]
+            elif target in {"openvino_gpu", "openvino_npu"}:
+                providers = [("OpenVINOExecutionProvider", {"device_type": "GPU" if target.endswith("gpu") else "NPU"})]
+            elif target == "directml":
+                index = next((int(device[9:]) for device in devices or [] if device.startswith("directml:")), 0)
+                providers = [("DmlExecutionProvider", {"device_id": index})]
+            else:
+                continue
+            names = [entry[0] if isinstance(entry, tuple) else entry for entry in providers]
+            if not set(names).issubset(registered):
+                attempts.append(f"{target}: providers {names} are not registered")
+                continue
+            try:
+                model = backend.load_model(
+                    model_id, providers=providers, allow_provider_fallback=False, **load_options,
+                )
+            except BackendError as exc:
+                if devices is not None:
+                    raise
+                attempts.append(f"{target}: {exc}")
+                logger.warning("ONNX provider initialization failed for %s: %s", target, exc)
+                continue
+            return backend, model, target
+        raise BackendNotAvailableError(
+            "No compatible ONNX provider could initialize this model; " + "; ".join(attempts),
+            backend_name="onnx",
+        )
+
+    @runtime_operation
     def _load_model(self, model_id: str) -> Backend:
         """Ensure a model is loaded and return the backend that loaded it."""
         with self._lock:
@@ -559,90 +866,70 @@ class Runtime:
             local_onnx = requested_path.is_file() and requested_path.suffix.lower() == ".onnx"
             if aeg_path is None and not local_onnx and (
                 requested_path.suffix.lower() in {".aeg", ".aegpkg"}
-                or requested_path.parent != Path(".")
+                or (
+                    not requested_path.exists()
+                    and (requested_path.is_absolute() or model_id.startswith(("./", "../", ".\\", "..\\")))
+                )
             ):
                 raise ModelNotFoundError(
                     f"AEG artifact does not exist or has no manifest: {model_id}",
                     model_id=model_id,
                 )
+            package = None
+            target = self.fingerprint.target_id
+            execution_devices = self.config.execution_devices
+            load_options = {
+                "offline": self.config.hf_offline,
+                "download_timeout_s": self.config.model_download_timeout_s,
+                "trust_remote_code": self.config.allow_remote_code,
+                "retain_host_weights": bool(self.config.disaggregate_prefill_decode
+                    and (self.config.prefill_devices is not None or self.config.decode_devices is not None)),
+            }
             if aeg_path is not None:
-                # An AEG is a portable graph/weight container, not a license
-                # to execute an incompatible target variant.  Validate the
-                # current target before backend selection so a GPU/accelerator
-                # request cannot silently fall back to the CPU reference path.
-                portable_pytorch = False
                 try:
-                    from aether.core.aeg_format import AEGPackage
-
                     package = AEGPackage(Path(aeg_path)).load()
-                    portable_pytorch = package.supports_portable_backend("pytorch")
-                    if not package.supports_runtime_target(self.fingerprint.target_id):
-                        compiled_targets = list(package.manifest.kernels.targets) if package.manifest else []
-                        raise BackendNotAvailableError(
-                            "AEG artifact has no executable variant for the detected target "
-                            f"{self.fingerprint.target_id!r}; compiled variants: {compiled_targets}. "
-                            "Compile the same source model for this target or include both targets "
-                            "in one AEG package.",
-                            target_id=self.fingerprint.target_id,
-                        )
-                except BackendNotAvailableError:
-                    raise
                 except Exception as exc:
                     raise AetherRuntimeError(
                         f"Unable to validate AEG target compatibility for {aeg_path}: {exc}"
                     ) from exc
+                validate_aeg_evaluation(package)
             # A local ONNX file has an explicit execution contract. Do not
             # route it to the generic PyTorch backend merely because that
             # backend is available on the host.
             if requested_path.suffix.lower() == ".onnx":
-                backend = self.backend_registry.get_backend("onnx")
-                if backend is None or not backend.is_available():
-                    raise BackendNotAvailableError(
-                        "ONNX Runtime is required to execute .onnx models",
-                        backend_name="onnx",
-                    )
-            elif aeg_path is not None and self.config.backend_name is None:
-                # A packaged AEG is already the compiler's executable
-                # contract. On CPU, prefer Aether's framework-free engine so a
-                # clean base installation does not route a native artifact
-                # through an optional PyTorch wrapper.
-                target = self.fingerprint.target_id
-                if target.startswith("cpu_"):
-                    native = self.backend_registry.get_backend("aether_cpu")
-                    if native is None or not native.is_available():
-                        raise BackendNotAvailableError(
-                            "The base installation could not load its native CPU backend",
-                            backend_name="aether_cpu",
-                            target_id=target,
-                        )
-                    backend = native
-                else:
-                    # A portable PyTorch AEG must stay on the backend that
-                    # implements its graph/weight contract.  Selecting vLLM
-                    # or another frontend here would either ignore the AEG or
-                    # silently execute a different model path.
-                    if portable_pytorch and self.fingerprint.target_id.startswith(("cuda_", "rocm_", "metal_")):
-                        backend = self.backend_registry.get_backend("pytorch")
-                        if backend is None or not backend.available_for_target(self.fingerprint.target_id):
-                            raise BackendNotAvailableError(
-                                "portable AEG execution requires an installed PyTorch backend "
-                                f"for target {self.fingerprint.target_id}",
-                                backend_name="pytorch",
-                                target_id=self.fingerprint.target_id,
-                            )
-                    else:
-                        backend = self._resolve_backend(model_id=model_id)
+                backend, loaded_model, target = self._load_onnx_model(model_id, load_options)
+            elif package is not None:
+                backend, target, execution_devices = self._resolve_aeg_backend(package, model_id)
             else:
-                backend = self._resolve_backend(model_id=model_id)
-            self._loaded_models[model_id] = backend.load_model(
-                model_id,
-                aeg_path,
-                offline=self.config.hf_offline,
-                download_timeout_s=self.config.model_download_timeout_s,
-                trust_remote_code=self.config.allow_remote_code,
-                execution_devices=self.config.execution_devices,
-            )
+                backend, target, execution_devices = self._resolve_model_backend(model_id)
+            if requested_path.suffix.lower() != ".onnx":
+                attempted: set[str] = set()
+                while True:
+                    try:
+                        loaded_model = backend.load_model(
+                            model_id, aeg_path, execution_devices=execution_devices,
+                            **({"target_id": target} if backend.name == "onnx" else {}), **load_options,
+                        )
+                        break
+                    except BackendError as exc:
+                        # A detected device is not proof that this particular
+                        # graph/provider can execute. Automatic selection can
+                        # try another authorized target; explicit constraints
+                        # always preserve the initialization error.
+                        if isinstance(exc, ArtifactValidationError):
+                            raise
+                        if package is None or self.config.backend_name or self.config.execution_devices is not None:
+                            raise
+                        if os.environ.get("AETHER_EXECUTION_DEVICES", "").strip():
+                            raise
+                        attempted.add(target)
+                        logger.warning("AEG backend initialization failed for %s: %s", target, exc)
+                        backend, target, execution_devices = self._resolve_aeg_backend(
+                            package, model_id, excluded_targets=attempted,
+                        )
+            self._loaded_models[model_id] = loaded_model
             self._loaded_backends[model_id] = backend
+            self._model_targets[model_id] = target
             self._aeg_paths[model_id] = (
                 aeg_path,
                 str(Path(aeg_path).resolve()) if aeg_path is not None else None,
@@ -689,6 +976,343 @@ class Runtime:
             return str(local)
         return None
 
+    def _prepare_execution_features(self, request: GenerationRequest) -> Any:
+        """Validate request-local weights before delegating model execution.
+
+        Frontend plugins may opt in through explicit ``task_reweighting`` or
+        ``lora_adapter_selection`` capabilities; each opt-in promises to apply
+        the corresponding validated request inputs. Dependency presence alone
+        does not establish this execution contract.
+        """
+        from aether.backends.compiled_handle import CompiledAEGHandle
+        from aether.runtime.session_contract import validate_task_weights
+
+        handle = self._loaded_models.get(request.model_id)
+        backend = self._loaded_backends.get(request.model_id)
+        backend_name = getattr(backend, "name", self.config.backend_name)
+        try:
+            coefficients = validate_task_weights(request.extra.get("task_weights"))
+        except ValueError as exc:
+            raise BackendError(str(exc), backend_name=backend_name) from exc
+        adapter_id = request.extra.get("adapter_id", request.extra.get("adapter_name"))
+        if request.extra.get("adapter_id") is not None and request.extra.get("adapter_name") is not None and request.extra["adapter_id"] != request.extra["adapter_name"]:
+            raise BackendError("adapter_id and adapter_name select different adapters", backend_name=backend_name)
+        if adapter_id is not None and (not isinstance(adapter_id, str) or not adapter_id):
+            raise BackendError("adapter identity must be a nonempty string", backend_name=backend_name)
+        if coefficients or adapter_id is not None:
+            if isinstance(handle, CompiledAEGHandle):
+                if coefficients:
+                    vectors = handle.metadata.get("task_vectors", {})
+                    catalog = vectors.get("vectors", []) if isinstance(vectors, dict) else []
+                    available = {item.get("name") for item in catalog
+                                 if isinstance(item, dict) and isinstance(item.get("name"), str)} if isinstance(catalog, list) else set()
+                    try:
+                        validate_task_weights(coefficients, available=available)
+                    except ValueError as exc:
+                        raise BackendError(str(exc), backend_name=backend_name) from exc
+                    if not callable(getattr(handle.engine, "with_task_deltas", None)):
+                        raise BackendError("the loaded engine has no task-vector application contract", backend_name=backend_name)
+                if adapter_id is not None:
+                    if adapter_id not in handle.lora_adapters:
+                        raise BackendError(f"compiled LoRA adapter {adapter_id!r} is absent", backend_name=backend_name)
+                    if not callable(getattr(handle.engine, "with_lora_adapter", None)):
+                        raise BackendError("the loaded engine has no compiled LoRA application contract", backend_name=backend_name)
+            else:
+                get_capabilities = getattr(backend, "get_capabilities", None)
+                try:
+                    capabilities = get_capabilities() if callable(get_capabilities) else []
+                except NotImplementedError:
+                    capabilities = []
+                if not isinstance(capabilities, (list, tuple, set, frozenset)) or not all(isinstance(item, str) for item in capabilities):
+                    raise BackendError("backend returned an invalid request-state capability contract", backend_name=backend_name)
+                required = (["task_reweighting"] if coefficients else []) + (["lora_adapter_selection"] if adapter_id is not None else [])
+                if any(capability not in capabilities for capability in required):
+                    raise BackendError(
+                        f"backend {backend_name!r} has no request-state execution contract for {required}",
+                        backend_name=backend_name,
+                    )
+        if getattr(handle, "engine", None) is None:
+            if self.config.disaggregate_prefill_decode or self.config.draft_model_id:
+                raise BackendError("this backend has no compiled phase/cache execution contract", backend_name=self.config.backend_name)
+            return handle
+        request.extra["_execution_features"] = self._execution_features
+        precision_epoch = handle.metadata.get("_precision_epoch", 0)
+        self._execution_features.automatic_precision(request.model_id, handle)
+        if handle.metadata.get("_precision_epoch", 0) != precision_epoch:
+            self._stored_sessions = {pair: key for pair, key in self._stored_sessions.items()
+                                     if pair[0] != request.model_id}
+        session_id = request.extra.get("aether_kv_session_id")
+        stored = self._stored_sessions.get((request.model_id, session_id)) if isinstance(session_id, str) else None
+        if stored is not None:
+            self.restore_session(request.model_id, session_id, stored)
+        if self.config.draft_model_id:
+            with self._lock:
+                if self._draft_runtime is None:
+                    draft_config = self.config.to_dict()
+                    draft_config.update(backend_name=self.config.draft_backend_name,
+                        execution_devices=self.config.draft_execution_devices,
+                        draft_model_id=None, dynamic_precision=False,
+                        disaggregate_prefill_decode=False, enable_semantic_cache=False,
+                        kv_cache_path=None, ttt_enabled=False)
+                    self._draft_runtime = Runtime(RuntimeConfig.from_dict(draft_config))
+            draft_runtime = self._draft_runtime
+            draft_runtime._load_model(self.config.draft_model_id)
+            draft = draft_runtime._loaded_models[self.config.draft_model_id]
+            if getattr(draft, "engine", None) is None or getattr(draft, "tokenizer", None) is None:
+                raise BackendError("speculative draft requires a loaded incremental engine and tokenizer")
+            from aether.runtime.execution_features import validate_draft_tokenizers
+
+            pair = (id(handle), id(draft), id(handle.tokenizer), id(draft.tokenizer))
+            with self._lock:
+                if pair not in self._draft_pairs:
+                    validate_draft_tokenizers(handle, draft)
+                    self._draft_pairs.add(pair)
+            request.extra["_explicit_draft_engine"] = draft.engine
+            request.extra["spec_gamma"] = self.config.speculative_gamma
+        return handle
+
+    def _generate_with_features(self, backend: Backend, request: GenerationRequest) -> GenerationResult:
+        lifecycle = runtime_lifecycle(self)
+        with lifecycle.session(request.model_id, request.extra.get("aether_kv_session_id")) as key:
+            try:
+                with lifecycle.preparing_session(key):
+                    handle = self._prepare_execution_features(request)
+                with self._execution_features.gate(request.model_id).read():
+                    result = backend.generate(request)
+                    result.metrics.update(self._execution_features.report(request.model_id, handle))
+                return result
+            except BaseException:
+                if key is not None:
+                    handle = self._loaded_models.get(request.model_id)
+                    clear = getattr(handle, "clear_session_cache", None)
+                    if callable(clear):
+                        clear(key[1])
+                raise
+
+    def _stream_with_features(self, backend: Backend, request: GenerationRequest) -> Iterator[str]:
+        lifecycle = runtime_lifecycle(self)
+        with lifecycle.session(request.model_id, request.extra.get("aether_kv_session_id")) as key:
+            completed = False
+            try:
+                with lifecycle.preparing_session(key):
+                    self._prepare_execution_features(request)
+                with self._execution_features.gate(request.model_id).read():
+                    iterator = backend.generate_stream(request)
+                    try:
+                        yield from iterator
+                        completed = True
+                    finally:
+                        close = getattr(iterator, "close", None)
+                        if callable(close):
+                            close()
+            finally:
+                # Ordinary engines can mutate a reused cache before their
+                # final callback. Canceled/error state cannot be committed
+                # safely without the complete consumed token prefix.
+                if not completed and key is not None:
+                    handle = self._loaded_models.get(request.model_id)
+                    clear = getattr(handle, "clear_session_cache", None)
+                    if callable(clear):
+                        clear(key[1])
+
+    @runtime_operation
+    def adjust_precision(self, model_id: str, calibration_tokens: list[list[int]] | None = None,
+                         *, restore: bool = False) -> dict[str, Any]:
+        """Measure and apply a reversible change; calibration is not a universal quality certificate."""
+        self._load_model(model_id)
+        report = self._execution_features.adjust_precision(model_id, self._loaded_models[model_id],
+            calibration_tokens=calibration_tokens, restore=restore)
+        if report["execution_changed"]:
+            self._stored_sessions = {pair: key for pair, key in self._stored_sessions.items() if pair[0] != model_id}
+        return report
+
+    @runtime_session_operation
+    def persist_session(self, model_id: str, session_id: str, *, tier: str = "disk") -> dict[str, Any]:
+        """Persist exact target state; rebuild speculative drafts from the saved prefix."""
+        from aether.core.types import MemoryTier
+        from aether.runtime.execution_features import model_fingerprint
+        from aether.runtime.kv_payload import CachePayload
+        from aether.runtime.session_contract import validate_persisted_contract
+
+        if tier not in {"disk", "hub"}:
+            raise ValueError("session storage tier must be disk or hub")
+        self._load_model(model_id)
+        handle = self._loaded_models[model_id]
+        with self._execution_features.gate(model_id).write():
+            cached = getattr(handle, "session_caches", {}).get(session_id)
+            if cached is None:
+                raise ValueError("session has no live execution cache")
+            ids, cache = cached
+            contract = validate_persisted_contract(handle, handle.session_contracts.get(session_id))
+            from aether.runtime.spec_generation import SpeculativeSessionCache
+
+            speculative_resume = {}
+            if isinstance(cache, SpeculativeSessionCache):
+                if cache.source_identity[0] != handle.session_target_ids.get(session_id):
+                    raise ValueError("speculative target cache belongs to a different execution engine")
+                if tuple(ids.tolist()) != cache.token_ids or cache.length != len(ids):
+                    raise ValueError("speculative target cache differs from its recorded token prefix")
+                # The target owns the authoritative decoding state. Draft state
+                # is acceleration-only and can be reconstructed by a freshly
+                # tokenizer-validated draft from this exact consumed prefix.
+                cache = cache.target_cache
+                speculative_resume = {"speculative_resume": {
+                    "target_state": "lossless", "draft_state": "rebuild_from_token_prefix"
+                }}
+            fingerprint = model_fingerprint(handle)
+            if hasattr(handle.engine, "torch"):
+                from aether.runtime.torch_cache_handoff import export_torch_cache
+
+                payload = export_torch_cache(cache, engine=handle.engine, model_fingerprint=fingerprint)
+            else:
+                from aether.runtime.cache_handoff import export_cpu_cache
+
+                payload = export_cpu_cache(cache, model_fingerprint=fingerprint)
+            payload = CachePayload(payload.model_fingerprint, payload.cache_kind, payload.logical_length,
+                payload.tensors, {**payload.metadata, "session_token_ids": ids.tolist(),
+                                 "precision_epoch": handle.metadata.get("_precision_epoch", 0),
+                                 "execution_contract": contract,
+                                 **speculative_resume})
+            block = self.kv_cache.import_payload(payload)
+            try:
+                self.kv_cache.swap(block.block_id, MemoryTier.L3_NVME if tier == "disk" else MemoryTier.L4_HUB)
+            except Exception:
+                self.kv_cache.remove(block.block_id)
+                raise
+            key = self.kv_cache.payload_key(block.block_id)
+            handle.clear_session_cache(session_id)
+            self._stored_sessions[model_id, session_id] = key
+            return {"key": key, "tier": tier, "tensor_bytes": payload.byte_size,
+                    "logical_length": payload.logical_length, "model_fingerprint": fingerprint,
+                    "execution_contract": contract,
+                    **speculative_resume}
+
+    @runtime_operation
+    def configure_cache_hub(self, client: Any, namespace: str) -> None:
+        """Bind an explicit authenticated Hub client; this does not initiate I/O."""
+        if not isinstance(namespace, str) or not namespace or any(
+            not callable(getattr(client, method, None)) for method in ("put_kv", "get_kv", "delete_kv")):
+            raise ValueError("a cache namespace and a Hub byte-storage client are required")
+        self.kv_cache.hub_client = client
+        self.kv_cache.hub_namespace = namespace
+
+    @runtime_session_operation
+    def restore_session(self, model_id: str, session_id: str, key: str) -> dict[str, Any]:
+        """Restore a verified snapshot, including after process restart."""
+        import numpy as np
+        from aether.runtime.execution_features import model_fingerprint
+        from aether.runtime.session_contract import validate_persisted_contract
+
+        self._load_model(model_id)
+        handle = self._loaded_models[model_id]
+        # Callers restoring automatically already own a request preparation
+        # boundary; this writer runs before the request acquires its read gate.
+        with self._execution_features.gate(model_id).write():
+            fingerprint = model_fingerprint(handle)
+            block = self.kv_cache.block_for_payload_key(key)
+            if block is None:
+                if self.kv_cache.hub_client is None or not self.kv_cache.hub_namespace:
+                    raise ValueError("cache snapshot key is not present in configured storage")
+                payload = self.kv_cache.hub_client.get_kv(self.kv_cache.hub_namespace, key,
+                                                        expected_model_fingerprint=fingerprint)
+            else:
+                payload = self.kv_cache.export_payload(block.block_id, expected_model_fingerprint=fingerprint)
+            ids = payload.metadata.get("session_token_ids")
+            if not isinstance(ids, list) or len(ids) != payload.logical_length or any(
+                type(token) is not int or token < 0 for token in ids):
+                raise ValueError("persisted session token prefix does not match its logical cache length")
+            if payload.metadata.get("precision_epoch", 0) != handle.metadata.get("_precision_epoch", 0):
+                raise ValueError("persisted session uses a different execution precision state")
+            contract = validate_persisted_contract(handle, payload.metadata.get("execution_contract"))
+            if hasattr(handle.engine, "torch"):
+                from aether.runtime.torch_cache_handoff import restore_torch_cache
+
+                cache = restore_torch_cache(payload, expected_model_fingerprint=fingerprint, engine=handle.engine)
+            else:
+                from aether.runtime.cache_handoff import restore_cpu_cache
+
+                cache = restore_cpu_cache(payload, expected_model_fingerprint=fingerprint)
+            handle.save_session_cache(session_id, np.asarray(ids, dtype=np.int64), cache, contract=contract)
+            if block is not None:
+                self.kv_cache.release_payload_residency(block.block_id)
+            self._stored_sessions.pop((model_id, session_id), None)
+            return {"logical_length": payload.logical_length, "tensor_bytes": payload.byte_size,
+                    "model_fingerprint": fingerprint, "execution_contract": contract}
+
+    def close(self, *, timeout: float = 10.0) -> None:
+        """Join owned phase workers, discard restoration files, and unload models."""
+        lifecycle = runtime_lifecycle(self)
+        claimed, errors = lifecycle.begin_close(timeout)
+        if not claimed:
+            return
+        try:
+            self._execution_features.close()
+            deadline = time.monotonic() + timeout
+            for job in list(self._compile_jobs.values()):
+                worker = job.get("_thread")
+                if isinstance(worker, threading.Thread) and worker.is_alive():
+                    if worker is threading.current_thread():
+                        raise RuntimeError("An executing compiler job cannot close its owning Runtime")
+                    worker.join(max(0, deadline - time.monotonic()))
+                    if worker.is_alive():
+                        raise TimeoutError("Runtime compiler job is still executing; shutdown has not completed")
+            if self._draft_runtime is not None:
+                self._draft_runtime.close(timeout=timeout)
+                self._draft_runtime = None
+            for attribute, method in (("mcp_layer", "disconnect_all"), ("_cxl_pool", "close")):
+                owner = getattr(self, attribute, None)
+                if owner is None:
+                    continue
+                try:
+                    close_owner = getattr(owner, method, None)
+                    if callable(close_owner):
+                        close_owner()
+                    setattr(self, attribute, None)
+                except BaseException as error:
+                    errors.append(error)
+            for model_id in list(self._loaded_models):
+                backend = self._loaded_backends.get(model_id)
+                unload = getattr(backend, "unload_model", None)
+                try:
+                    if callable(unload):
+                        unload(model_id)
+                    self._loaded_models.pop(model_id, None)
+                    self._loaded_backends.pop(model_id, None)
+                    self._model_targets.pop(model_id, None)
+                    self._aeg_paths.pop(model_id, None)
+                except BaseException as error:
+                    errors.append(error)
+            if not self._loaded_models:
+                self._loaded_backends.clear()
+                self._aeg_packages.clear()
+                self._peagle_engines.clear()
+                self._draft_pairs.clear()
+                self._stored_sessions.clear()
+                for attribute in ("peagle_engine", "ttt_engine", "grammar_engine", "tee_manager",
+                                  "_diffusion_engine", "_semantic_cache", "_multi_agent_coordinator"):
+                    setattr(self, attribute, None)
+                for attribute in ("_task_weights_by_model", "_task_weights"):
+                    weights = getattr(self, attribute, None)
+                    if isinstance(weights, dict):
+                        weights.clear()
+                # A caller may retain this closed Runtime/manager object.
+                # Release owned host snapshots while keeping committed disk
+                # and Hub keys available to a new Runtime after restart.
+                self.kv_cache.discard_resident_payloads()
+            if errors:
+                raise RuntimeError(f"Runtime resource cleanup failed: {errors[0]}") from errors[0]
+        except BaseException:
+            lifecycle.finish_close(False)
+            raise
+        lifecycle.finish_close(True)
+
+    def __enter__(self) -> Runtime:
+        with runtime_lifecycle(self).operation():
+            return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
     def _loaded_aeg_path(self, model_id: str) -> tuple[str | None, str | None]:
         """The artifact path for a model this process has already loaded.
 
@@ -721,8 +1345,8 @@ class Runtime:
             logger.info(f"Model {model_id} already available at {aeg_path}")
             return
         logger.info(f"Pulling and compiling model {model_id}")
-        from aether import Compiler
-        compiler = Compiler()
+        from aether import Compiler, CompilerConfig
+        compiler = Compiler(CompilerConfig(cache_dir=str(aether_cache_dir(self.config.model_cache_dir))))
         # No explicit output path: the compiler derives the canonical cache path
         # from the same naming contract this class resolves through, so passing one
         # here could only reintroduce a divergence between writer and reader.
@@ -770,17 +1394,37 @@ class Runtime:
             "sharding_plans": {k: v.to_dict() for k, v in aeg.sharding_plans.items()},
         }
 
+    @runtime_exclusive
     def remove(self, model_id: str) -> None:
         """Remove a model from the local AEG cache."""
-        from aether.utils.file_io import delete_model
+        from aether.utils.file_io import cached_model_paths, delete_model
 
-        delete_model(model_id, self.config.model_cache_dir)
+        paths = cached_model_paths(model_id, self.config.model_cache_dir)
+        if not paths:
+            raise ModelNotFoundError(f"Cached model {model_id} not found", model_id=model_id)
         with self._lock:
-            self._loaded_models.pop(model_id, None)
-            self._loaded_backends.pop(model_id, None)
-            self._aeg_paths.pop(model_id, None)
+            aliases = {model_id}
+            for alias, (_, resolved) in self._aeg_paths.items():
+                if resolved and Path(resolved) in paths:
+                    aliases.add(alias)
+            errors = runtime_lifecycle(self).cancel_streams(aliases)
+            if errors:
+                raise RuntimeError(f"Runtime stream cleanup failed: {errors[0]}") from errors[0]
+            for alias in aliases:
+                self._execution_features.unload(alias)
+                backend = self._loaded_backends.get(alias)
+                unload = getattr(backend, "unload_model", None)
+                if callable(unload):
+                    unload(alias)
+            delete_model(model_id, self.config.model_cache_dir)
+            for alias in aliases:
+                self._loaded_models.pop(alias, None)
+                self._loaded_backends.pop(alias, None)
+                self._model_targets.pop(alias, None)
+                self._aeg_paths.pop(alias, None)
         logger.info(f"Removed model {model_id} from cache")
 
+    @runtime_operation
     def generate(
         self,
         model_id: str,
@@ -840,12 +1484,25 @@ class Runtime:
                     raise AetherRuntimeError("SLO scheduler did not admit the request")
             except (ValueError, KeyError) as exc:
                 raise AetherRuntimeError(f"invalid SLO tier {requested_tier!r}") from exc
-        cache_bypass = bool(kwargs.pop("cache_bypass", False))
+        task_weights = self._effective_task_weights(model_id, kwargs)
+        if task_weights is not None:
+            kwargs["task_weights"] = task_weights
+        # The response cache's current key covers ordinary prompt sampling,
+        # not arbitrary backend hooks, prompt formatting or mutable weights.
+        # Such requests must execute and must not seed ordinary cache entries.
+        cache_bypass = bool(kwargs.pop("cache_bypass", False)) or bool(kwargs) or bool(stop) or messages is not None
+        cache_bypass = cache_bypass or self.ttt_engine is not None or self.config.ttt_enabled
+        cache_bypass = cache_bypass or self.config.disaggregate_prefill_decode or bool(self.config.draft_model_id)
+        cache_bypass = cache_bypass or self.slo_scheduler is not None
+        with self._lock:
+            cache_handle = self._loaded_models.get(model_id)
+            precision_epoch = getattr(cache_handle, "metadata", {}).get("_precision_epoch", 0)
         cache_config = {
-            "max_new_tokens": max_tokens or self.config.default_max_tokens,
+            "max_new_tokens": max_tokens if max_tokens is not None else self.config.default_max_tokens,
             "temperature": temperature if temperature is not None else self.config.default_temperature,
             "top_p": top_p if top_p is not None else self.config.default_top_p,
             "top_k": top_k,
+            "precision_epoch": precision_epoch,
         }
         if self.config.enable_semantic_cache:
             self._init_v5_layers()
@@ -863,7 +1520,7 @@ class Runtime:
                             "total_tokens": len(prompt.split()) + completion_tokens,
                         },
                         metrics=InferenceMetrics(
-                            kernel_target=self.fingerprint.target_id,
+                            kernel_target=self._model_targets.get(model_id, self.fingerprint.target_id),
                             backend_name="semantic_cache",
                             extra={"cache_hit": True, "similarity": cached.similarity_score},
                         ),
@@ -873,7 +1530,7 @@ class Runtime:
             model_id=model_id,
             prompt=prompt,
             messages=messages,
-            max_tokens=max_tokens or self.config.default_max_tokens,
+            max_tokens=max_tokens if max_tokens is not None else self.config.default_max_tokens,
             temperature=temperature if temperature is not None else self.config.default_temperature,
             top_p=top_p if top_p is not None else self.config.default_top_p,
             top_k=top_k,
@@ -892,13 +1549,10 @@ class Runtime:
         )
         if peagle_engine is not None:
             request.extra.setdefault("peagle_engine", peagle_engine)
-        task_weights = getattr(self, "_task_weights_by_model", {}).get(model_id)
-        if task_weights is not None:
-            request.extra.setdefault("task_weights", dict(task_weights))
         start = datetime.datetime.now(datetime.timezone.utc)
         start_ns = time.time_ns()
         try:
-            result = backend.generate(request)
+            result = self._generate_with_features(backend, request)
         except Exception as exc:
             error_span = self.tracer.start_span(
                 "aether.inference", attributes={"model_id": model_id, "error": str(exc)}
@@ -925,7 +1579,7 @@ class Runtime:
             result.metrics.get("ttft_ms", duration_s * 1000),
             result.completion_tokens / max(duration_s, 1e-9),
             duration_s * 1000,
-            eagle_accept_rate=self.kv_cache.hit_rate(),
+            eagle_accept_rate=float(result.metrics.get("speculative", {}).get("acceptance_rate", 0.0)),
             kv_hit_rate=self.kv_cache.hit_rate(),
         )
         backend_metrics = {
@@ -960,11 +1614,11 @@ class Runtime:
         metrics = InferenceMetrics(
             throughput_tps=result.completion_tokens / max(duration_s, 1e-6),
             ttft_ms=result.metrics.get("ttft_ms", duration_s * 1000),
-            kernel_target=self.fingerprint.target_id,
-            active_precision="mixed",  # Could be refined from AEG
-            spec_accept_rate=self.kv_cache.hit_rate(),
+            kernel_target=self._model_targets.get(model_id, self.fingerprint.target_id),
+            active_precision=result.metrics.get("active_precision"),
+            spec_accept_rate=float(result.metrics.get("speculative", {}).get("acceptance_rate", 0.0)),
             kv_cache_hit_rate=self.kv_cache.hit_rate(),
-            memory_pressure=0.0,
+            memory_pressure=result.metrics.get("memory_pressure"),
             backend_name=result.backend_name or backend.name,
             extra=backend_metrics,
         )
@@ -978,12 +1632,13 @@ class Runtime:
             metrics=metrics,
             finish_reason=result.finish_reason,
         )
-        if self.config.enable_semantic_cache and prompt is not None:
+        if self.config.enable_semantic_cache and prompt is not None and not cache_bypass:
             cache = getattr(self, "_semantic_cache", None)
             if cache is not None:
                 cache.store(prompt, result.text, model_id, cache_config, tokens_saved=0)
         return response
 
+    @runtime_operation
     def generate_batch(
         self,
         model_id: str,
@@ -1018,7 +1673,7 @@ class Runtime:
             return []
         if not all(isinstance(prompt, str) for prompt in prompts):
             raise ValueError("prompts must be a list of strings")
-        resolved_max = max_tokens or self.config.default_max_tokens
+        resolved_max = max_tokens if max_tokens is not None else self.config.default_max_tokens
         resolved_temperature = (
             temperature if temperature is not None else self.config.default_temperature
         )
@@ -1041,6 +1696,27 @@ class Runtime:
             self._check_safety_prompt(prompt)
 
         backend = self._load_model(model_id)
+        task_weights = self._effective_task_weights(model_id, kwargs)
+        if task_weights is not None:
+            kwargs["task_weights"] = task_weights
+        unsupported = {
+            key for key in (
+                "adapter_id", "adapter_name", "task_weights", "ttt_engine", "ttt_slots",
+                "grammar_session", "multi_agent_kv_coordinator", "multi_agent_prefix",
+                "multi_agent_prefix_hash", "peagle_engine", "spec_draft_engine",
+            ) if kwargs.get(key) is not None and (key != "task_weights" or bool(kwargs[key]))
+        }
+        if self.ttt_engine is not None:
+            unsupported.add("ttt_engine")
+        batch_aeg_key = self._loaded_aeg_path(model_id)[1]
+        batch_peagle = self._peagle_engines.get(batch_aeg_key) if batch_aeg_key is not None else self.peagle_engine
+        if batch_peagle is not None:
+            unsupported.add("peagle_engine")
+        if unsupported:
+            raise AetherRuntimeError(
+                "batched generation has no execution adapter for active request hooks "
+                f"{sorted(unsupported)}; submit individually rather than ignoring them"
+            )
         run_batch = getattr(backend, "generate_batch", None)
         if run_batch is None:
             raise AetherRuntimeError(
@@ -1065,7 +1741,21 @@ class Runtime:
         start = datetime.datetime.now(datetime.timezone.utc)
         start_ns = time.time_ns()
         try:
-            results = run_batch(requests)
+            concurrent_requests = self.config.disaggregate_prefill_decode or self.config.draft_model_id or isinstance(
+                kwargs.get("aether_kv_session_id"), str
+            )
+            if concurrent_requests:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=min(len(requests), self.config.disaggregate_queue_capacity)) as executor:
+                    results = list(executor.map(lambda request: self._generate_with_features(backend, request), requests))
+            else:
+                handle = self._loaded_models.get(model_id)
+                self._execution_features.automatic_precision(model_id, handle)
+                with self._execution_features.gate(model_id).read():
+                    results = run_batch(requests)
+                for result in results:
+                    result.metrics.update(self._execution_features.report(model_id, handle))
         except Exception as exc:
             error_span = self.tracer.start_span(
                 "aether.inference.batch",
@@ -1091,6 +1781,7 @@ class Runtime:
                 if key not in {"ttft_ms", "throughput_tps"}
             }
             backend_metrics.setdefault("batch_size", len(prompts))
+            backend_metrics["execution_mode"] = "concurrent_requests" if concurrent_requests else "batched_forward"
             # The wall time belongs to the batch, so the aggregate rate is the
             # figure batching actually improves.  Both are labelled rather than
             # letting a per-row number stand in for batch throughput.
@@ -1106,8 +1797,8 @@ class Runtime:
                     metrics=InferenceMetrics(
                         throughput_tps=result.completion_tokens / max(duration_s, 1e-6),
                         ttft_ms=result.metrics.get("ttft_ms", duration_s * 1000),
-                        kernel_target=self.fingerprint.target_id,
-                        active_precision="mixed",
+                        kernel_target=self._model_targets.get(model_id, self.fingerprint.target_id),
+                        active_precision=result.metrics.get("active_precision"),
                         backend_name=result.backend_name or backend.name,
                         extra=backend_metrics,
                     ),
@@ -1132,6 +1823,7 @@ class Runtime:
             )
         return prompt
 
+    @runtime_stream
     def generate_stream(
         self,
         model_id: str,
@@ -1185,9 +1877,9 @@ class Runtime:
         if self.ttt_engine is not None:
             request_extra.setdefault("ttt_engine", self.ttt_engine)
             request_extra.setdefault("ttt_request_id", uuid.uuid4().hex)
-        task_weights = getattr(self, "_task_weights_by_model", {}).get(model_id)
+        task_weights = self._effective_task_weights(model_id, request_extra)
         if task_weights is not None:
-            request_extra.setdefault("task_weights", dict(task_weights))
+            request_extra["task_weights"] = task_weights
         stream_aeg_key = self._loaded_aeg_path(model_id)[1]
         stream_peagle = (
             self._peagle_engines.get(stream_aeg_key)
@@ -1200,7 +1892,7 @@ class Runtime:
             model_id=model_id,
             prompt=prompt,
             messages=messages,
-            max_tokens=max_tokens or self.config.default_max_tokens,
+            max_tokens=max_tokens if max_tokens is not None else self.config.default_max_tokens,
             temperature=temperature if temperature is not None else self.config.default_temperature,
             top_p=top_p if top_p is not None else self.config.default_top_p,
             top_k=top_k,
@@ -1208,7 +1900,7 @@ class Runtime:
             stop=stop,
             extra=request_extra,
         )
-        stream = backend.generate_stream(request)
+        stream = self._stream_with_features(backend, request)
         stream_started = time.perf_counter()
         pending = ""
         # Output policy checks must cover the complete generated response.  A
@@ -1265,6 +1957,9 @@ class Runtime:
             elif pending:
                 yield pending
         finally:
+            close_stream = getattr(stream, "close", None)
+            if callable(close_stream):
+                close_stream()
             if slo_request is not None:
                 self.slo_scheduler.record_batch_latency((time.perf_counter() - stream_started) * 1000.0)
 
@@ -1288,6 +1983,7 @@ class Runtime:
         """Chat completion with a list of messages."""
         return self.generate(model_id, messages=messages, **kwargs)
 
+    @runtime_operation
     def embed(self, model_id: str, input: list[str]) -> list[list[float]]:
         """Generate embeddings for a list of texts."""
         backend = self._load_model(model_id)
@@ -1296,6 +1992,7 @@ class Runtime:
         msg = f"Backend {backend.name} does not support embeddings"
         raise AetherRuntimeError(msg)
 
+    @runtime_operation
     def rerank(self, model_id: str, query: str, documents: list[str]) -> list[dict[str, Any]]:
         """Rerank documents for a query."""
         backend = self._load_model(model_id)
@@ -1304,6 +2001,7 @@ class Runtime:
         msg = f"Backend {backend.name} does not support reranking"
         raise AetherRuntimeError(msg)
 
+    @runtime_operation
     def transcribe(self, model_id: str, audio: str, language: str | None = None) -> str:
         """Transcribe an audio file."""
         backend = self._load_model(model_id)
@@ -1312,6 +2010,7 @@ class Runtime:
         msg = f"Backend {backend.name} does not support transcription"
         raise AetherRuntimeError(msg)
 
+    @runtime_operation
     def benchmark(self, model_id: str, prompt: str = "Hello, my name is", max_tokens: int = 128) -> dict[str, Any]:
         """Run a simple benchmark on a model."""
         backend = self._load_model(model_id)
@@ -1329,6 +2028,7 @@ class Runtime:
         return {
             "model_id": model_id,
             "backend": backend.name,
+            "kernel_target": self._model_targets.get(model_id, self.fingerprint.target_id),
             "prompt_tokens": result.prompt_tokens,
             "completion_tokens": result.completion_tokens,
             "duration_s": end - start,
@@ -1408,27 +2108,60 @@ class Runtime:
             "energy_savings_est_pct": None,
         }
 
+    def _effective_task_weights(
+        self, model_id: str, request_extra: dict[str, Any] | None = None,
+    ) -> dict[str, float] | None:
+        """Snapshot validated request, model-specific or global coefficients."""
+        from aether.runtime.session_contract import validate_task_weights
+
+        with self._lock:
+            if request_extra is not None and "task_weights" in request_extra:
+                selected = request_extra["task_weights"]
+            else:
+                selected = getattr(self, "_task_weights_by_model", {}).get(
+                    model_id, getattr(self, "_task_weights", None),
+                )
+            return None if selected is None else validate_task_weights(selected)
+
+    @runtime_operation
     def set_task_weights(
         self,
         weights: dict[str, float] | str,
         **task_weights: float,
     ) -> dict[str, float]:
-        """Set normalized task-routing weights used by this runtime session."""
-        # The v4 public API accepts ``set_task_weights(model_id, legal=..., ...)``
-        # while the internal API accepts a mapping.  The model identifier is
-        # retained for future per-artifact routing, but weights are normalized
-        # and applied to the active runtime session immediately.
+        """Set normalized global defaults or coefficients for one model.
+
+        Per-model defaults override a mapping-only global default. Each request
+        snapshots its coefficients, so a concurrent update affects later
+        requests without mutating an admitted request's selected engine.
+        Use ``set_model_task_weights(model_id, mapping)`` for arbitrary labels
+        that cannot be represented safely as Python keyword arguments.
+        """
         task_model_id = weights if isinstance(weights, str) else None
         if task_model_id is not None:
             weights = task_weights
         elif task_weights:
             raise ValueError("keyword task weights cannot be combined with a mapping")
-        if not weights or any(not isinstance(value, (int, float)) or value < 0 for value in weights.values()):
-            raise ValueError("task weights must be a non-empty mapping of non-negative numbers")
-        total = float(sum(weights.values()))
-        if total <= 0:
+        return self._set_task_weight_defaults(task_model_id, weights)
+
+    @runtime_operation
+    def set_model_task_weights(self, model_id: str, weights: dict[str, float]) -> dict[str, float]:
+        """Set one model's coefficients from a mapping with unrestricted labels.
+
+        Labels are data rather than Python parameter names. Validation,
+        normalization and request snapshot semantics match ``set_task_weights``.
+        """
+        if not isinstance(model_id, str) or not model_id:
+            raise ValueError("model_id must be a nonempty string")
+        return self._set_task_weight_defaults(model_id, weights)
+
+    def _set_task_weight_defaults(self, task_model_id: str | None, weights: Any) -> dict[str, float]:
+        """Validate and atomically publish coefficients for both public forms."""
+        from aether.runtime.session_contract import validate_task_weights
+
+        normalized = validate_task_weights(weights, normalize=True)
+        if not normalized:
             raise ValueError("at least one task weight must be greater than zero")
-        normalized = {name: float(value) / total for name, value in weights.items()}
         if task_model_id is not None:
             aeg_path = self._resolve_aeg_path(task_model_id)
             if aeg_path is None:
@@ -1441,17 +2174,15 @@ class Runtime:
                 raise AetherRuntimeError(
                     f"AEG {task_model_id!r} contains no persisted executable task-vector payloads"
                 )
-            unknown = sorted(set(normalized) - available)
-            if unknown:
-                raise ValueError(
-                    f"task weights reference unknown vectors {unknown}; available vectors are {sorted(available)}"
-                )
-            if not hasattr(self, "_task_weights_by_model"):
-                self._task_weights_by_model: dict[str, dict[str, float]] = {}
-                self._task_weights_by_model: dict[str, dict[str, float]] = {}
-            self._task_weights_by_model[task_model_id] = normalized
-        self._task_weights = normalized
-        return dict(self._task_weights)
+            validate_task_weights(weights, available=available)
+        with self._lock:
+            if task_model_id is not None:
+                if not hasattr(self, "_task_weights_by_model"):
+                    self._task_weights_by_model: dict[str, dict[str, float]] = {}
+                self._task_weights_by_model[task_model_id] = dict(normalized)
+            else:
+                self._task_weights = dict(normalized)
+        return dict(normalized)
 
     def generate_cascade(
         self,
@@ -1791,6 +2522,7 @@ class Runtime:
         except Exception as exc:
             logger.warning("v4.0 layer init skipped", error=str(exc))
 
+    @runtime_operation
     def compile_async(
         self,
         model_id: str,
@@ -1927,45 +2659,116 @@ class Runtime:
         method: str = "task_arithmetic",
         density: float = 1.0,
     ) -> dict[str, Any]:
-        """Apply model merging task vectors using Pass 12 logic.
+        """Publish an integrity-checked AEG with real, persisted task-vector deltas.
 
-        Merges a base model with one or more task-specific delta-weight
-        vectors (task_arithmetic / dare_ties / free_merging / evolutionary).
-
-        Args:
-            model_id: Base model AEG path or identifier.
-            task_vectors: List of task vector configs. Each entry:
-                {name: str, coefficient: float, path: str}
-            method: Merge strategy: task_arithmetic | dare_ties |
-                    free_merging | heterogeneous | evolutionary.
-            density: Pruning density for DARE/TIES (0.0-1.0, default 1.0).
-
-        Returns:
-            Dict with merge result metadata.
-
-        Research basis:
-            Task Arithmetic (ICLR 2023), TIES-Merging (NeurIPS 2023),
-            DARE-TIES (arXiv 2024), FREE-Merging (arXiv 2026).
+        Each source may update a different subset of base parameters, but must
+        contribute at least one matching tensor. ``density`` controls DARE's
+        retained probability or TIES's per-tensor magnitude trimming; dare_ties
+        applies DARE followed by TIES at that retention fraction. Other methods
+        require density=1. FREE/evolutionary retain their existing L2 proxy
+        search, which is not a model-quality evaluation. All outputs require
+        fresh quality evaluation, signatures and weight-dependent attestations.
         """
+        import math
+        import re
+        import shutil
+        import tempfile
+        from collections.abc import Mapping
+
         if not task_vectors:
             raise ValueError("at least one task vector source is required")
-        if not 0.0 < density <= 1.0:
-            raise ValueError("density must be greater than 0 and no more than 1")
-        method_aliases = {"dare_ties": "dare", "task-arithmetic": "task_arithmetic"}
+        if (
+            isinstance(density, bool)
+            or not isinstance(density, (int, float))
+            or not math.isfinite(density)
+            or not 0.0 < density <= 1.0
+        ):
+            raise ValueError("density must be finite, greater than 0 and no more than 1")
+        method_aliases = {"task-arithmetic": "task_arithmetic", "free_merging": "free"}
         method = method_aliases.get(method, method)
-        supported_methods = {"task_arithmetic", "dare", "ties", "free", "evolutionary", "soup"}
+        supported_methods = {
+            "task_arithmetic",
+            "dare",
+            "ties",
+            "dare_ties",
+            "free",
+            "evolutionary",
+            "soup",
+        }
         if method not in supported_methods:
-            raise ValueError(f"unsupported merge method {method!r}; choose one of {sorted(supported_methods)}")
+            raise ValueError(
+                f"unsupported merge method {method!r}; choose one of {sorted(supported_methods)}"
+            )
+        if density != 1.0 and method not in {"dare", "ties", "dare_ties"}:
+            raise ValueError(f"density is not supported for merge method {method!r}; use density=1")
+        coefficients: list[float] = []
+        names: list[str] = []
+        for index, item in enumerate(task_vectors):
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("path"), str)
+                or not item["path"].strip()
+            ):
+                raise ValueError("each task vector requires a readable 'path'")
+            coefficient = item.get("coefficient", 1.0 / len(task_vectors))
+            if (
+                isinstance(coefficient, bool)
+                or not isinstance(coefficient, (int, float))
+                or not math.isfinite(coefficient)
+                or coefficient < 0
+            ):
+                raise ValueError("task vector coefficients must be finite non-negative numbers")
+            coefficients.append(float(coefficient))
+            name = str(item.get("name") or Path(item["path"]).stem or f"task_{index}")
+            if name in names:
+                raise ValueError(f"duplicate task vector name {name!r}")
+            names.append(name)
+        total = sum(coefficients)
+        if not math.isfinite(total) or total <= 0:
+            raise ValueError("task vector coefficients must have a finite positive sum")
+        # Task arithmetic coefficients are absolute delta scales. Convex and
+        # proxy-search algorithms use normalized initial coefficients instead.
+        if method in {"soup", "free", "evolutionary"}:
+            coefficients = [value / total for value in coefficients]
+        if method == "soup" and any(
+            not math.isclose(value, 1.0 / len(coefficients), abs_tol=1e-12)
+            for value in coefficients
+        ):
+            raise ValueError(
+                "soup requires uniform coefficients; use task_arithmetic for weighted task vectors"
+            )
 
         # Runtime merging operates on native AEG artifacts.  It deliberately
         # does not return a recorded/config-only success: a caller receives a
         # new artifact only after real source weights were read and persisted.
         base_path = self._resolve_aeg_path(model_id)
         if base_path is None:
-            raise ModelNotFoundError(f"base AEG model {model_id!r} was not found", model_id=model_id)
+            raise ModelNotFoundError(
+                f"base AEG model {model_id!r} was not found", model_id=model_id
+            )
         base = load_aeg_package(base_path)
-        if not base.has_weights:
+        from aether.compiler.aeg_merging import (
+            _validate_input_tree,
+            invalidate_weight_dependent_evidence,
+        )
+
+        _validate_input_tree(base.root)
+        base.verify_integrity()
+        if base.manifest is None or base.ir is None or not base.has_weights:
             raise AetherRuntimeError(f"base AEG {model_id!r} has no persisted weights")
+        if "tee_kernel_wrapping" in base.metadata.get("optimizer_passes", []):
+            raise AetherRuntimeError(
+                "TEE-bound AEG weights require a fresh attested compilation after merging"
+            )
+        output_root = base.root.with_name(base.root.name + ".merged")
+        if output_root.exists():
+            raise AetherRuntimeError(
+                f"merge output already exists: {output_root}; remove it explicitly first"
+            )
+        if not (base.root / "tokenizer").is_dir():
+            raise AetherRuntimeError(
+                "base AEG has no packaged tokenizer; merged text generation cannot be portable"
+            )
 
         import numpy as np
         from aether.compiler.stage2_optimizer.pass12_model_merging import (
@@ -1974,6 +2777,7 @@ class Runtime:
             _get_merger,
             _load_source_weights,
         )
+        from aether.core.weight_store import WeightStore
         from aether.quantization.formats import quantize_tensor
 
         store = base.weight_store()
@@ -1982,116 +2786,190 @@ class Runtime:
             name: tensor.reshape(-1).astype("float32").tolist()
             for name, tensor in store.dequantize_all().items()
         }
+        if any(not np.isfinite(values).all() for values in base_weights.values()):
+            raise ValueError("base merge tensors must contain finite coordinates")
         sources: list[dict[str, list[float]]] = []
-        coefficients: list[float] = []
         for item in task_vectors:
-            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
-                raise ValueError("each task vector requires a readable 'path'")
             source = _load_source_weights(item["path"], base)
             if not source:
-                raise AetherRuntimeError(f"task vector source has no readable weights: {item['path']}")
+                raise AetherRuntimeError(
+                    f"task vector source has no readable weights: {item['path']}"
+                )
             sources.append(source)
-            coefficient = item.get("coefficient", 1.0 / len(task_vectors))
-            if not isinstance(coefficient, (int, float)) or coefficient < 0:
-                raise ValueError("task vector coefficients must be non-negative numbers")
-            coefficients.append(float(coefficient))
-        if sum(coefficients) <= 0:
-            raise ValueError("at least one task vector coefficient must be greater than zero")
-
-        # Keep coefficients as supplied for task arithmetic; normalize only
-        # for algorithms whose semantics require a convex combination.
-        if method in {"soup", "free", "evolutionary"}:
-            total = sum(coefficients)
-            coefficients = [value / total for value in coefficients]
-        merger = _get_merger(method)
         task_delta = _compute_task_vectors(base_weights, sources)
-        merged_delta = merger.merge(task_delta, coefficients, self.config)
+        for name, vector in zip(names, task_delta):
+            if not vector:
+                raise AetherRuntimeError(
+                    f"task vector {name!r} has no overlapping matching base tensor"
+                )
+        if method in {"ties", "dare_ties"}:
+            # Vectorized trim/elect/disjoint-mean supports partial adapters:
+            # missing source coordinates never count toward its denominator.
+            rng = np.random.default_rng(42)
+            merged_delta = {}
+            for key in sorted(set().union(*(vector.keys() for vector in task_delta))):
+                vectors = []
+                for coefficient, vector in zip(coefficients, task_delta):
+                    if key not in vector:
+                        continue
+                    values = np.asarray(vector[key], dtype=np.float64)
+                    if method == "dare_ties":
+                        values = np.where(rng.random(values.size) < density, values / density, 0.0)
+                    keep = max(1, math.ceil(values.size * density))
+                    magnitudes = np.abs(values)
+                    threshold = np.partition(magnitudes, values.size - keep)[values.size - keep]
+                    retained = magnitudes > threshold
+                    # Include only the required number of tied coordinates,
+                    # in stable index order, so density keeps its exact meaning.
+                    tied = np.flatnonzero(magnitudes == threshold)
+                    retained[tied[: keep - int(retained.sum())]] = True
+                    vectors.append((coefficient, np.where(retained, values, 0.0)))
+                elected = np.sign(sum(coefficient * vector for coefficient, vector in vectors))
+                numerator = np.zeros(elected.shape, dtype=np.float64)
+                denominator = np.zeros(elected.shape, dtype=np.float64)
+                for coefficient, vector in vectors:
+                    aligned = (np.sign(vector) == elected) & (vector != 0)
+                    numerator += coefficient * np.where(aligned, vector, 0.0)
+                    denominator += coefficient * aligned
+                merged_delta[key] = np.divide(
+                    numerator, denominator, out=np.zeros_like(numerator), where=denominator > 0
+                ).tolist()
+        elif method == "dare":
+            from aether.compiler.stage2_optimizer.pass12_model_merging import _DAREMerger
+
+            merged_delta = _DAREMerger(drop_prob=1.0 - density).merge(
+                task_delta, coefficients, self.config
+            )
+        else:
+            merged_delta = _get_merger(method).merge(task_delta, coefficients, self.config)
         if not merged_delta:
             raise AetherRuntimeError("task vector sources have no overlapping tensor names")
         merged_weights = _apply_delta(base_weights, merged_delta)
-
-        output_root = Path(base_path).with_name(Path(base_path).name + ".merged")
-        if output_root.exists():
-            raise AetherRuntimeError(f"merge output already exists: {output_root}; remove it explicitly first")
-        tokenizer_root = Path(base_path) / "tokenizer"
-        if not tokenizer_root.is_dir():
-            raise AetherRuntimeError("base AEG has no packaged tokenizer; merged text generation cannot be portable")
-        import shutil
-
-        # AEG metadata may reference immutable payloads outside the graph and
-        # weights trees, most importantly packaged native kernels.  Copy the
-        # complete source artifact first so the merged package remains
-        # self-contained; ``save()`` below then replaces the mutable manifest,
-        # graph, metadata, and quantized weight payloads with their merged
-        # versions.  Copying only the tokenizer would leave a valid-looking
-        # manifest pointing at missing executable artifacts after reload.
-        shutil.copytree(base.root, output_root)
-
-        merged = copy.deepcopy(base)
-        merged.root = output_root.resolve()
-        merged._weight_store = None  # noqa: SLF001 - invalidate copied disk reader
-        merged.weights = {}
-        merged.manifest.model_id = f"{base.manifest.model_id or model_id}+merged"
-        merged.metadata["model_merge"] = {
+        if any(
+            not np.isfinite(np.asarray(values, dtype=np.float32)).all()
+            for values in merged_weights.values()
+        ):
+            raise ValueError("Merge overflowed the FP32 output format")
+        record = {
+            "format": "aether_merge_manifest_v1",
             "method": method,
             "density": density,
             "sources": [item["path"] for item in task_vectors],
             "coefficients": coefficients,
             "tensor_count": len(merged_delta),
+            "n_sources": len(task_vectors),
+            "n_tensors_updated": len(merged_delta),
+            "precision_policy": "preserve_base_storage_formats_and_block_sizes",
+            "auxiliary_policy": "preserve_base_requires_reevaluation",
+            "quality_validated": False,
+            "seed": 42 if method in {"dare", "dare_ties", "free", "evolutionary"} else None,
+            "density_policy": "drop_then_per_tensor_trim"
+            if method == "dare_ties"
+            else (
+                "retained_probability"
+                if method == "dare"
+                else "per_tensor_top_magnitude"
+                if method == "ties"
+                else "not_applicable"
+            ),
+            "coefficient_policy": "initial_for_l2_proxy_search"
+            if method in {"free", "evolutionary"}
+            else "applied",
+            "task_vector_policy": "raw_source_minus_original_base; runtime reweighting adds deltas to the merged model",
         }
-        # Persist the actual per-source task deltas so runtime reweighting does
-        # not depend on source files remaining available after compilation.
-        # AEGPackage.save() includes these files in the manifest artifact hash.
-        task_delta_vectors = _compute_task_vectors(base_weights, sources)
-        task_vector_descriptors: list[dict[str, Any]] = []
-        import re
 
-        task_vector_root = output_root / "merging" / "task_vectors"
-        task_vector_root.mkdir(parents=True, exist_ok=True)
-        task_vector_names: set[str] = set()
-        for index, (item, delta) in enumerate(zip(task_vectors, task_delta_vectors)):
-            requested_name = str(item.get("name") or Path(str(item["path"])).stem or f"task_{index}")
-            if requested_name in task_vector_names:
-                raise ValueError(f"duplicate task vector name {requested_name!r}")
-            task_vector_names.add(requested_name)
-            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", requested_name).strip("._") or f"task_{index}"
-            file_name = f"{index:03d}_{safe_name}.npz"
-            file_path = task_vector_root / file_name
-            arrays: dict[str, Any] = {}
-            tensor_descriptors: list[dict[str, Any]] = []
-            for tensor_index, (tensor_name, values) in enumerate(sorted(delta.items())):
-                key = f"tensor_{tensor_index:06d}"
-                arrays[key] = np.asarray(values, dtype=np.float32)
-                base_entry = entries.get(tensor_name)
-                shape = list(base_entry.shape) if base_entry is not None else [len(values)]
-                tensor_descriptors.append({"name": tensor_name, "key": key, "shape": shape})
-            if not arrays:
-                raise AetherRuntimeError(f"task vector {requested_name!r} has no persisted tensor deltas")
-            np.savez_compressed(file_path, **arrays)
-            task_vector_descriptors.append(
-                {
-                    "name": requested_name,
-                    "path": f"merging/task_vectors/{file_name}",
-                    "tensors": tensor_descriptors,
-                }
+        class MergedTensors(Mapping):
+            def __len__(self):
+                return len(entries)
+
+            def __iter__(self):
+                return iter(entries)
+
+            def __getitem__(self, name):
+                entry = entries[name]
+                if name not in merged_delta:
+                    return store.load_tensor(name)
+                return quantize_tensor(
+                    np.asarray(merged_weights[name], dtype=np.float32).reshape(entry.shape),
+                    entry.precision,
+                    block_size=entry.block_size,
+                )
+
+        # Only a verified staged artifact is published. All mutation, optional
+        # payload preservation and cleanup occur under the base's parent, so
+        # exceptions cannot leave a partial output at the public model path.
+        with tempfile.TemporaryDirectory(
+            prefix=".aether-runtime-merge-", dir=output_root.parent
+        ) as temporary:
+            staging = Path(temporary) / "merged.aeg"
+            shutil.copytree(base.root, staging)
+            merged = load_aeg_package(staging)
+            merged.verify_integrity()
+            invalidate_weight_dependent_evidence(merged)
+            merged.manifest.model_id = f"{base.manifest.model_id or model_id}+merged"
+            merged.manifest.compiled_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            if merged.manifest.format_version not in {"AEG/2.0", "AEG/3.0"}:
+                merged.manifest.format_version = "AEG/2.0"
+            merged.metadata["model_merge"] = record
+            merged.metadata["model_merging"] = record
+            passes = list(merged.metadata.get("optimizer_passes", []))
+            if "model_merging" not in passes:
+                passes.append("model_merging")
+            merged.metadata["optimizer_passes"] = passes
+            merged.metadata.setdefault("pass_reports", {})["model_merging"] = {
+                "status": "applied",
+                "details": record,
+            }
+            task_vector_root = staging / "merging" / "task_vectors"
+            task_vector_root.mkdir(parents=True, exist_ok=True)
+            descriptors = []
+            for index, (name, delta) in enumerate(zip(names, task_delta)):
+                safe_name = (
+                    re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")[:80] or f"task_{index}"
+                )
+                file_name = f"{index:03d}_{safe_name}.npz"
+                arrays = {}
+                tensor_descriptors = []
+                for tensor_index, (tensor_name, values) in enumerate(sorted(delta.items())):
+                    key = f"tensor_{tensor_index:06d}"
+                    array = np.asarray(values, dtype=np.float32)
+                    if not np.isfinite(array).all():
+                        raise ValueError(
+                            f"task vector {name!r} overflowed its persisted FP32 format"
+                        )
+                    arrays[key] = array
+                    tensor_descriptors.append(
+                        {"name": tensor_name, "key": key, "shape": list(entries[tensor_name].shape)}
+                    )
+                np.savez_compressed(task_vector_root / file_name, **arrays)
+                descriptors.append(
+                    {
+                        "name": name,
+                        "path": f"merging/task_vectors/{file_name}",
+                        "tensors": tensor_descriptors,
+                    }
+                )
+            merged.metadata["task_vectors"] = {
+                "format": "aether_task_vectors_v1",
+                "vectors": descriptors,
+            }
+            (staging / "merging" / "merge_manifest.json").write_text(
+                json.dumps(record, indent=2), encoding="utf-8"
             )
-        merged.metadata["task_vectors"] = {
-            "format": "aether_task_vectors_v1",
-            "vectors": task_vector_descriptors,
-        }
-        for name, values in merged_weights.items():
-            entry = entries.get(name)
-            precision = (entry.precision if entry is not None else base.precision_map.get(name, "BF16"))
-            shape = entry.shape if entry is not None else (len(values),)
-            merged.weights[name] = quantize_tensor(
-                np.asarray(values, dtype=np.float32).reshape(shape), precision
+            merged.metadata["weight_bytes"] = WeightStore(staging / "weights" / "quantized").save(
+                MergedTensors()
             )
-        # ``copytree(base.root, output_root)`` above already preserved the
-        # tokenizer together with every other immutable package payload.
-        merged.save()
-        # Reload verifies manifest, payload hashes, graph and weight index.
-        verified = load_aeg_package(output_root)
-        verified.verify_integrity()
+            merged.weights = {}
+            merged._weight_store = None  # noqa: SLF001 - staged payload was replaced
+            merged.save()
+            load_aeg_package(staging).verify_integrity()
+            if output_root.exists():
+                raise AetherRuntimeError(
+                    f"merge output already exists: {output_root}; remove it explicitly first"
+                )
+            from aether.utils.artifact_publication import publish_staged_directory
+
+            publish_staged_directory(staging, output_root)
         return {
             "model": model_id,
             "output_model": str(output_root),
@@ -2099,6 +2977,7 @@ class Runtime:
             "task_count": len(task_vectors),
             "density": density,
             "tensor_count": len(merged_delta),
+            "quality_validated": False,
             "status": "merged",
         }
 
@@ -2379,6 +3258,7 @@ class Runtime:
             "harness": harness.summary(),
         }
 
+    @runtime_operation
     def generate_video(
         self,
         model_id: str | None = None,
@@ -2472,6 +3352,9 @@ class Runtime:
             "enabled": False,
             "network_available": False,
             "network_backend": None,
+            "network_scope": "rdma_nixl_uccl",
+            "hub_configured": self.kv_cache.hub_client is not None and bool(self.kv_cache.hub_namespace),
+            "hub_namespace": self.kv_cache.hub_namespace,
             "fallback_backend": "local_tier_cache",
             "fallback_active": True,
             "research_basis": "NIKA SCITEPRESS 2026 + NIXL NVIDIA 2026",

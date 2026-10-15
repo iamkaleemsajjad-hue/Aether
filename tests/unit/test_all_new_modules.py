@@ -708,34 +708,36 @@ class TestHardwareBackends:
 
     def test_cuda_backend_availability_matches_cuda_runtime(self) -> None:
         from aether.backends.hardware_backends import CUDABackend
-        import torch
+        torch = pytest.importorskip("torch")
 
         backend = CUDABackend("cuda_sm90")
-        assert backend.is_available() is torch.cuda.is_available()
+        has_compatible_device = bool(torch.cuda.is_available() and not torch.version.hip and any(
+            torch.cuda.get_device_capability(index)[0] == 9
+            for index in range(torch.cuda.device_count())
+        ))
+        assert backend.is_available() is has_compatible_device
 
     def test_cuda_backend_capabilities_sm90(self) -> None:
         from aether.backends.hardware_backends import CUDABackend
         backend = CUDABackend("cuda_sm90")
         caps = backend.get_capabilities()
-        assert caps["supports_fp8"] is True
-        assert caps["supports_fp4"] is False
+        assert caps["target_profile_capabilities"]["fp8"] is True
+        assert caps["target_profile_capabilities"]["fp4"] is False
         assert "cuda_sm90" in caps["target_id"]
 
     def test_cuda_backend_capabilities_sm130(self) -> None:
         from aether.backends.hardware_backends import CUDABackend
         backend = CUDABackend("cuda_sm130")
         caps = backend.get_capabilities()
-        assert caps["supports_fp8"] is True
-        assert caps["supports_fp4"] is True
+        assert caps["target_profile_capabilities"]["fp8"] is True
+        assert caps["target_profile_capabilities"]["fp4"] is True
 
-    def test_riscv_backend_availability_matches_onnxruntime(self) -> None:
-        import platform
-
+    def test_riscv_backend_requires_a_vendor_execution_adapter(self) -> None:
         from aether.backends.hardware_backends import RISCVNPUBackend
 
         backend = RISCVNPUBackend("riscv_mips_s8200")
-        host_is_riscv = platform.machine().lower() in {"riscv", "riscv64", "risc-v"}
-        assert backend.is_available() is (backend._ort_available and host_is_riscv)
+        assert backend.is_available() is False
+        assert "execution adapter" in backend.unavailable_reason
 
     def test_cuda_backend_info(self) -> None:
         from aether.backends.hardware_backends import CUDABackend

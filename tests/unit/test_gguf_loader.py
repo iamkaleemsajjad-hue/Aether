@@ -365,6 +365,7 @@ def test_architecture_detector_reads_gguf_header(tmp_path: Path) -> None:
 
 
 def test_embedded_gguf_tokenizer_exports_as_loadable_fast_tokenizer(tmp_path: Path) -> None:
+    pytest.importorskip("transformers")
     from transformers import AutoTokenizer
 
     output = tmp_path / "tokenizer"

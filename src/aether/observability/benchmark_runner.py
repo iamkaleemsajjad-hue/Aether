@@ -1,9 +1,9 @@
 """
 Aether Runtime — Real Performance Benchmark Runner (PRD §36).
 
-This module measures genuine runtime performance metrics from real inference
-runs.  No values are hardcoded or fabricated.  All timing comes from
-``time.perf_counter()``; all memory comes from live system queries.
+This module aggregates backend measurements or times inference callbacks with
+``time.perf_counter()``. Text-only callbacks cannot expose tokenizer counts or
+first-token timing; their estimates are explicitly labeled in the report.
 
 Measured metrics:
   - TTFT  — Time To First Token (seconds)
@@ -20,9 +20,12 @@ attributable to specific software versions and hardware.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
+import math
 import platform
 import statistics
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -51,6 +54,7 @@ class BenchmarkProvenance:
     torch_version: str = "unknown"
     cuda_version: str | None = None
     hardware_target: str = "cpu"
+    backend_name: str | None = None
     device_name: str = "unknown"
     model_id: str = "unknown"
     model_hash: str | None = None
@@ -67,8 +71,15 @@ class BenchmarkProvenance:
             self.aether_version = AETHER_VERSION
         except ImportError:
             pass
+        self.device_name = platform.processor() or platform.machine()
         try:
-            import torch
+            self.torch_version = importlib.metadata.version("torch")
+        except importlib.metadata.PackageNotFoundError:
+            pass
+        # Provenance must not initialize an optional execution framework just
+        # to benchmark a CPU artifact. Reuse it only if execution imported it.
+        torch = sys.modules.get("torch")
+        if torch is not None:
             self.torch_version = torch.__version__
             if torch.cuda.is_available():
                 self.cuda_version = torch.version.cuda
@@ -79,8 +90,6 @@ class BenchmarkProvenance:
                 self.device_name = platform.machine()
             else:
                 self.device_name = platform.processor() or platform.machine()
-        except ImportError:
-            pass
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -108,11 +117,16 @@ class RunResult:
     peak_memory_bytes: int
     token_latencies: list[float] = field(default_factory=list)
     error: str | None = None
+    measurement_source: str = "text_callback"
+    backend_name: str | None = None
+    kernel_target: str | None = None
 
     @property
-    def tbt_mean_s(self) -> float:
+    def tbt_mean_s(self) -> float | None:
         """Mean inter-token latency."""
         if len(self.token_latencies) < 2:
+            if self.measurement_source in {"backend", "stream_callback"}:
+                return None
             return self.e2e_s / max(self.output_tokens, 1)
         return statistics.mean(self.token_latencies[1:])  # Skip first token (TTFT)
 
@@ -127,6 +141,11 @@ class RunResult:
             "tbt_mean_s": self.tbt_mean_s,
             "peak_memory_bytes": self.peak_memory_bytes,
             "error": self.error,
+            "measurement_source": self.measurement_source,
+            "backend_name": self.backend_name,
+            "kernel_target": self.kernel_target,
+            "token_counts_estimated": self.measurement_source != "backend",
+            "ttft_estimated": self.measurement_source == "text_callback",
         }
 
 
@@ -227,7 +246,7 @@ class BenchmarkRunner:
       - Executes a real generate callback
       - Measures wall-clock timing with time.perf_counter()
       - Measures real memory usage from the OS / PyTorch
-      - Never fabricates or interpolates values
+      - Labels estimates when a callback cannot expose a measurement
       - Raises BenchmarkError instead of returning fake results
     """
 
@@ -240,6 +259,7 @@ class BenchmarkRunner:
         num_measured_runs: int = 5,
         batch_size: int = 1,
         precision: str = "fp32",
+        measurement_fn: Callable[[str, int], dict[str, Any]] | None = None,
     ) -> None:
         """
         Args:
@@ -251,10 +271,13 @@ class BenchmarkRunner:
             num_measured_runs: Number of runs whose results are recorded.
             batch_size: Batch size for each run.
             precision: Precision used for inference.
+            measurement_fn: Optional callback returning the Runtime.benchmark
+                            measurements, including real token counts and TTFT.
         """
         if not callable(generate_fn):
             raise ValueError("generate_fn must be a callable that invokes real inference")
         self.generate_fn = generate_fn
+        self.measurement_fn = measurement_fn
         self.model_id = model_id
         self.num_warmup_runs = num_warmup_runs
         self.num_measured_runs = num_measured_runs
@@ -295,7 +318,7 @@ class BenchmarkRunner:
         for i in range(self.num_warmup_runs):
             prompt = prompts[i % len(prompts)]
             try:
-                self.generate_fn(prompt, max_tokens)
+                (self.measurement_fn or self.generate_fn)(prompt, max_tokens)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Warm-up run %d failed: %s", i, exc)
 
@@ -307,6 +330,16 @@ class BenchmarkRunner:
             prompt_tokens = len(prompt.split())  # Approximate; tokenizer-counted if available
             prov.context_length_tokens = max(prov.context_length_tokens, prompt_tokens)
             run_results.append(self._measure_run(i, prompt, max_tokens, prompt_tokens))
+            run = run_results[-1]
+            prov.context_length_tokens = max(prov.context_length_tokens, run.prompt_tokens)
+            if run.kernel_target is not None:
+                prov.hardware_target = run.kernel_target
+                # The host's accelerator is not the executing device when a
+                # CPU artifact was selected on a GPU machine.
+                if run.kernel_target.startswith("cpu_"):
+                    prov.device_name = platform.processor() or platform.machine()
+            if run.backend_name is not None:
+                prov.backend_name = run.backend_name
 
         report = BenchmarkReport(provenance=prov, runs=run_results)
         if output_path is not None:
@@ -329,20 +362,31 @@ class BenchmarkRunner:
         ttft_s = 0.0
         e2e_s = 0.0
         token_latencies: list[float] = []
+        backend_name = None
+        kernel_target = None
 
         try:
-            t_start = time.perf_counter()
-            result_text = self.generate_fn(prompt, max_tokens)
-            t_end = time.perf_counter()
-
-            e2e_s = t_end - t_start
-
-            # Count output tokens (word-split approximation)
-            output_tokens = max(1, len(result_text.split()))
-
-            # TTFT estimate: assume first token latency proportional to 1/N of total
-            # (accurate streaming measurement requires the generate_fn to be a generator)
-            ttft_s = e2e_s / max(output_tokens, 1)
+            if self.measurement_fn is not None:
+                measured = self.measurement_fn(prompt, max_tokens)
+                backend_name = measured.get("backend")
+                kernel_target = measured.get("kernel_target")
+                prompt_tokens = int(measured["prompt_tokens"])
+                output_tokens = int(measured["completion_tokens"])
+                e2e_s = float(measured["duration_s"])
+                ttft_s = float(measured["ttft_ms"]) / 1000.0
+                if (
+                    prompt_tokens < 0 or output_tokens < 0 or e2e_s <= 0 or ttft_s < 0
+                    or not math.isfinite(e2e_s) or not math.isfinite(ttft_s)
+                ):
+                    raise ValueError("invalid backend benchmark measurements")
+            else:
+                t_start = time.perf_counter()
+                result_text = self.generate_fn(prompt, max_tokens)
+                e2e_s = time.perf_counter() - t_start
+                # A legacy text-only callback cannot observe tokenizer counts
+                # or first-token timing. Label these estimates in the report.
+                output_tokens = max(1, len(result_text.split()))
+                ttft_s = e2e_s / max(output_tokens, 1)
 
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
@@ -363,6 +407,9 @@ class BenchmarkRunner:
             peak_memory_bytes=peak_memory,
             token_latencies=token_latencies,
             error=error,
+            measurement_source="backend" if self.measurement_fn is not None else "text_callback",
+            backend_name=backend_name,
+            kernel_target=kernel_target,
         )
 
     def run_streaming(
@@ -462,6 +509,7 @@ class BenchmarkRunner:
             peak_memory_bytes=peak_memory,
             token_latencies=token_latencies,
             error=error,
+            measurement_source="stream_callback",
         )
 
 

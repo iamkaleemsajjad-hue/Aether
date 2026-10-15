@@ -71,6 +71,7 @@ SUPPORTED_TARGETS: dict[str, str] = {
     "cuda_sm100": "NVIDIA B200 (Blackwell)",
     "cuda_sm120": "NVIDIA Rubin R100 (sm_120)",
     # ── v3.1 Apple ────────────────────────────────────────────────────────────
+    "metal": "Metal GPU (portable contract)",
     "metal_m1": "Apple M1/M2",
     "metal_m3": "Apple M3/M4/M5",
     # ── v3.1 AMD ──────────────────────────────────────────────────────────────
@@ -80,6 +81,7 @@ SUPPORTED_TARGETS: dict[str, str] = {
     "openvino_npu": "Intel Arc NPU (OpenVINO)",
     "openvino_gpu": "Intel GPU (OpenVINO)",
     "qualcomm_qnn": "Qualcomm Snapdragon NPU (QNN)",
+    "cpu_generic": "CPU (portable baseline)",
     "cpu_avx512": "x86_64 (AVX-512)",
     "cpu_avx2": "x86_64 (AVX2)",
     "cpu_neon": "ARM (NEON SIMD)",
@@ -113,6 +115,7 @@ BACKEND_BY_TARGET: dict[str, list[str]] = {
     "cuda_sm90": ["vllm", "pytorch", "tensorrt-llm"],
     "cuda_sm100": ["vllm", "pytorch", "tensorrt-llm"],
     "cuda_sm120": ["vllm", "pytorch", "tensorrt-llm"],
+    "metal": ["llama.cpp", "pytorch"],
     "metal_m1": ["mlx", "llama.cpp", "pytorch"],
     "metal_m3": ["mlx", "llama.cpp", "pytorch"],
     "rocm_rdna3": ["pytorch", "llama.cpp"],
@@ -120,6 +123,7 @@ BACKEND_BY_TARGET: dict[str, list[str]] = {
     "openvino_npu": ["onnxruntime", "pytorch"],
     "openvino_gpu": ["onnxruntime", "pytorch"],
     "qualcomm_qnn": ["onnxruntime", "pytorch"],
+    "cpu_generic": ["aether_cpu", "onnxruntime", "pytorch"],
     "cpu_avx512": ["aether_cpu", "llama.cpp", "onnxruntime", "pytorch"],
     "cpu_avx2": ["llama.cpp", "onnxruntime", "aether_cpu"],
     "cpu_neon": ["aether_cpu", "llama.cpp", "onnxruntime", "pytorch"],

@@ -223,10 +223,11 @@ def _load_adapter(adapter_path: str) -> dict[str, Any]:
     )
     if sf_path and sf_path.exists():
         try:
-            import safetensors.torch as st  # type: ignore[import]
-            tensors = st.load_file(str(sf_path))
+            from aether.compiler.stage1_ingestion.safetensors_loader import SafeTensorsLoader
+
+            tensors = SafeTensorsLoader(sf_path).load()
             for name, tensor in tensors.items():
-                flat = tensor.float().reshape(-1).tolist()
+                flat = tensor.astype("float32").reshape(-1).tolist()
                 if "lora_A" in name:
                     adapter["lora_A"][name] = flat
                     adapter["lora_A_shapes"][name] = list(tensor.shape)

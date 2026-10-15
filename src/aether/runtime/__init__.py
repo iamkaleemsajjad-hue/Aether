@@ -27,6 +27,8 @@ from __future__ import annotations
 from aether.runtime.runtime import Runtime
 from aether.runtime.config import RuntimeConfig
 from aether.runtime.kv_cache import KVCacheManager
+from aether.runtime.kv_payload import CachePayload, TensorPayload
+from aether.runtime.kv_storage import KVPayloadStore, CacheQuotaError
 from aether.runtime.scheduler import DisaggregatedScheduler
 from aether.runtime.speculative import TreeSpeculativeEngine
 from aether.runtime.hardware import HardwareDetector
@@ -76,6 +78,10 @@ __all__ = [
     "Runtime",
     "RuntimeConfig",
     "KVCacheManager",
+    "CachePayload",
+    "TensorPayload",
+    "KVPayloadStore",
+    "CacheQuotaError",
     "DisaggregatedScheduler",
     "TreeSpeculativeEngine",
     "HardwareDetector",

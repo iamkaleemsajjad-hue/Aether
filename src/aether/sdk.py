@@ -809,11 +809,15 @@ class AetherClient:
         return self._runtime.kv_transfer_stats()
 
     def set_task_weights(self, **weights: float) -> dict[str, float]:
-        """Update task-routing weights through the loaded runtime."""
+        """Set task weights by keyword; use the mapping form for arbitrary labels."""
+        return self.set_task_weights_mapping(weights)
+
+    def set_task_weights_mapping(self, weights: dict[str, float]) -> dict[str, float]:
+        """Set the loaded model's weights without interpreting labels as parameters."""
         self._ensure_loaded()
-        if self._runtime is None or not hasattr(self._runtime, "set_task_weights"):
+        if self._runtime is None or not hasattr(self._runtime, "set_model_task_weights"):
             raise RuntimeError("task-weight routing is unavailable")
-        return self._runtime.set_task_weights(str(self.model_path), **weights)
+        return self._runtime.set_model_task_weights(str(self.model_path), weights)
 
     def multi_agent_session(
         self,

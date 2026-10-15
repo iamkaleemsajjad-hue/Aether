@@ -534,7 +534,13 @@ def test_the_memo_is_written_and_cleared_where_the_load_is(tmp_path: Path) -> No
     assert load.index("self._loaded_backends[model_id] = backend") < load.index(
         "self._aeg_paths[model_id] = ("
     )
-    assert "self._aeg_paths.pop(model_id, None)" in inspect.getsource(Runtime.remove)
+    runtime, package = _runtime_with_artifact(tmp_path, "org/memo-lifecycle")
+    runtime._aeg_paths["org/memo-lifecycle"] = (str(package), str(package.resolve()))
+    runtime._aeg_paths["local-alias"] = (str(package), str(package.resolve()))
+    runtime.remove("org/memo-lifecycle")
+    assert not runtime._aeg_paths
+    assert not package.exists()
+    assert runtime._loaded_aeg_path("org/memo-lifecycle") == (None, None)
 
 
 def test_neither_request_path_resolves_the_artifact_itself() -> None:

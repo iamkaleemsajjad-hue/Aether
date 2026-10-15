@@ -20,32 +20,45 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import shutil
 import sys
 import tempfile
 import time
 import builtins
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import click
 from rich.console import Console
-from rich.json import JSON as RichJSON
 from rich.table import Table
 from rich.text import Text
 
 from aether import Compiler, CompilerConfig, Runtime, RuntimeConfig
+from aether.compiler.config import SUPPORTED_COMPILATION_PRECISIONS
 from aether.compiler.stage2_optimizer.pass16_green_energy import GreenEnergyCompilationPass
 from aether.compiler.stage3_targeting.hardware_profile import HardwareProfile
 from aether.compiler.stage3_targeting.target_registry import TargetRegistry
 from aether.core.aeg_format import load_aeg_package
-from aether.core.constants import AETHER_VERSION, DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT
+from aether.core.constants import AETHER_VERSION, DEFAULT_HUB_URL, DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT
+from aether.core.exceptions import AetherError
 from aether.hub.client import HubClient
 from aether.utils.file_io import aether_cache_dir, delete_model
 from aether.utils.logging import configure_logging
 
 console = Console()
+
+
+@contextmanager
+def _cli_runtime(config: RuntimeConfig) -> Iterator[Runtime]:
+    """Own a command's runtime across returns, failures and Click exits."""
+    runtime = Runtime(config)
+    try:
+        yield runtime
+    finally:
+        runtime.close()
 
 
 def _display_text(value: object) -> str:
@@ -83,29 +96,76 @@ def _require_applied_pass(aeg: Any, pass_name: str, feature: str) -> None:
         )
 
 
-@click.group(context_settings={"max_content_width": 120})
+def _runtime_config(ctx: click.Context, **overrides: Any) -> RuntimeConfig:
+    """Preserve environment controls when a CLI command overrides settings."""
+    data = RuntimeConfig.from_env().to_dict()
+    config_path = ctx.obj.get("runtime_config")
+    if config_path is not None:
+        config_path = Path(config_path)
+        if config_path.stat().st_size > 1024**2:
+            raise click.ClickException("runtime configuration exceeds the 1 MiB limit")
+        supplied = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(supplied, dict):
+            raise click.ClickException("runtime configuration must be a JSON object")
+        unknown = set(supplied) - set(data)
+        if unknown:
+            raise click.ClickException(f"unknown runtime configuration fields: {sorted(unknown)}")
+        data.update(supplied)
+    if ctx.obj.get("cache_dir") is not None:
+        data["model_cache_dir"] = ctx.obj["cache_dir"]
+    data.update(overrides)
+    return RuntimeConfig.from_dict(data)
+
+
+class _AetherGroup(click.Group):
+    """Present expected configuration and execution errors as CLI errors."""
+
+    def invoke(self, ctx: click.Context) -> Any:
+        try:
+            return super().invoke(ctx)
+        except (AetherError, OSError, ValueError) as exc:
+            raise click.ClickException(_display_text(exc)) from exc
+        except ImportError as exc:
+            raise click.ClickException(f"missing optional dependency: {_display_text(exc)}") from exc
+
+
+class _FiniteFloatRange(click.FloatRange):
+    """Reject non-finite CLI values before they reach models or scheduling."""
+
+    def convert(self, value: Any, param: Any, ctx: Any) -> float:
+        converted = super().convert(value, param, ctx)
+        if not math.isfinite(converted):
+            self.fail("must be a finite number", param, ctx)
+        return converted
+
+
+@click.group(cls=_AetherGroup, context_settings={"max_content_width": 120})
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose output.")
 @click.option("--cache-dir", type=click.Path(), help="Custom Aether cache directory.")
+@click.option("--runtime-config", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="RuntimeConfig JSON for serving, generation and execution features.")
 @click.pass_context
-def cli(ctx: click.Context, verbose: bool, cache_dir: str | None) -> None:
+def cli(ctx: click.Context, verbose: bool, cache_dir: str | None, runtime_config: Path | None) -> None:
     """Aether Runtime — compile any AI model, run it on any hardware."""
     configure_logging(level="DEBUG" if verbose else "INFO")
     # Rich captures the stream that existed when this module was imported.
     # Click (and test runners) replace stdout per invocation, so bind the
     # console to the active Click stream for every command invocation.
-    try:
-        console.file = click.get_text_stream("stdout")
-    except (AttributeError, RuntimeError):
-        console.file = sys.stdout
+    console.file = sys.stdout
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
     ctx.obj["cache_dir"] = cache_dir
+    ctx.obj["runtime_config"] = runtime_config
 
 
 @cli.command("compile")
 @click.argument("model")
 @click.option("--target", "-t", multiple=True, help="Hardware target(s). Repeat for multiple targets.")
-@click.option("--quality-budget", type=float, default=0.02, help="Maximum perplexity increase budget.")
+@click.option(
+    "--precision", type=click.Choice(SUPPORTED_COMPILATION_PRECISIONS, case_sensitive=False),
+    default=None, help="Explicit uniform layer precision; default preserves automatic assignment.",
+)
+@click.option("--quality-budget", type=_FiniteFloatRange(min=0.0), default=0.02, help="Maximum perplexity increase budget.")
 @click.option("--calibration-dataset", default="wikitext-2", help="Calibration dataset for sensitivity analysis.")
 @click.option("--upload", is_flag=True, help="Upload compiled AEG to Aether Hub.")
 @click.option("--output", "-o", type=click.Path(), help="Output path for the AEG artifact.")
@@ -159,6 +219,7 @@ def cmd_compile(
     ctx: click.Context,
     model: str,
     target: tuple[str, ...],
+    precision: str | None,
     quality_budget: float,
     calibration_dataset: str,
     upload: bool,
@@ -178,9 +239,12 @@ def cmd_compile(
     enable_tee: bool,
 ) -> None:
     """Compile a model into an AEG artifact."""
+    if not mdlm_drafter and any(value is not None for value in (mdlm_weights, mdlm_k, mdlm_t)):
+        raise click.UsageError("--mdlm-weights/--mdlm-K/--mdlm-T require --mdlm-drafter")
     targets = list(target) if target else ["auto"]
     config = CompilerConfig(
         targets=targets,
+        precision=precision,
         quality_budget=quality_budget,
         calibration_dataset=calibration_dataset,
         upload_kernels=upload,
@@ -249,22 +313,28 @@ def cmd_compile(
 
 @cli.command()
 @click.argument("model")
-@click.option("--compile-local", is_flag=True, help="Force local compilation even if Hub has the AEG.")
+@click.option("--compile-local", is_flag=True, help="Recompile the source locally even if a cached AEG exists.")
 @click.pass_context
 def pull(ctx: click.Context, model: str, compile_local: bool) -> None:
     """Download and compile a model to the local AEG cache."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
     with console.status(f"[bold green]Pulling {model}..."):
-        rt.pull(model)
+        if compile_local:
+            Compiler(CompilerConfig(
+                cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
+                overwrite=True,
+            )).compile(model)
+        else:
+            with _cli_runtime(_runtime_config(ctx)) as runtime:
+                runtime.pull(model)
     console.print(f"[bold green]Model {model} ready.[/bold green]")
 
 
 @cli.command()
 @click.argument("model")
 @click.option("--prompt", "-p", default="Hello, my name is", help="Prompt for generation.")
-@click.option("--max-tokens", default=128, help="Maximum tokens to generate.")
-@click.option("--temperature", default=0.7, help="Sampling temperature.")
-@click.option("--top-p", default=0.9, help="Top-p sampling parameter.")
+@click.option("--max-tokens", type=click.IntRange(1), default=128, help="Maximum tokens to generate.")
+@click.option("--temperature", type=_FiniteFloatRange(min=0.0), default=0.7, help="Sampling temperature.")
+@click.option("--top-p", type=_FiniteFloatRange(0.0, 1.0, min_open=True), default=0.9, help="Top-p sampling parameter.")
 @click.option("--stream", is_flag=True, help="Stream output.")
 @click.option(
     "--raw",
@@ -309,44 +379,63 @@ def run(
     A checkpoint that packages no template cannot have its format recovered from the
     artifact, so a warning names ``--chat-template`` as the remedy.
     """
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
-    with console.status(f"[bold green]Loading {model}..."):
-        rt._load_model(model)  # noqa: SLF001
+    rt = Runtime(_runtime_config(ctx))
+    try:
+        with console.status(f"[bold green]Loading {model}..."):
+            rt._load_model(model)  # noqa: SLF001
 
-    if not non_interactive:
-        console.print(f"[bold]Aether Runtime[/bold] — model: {model} (backend: {rt._loaded_backends[model].name})")  # noqa: SLF001
+        if not non_interactive:
+            console.print(f"[bold]Aether Runtime[/bold] — model: {model} (backend: {rt._loaded_backends[model].name})")  # noqa: SLF001
 
-    template = chat_template
-    if template:
-        candidate = Path(template)
-        # A template is usually long and awkward to quote on a command line, so a path
-        # is accepted wherever the string is.
-        if candidate.is_file():
-            template = candidate.read_text(encoding="utf-8")
+        template = chat_template
+        if template:
+            candidate = Path(template)
+            # A template is usually long and awkward to quote on a command line, so a path
+            # is accepted wherever the string is.
+            if candidate.is_file():
+                template = candidate.read_text(encoding="utf-8")
 
-    extra: dict[str, Any] = {"apply_chat_template": not raw}
-    if template:
-        extra["chat_template"] = template
+        extra: dict[str, Any] = {"apply_chat_template": not raw}
+        if template:
+            extra["chat_template"] = template
 
-    with console.status("[bold green]Generating..."):
-        response = rt.generate(
-            model_id=model,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            **extra,
-        )
-    console.print(f"[bold]Response:[/bold] {_display_text(response.text)}")
-    console.print(f"[dim]Tokens: {response.usage}[/dim]")
-    console.print(f"[dim]Metrics: {response.metrics.to_dict()}[/dim]")
+        if stream:
+            click.echo("Response: ", nl=False)
+            iterator = rt.generate_stream(
+                model_id=model, prompt=prompt, max_tokens=max_tokens,
+                temperature=temperature, top_p=top_p, **extra,
+            )
+            try:
+                for delta in iterator:
+                    click.echo(_display_text(delta), nl=False)
+            finally:
+                close = getattr(iterator, "close", None)
+                if callable(close):
+                    close()
+            click.echo()
+            return
+
+        with console.status("[bold green]Generating..."):
+            response = rt.generate(
+                model_id=model,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                **extra,
+            )
+        console.print(f"[bold]Response:[/bold] {_display_text(response.text)}")
+        console.print(f"[dim]Tokens: {response.usage}[/dim]")
+        console.print(f"[dim]Metrics: {response.metrics.to_dict()}[/dim]")
+    finally:
+        rt.close()
 
 
 @cli.command()
 @click.argument("model", required=False)
-@click.option("--port", default=DEFAULT_SERVER_PORT, help="Server port.")
+@click.option("--port", type=click.IntRange(1, 65535), default=DEFAULT_SERVER_PORT, help="Server port.")
 @click.option("--host", default=DEFAULT_SERVER_HOST, help="Server host.")
-@click.option("--grpc-port", default=None, type=int, help="Also expose authenticated gRPC on this port.")
+@click.option("--grpc-port", default=None, type=click.IntRange(0, 65535), help="Also expose authenticated gRPC on this port (0 selects a free port).")
 @click.option(
     "--semantic-cache/--no-semantic-cache",
     default=None,
@@ -355,7 +444,7 @@ def run(
 @click.option(
     "--threshold",
     "semantic_cache_threshold",
-    type=click.FloatRange(0.0, 1.0),
+    type=_FiniteFloatRange(0.0, 1.0),
     default=0.92,
     show_default=True,
     help="Cosine similarity threshold for semantic cache hits.",
@@ -389,8 +478,8 @@ def serve(
             raise click.ClickException(f"SLO profile file {slo_profile_path} must contain a JSON object")
         configured_slo_profiles = loaded_profiles
 
-    config = RuntimeConfig(
-        model_cache_dir=ctx.obj.get("cache_dir"),
+    config = _runtime_config(
+        ctx,
         server_port=port,
         server_host=host,
         semantic_cache_threshold=semantic_cache_threshold,
@@ -398,41 +487,51 @@ def serve(
         **({"enable_semantic_cache": semantic_cache} if semantic_cache is not None else {}),
     )
     app = create_app(config)
-    if model:
-        try:
-            # A model argument is a startup contract, not decorative CLI
-            # metadata: validate and load it before accepting requests.
-            app.state.aether_runtime._load_model(model)  # noqa: SLF001
-        except Exception as exc:  # noqa: BLE001
-            raise click.ClickException(f"unable to load model {model!r}: {exc}") from exc
+    runtime = app.state.aether_runtime
     grpc_server = None
-    if grpc_port is not None:
-        try:
-            from aether.server.grpc_service import start_grpc_server
-
-            grpc_server = start_grpc_server(
-                app.state.aether_runtime,
-                host=host,
-                port=grpc_port,
-                auth_token=os.environ.get("AETHER_GRPC_API_KEY"),
-            )
-        except Exception as exc:  # noqa: BLE001
-            console.print(f"[red]Unable to start gRPC: {exc}[/red]")
-            sys.exit(1)
-    console.print(f"[bold green]Starting Aether server at http://{host}:{port}[/bold green]")
-    if grpc_server is not None:
-        console.print(f"[bold green]gRPC listening at {host}:{grpc_server.aether_port}[/bold green]")
     try:
+        if model:
+            try:
+                # A model argument is a startup contract, not decorative CLI
+                # metadata: validate and load it before accepting requests.
+                app.state.aether_runtime._load_model(model)  # noqa: SLF001
+            except Exception as exc:  # noqa: BLE001
+                raise click.ClickException(f"unable to load model {model!r}: {exc}") from exc
+        if grpc_port is not None:
+            try:
+                from aether.server.grpc_service import start_grpc_server
+
+                grpc_server = start_grpc_server(
+                    app.state.aether_runtime,
+                    host=host,
+                    port=grpc_port,
+                    auth_token=os.environ.get("AETHER_GRPC_API_KEY"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"[red]Unable to start gRPC: {exc}[/red]")
+                sys.exit(1)
+        console.print(f"[bold green]Starting Aether server at http://{host}:{port}[/bold green]")
+        if grpc_server is not None:
+            console.print(f"[bold green]gRPC listening at {host}:{grpc_server.aether_port}[/bold green]")
         uvicorn.run(app, host=host, port=port)
     finally:
-        if grpc_server is not None:
-            grpc_server.stop(0)
+        # Stop admitting RPCs and wait for their handlers before unloading
+        # the shared REST/gRPC execution state.
+        try:
+            if grpc_server is not None:
+                from aether.server.grpc_service import shutdown_grpc_server
+
+                shutdown_grpc_server(grpc_server)
+        finally:
+            runtime.close()
 
 
 @cli.command()
 @click.argument("model")
-@click.option("--compare", help="Compare against another backend (e.g., 'vllm').")
-@click.option("--max-tokens", default=128, help="Maximum tokens per benchmark run.")
+@click.option("--compare", help="Compare against a saved bench JSON result or an installed backend.")
+@click.option("--max-tokens", type=click.IntRange(min=1), default=128, help="Maximum tokens per benchmark run.")
+@click.option("--output", "-o", type=click.Path(dir_okay=False), help="Save measured results as JSON.")
+@click.option("--json", "as_json", is_flag=True, help="Output measured results as JSON.")
 @click.option("--video", "video_path", type=click.Path(exists=True, dir_okay=False), default=None)
 @click.option(
     "--speculative",
@@ -446,6 +545,8 @@ def bench(
     model: str,
     compare: str | None,
     max_tokens: int,
+    output: str | None,
+    as_json: bool,
     video_path: str | None,
     speculative: str | None,
 ) -> None:
@@ -460,9 +561,37 @@ def bench(
             f"speculative benchmark mode {speculative!r} is unavailable until its "
             "real draft/verification backend is loaded"
         )
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
-    with console.status(f"[bold green]Benchmarking {model}..."):
-        result = rt.benchmark(model, max_tokens=max_tokens)
+    rt = Runtime(_runtime_config(ctx))
+    try:
+        with console.status(f"[bold green]Benchmarking {model}..."):
+            result = rt.benchmark(model, max_tokens=max_tokens)
+    finally:
+        # Release the primary model before allocating a comparison backend.
+        rt.close()
+    if compare:
+        baseline_path = Path(compare)
+        if baseline_path.suffix.lower() == ".json":
+            baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        else:
+            comparison_runtime = Runtime(_runtime_config(ctx, backend_name=compare))
+            try:
+                baseline = comparison_runtime.benchmark(model, max_tokens=max_tokens)
+            finally:
+                comparison_runtime.close()
+        import math
+
+        rate = baseline.get("throughput_tps") if isinstance(baseline, dict) else None
+        if not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0:
+            raise click.ClickException("comparison result requires a positive finite throughput_tps")
+        result["comparison"] = {
+            "baseline": baseline,
+            "throughput_speedup": result["throughput_tps"] / rate,
+        }
+    if output:
+        Path(output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
     table = Table(title=f"Benchmark: {model}")
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="magenta")
@@ -470,52 +599,17 @@ def bench(
         table.add_row(key, str(value))
     console.print(table)
 
-    if compare:
-        raise click.ClickException(
-            f"benchmark comparison backend {compare!r} is unavailable; "
-            "only the active Aether backend was measured"
-        )
-
-
 @cli.command()
 @click.argument("model")
 @click.pass_context
 def info(ctx: click.Context, model: str) -> None:
     """Show metadata and precision map for a compiled model."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
-    try:
-        data = rt.info(model)
-        console.print(RichJSON(json.dumps(data, indent=2, default=str)))
-    except Exception as exc:
-        console.print(f"[red]Error: {exc}[/red]")
-
-
-@cli.command("inspect")
-@click.argument("model")
-@click.option("--mtp", is_flag=True, help="Inspect the persisted native MTP head artifact.")
-@click.pass_context
-def inspect_model(ctx: click.Context, model: str, mtp: bool) -> None:
-    """Inspect an AEG manifest and optional persisted MTP configuration."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-    try:
-        info_data = rt.info(model)
-    except Exception as exc:  # noqa: BLE001
-        raise click.ClickException(str(exc)) from exc
-    result: dict[str, Any] = {"model_id": model, "info": info_data}
-    if mtp:
-        path = rt._resolve_aeg_path(model)  # noqa: SLF001
-        if path is None:
-            raise click.ClickException(f"model {model!r} was not found")
-        mtp_path = Path(path) / "speculation" / "mtp_config.json"
-        if not mtp_path.is_file():
-            raise click.ClickException(
-                f"model {model!r} has no persisted MTP head; compile with --mtp"
-            )
+    with _cli_runtime(_runtime_config(ctx)) as rt:
         try:
-            result["mtp"] = json.loads(mtp_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise click.ClickException(f"invalid MTP metadata: {exc}") from exc
-    console.print(RichJSON(json.dumps(result, indent=2, default=str)))
+            data = rt.info(model)
+            click.echo(json.dumps(data, indent=2, default=str))
+        except Exception as exc:
+            raise click.ClickException(str(exc)) from exc
 
 
 @cli.command()
@@ -523,32 +617,31 @@ def inspect_model(ctx: click.Context, model: str, mtp: bool) -> None:
 @click.pass_context
 def graph(ctx: click.Context, model: str) -> None:
     """Print the AEG-IR graph of a compiled model."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
-    aeg_path = rt._resolve_aeg_path(model)  # noqa: SLF001
-    if aeg_path is None:
-        console.print(f"[red]Model {model} not found.[/red]")
-        return
-    aeg = load_aeg_package(aeg_path)
-    if aeg.ir:
-        console.print(aeg.ir.to_text())
-    else:
-        console.print("[red]AEG has no IR loaded.[/red]")
+    with _cli_runtime(_runtime_config(ctx)) as rt:
+        aeg_path = rt._resolve_aeg_path(model)  # noqa: SLF001
+        if aeg_path is None:
+            raise click.ClickException(f"model {model!r} was not found")
+        aeg = load_aeg_package(aeg_path)
+        if aeg.ir:
+            console.print(aeg.ir.to_text())
+        else:
+            raise click.ClickException("AEG has no IR loaded")
 
 
 @cli.command("list")
 @click.pass_context
 def cmd_list(ctx: click.Context) -> None:
     """List all compiled models in the local cache."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
-    models = rt.list()
-    if not models:
-        console.print("[dim]No compiled models found.[/dim]")
-        return
-    table = Table(title="Compiled Models")
-    table.add_column("Model ID", style="cyan")
-    for model in models:
-        table.add_row(model)
-    console.print(table)
+    with _cli_runtime(_runtime_config(ctx)) as rt:
+        models = rt.list()
+        if not models:
+            console.print("[dim]No compiled models found.[/dim]")
+            return
+        table = Table(title="Compiled Models")
+        table.add_column("Model ID", style="cyan")
+        for model in models:
+            table.add_row(model)
+        console.print(table)
 
 
 @cli.command()
@@ -557,17 +650,16 @@ def cmd_list(ctx: click.Context) -> None:
 @click.pass_context
 def rm(ctx: click.Context, model: str) -> None:
     """Remove a compiled model from the cache."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
-    rt.remove(model)
-    console.print(f"[bold green]Removed {model}[/bold green]")
+    with _cli_runtime(_runtime_config(ctx)) as rt:
+        rt.remove(model)
+        console.print(f"[bold green]Removed {model}[/bold green]")
 
 
-@cli.command("hardware")
-def hw() -> None:
-    """Show hardware fingerprint."""
+def _print_hardware_fingerprint() -> None:
+    """Show the current device fingerprint without terminal JSON wrapping."""
     from aether.runtime.hardware import HardwareDetector
     fingerprint = HardwareDetector().detect()
-    console.print(RichJSON(json.dumps(fingerprint.to_dict(), indent=2, default=str)))
+    click.echo(json.dumps(fingerprint.to_dict(), indent=2, default=str))
 
 
 @cli.command()
@@ -588,7 +680,7 @@ def kernels() -> None:
 
 @cli.command()
 @click.option("--follow", "-f", is_flag=True, help="Follow log output.")
-@click.option("--lines", default=50, help="Number of lines to show.")
+@click.option("--lines", type=click.IntRange(1), default=50, help="Number of lines to show.")
 @click.pass_context
 def logs(ctx: click.Context, follow: bool, lines: int) -> None:
     """Show recent Aether runtime logs."""
@@ -607,10 +699,11 @@ def logs(ctx: click.Context, follow: bool, lines: int) -> None:
         # Simplified tail
         try:
             import tailer
-            for line in tailer.follow(open(latest, encoding="utf-8")):  # noqa: SIM115
-                console.print(line, end="")
-        except ImportError:
-            console.print("[red]Install 'tailer' for follow mode.[/red]")
+            with latest.open(encoding="utf-8") as stream:
+                for line in tailer.follow(stream):
+                    click.echo(line, nl=False)
+        except ImportError as exc:
+            raise click.ClickException("Install 'tailer' for follow mode.") from exc
     else:
         content = latest.read_text(encoding="utf-8")
         for line in content.splitlines()[-lines:]:
@@ -648,50 +741,46 @@ def grammar(
     if action == "list":
         if len(args) != 1:
             raise click.UsageError("grammar list requires <model.aeg>")
-        rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-        path = rt._resolve_aeg_path(args[0])  # noqa: SLF001
-        if path is None:
-            raise click.ClickException(f"model {args[0]!r} was not found")
-        root = Path(path)
-        config_path = root / "grammar" / "fsm_config.json"
-        if not config_path.is_file():
-            raise click.ClickException(f"model {args[0]!r} has no persisted grammar FSM")
-        try:
-            payload = json.loads(config_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise click.ClickException(f"invalid grammar metadata: {exc}") from exc
-        console.print(RichJSON(json.dumps({"model_id": args[0], "grammars": [payload]}, indent=2)))
-        return
+        with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+            path = rt._resolve_aeg_path(args[0])  # noqa: SLF001
+            if path is None:
+                raise click.ClickException(f"model {args[0]!r} was not found")
+            root = Path(path)
+            config_path = root / "grammar" / "fsm_config.json"
+            if not config_path.is_file():
+                raise click.ClickException(f"model {args[0]!r} has no persisted grammar FSM")
+            try:
+                payload = json.loads(config_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise click.ClickException(f"invalid grammar metadata: {exc}") from exc
+            click.echo(json.dumps({"model_id": args[0], "grammars": [payload]}, indent=2))
+            return
 
     if action == "test":
         if len(args) != 1:
             raise click.UsageError("grammar test requires <model.aeg>")
-        rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-        path = rt._resolve_aeg_path(args[0])  # noqa: SLF001
-        if path is None:
-            raise click.ClickException(f"model {args[0]!r} was not found")
-        rt._init_v4_layers(path)  # noqa: SLF001
-        engine = rt.grammar_engine
-        if engine is None or not engine.is_loaded():
-            raise click.ClickException(f"model {args[0]!r} has no loadable grammar FSM")
-        session = engine.create_session()
-        mask = session.get_token_mask()
-        console.print(
-            RichJSON(
-                json.dumps(
-                    {
-                        "model_id": args[0],
-                        "grammar": grammar_name,
-                        "loaded": True,
-                        "initial_allowed_token_count": sum(mask).bit_count(),
-                        "prompt_tested": False,
-                        "message": "FSM loaded and initial token mask inspected; no model prompt was executed.",
-                    },
-                    indent=2,
-                )
-            )
-        )
-        return
+        with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+            path = rt._resolve_aeg_path(args[0])  # noqa: SLF001
+            if path is None:
+                raise click.ClickException(f"model {args[0]!r} was not found")
+            rt._init_v4_layers(path)  # noqa: SLF001
+            engine = rt.grammar_engine
+            if engine is None or not engine.is_loaded():
+                raise click.ClickException(f"model {args[0]!r} has no loadable grammar FSM")
+            session = engine.create_session()
+            mask = session.get_token_mask()
+            click.echo(json.dumps(
+                        {
+                            "model_id": args[0],
+                            "grammar": grammar_name,
+                            "loaded": True,
+                            "initial_allowed_token_count": sum(byte.bit_count() for byte in mask),
+                            "prompt_tested": False,
+                            "message": "FSM loaded and initial token mask inspected; no model prompt was executed.",
+                        },
+                        indent=2,
+                    ))
+            return
 
     if args and target_model is None:
         # Legacy form: aether grammar <model> --schema schema.gbnf
@@ -701,15 +790,13 @@ def grammar(
         if len(args) != 1:
             raise click.UsageError("grammar compile requires <schema> --target <model.aeg>")
         model = target_model
-        schema = args[0]
+        schema = args.pop(0)
     if args:
         raise click.UsageError(f"unexpected grammar arguments: {' '.join(args)}")
     if model is None:
         raise click.UsageError("a grammar target model is required")
     if schema is None:
-        console.print("[red]--schema is required to define the grammar.[/red]")
-        console.print("[dim]Example: aether grammar gpt2 --schema ./json.gbnf --mode gbnf[/dim]")
-        return
+        raise click.UsageError("--schema is required to define the grammar")
     schema_path = Path(schema)
     config = CompilerConfig(
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
@@ -727,6 +814,7 @@ def grammar(
     with console.status(f"[bold green]Injecting grammar constraints into {model}..."):
         compiler = Compiler(config)
         aeg = compiler.compile(model)
+    _require_applied_pass(aeg, "grammar_constraint_compilation", "grammar compilation")
     console.print(
         f"[bold green]Grammar-constrained AEG saved to[/bold green] {aeg.root}"
     )
@@ -735,7 +823,7 @@ def grammar(
 @cli.command()
 @click.argument("models", nargs=-1, required=True)
 @click.option("--method", type=click.Choice(["ties", "dare", "linear", "slerp"]), default="ties",
-              help="Model merging algorithm (PRD §12).")
+              help="Model merging algorithm; slerp is reserved and currently unsupported.")
 @click.option("--output", "-o", type=click.Path(), help="Output path for merged AEG.")
 @click.option("--weights", default="", help="Comma-separated merge coefficients (e.g. '0.6,0.4').")
 @click.pass_context
@@ -743,34 +831,56 @@ def merge(ctx: click.Context, models: tuple[str, ...], method: str, output: str 
     """Merge two or more compiled AEG models (Pass 12).
 
     Supports TIES (trimming + elect sign + merge), DARE (dropout +
-    rescale), linear interpolation, and SLERP. The merged AEG can be
-    served directly like any single-model AEG.
+    rescale), and linear interpolation for compatible AEG inputs. SLERP
+    is reserved and fails explicitly. Merged weights require a new quality
+    evaluation; compatible execution contracts are preserved.
 
     Examples:
         aether merge model-a model-b --method ties
         aether merge model-a model-b model-c --method linear --weights 0.5,0.3,0.2
     """
     if len(models) < 2:
-        console.print("[red]At least two models are required for merging.[/red]")
-        return
+        raise click.UsageError("At least two models are required for merging")
+    if method == "slerp":
+        raise click.ClickException("SLERP is not implemented by the model-merging pass")
     merge_weights: list[float] = []
     if weights:
         try:
             merge_weights = [float(w.strip()) for w in weights.split(",")]
-        except ValueError:
-            console.print("[red]--weights must be comma-separated floats.[/red]")
-            return
+        except ValueError as exc:
+            raise click.BadParameter("must be comma-separated floats", param_hint="--weights") from exc
+        if len(merge_weights) != len(models) or not all(math.isfinite(weight) for weight in merge_weights):
+            raise click.BadParameter("provide one finite coefficient per model", param_hint="--weights")
+        if method == "linear" and not math.isclose(sum(merge_weights), 1.0, abs_tol=1e-9):
+            raise click.BadParameter("linear interpolation coefficients must sum to 1", param_hint="--weights")
     config = CompilerConfig(
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
         enable_model_merging=True,
+        model_merging_method="task_arithmetic" if method == "linear" else method,
+        model_merging_sources=list(models),
+        model_merging_coefficients=merge_weights or [1.0 / len(models)] * len(models),
     )
-    config.merge_strategy = method
-    config.merge_task_models = list(models)
-    config.merge_coefficients = merge_weights or [1.0 / len(models)] * len(models)
 
     with console.status(f"[bold green]Merging {len(models)} models via {method.upper()}..."):
-        compiler = Compiler(config)
-        aeg = compiler.compile(models[0], output_path=output)
+        from aether.utils.file_io import aeg_cache_candidates, aeg_cache_path
+
+        resolved = []
+        for reference in models:
+            candidates = [Path(reference), *aeg_cache_candidates(reference, config.cache_dir)]
+            resolved.append(next((candidate for candidate in candidates if (candidate / "manifest.json").is_file()), None))
+        if any(path is not None for path in resolved):
+            if not all(path is not None for path in resolved):
+                raise click.ClickException("Merging AEG inputs requires every input to resolve to an AEG package")
+            from aether.compiler.aeg_merging import merge_aeg_packages
+
+            destination = output or aeg_cache_path(f"merged/{models[0]}", config.cache_dir)
+            try:
+                aeg = merge_aeg_packages(resolved, destination, method=method, coefficients=config.model_merging_coefficients)
+            except (ValueError, OSError) as exc:
+                raise click.ClickException(str(exc)) from exc
+        else:
+            compiler = Compiler(config)
+            aeg = compiler.compile(models[0], output_path=output)
     _require_applied_pass(aeg, "model_merging", "model merging")
     console.print(f"[bold green]Merged AEG saved to[/bold green] {aeg.root}")
     table = Table(title="Merge Summary")
@@ -784,11 +894,11 @@ def merge(ctx: click.Context, models: tuple[str, ...], method: str, output: str 
 
 @cli.command("ttt-config")
 @click.argument("model")
-@click.option("--adapter-rank", type=int, default=8, help="LoRA rank for TTT fast-weight adapters.")
-@click.option("--ttl", type=int, default=512, help="Fast-weight context TTL (tokens).")
+@click.option("--adapter-rank", type=click.IntRange(1), default=8, help="LoRA rank for TTT fast-weight adapters.")
+@click.option("--ttl", type=click.IntRange(1), default=None, help="Reserved context TTL; unsupported until the TTT engine implements token expiry.")
 @click.option("--layers", default="", help="Comma-separated layer indices to enable TTT (empty=all).")
 @click.pass_context
-def ttt_config(ctx: click.Context, model: str, adapter_rank: int, ttl: int, layers: str) -> None:
+def ttt_config(ctx: click.Context, model: str, adapter_rank: int, ttl: int | None, layers: str) -> None:
     """Configure Test-Time Training fast-weight injection (Pass 13).
 
     Compiles LoRA-style fast-weight adapters into the AEG that update
@@ -799,9 +909,13 @@ def ttt_config(ctx: click.Context, model: str, adapter_rank: int, ttl: int, laye
     if layers:
         try:
             target_layers = [int(x.strip()) for x in layers.split(",")]
-        except ValueError:
-            console.print("[red]--layers must be comma-separated integers.[/red]")
-            return
+        except ValueError as exc:
+            raise click.BadParameter("must be comma-separated non-negative integers", param_hint="--layers") from exc
+        if any(layer < 0 for layer in target_layers):
+            raise click.BadParameter("must be non-negative", param_hint="--layers")
+        raise click.ClickException("--layers selection is not implemented by the TTT compilation pass")
+    if ttl is not None:
+        raise click.ClickException("--ttl token expiry is not implemented by the TTT engine")
 
     config = CompilerConfig(
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
@@ -820,7 +934,7 @@ def ttt_config(ctx: click.Context, model: str, adapter_rank: int, ttl: int, laye
     table.add_column("Parameter", style="cyan")
     table.add_column("Value", style="magenta")
     table.add_row("Adapter rank (r)", str(adapter_rank))
-    table.add_row("Context TTL (tokens)", str(ttl))
+    table.add_row("Context TTL", "not implemented")
     table.add_row("Target layers", str(target_layers or "all"))
     console.print(table)
 
@@ -829,12 +943,12 @@ def ttt_config(ctx: click.Context, model: str, adapter_rank: int, ttl: int, laye
 @click.argument("model")
 @click.option("--method", type=click.Choice(["semantic", "cross-layer", "both"]), default="both",
               help="KV compression method: semantic (Pass 14), cross-layer (Pass 15), or both.")
-@click.option("--retention", type=float, default=0.5,
+@click.option("--retention", type=_FiniteFloatRange(0.0, 1.0, min_open=True), default=0.5,
               help="Fraction of KV tokens to retain (0.0–1.0).")
-@click.option("--cross-layer-groups", type=int, default=4,
-              help="Number of KV sharing groups for cross-layer (Pass 15).")
+@click.option("--cross-layer-groups", type=click.IntRange(1), default=None,
+              help="Reserved group count; current Pass 15 selects groups from its sharing threshold.")
 @click.pass_context
-def kv_compress(ctx: click.Context, model: str, method: str, retention: float, cross_layer_groups: int) -> None:
+def kv_compress(ctx: click.Context, model: str, method: str, retention: float, cross_layer_groups: int | None) -> None:
     """Compile KV cache compression into the AEG (Passes 14 and 15).
 
     Semantic KV (Pass 14) compresses the KV cache by identifying semantically
@@ -842,16 +956,15 @@ def kv_compress(ctx: click.Context, model: str, method: str, retention: float, c
     (Pass 15) groups layers to share a single KV cache, reducing memory footprint
     by up to 50% on deep models.
     """
-    if not (0.0 < retention <= 1.0):
-        console.print("[red]--retention must be between 0.0 (exclusive) and 1.0.[/red]")
-        return
+    if cross_layer_groups is not None:
+        raise click.ClickException("--cross-layer-groups is not implemented by the cross-layer KV compilation pass")
 
     config = CompilerConfig(
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
         enable_semantic_kv=method in ("semantic", "both"),
         enable_cross_layer_kv=method in ("cross-layer", "both"),
     )
-    config.kv_compression_ratio = retention
+    config.semantic_kv_compression_ratio = retention
     config.cross_layer_kv_share_threshold = max(0.0, min(1.0, 1.0 - retention))
 
     with console.status(f"[bold green]Compiling KV compression into {model} (method={method})..."):
@@ -869,14 +982,14 @@ def kv_compress(ctx: click.Context, model: str, method: str, retention: float, c
     table.add_row("Method", method)
     table.add_row("Retention ratio", f"{retention:.1%}")
     if method in ("cross-layer", "both"):
-        table.add_row("Cross-layer groups", str(cross_layer_groups))
+        table.add_row("Cross-layer groups", "selected by compilation pass")
     console.print(table)
 
 
 @cli.command("green-profile")
 @click.argument("model")
 @click.option("--carbon-region", default="", help="Electricity grid carbon region (e.g. 'us-west-2').")
-@click.option("--renewable-threshold", type=float, default=0.80,
+@click.option("--renewable-threshold", type=_FiniteFloatRange(0.0, 1.0), default=0.80,
               help="Minimum renewable energy fraction to enable full compilation (0.0-1.0).")
 @click.option("--defer/--no-defer", default=False,
               help="Defer compilation until renewable threshold is met.")
@@ -985,23 +1098,30 @@ def tee(ctx: click.Context, tee_args: tuple[str, ...], backend: str, output: str
     model = args.pop(0)
 
     if action == "attest":
-        rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-        aeg_path = rt._resolve_aeg_path(model)  # noqa: SLF001
-        if aeg_path is None:
-            raise click.ClickException(f"model {model!r} was not found")
-        security_dir = Path(aeg_path) / "security"
-        tee_config = security_dir / "tee_config.json"
-        from aether.runtime.r8_tee_manager import TEERuntimeManager
+        if args:
+            raise click.UsageError(f"unexpected TEE arguments: {' '.join(args)}")
+        with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+            aeg_path = rt._resolve_aeg_path(model)  # noqa: SLF001
+            if aeg_path is None:
+                raise click.ClickException(f"model {model!r} was not found")
+            security_dir = Path(aeg_path) / "security"
+            tee_config = security_dir / "tee_config.json"
+            from aether.runtime.r8_tee_manager import TEERuntimeManager
 
-        manager = TEERuntimeManager(
-            backend=backend,
-            tee_config_path=str(tee_config) if tee_config.is_file() else None,
-        )
-        if not manager.initialize():
-            raise click.ClickException("TEE initialization failed")
-        console.print(RichJSON(json.dumps(manager.get_attestation_report(), indent=2, default=str)))
-        manager.shutdown()
-        return
+            manager = TEERuntimeManager(
+                backend=backend,
+                tee_config_path=str(tee_config) if tee_config.is_file() else None,
+            )
+            try:
+                if not manager.initialize():
+                    raise click.ClickException("TEE initialization failed")
+                attestation = manager.get_attestation_report()
+                attestation["verification_scope"] = "local_platform_probe_and_report_generation"
+                attestation["cryptographically_verified"] = False
+                click.echo(json.dumps(attestation, indent=2, default=str))
+            finally:
+                manager.shutdown()
+            return
 
     if action == "verify":
         report_path = args.pop(0) if args else None
@@ -1009,6 +1129,8 @@ def tee(ctx: click.Context, tee_args: tuple[str, ...], backend: str, output: str
             raise click.UsageError("tee verify requires --report <attestation.json>")
         if report_path is None:
             raise click.UsageError("tee verify requires a report path after --report")
+        if args:
+            raise click.UsageError(f"unexpected TEE arguments: {' '.join(args)}")
         path = Path(report_path)
         if not path.is_file():
             raise click.ClickException(f"attestation report {path} was not found")
@@ -1025,13 +1147,15 @@ def tee(ctx: click.Context, tee_args: tuple[str, ...], backend: str, output: str
         result = {
             "model_id": model,
             "structural_valid": True,
-            "verified": True,
-            "hardware_backed": bool(attestation.get("hardware_backed", False)),
-            "trust_level": "hardware" if attestation.get("hardware_backed") else "software_simulation",
+            "verified": False,
+            "hardware_backed_claim": attestation.get("hardware_backed"),
+            "trust_level": "unverified",
+            "verification_scope": "report_structure_only",
+            "error": "vendor attestation signature, trust chain and artifact binding verification are not implemented",
             "report": attestation,
         }
-        console.print(RichJSON(json.dumps(result, indent=2, default=str)))
-        return
+        click.echo(json.dumps(result, indent=2, default=str))
+        ctx.exit(1)
 
     if args:
         raise click.UsageError(f"unexpected TEE arguments: {' '.join(args)}")
@@ -1053,8 +1177,12 @@ def tee(ctx: click.Context, tee_args: tuple[str, ...], backend: str, output: str
         try:
             from aether.runtime.r8_tee_manager import TEERuntimeManager
             tee_mgr = TEERuntimeManager(backend=backend)
-            tee_mgr.initialize()
-            attestation = tee_mgr.get_attestation_report()
+            if not tee_mgr.initialize():
+                raise click.ClickException("TEE initialization failed")
+            try:
+                attestation = tee_mgr.get_attestation_report()
+            finally:
+                tee_mgr.shutdown()
             console.print(f"\n[bold]Attestation Report[/bold]")
             table = Table()
             table.add_column("Field", style="cyan")
@@ -1064,11 +1192,11 @@ def tee(ctx: click.Context, tee_args: tuple[str, ...], backend: str, output: str
             console.print(table)
             hw_backed = attestation.get("hardware_backed", False)
             if hw_backed:
-                console.print("[bold green]PASS: Hardware-backed TEE confirmed.[/bold green]")
+                console.print("[bold yellow]Platform reports TEE support; vendor attestation and model execution are unverified.[/bold yellow]")
             else:
                 console.print("[bold yellow]WARN: Running in software simulation mode (no hardware TEE detected).[/bold yellow]")
         except Exception as exc:
-            console.print(f"[red]Could not generate attestation report: {exc}[/red]")
+            raise click.ClickException(f"Could not generate attestation report: {exc}") from exc
 
 
 @cli.command()
@@ -1076,7 +1204,7 @@ def tee(ctx: click.Context, tee_args: tuple[str, ...], backend: str, output: str
 @click.option("--tool", default="", help="Name of a specific MCP tool to inspect.")
 @click.option("--call", default="", help="JSON arguments to call a tool (requires --tool).")
 @click.option("--server", default="", help="MCP server identifier for PRD add/test forms.")
-@click.option("--transport", type=click.Choice(["stdio", "http", "websocket"]), default="stdio")
+@click.option("--transport", type=click.Choice(["stdio", "http", "ws", "websocket"]), default="stdio")
 @click.option("--endpoint", default=None, help="MCP HTTP/WebSocket endpoint.")
 @click.option("--command", "server_command", default=None, help="MCP stdio server command.")
 @click.argument("mcp_args", nargs=-1)
@@ -1104,12 +1232,15 @@ def mcp(
         aether mcp mymodel --tool web_search --call '{\"query\": \"Aether Runtime\"}'
     """
     args = list(mcp_args)
+    transport = "ws" if transport == "websocket" else transport
     action = "legacy"
     model: str | None = None
     if args and args[0].lower() in {"add", "list", "test"}:
         action = args.pop(0).lower()
         if args:
             model = args.pop(0)
+        if args:
+            raise click.UsageError(f"unexpected MCP arguments: {' '.join(args)}")
         if action == "list":
             list_tools = True
         elif action == "test":
@@ -1127,66 +1258,64 @@ def mcp(
                 # runtime will perform the real connection and fail closed if
                 # it is not installed.
                 server_command = server
-            if transport in {"http", "websocket"} and not endpoint:
+            if transport in {"http", "ws"} and not endpoint:
                 raise click.UsageError(f"{transport} MCP servers require --endpoint <url>")
-            rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-            aeg_path = rt._resolve_aeg_path(model)  # noqa: SLF001
-            if aeg_path is None:
-                raise click.ClickException(f"model {model!r} not found in cache")
-            package = load_aeg_package(aeg_path)
-            root = Path(aeg_path)
-            config_path = root / "mcp" / "mcp_config.json"
-            existing: dict[str, Any] = {}
-            if config_path.is_file():
-                try:
-                    existing = json.loads(config_path.read_text(encoding="utf-8"))
-                except json.JSONDecodeError as exc:
-                    raise click.ClickException(f"invalid MCP config: {exc}") from exc
-            registry = existing.get("server_registry", [])
-            if not isinstance(registry, list):
-                raise click.ClickException("MCP server_registry must be a JSON list")
-            if any(isinstance(item, dict) and item.get("id") == server for item in registry):
-                raise click.ClickException(f"MCP server {server!r} is already registered")
-            registry.append(
-                {
-                    "id": server,
-                    "transport": transport,
-                    "endpoint": endpoint,
-                    "command": server_command,
-                    "tools": [],
+            with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+                aeg_path = rt._resolve_aeg_path(model)  # noqa: SLF001
+                if aeg_path is None:
+                    raise click.ClickException(f"model {model!r} not found in cache")
+                package = load_aeg_package(aeg_path)
+                root = Path(aeg_path)
+                config_path = root / "mcp" / "mcp_config.json"
+                existing: dict[str, Any] = {}
+                if config_path.is_file():
+                    try:
+                        existing = json.loads(config_path.read_text(encoding="utf-8"))
+                    except json.JSONDecodeError as exc:
+                        raise click.ClickException(f"invalid MCP config: {exc}") from exc
+                if not isinstance(existing, dict):
+                    raise click.ClickException("MCP config must be a JSON object")
+                registry = existing.get("server_registry", [])
+                if not isinstance(registry, list):
+                    raise click.ClickException("MCP server_registry must be a JSON list")
+                if any(isinstance(item, dict) and item.get("id") == server for item in registry):
+                    raise click.ClickException(f"MCP server {server!r} is already registered")
+                registry.append(
+                    {
+                        "id": server,
+                        "transport": transport,
+                        "endpoint": endpoint,
+                        "command": server_command,
+                        "tools": [],
+                    }
+                )
+                payload = {
+                    "format_version": "AEG/2.0" if package.manifest and package.manifest.format_version == "AEG/2.0" else "AEG/3.0",
+                    "status": "enabled",
+                    "enabled": True,
+                    "server_registry": registry,
+                    "default_timeout_ms": int(existing.get("default_timeout_ms", 5000)),
+                    "max_parallel_tool_calls": int(existing.get("max_parallel_tool_calls", 4)),
                 }
-            )
-            payload = {
-                "format_version": "AEG/2.0" if package.manifest and package.manifest.format_version == "AEG/2.0" else "AEG/3.0",
-                "status": "enabled",
-                "enabled": True,
-                "server_registry": registry,
-                "default_timeout_ms": int(existing.get("default_timeout_ms", 5000)),
-                "max_parallel_tool_calls": int(existing.get("max_parallel_tool_calls", 4)),
-            }
-            registry_payload = {"servers": registry}
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            registry_path = root / "mcp" / "server_registry.json"
-            config_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-            registry_path.write_text(json.dumps(registry_payload, indent=2, sort_keys=True), encoding="utf-8")
-            if package.manifest is not None:
-                from aether.core.hash_utils import compute_file_hash
+                registry_payload = {"servers": registry}
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                registry_path = root / "mcp" / "server_registry.json"
+                config_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+                registry_path.write_text(json.dumps(registry_payload, indent=2, sort_keys=True), encoding="utf-8")
+                if package.manifest is not None:
+                    from aether.core.hash_utils import compute_file_hash
 
-                package.manifest.artifacts["mcp/mcp_config.json"] = compute_file_hash(config_path)
-                package.manifest.artifacts["mcp/server_registry.json"] = compute_file_hash(registry_path)
-                package.manifest.compute_and_set_manifest_hash()
-                (root / "manifest.json").write_text(
-                    package.manifest.to_json(indent=2), encoding="utf-8"
-                )
-            console.print(
-                RichJSON(
-                    json.dumps(
-                        {"model_id": model, "server": registry[-1], "persisted": True},
-                        indent=2,
+                    package.manifest.artifacts["mcp/mcp_config.json"] = compute_file_hash(config_path)
+                    package.manifest.artifacts["mcp/server_registry.json"] = compute_file_hash(registry_path)
+                    package.manifest.compute_and_set_manifest_hash()
+                    (root / "manifest.json").write_text(
+                        package.manifest.to_json(indent=2), encoding="utf-8"
                     )
-                )
-            )
-            return
+                click.echo(json.dumps(
+                            {"model_id": model, "server": registry[-1], "persisted": True},
+                            indent=2,
+                        ))
+                return
     elif args:
         model = args.pop(0)
     if args:
@@ -1195,9 +1324,13 @@ def mcp(
     if not model:
         console.print("[dim]Usage: aether mcp <model> --list-tools[/dim]")
         return
+    if call and not tool:
+        raise click.UsageError("--call requires --tool")
 
+    mcp_layer = None
+    rt = None
     try:
-        rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
+        rt = Runtime(_runtime_config(ctx))
         aeg_path = rt._resolve_aeg_path(model)  # noqa: SLF001
         if aeg_path is None:
             raise click.ClickException(f"model {model!r} not found in cache")
@@ -1208,6 +1341,8 @@ def mcp(
         rt._init_v4_layers(aeg_path)  # noqa: SLF001
         mcp_layer = rt.mcp_layer
         if mcp_layer is None:
+            if tool:
+                raise click.ClickException("MCP is not enabled by this AEG")
             console.print("[dim]MCP is not enabled by this AEG.[/dim]")
             return
         if list_tools:
@@ -1231,24 +1366,35 @@ def mcp(
             try:
                 args = json.loads(call)
             except json.JSONDecodeError as exc:
-                console.print(f"[red]Invalid JSON for --call: {exc}[/red]")
-                return
+                raise click.BadParameter(f"invalid JSON: {exc}", param_hint="--call") from exc
+            if not isinstance(args, dict):
+                raise click.BadParameter("arguments must be a JSON object", param_hint="--call")
             with console.status(f"[bold green]Calling MCP tool {tool!r}..."):
                 result = mcp_layer.call_tool(tool, args)
-            console.print(f"[bold]Result from {tool!r}:[/bold]")
-            console.print(RichJSON(json.dumps(result, indent=2, default=str)))
+            click.echo(json.dumps(result, indent=2, default=str))
+            if isinstance(result, dict) and result.get("isError"):
+                raise click.ClickException(f"MCP tool {tool!r} returned an error")
 
         elif tool:
-            info = mcp_layer.get_tool(tool)
+            info = next((item for item in mcp_layer.list_tools() if item.get("name") == tool), None)
             if info:
-                console.print(RichJSON(json.dumps(info, indent=2, default=str)))
+                click.echo(json.dumps(info, indent=2, default=str))
             else:
-                console.print(f"[red]Tool {tool!r} not found.[/red]")
+                raise click.ClickException(f"Tool {tool!r} not found")
         else:
             console.print("[dim]Use --list-tools to see available tools, or --tool + --call to invoke.[/dim]")
 
     except Exception as exc:
-        console.print(f"[red]MCP error: {exc}[/red]")
+        if isinstance(exc, click.ClickException):
+            raise
+        raise click.ClickException(f"MCP error: {exc}") from exc
+    finally:
+        try:
+            if mcp_layer is not None:
+                mcp_layer.disconnect_all()
+        finally:
+            if rt is not None:
+                rt.close()
 
 
 @cli.command()
@@ -1311,7 +1457,7 @@ def models(counts_only: bool, level_filter: str | None, as_json: bool) -> None:
                 }
                 for family in rows
             ]
-        console.print_json(json.dumps(payload))
+        click.echo(json.dumps(payload))
         return
 
     console.print(f"[bold]Aether model-family support[/bold] — {AETHER_VERSION}\n")
@@ -1365,7 +1511,7 @@ def models(counts_only: bool, level_filter: str | None, as_json: bool) -> None:
 @click.argument("model")
 @click.option("--domain", default="general", help="Evaluation domain.")
 @click.option("--examples", type=click.IntRange(1), default=100, help="Number of examples.")
-@click.option("--threshold", type=click.FloatRange(0.0, 1.0), default=0.98)
+@click.option("--threshold", type=_FiniteFloatRange(0.0, 1.0), default=0.98)
 @click.option(
     "--dataset",
     "dataset_specs",
@@ -1390,55 +1536,55 @@ def evaluate(
     allow_code_execution: bool,
 ) -> None:
     """Run the runtime quality gate and fail if the configured threshold is missed."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-    evaluator = None
-    benchmarks = None
-    if dataset_specs:
-        datasets: dict[str, str] = {}
-        for spec in dataset_specs:
-            benchmark, separator, path = spec.partition("=")
-            benchmark = benchmark.strip().lower()
-            path = path.strip()
-            if not separator or not benchmark or not path:
-                raise click.ClickException(
-                    "--dataset must use BENCHMARK=PATH, for example --dataset mmlu=data.csv"
-                )
-            if benchmark in datasets:
-                raise click.ClickException(f"duplicate dataset benchmark {benchmark!r}")
-            datasets[benchmark] = path
+    with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+        evaluator = None
+        benchmarks = None
+        if dataset_specs:
+            datasets: dict[str, str] = {}
+            for spec in dataset_specs:
+                benchmark, separator, path = spec.partition("=")
+                benchmark = benchmark.strip().lower()
+                path = path.strip()
+                if not separator or not benchmark or not path:
+                    raise click.ClickException(
+                        "--dataset must use BENCHMARK=PATH, for example --dataset mmlu=data.csv"
+                    )
+                if benchmark in datasets:
+                    raise click.ClickException(f"duplicate dataset benchmark {benchmark!r}")
+                datasets[benchmark] = path
 
-        from aether.observability.ci_pipeline import DatasetBenchmarkEvaluator
+            from aether.observability.ci_pipeline import DatasetBenchmarkEvaluator
 
-        def generate_fn(*, prompt: str, benchmark: str, max_tokens: int) -> str:
-            return rt.generate(
-                model,
-                prompt,
+            def generate_fn(*, prompt: str, benchmark: str, max_tokens: int) -> str:
+                return rt.generate(
+                    model,
+                    prompt,
+                    max_tokens=max_tokens,
+                    temperature=0.0,
+                ).text
+
+            evaluator = DatasetBenchmarkEvaluator(
+                datasets,
+                generate_fn,
                 max_tokens=max_tokens,
-                temperature=0.0,
-            ).text
+                max_examples=examples,
+                allow_code_execution=allow_code_execution,
+            )
+            # The module also exposes the ``aether list`` command, so its global
+            # name shadows Python's built-in list constructor.
+            benchmarks = builtins.list(datasets)
 
-        evaluator = DatasetBenchmarkEvaluator(
-            datasets,
-            generate_fn,
-            max_tokens=max_tokens,
-            max_examples=examples,
-            allow_code_execution=allow_code_execution,
+        report = rt.eval_gate(
+            model,
+            domain=domain,
+            benchmarks=benchmarks,
+            num_examples=examples,
+            quality_threshold=threshold,
+            evaluator=evaluator,
         )
-        # The module also exposes the ``aether list`` command, so its global
-        # name shadows Python's built-in list constructor.
-        benchmarks = builtins.list(datasets)
-
-    report = rt.eval_gate(
-        model,
-        domain=domain,
-        benchmarks=benchmarks,
-        num_examples=examples,
-        quality_threshold=threshold,
-        evaluator=evaluator,
-    )
-    console.print(RichJSON(json.dumps(report, indent=2, default=str)))
-    if not report.get("passed", False):
-        raise click.ClickException("evaluation gate failed")
+        click.echo(json.dumps(report, indent=2, default=str))
+        if not report.get("passed", False):
+            raise click.ClickException("evaluation gate failed")
 
 
 @cli.command("safety")
@@ -1446,47 +1592,47 @@ def evaluate(
 @click.pass_context
 def safety(ctx: click.Context, model: str) -> None:
     """Inspect persisted safety/provenance controls for an AEG artifact."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-    path = rt._resolve_aeg_path(model)  # noqa: SLF001
-    if path is None:
-        raise click.ClickException(f"model {model!r} was not found")
-    package = load_aeg_package(path)
-    root = Path(path)
-    safety_files = (
-        sorted(str(p.relative_to(root)) for p in (root / "safety").rglob("*") if p.is_file())
-        if (root / "safety").exists()
-        else []
-    )
-    # Collect provenance data from the manifest's provenance field (always
-    # populated — defaults to an empty ProvenanceInfo when not recorded).
-    prov_dict: dict = {}
-    if package.manifest:
-        prov_obj = getattr(package.manifest, "provenance", None)
-        if prov_obj is not None:
-            prov_dict = prov_obj.to_dict() if callable(getattr(prov_obj, "to_dict", None)) else {}
-    # Supplement with any raw provenance/manifest.json that may exist.
-    prov_json_path = root / "provenance" / "manifest.json"
-    if prov_json_path.is_file():
-        try:
-            raw_prov = json.loads(prov_json_path.read_text(encoding="utf-8"))
-            prov_dict.update(raw_prov)
-        except Exception:  # noqa: BLE001
-            pass
-    # Verify integrity flag: True when the manifest hash is present and valid.
-    integrity_verified = False
-    if package.manifest and package.manifest.manifest_hash:
-        try:
-            package.manifest.verify()
-            integrity_verified = True
-        except Exception:  # noqa: BLE001
-            integrity_verified = False
-    report = {
-        "model_id": model,
-        "integrity_verified": integrity_verified,
-        "safety_files": safety_files,
-        "provenance": prov_dict,
-    }
-    console.print(RichJSON(json.dumps(report, indent=2, default=str)))
+    with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+        path = rt._resolve_aeg_path(model)  # noqa: SLF001
+        if path is None:
+            raise click.ClickException(f"model {model!r} was not found")
+        package = load_aeg_package(path)
+        root = Path(path)
+        safety_files = (
+            sorted(str(p.relative_to(root)) for p in (root / "safety").rglob("*") if p.is_file())
+            if (root / "safety").exists()
+            else []
+        )
+        # Collect provenance data from the manifest's provenance field (always
+        # populated — defaults to an empty ProvenanceInfo when not recorded).
+        prov_dict: dict = {}
+        if package.manifest:
+            prov_obj = getattr(package.manifest, "provenance", None)
+            if prov_obj is not None:
+                prov_dict = prov_obj.to_dict() if callable(getattr(prov_obj, "to_dict", None)) else {}
+        # Supplement with any raw provenance/manifest.json that may exist.
+        prov_json_path = root / "provenance" / "manifest.json"
+        if prov_json_path.is_file():
+            try:
+                raw_prov = json.loads(prov_json_path.read_text(encoding="utf-8"))
+                prov_dict.update(raw_prov)
+            except Exception:  # noqa: BLE001
+                pass
+        # Verify integrity flag: True when the manifest hash is present and valid.
+        integrity_verified = False
+        if package.manifest and package.manifest.manifest_hash:
+            try:
+                package.verify_integrity()
+                integrity_verified = True
+            except Exception:  # noqa: BLE001
+                integrity_verified = False
+        report = {
+            "model_id": model,
+            "integrity_verified": integrity_verified,
+            "safety_files": safety_files,
+            "provenance": prov_dict,
+        }
+        click.echo(json.dumps(report, indent=2, default=str))
 
 
 @cli.command("trace")
@@ -1495,19 +1641,23 @@ def safety(ctx: click.Context, model: str) -> None:
 @click.pass_context
 def trace(ctx: click.Context, model: str | None, prompt: str) -> None:
     """Export measured runtime spans as OTLP-compatible JSON."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-    if model and prompt:
-        rt.generate(model, prompt, max_tokens=1, temperature=0.0)
-    payload = rt.tracer.export_otlp_json()
-    if not rt.tracer.get_finished_spans():
-        # Empty telemetry is valid when no request was executed, but it must
-        # be distinguishable from a successful measured trace export.
-        payload["status"] = "no_measured_requests"
-        payload["message"] = (
-            "No runtime spans were recorded. Provide an AEG model and --prompt "
-            "to execute and trace a real request."
-        )
-    console.print(RichJSON(json.dumps(payload, indent=2, default=str)))
+    with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+        if prompt and not model:
+            raise click.UsageError("--prompt requires an AEG model")
+        if model and not prompt:
+            raise click.UsageError("provide --prompt to trace a real model request")
+        if model and prompt:
+            rt.generate(model, prompt, max_tokens=1, temperature=0.0)
+        payload = rt.tracer.export_otlp_json()
+        if not rt.tracer.get_finished_spans():
+            # Empty telemetry is valid when no request was executed, but it must
+            # be distinguishable from a successful measured trace export.
+            payload["status"] = "no_measured_requests"
+            payload["message"] = (
+                "No runtime spans were recorded. Provide an AEG model and --prompt "
+                "to execute and trace a real request."
+            )
+        click.echo(json.dumps(payload, indent=2, default=str))
 
 
 @cli.command("reasoning")
@@ -1515,22 +1665,28 @@ def trace(ctx: click.Context, model: str | None, prompt: str) -> None:
 @click.pass_context
 def reasoning(ctx: click.Context, model: str) -> None:
     """Inspect the persisted reasoning graph for an AEG artifact."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-    path = rt._resolve_aeg_path(model)  # noqa: SLF001
-    if path is None:
-        raise click.ClickException(f"model {model!r} was not found")
-    root = Path(path)
-    candidates = [root / "reasoning" / "reasoning_graph.json", root / "reasoning_graph.json"]
-    graph_path = next((p for p in candidates if p.is_file()), None)
-    if graph_path is None:
-        raise click.ClickException(
-            f"model {model!r} has no persisted reasoning graph; compile with "
-            "reasoning-graph enabled"
-        )
-    data = json.loads(graph_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or not data:
-        raise click.ClickException(f"reasoning graph for {model!r} is empty or malformed")
-    console.print(RichJSON(json.dumps(data, indent=2, default=str)))
+    with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+        path = rt._resolve_aeg_path(model)  # noqa: SLF001
+        if path is None:
+            raise click.ClickException(f"model {model!r} was not found")
+        root = Path(path)
+        candidates = [
+            root / "reasoning" / "reasoning_graph.json",
+            root / "reasoning_graph.json",
+            root / "graph" / "reasoning_graph.aeg-ir",
+        ]
+        graph_path = next((p for p in candidates if p.is_file()), None)
+        if graph_path is None:
+            raise click.ClickException(
+                f"model {model!r} has no persisted reasoning graph; compile with "
+                "reasoning-graph enabled"
+            )
+        data = json.loads(graph_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not data:
+            raise click.ClickException(f"reasoning graph for {model!r} is empty or malformed")
+        if data.get("entrypoint") == "disabled" or data.get("enabled") is False:
+            raise click.ClickException(f"reasoning graph for {model!r} is disabled")
+        click.echo(json.dumps(data, indent=2, default=str))
 
 
 @cli.command("mla-stats")
@@ -1538,11 +1694,11 @@ def reasoning(ctx: click.Context, model: str) -> None:
 @click.pass_context
 def mla_stats(ctx: click.Context, model: str) -> None:
     """Show MLA/attention metadata persisted in the AEG manifest."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-    info_data = rt.info(model)
-    architecture = info_data.get("architecture", {})
-    result = {"model_id": model, "mla_detected": bool(architecture.get("mla_enabled") or architecture.get("mla")), "architecture": architecture}
-    console.print(RichJSON(json.dumps(result, indent=2, default=str)))
+    with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+        info_data = rt.info(model)
+        architecture = info_data.get("architecture", {})
+        result = {"model_id": model, "mla_detected": bool(architecture.get("mla_enabled") or architecture.get("mla")), "architecture": architecture}
+        click.echo(json.dumps(result, indent=2, default=str))
 
 
 @cli.command("merge-info")
@@ -1550,18 +1706,21 @@ def mla_stats(ctx: click.Context, model: str) -> None:
 @click.pass_context
 def merge_info(ctx: click.Context, model: str) -> None:
     """Inspect the persisted task-vector merge metadata for an AEG artifact."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-    try:
-        data = rt.info(model)
-    except Exception as exc:  # noqa: BLE001
-        raise click.ClickException(str(exc)) from exc
-    metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
-    merge = metadata.get("merge") or metadata.get("model_merging")
-    if not isinstance(merge, dict):
-        raise click.ClickException(
-            f"model {model!r} has no persisted model-merging metadata; compile it with merging enabled"
-        )
-    console.print(RichJSON(json.dumps({"model_id": model, "merge": merge}, indent=2, default=str)))
+    with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+        try:
+            path = rt._resolve_aeg_path(model)  # noqa: SLF001
+            if path is None:
+                raise click.ClickException(f"model {model!r} was not found")
+            package = load_aeg_package(path)
+        except Exception as exc:  # noqa: BLE001
+            raise click.ClickException(str(exc)) from exc
+        metadata = package.metadata
+        merge = metadata.get("merge") or metadata.get("model_merging")
+        if not isinstance(merge, dict):
+            raise click.ClickException(
+                f"model {model!r} has no persisted model-merging metadata; compile it with merging enabled"
+            )
+        click.echo(json.dumps({"model_id": model, "merge": merge}, indent=2, default=str))
 
 
 @cli.group("runtime")
@@ -1596,17 +1755,21 @@ def runtime_reweight(
             weights[name.strip()] = float(raw_value)
         except ValueError as exc:
             raise click.ClickException(f"invalid task weight {spec!r}") from exc
+        if not math.isfinite(weights[name.strip()]):
+            raise click.ClickException(f"task weight {spec!r} must be finite")
     for name, value in (("task1", task1), ("task2", task2), ("task3", task3), ("task4", task4)):
         if value is not None:
+            if not math.isfinite(value):
+                raise click.ClickException(f"{name} weight must be finite")
             weights[name] = value
     if not weights:
         raise click.UsageError("provide at least one --task NAME=VALUE or --task1/--task2 weight")
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-    try:
-        normalized = rt.set_task_weights(model, **weights)
-    except Exception as exc:  # noqa: BLE001
-        raise click.ClickException(str(exc)) from exc
-    console.print(RichJSON(json.dumps({"model_id": model, "weights": normalized}, indent=2)))
+    with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+        try:
+            normalized = rt.set_model_task_weights(model, weights)
+        except Exception as exc:  # noqa: BLE001
+            raise click.ClickException(str(exc)) from exc
+        click.echo(json.dumps({"model_id": model, "weights": normalized}, indent=2))
 
 
 @cli.command("kv-share")
@@ -1617,6 +1780,7 @@ def kv_share(ctx: click.Context, model: str, output_path: str | None) -> None:
     """Compile with cross-layer KV sharing enabled (Pass 15)."""
     config = CompilerConfig(cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(), enable_cross_layer_kv=True)
     result = Compiler(config).compile(model, output_path=output_path)
+    _require_applied_pass(result, "cross_layer_kv_sharing", "cross-layer KV sharing")
     console.print(f"[bold green]Cross-layer KV AEG saved to[/bold green] {result.root}")
 
 
@@ -1624,7 +1788,7 @@ def kv_share(ctx: click.Context, model: str, output_path: str | None) -> None:
 @click.argument("multi_agent_args", nargs=-1)
 @click.option("--agents", type=click.IntRange(1), default=4)
 @click.option("--shared-prefix", default="")
-@click.option("--coordination", type=click.Choice(["relay", "broadcast", "tree"]), default="relay")
+@click.option("--coordination", type=click.Choice(["relay", "kvcomm", "droidspeak", "swarm"]), default="relay")
 @click.pass_context
 def multi_agent(
     ctx: click.Context,
@@ -1645,43 +1809,50 @@ def multi_agent(
         model = args.pop(0)
     if args:
         raise click.UsageError(f"unexpected multi-agent arguments: {' '.join(args)}")
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
-    if action == "test" and rt._resolve_aeg_path(model) is None:  # noqa: SLF001
-        raise click.ClickException(f"model {model!r} was not found")
-    result = rt.multi_agent_session(agents, shared_prefix)
-    if action == "test":
-        result.update(
-            {
-                "model_id": model,
-                "coordination": coordination,
-                "test": "local_kv_coordinator_initialization",
-                "tested": True,
-            }
+    with _cli_runtime(_runtime_config(ctx)) as rt:
+        if action == "test" and rt._resolve_aeg_path(model) is None:  # noqa: SLF001
+            raise click.ClickException(f"model {model!r} was not found")
+        result = rt.multi_agent_session(
+            models=[model] if model else [],
+            coordination=coordination,
+            agent_count=agents,
+            shared_prefix=shared_prefix,
         )
-    console.print(RichJSON(json.dumps(result, indent=2, default=str)))
+        try:
+            if action == "test":
+                result.update(
+                    {
+                        "model_id": model,
+                        "coordination": coordination,
+                        "test": "local_kv_coordinator_initialization",
+                        "tested": True,
+                        "model_execution_tested": False,
+                    }
+                )
+            click.echo(json.dumps(result, indent=2, default=str))
+        finally:
+            result.close()
 
 
 @cli.command("slo-status")
 @click.pass_context
 def slo_status(ctx: click.Context) -> None:
     """Show the live scheduler queue and configured SLO mode."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
-    report = {"scheduler": rt.config.scheduler, "queue": rt.scheduler.queue_snapshot(), "max_batch_size": rt.scheduler.max_batch_size}
-    console.print(RichJSON(json.dumps(report, indent=2, default=str)))
+    with _cli_runtime(_runtime_config(ctx)) as rt:
+        report = {"scheduler": rt.config.scheduler, "queue": rt.scheduler.queue_snapshot(), "max_batch_size": rt.scheduler.max_batch_size}
+        click.echo(json.dumps(report, indent=2, default=str))
 
 
 @cli.command("green-route")
 @click.option("--regions", multiple=True, required=True, help="Candidate deployment regions; repeat for multiple regions.")
-@click.option("--latency-deadline", type=click.FloatRange(min=0.0), default=1.0, show_default=True)
+@click.option("--latency-deadline", type=_FiniteFloatRange(min=0.0), default=1.0, show_default=True)
 def green_route(regions: tuple[str, ...], latency_deadline: float) -> None:
     """Select the lowest-carbon candidate region within the latency deadline."""
     from aether.runtime.r7_green_power_manager import GreenPowerManager
 
     manager = GreenPowerManager()
     selected = manager.select_region(list(regions), latency_deadline_s=latency_deadline)
-    console.print(
-        RichJSON(
-            json.dumps(
+    click.echo(json.dumps(
                 {
                     "selected_region": selected,
                     "candidate_regions": list(regions),
@@ -1690,9 +1861,7 @@ def green_route(regions: tuple[str, ...], latency_deadline: float) -> None:
                     "telemetry_source": "compiled/static_region_profile",
                 },
                 indent=2,
-            )
-        )
-    )
+            ))
 
 
 @cli.group("slo-profile")
@@ -1702,8 +1871,8 @@ def slo_profile() -> None:
 
 @slo_profile.command("add")
 @click.argument("name")
-@click.option("--ttft", type=click.FloatRange(min=0.0), required=True, help="Maximum TTFT in milliseconds.")
-@click.option("--tbt", type=click.FloatRange(min=0.0), required=True, help="Maximum TBT in milliseconds.")
+@click.option("--ttft", type=_FiniteFloatRange(min=0.0), required=True, help="Maximum TTFT in milliseconds.")
+@click.option("--tbt", type=_FiniteFloatRange(min=0.0), required=True, help="Maximum TBT in milliseconds.")
 @click.pass_context
 def slo_profile_add(ctx: click.Context, name: str, ttft: float, tbt: float) -> None:
     """Persist a named SLO profile in the Aether cache configuration."""
@@ -1721,56 +1890,61 @@ def slo_profile_add(ctx: click.Context, name: str, ttft: float, tbt: float) -> N
     profiles[name] = {"max_ttft_ms": ttft, "max_tbt_ms": tbt}
     cache_dir.mkdir(parents=True, exist_ok=True)
     profile_path.write_text(json.dumps(profiles, indent=2, sort_keys=True), encoding="utf-8")
-    console.print(
-        RichJSON(
-            json.dumps(
+    click.echo(json.dumps(
                 {"name": name, "profile": profiles[name], "persisted_to": str(profile_path)},
                 indent=2,
-            )
-        )
-    )
+            ))
 
 
 @cli.group("hub")
-def hub() -> None:
+@click.option("--url", envvar="AETHER_HUB_URL", default=DEFAULT_HUB_URL, show_default=True, help="Aether Hub service URL.")
+@click.pass_context
+def hub(ctx: click.Context, url: str) -> None:
     """Authenticate and exchange AEG artifacts with Aether Hub."""
+    ctx.obj["hub_url"] = url
 
 
-def _hub_client() -> HubClient:
-    token_path = aether_cache_dir() / "hub_token"
+def _hub_client(ctx: click.Context) -> HubClient:
+    token_path = aether_cache_dir(ctx.obj.get("cache_dir")) / "hub_token"
     token = token_path.read_text(encoding="utf-8").strip() if token_path.is_file() else None
-    return HubClient(auth_token=token)
+    return HubClient(hub_url=ctx.obj.get("hub_url", DEFAULT_HUB_URL), auth_token=token, allow_local_cache=False)
 
 
 @hub.command("login")
 @click.option("--token", prompt=True, hide_input=True)
-def hub_login(token: str) -> None:
-    result = _hub_client().login(token)
-    token_path = aether_cache_dir() / "hub_token"
+@click.pass_context
+def hub_login(ctx: click.Context, token: str) -> None:
+    if not token.strip():
+        raise click.BadParameter("must not be empty", param_hint="--token")
+    result = _hub_client(ctx).login(token)
+    token_path = aether_cache_dir(ctx.obj.get("cache_dir")) / "hub_token"
     token_path.parent.mkdir(parents=True, exist_ok=True)
     token_path.write_text(token, encoding="utf-8")
-    console.print(RichJSON(json.dumps(result, indent=2)))
+    click.echo(json.dumps(result, indent=2))
 
 
 @hub.command("search")
 @click.argument("query")
-def hub_search(query: str) -> None:
-    console.print(RichJSON(json.dumps([m.to_dict() for m in _hub_client().search(query)], indent=2)))
+@click.pass_context
+def hub_search(ctx: click.Context, query: str) -> None:
+    click.echo(json.dumps([m.to_dict() for m in _hub_client(ctx).search(query)], indent=2))
 
 
 @hub.command("push")
 @click.argument("model_id")
 @click.argument("package", type=click.Path(exists=True))
-def hub_push(model_id: str, package: str) -> None:
-    manifest = _hub_client().upload(model_id, package)
-    console.print(RichJSON(json.dumps(manifest.to_dict(), indent=2)))
+@click.pass_context
+def hub_push(ctx: click.Context, model_id: str, package: str) -> None:
+    manifest = _hub_client(ctx).upload(model_id, package)
+    click.echo(json.dumps(manifest.to_dict(), indent=2))
 
 
 @hub.command("pull")
 @click.argument("model_id")
 @click.argument("output", type=click.Path())
-def hub_pull(model_id: str, output: str) -> None:
-    path = _hub_client().download(model_id, output)
+@click.pass_context
+def hub_pull(ctx: click.Context, model_id: str, output: str) -> None:
+    path = _hub_client(ctx).download(model_id, output)
     console.print(str(path))
 
 
@@ -1785,11 +1959,11 @@ def train() -> None:
 @click.option("--group-size", type=click.IntRange(2), default=8)
 @click.pass_context
 def train_grpo(ctx: click.Context, model: str, prompts: tuple[str, ...], group_size: int) -> None:
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-    report = rt.grpo_train_step(model, list(prompts), group_size=group_size)
-    console.print(RichJSON(json.dumps(report, indent=2, default=str)))
-    if report.get("status") == "failed":
-        raise click.ClickException(report.get("error", "GRPO step failed"))
+    with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+        report = rt.grpo_train_step(model, list(prompts), group_size=group_size)
+        click.echo(json.dumps(report, indent=2, default=str))
+        if report.get("status") == "failed":
+            raise click.ClickException(report.get("error", "GRPO step failed"))
 
 
 @train.command("verify")
@@ -1798,7 +1972,9 @@ def train_grpo(ctx: click.Context, model: str, prompts: tuple[str, ...], group_s
 @click.option("--example", "example_text", required=True, help="Response text to verify.")
 @click.option("--ground-truth", default=None)
 @click.option("--test-code", default=None, help="Optional code used by the code verifier.")
+@click.pass_context
 def train_verify(
+    ctx: click.Context,
     model: str | None,
     domain: str,
     example_text: str,
@@ -1813,6 +1989,12 @@ def train_verify(
     """
     from aether.compiler.stage2_optimizer.pass22_rlvr_verifier import GRPOTrainer
 
+    if domain not in {"math", "code"}:
+        raise click.ClickException(f"the {domain!r} domain has no deterministic verifier")
+    if domain == "math" and ground_truth is None:
+        raise click.UsageError("math verification requires --ground-truth")
+    if domain == "code" and test_code is None:
+        raise click.UsageError("code verification requires --test-code")
     try:
         reward = GRPOTrainer().verify_response(
             example_text,
@@ -1822,20 +2004,19 @@ def train_verify(
         )
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
-    console.print(
-        RichJSON(
-            json.dumps(
+    click.echo(json.dumps(
                 {
-                    "status": "verified",
+                    "status": "verified" if reward == 1.0 else "failed",
+                    "verified": reward == 1.0,
                     "model": model,
                     "domain": domain,
                     "reward": reward,
                 },
                 indent=2,
                 default=str,
-            )
-        )
-    )
+            ))
+    if reward != 1.0:
+        ctx.exit(1)
 
 
 @cli.group("kernel")
@@ -1883,7 +2064,7 @@ def kernel_generate(kernel_args: tuple[str, ...], target_option: str | None, out
         # fallback kernel was produced.
         raise click.ClickException(str(exc)) from exc
     payload = json.dumps(artifact.to_dict(), indent=2)
-    console.print(RichJSON(payload))
+    click.echo(payload)
 
 
 @kernel.command("verify")
@@ -1913,9 +2094,7 @@ def kernel_verify(kernel_path: str, reference_op: str) -> None:
         raise click.ClickException(
             f"kernel failed native loading or does not export {symbol!r}: {exc}"
         ) from exc
-    console.print(
-        RichJSON(
-            json.dumps(
+    click.echo(json.dumps(
                 {
                     "path": str(path),
                     "sha256": digest,
@@ -1925,9 +2104,7 @@ def kernel_verify(kernel_path: str, reference_op: str) -> None:
                     "verified": True,
                 },
                 indent=2,
-            )
-        )
-    )
+            ))
 
 
 @cli.group("kv")
@@ -1939,14 +2116,19 @@ def kv() -> None:
 @click.argument("model", required=False)
 @click.pass_context
 def kv_transfer_stats(ctx: click.Context, model: str | None) -> None:
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
-    console.print(RichJSON(json.dumps(rt.kv_transfer_stats(), indent=2, default=str)))
+    with _cli_runtime(_runtime_config(ctx)) as rt:
+        if model and rt._resolve_aeg_path(model) is None:  # noqa: SLF001
+            raise click.ClickException(f"model {model!r} was not found")
+        report = rt.kv_transfer_stats()
+        report["scope"] = "current_cli_process"
+        report["model_id"] = model
+        click.echo(json.dumps(report, indent=2, default=str))
 
 
 @kv.command("nika-policy")
-@click.option("--kv-size-gb", type=click.FloatRange(min=0.0), required=True)
-@click.option("--bw-gbps", type=click.FloatRange(min=0.0, min_open=True), required=True)
-@click.option("--decode-util", type=click.FloatRange(0.0, 1.0), required=True)
+@click.option("--kv-size-gb", type=_FiniteFloatRange(min=0.0), required=True)
+@click.option("--bw-gbps", type=_FiniteFloatRange(min=0.0, min_open=True), required=True)
+@click.option("--decode-util", type=_FiniteFloatRange(0.0, 1.0), required=True)
 def kv_nika_policy(kv_size_gb: float, bw_gbps: float, decode_util: float) -> None:
     """Evaluate the real NIKA transfer-versus-recompute policy."""
     from aether.runtime.r12_cxl_kv_pool import TraCTPolicy
@@ -1954,28 +2136,33 @@ def kv_nika_policy(kv_size_gb: float, bw_gbps: float, decode_util: float) -> Non
     result = TraCTPolicy().nika_policy(kv_size_gb, bw_gbps, decode_util)
     result["execution_mode"] = "analytical_policy"
     result["physical_network_transfer"] = False
-    console.print(RichJSON(json.dumps(result, indent=2, default=str)))
+    click.echo(json.dumps(result, indent=2, default=str))
 
 
 @kv.command("cxl-pool-status")
 @click.pass_context
 def kv_cxl_pool_status(ctx: click.Context) -> None:
     """Report the configured CXL KV pool and explicit local fallback state."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
-    console.print(RichJSON(json.dumps(rt.cxl_pool_status(), indent=2, default=str)))
+    with _cli_runtime(_runtime_config(ctx)) as rt:
+        click.echo(json.dumps(rt.cxl_pool_status(), indent=2, default=str))
 
 
 @cli.command()
 @click.argument("model")
 @click.pass_context
 def status(ctx: click.Context, model: str) -> None:
-    """Show runtime status for a loaded model."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir")))
-    if model not in rt._loaded_models:  # noqa: SLF001
-        console.print(f"[dim]Model {model} is not loaded.[/dim]")
-        return
-    backend = rt._loaded_backends[model].name  # noqa: SLF001
-    console.print(f"[bold]{model}[/bold] loaded on backend: {backend}")
+    """Inspect an artifact's presence and this CLI process's execution state."""
+    with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+        info_data = rt.info(model)
+        click.echo(json.dumps({
+            "model_id": info_data["model_id"],
+            "artifact_available": True,
+            "artifact_targets": info_data["targets"],
+            "loaded": model in rt._loaded_models,  # noqa: SLF001
+            "execution_tested": False,
+            "scope": "current_cli_process",
+            "message": "Artifact inspected; use run or serve to load and execute it.",
+        }, indent=2, default=str))
 
 
 @cli.command("quantize-report")
@@ -1983,12 +2170,12 @@ def status(ctx: click.Context, model: str) -> None:
 @click.pass_context
 def quantize_report(ctx: click.Context, model: str) -> None:
     """Show measured sub-2-bit quantization data for an AEG artifact."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-    try:
-        report = rt.quantization_report(model)
-    except Exception as exc:
-        raise click.ClickException(str(exc)) from exc
-    console.print(RichJSON(json.dumps(report, indent=2, default=str)))
+    with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+        try:
+            report = rt.quantization_report(model)
+        except Exception as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(json.dumps(report, indent=2, default=str))
 
 
 @cli.group("cache")
@@ -2000,20 +2187,20 @@ def cache() -> None:
 @click.pass_context
 def cache_stats(ctx: click.Context) -> None:
     """Show measured semantic-cache statistics."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-    console.print(RichJSON(json.dumps(rt.semantic_cache_stats(), indent=2, default=str)))
+    with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+        click.echo(json.dumps(rt.semantic_cache_stats(), indent=2, default=str))
 
 
 @cache.command("flush")
 @click.pass_context
 def cache_flush(ctx: click.Context) -> None:
     """Flush the semantic request cache and report the removed entry count."""
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
-    rt._init_v5_layers()  # noqa: SLF001
-    semantic_cache = getattr(rt, "_semantic_cache", None)  # noqa: SLF001
-    if semantic_cache is None:
-        raise click.ClickException("semantic cache is unavailable")
-    console.print(json.dumps({"removed": semantic_cache.flush()}))
+    with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+        rt._init_v5_layers()  # noqa: SLF001
+        semantic_cache = getattr(rt, "_semantic_cache", None)  # noqa: SLF001
+        if semantic_cache is None:
+            raise click.ClickException("semantic cache is unavailable")
+        console.print(json.dumps({"removed": semantic_cache.flush()}))
 
 
 # ---------------------------------------------------------------------------
@@ -2055,6 +2242,9 @@ def doctor(as_json: bool) -> None:
     for pkg in ["numpy", "click", "rich", "safetensors"]:
         def _check_import(p: str = pkg) -> str:
             mod = importlib.import_module(p)
+            if p == "click":
+                from importlib.metadata import version as package_version
+                return package_version("click")
             return getattr(mod, "__version__", "installed")
         report["checks"].append(check(f"import:{pkg}", _check_import))
 
@@ -2079,16 +2269,7 @@ def doctor(as_json: bool) -> None:
     try:
         from aether.backends.hardware_detector import detect_all_capabilities, validate_backend_environment
         caps = detect_all_capabilities()
-        report["hardware"] = [
-            {
-                "target_id": c.target_id,
-                "vendor": c.vendor,
-                "device": c.device,
-                "available": c.available,
-                "unavailable_reason": c.unavailable_reason,
-            }
-            for c in caps
-        ]
+        report["hardware"] = [c.to_dict() for c in caps]
         # CPU is always available — validate it
         cpu_val = validate_backend_environment("cpu")
         required_cpu_failures = [
@@ -2097,7 +2278,10 @@ def doctor(as_json: bool) -> None:
         ]
         report["checks"].append({
             "name": "hardware:cpu",
-            "status": "pass" if not required_cpu_failures else "warn",
+            "status": (
+                "fail" if required_cpu_failures or not cpu_val.available
+                else "warn" if cpu_val.warnings else "pass"
+            ),
             "detail": {
                 "passed": cpu_val.checks_passed,
                 "failed": cpu_val.checks_failed,
@@ -2106,6 +2290,7 @@ def doctor(as_json: bool) -> None:
                     if item not in required_cpu_failures
                 ],
                 "warnings": cpu_val.warnings,
+                "execution_tested": cpu_val.execution_tested,
             },
         })
     except Exception as exc:  # noqa: BLE001
@@ -2114,20 +2299,31 @@ def doctor(as_json: bool) -> None:
     # Smoke test: import and instantiate Runtime
     def _smoke() -> str:
         from aether import Runtime, RuntimeConfig
-        rt = Runtime(RuntimeConfig(hf_offline=True))
-        # Verify the runtime object was created properly without accessing private state
-        assert rt is not None
-        return f"Runtime instantiated OK (class={type(rt).__name__})"
+        with _cli_runtime(RuntimeConfig(hf_offline=True)) as rt:
+            # Verify the runtime object was created properly without accessing private state
+            assert rt is not None
+            return f"Runtime instantiated OK (class={type(rt).__name__})"
     report["checks"].append(check("smoke:runtime_init", _smoke))
 
     # Native CPU kernels
-    def _native_cpu() -> str:
+    def _native_cpu() -> str | dict[str, Any]:
         from aether.kernels.native_cpu import get_native_kernels
         nk = get_native_kernels()
         if nk.ensure_compiled():
             return f"kernels={nk.available_kernels()}"
-        return f"build_failed={nk.build_error}"
-    report["checks"].append(check("kernels:native_cpu", _native_cpu))
+        return {
+            "build_failed": nk.build_error,
+            "fallback": "NumPy reference execution remains available; a C++ compiler is optional",
+        }
+    native_check = check("kernels:native_cpu", _native_cpu)
+    if native_check["status"] == "fail":
+        native_check["detail"] = {
+            "build_failed": native_check["detail"],
+            "fallback": "NumPy reference execution remains available; a C++ compiler is optional",
+        }
+    if isinstance(native_check.get("detail"), dict) and "build_failed" in native_check["detail"]:
+        native_check["status"] = "warn"
+    report["checks"].append(native_check)
 
     # Public package surface.  A clean installation is not healthy if the
     # documented top-level compiler/runtime entry points cannot be imported.
@@ -2151,17 +2347,20 @@ def doctor(as_json: bool) -> None:
         for p in candidates:
             if p.is_file():
                 return f"found at {p}"
-        return "not found (run: aether hardware detect --save)"
+        return "not found (run: aether hardware detect --save hardware_validation_matrix.json)"
     report["checks"].append(check("file:hardware_validation_matrix", _hw_matrix))
 
 
     # Summarize
     passed = sum(1 for c in report["checks"] if c["status"] == "pass")
     failed = sum(1 for c in report["checks"] if c["status"] == "fail")
-    report["summary"] = {"passed": passed, "failed": failed, "total": len(report["checks"])}
+    warned = sum(1 for c in report["checks"] if c["status"] == "warn")
+    report["summary"] = {
+        "passed": passed, "failed": failed, "warnings": warned, "total": len(report["checks"])
+    }
 
     if as_json:
-        console.print(RichJSON(json.dumps(report, indent=2, default=str)))
+        click.echo(json.dumps(report, indent=2, default=str))
         return
 
     # Rich table output
@@ -2185,6 +2384,8 @@ def doctor(as_json: bool) -> None:
     console.print(f"\n[bold]Summary:[/bold] {passed}/{len(report['checks'])} checks passed", end="")
     if failed:
         console.print(f"  [red]{failed} failed[/red]")
+    elif warned:
+        console.print(f"  [yellow]{warned} warning(s); see fallback/environment details above[/yellow]")
     else:
         console.print("  [green]All OK[/green]")
 
@@ -2193,50 +2394,76 @@ def doctor(as_json: bool) -> None:
 # aether hardware — hardware detection and validation (PRD §41, §42)
 # ---------------------------------------------------------------------------
 
-@cli.group("hardware")
-def hardware() -> None:
+def _hardware_status(value: bool | None, *, unchecked: str = "UNKNOWN") -> str:
+    if value is None:
+        return f"[dim]{unchecked}[/dim]"
+    return "[green]YES[/green]" if value else "[red]NO[/red]"
+
+
+def _hardware_version(value: str | None) -> str:
+    if not value or value.lower().startswith("unknown"):
+        return "unknown / not measured"
+    return value
+
+
+@cli.group("hardware", invoke_without_command=True)
+@click.option("--json", "as_json", is_flag=True, help="Output the device fingerprint as JSON.")
+@click.pass_context
+def hardware(ctx: click.Context, as_json: bool) -> None:
     """Hardware detection, capability reporting, and backend validation."""
+    if ctx.invoked_subcommand is None:
+        _print_hardware_fingerprint()
 
 
 @hardware.command("detect")
 @click.option("--json", "as_json", is_flag=True, help="Output JSON.")
-@click.option("--save", is_flag=True, help="Update hardware_validation_matrix.json in the repo root.")
-def hardware_detect(as_json: bool, save: bool) -> None:
-    """Detect all hardware backends on this host and report real availability."""
+@click.option(
+    "--save", "save_path", type=click.Path(dir_okay=False, path_type=Path),
+    help="Write the detection snapshot to this explicit file path.",
+)
+def hardware_detect(as_json: bool, save_path: Path | None) -> None:
+    """Detect device/runtime capabilities without claiming successful execution."""
     from aether.backends.hardware_detector import detect_all_capabilities
 
     caps = detect_all_capabilities()
     data = {
         "detected_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "host_platform": sys.platform if "sys" in dir() else __import__("sys").platform,
+        "host_platform": sys.platform,
         "targets": [c.to_dict() for c in caps],
     }
 
-    if save:
-        import sys as _sys
-        repo_root = Path(__file__).parent.parent.parent.parent
-        matrix_path = repo_root / "hardware_validation_matrix.json"
-        import json as _json
-        matrix_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
-        console.print(f"[green]Saved to {matrix_path}[/green]")
+    if save_path is not None:
+        save_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        click.echo(f"Saved to {save_path}", err=True)
 
     if as_json:
-        console.print(RichJSON(json.dumps(data, indent=2, default=str)))
+        click.echo(json.dumps(data, indent=2, default=str))
         return
 
     table = Table(title="Hardware Capability Detection")
     table.add_column("Target ID", style="cyan")
-    table.add_column("Vendor", style="magenta")
     table.add_column("Device", style="white")
+    table.add_column("Hardware")
+    table.add_column("Runtime")
+    table.add_column("Impl")
+    table.add_column("Backend")
     table.add_column("Available", style="bold")
     table.add_column("Exec Tested", style="dim")
     for c in caps:
-        avail = "[green]YES[/green]" if c.available else "[red]NO[/red]"
-        tested = "[green]YES[/green]" if c.execution_tested else "[dim]NO[/dim]"
-        table.add_row(c.target_id, c.vendor, c.device[:40], avail, tested)
+        table.add_row(
+            c.target_id, c.device[:40], _hardware_status(c.hardware_present),
+            _hardware_status(c.runtime_available), _hardware_status(c.implemented),
+            _hardware_status(c.backend_available, unchecked="NOT CHECKED"),
+            _hardware_status(c.available),
+            "[green]YES[/green]" if c.execution_tested else "[dim]NOT TESTED[/dim]",
+        )
     console.print(table)
     console.print(f"\n[dim]{len([c for c in caps if c.available])} available, "
                   f"{len([c for c in caps if not c.available])} unavailable[/dim]")
+    console.print(
+        "[dim]Available means detected device + vendor runtime. Backend readiness is separate. "
+        "Detection does not execute inference; use hardware validate TARGET --execute.[/dim]"
+    )
 
 
 @hardware.command("capabilities")
@@ -2253,7 +2480,7 @@ def hardware_capabilities(target_id: str | None, as_json: bool) -> None:
             raise click.ClickException(f"No hardware target found for {target_id!r}")
 
     if as_json:
-        console.print(RichJSON(json.dumps([c.to_dict() for c in caps], indent=2, default=str)))
+        click.echo(json.dumps([c.to_dict() for c in caps], indent=2, default=str))
         return
 
     for c in caps:
@@ -2263,17 +2490,31 @@ def hardware_capabilities(target_id: str | None, as_json: bool) -> None:
         table.add_row("vendor", c.vendor)
         table.add_row("device", c.device)
         table.add_row("architecture", c.architecture)
-        table.add_row("driver_version", c.driver_version)
-        table.add_row("memory_bytes", f"{c.memory_bytes:,}")
-        table.add_row("supports_fp16", str(c.supports_fp16))
-        table.add_row("supports_bf16", str(c.supports_bf16))
-        table.add_row("supports_fp8", str(c.supports_fp8))
-        table.add_row("supports_fp4", str(c.supports_fp4))
+        table.add_row("driver_version", _hardware_version(c.driver_version))
+        table.add_row("runtime_version", _hardware_version(c.runtime_version))
+        table.add_row("memory_bytes", f"{c.memory_bytes:,}" if c.memory_bytes > 0 else "unknown / not measured")
+        runtime_formats = c.extra.get("precision_scope") == "runtime_formats"
+        precision_label = "runtime_format" if runtime_formats else "native"
+        table.add_row("precision_semantics", c.to_dict()["precision_semantics"])
+        for precision in ("fp32", "fp16", "bf16", "fp8", "fp4", "int8", "int4"):
+            confirmed = getattr(c, f"supports_{precision}")
+            table.add_row(
+                f"{precision_label}_{precision}", "confirmed" if confirmed else "not confirmed",
+            )
+        precision_execution = c.extra.get("precision_execution")
+        if precision_execution:
+            table.add_row("Aether precision paths", json.dumps(precision_execution, default=str))
         table.add_row("supports_tee", str(c.supports_tee))
-        table.add_row("implemented", "[green]YES[/green]" if c.implemented else "[red]NO[/red]")
-        table.add_row("available", "[green]YES[/green]" if c.available else "[red]NO[/red]")
-        table.add_row("execution_tested", "[green]YES[/green]" if c.execution_tested else "[dim]NO[/dim]")
-        table.add_row("production_validated", "[green]YES[/green]" if c.production_validated else "[dim]NO[/dim]")
+        table.add_row("hardware_present", _hardware_status(c.hardware_present))
+        table.add_row("runtime_available", _hardware_status(c.runtime_available))
+        table.add_row("implemented", _hardware_status(c.implemented))
+        table.add_row("backend_available", _hardware_status(c.backend_available, unchecked="NOT CHECKED"))
+        if c.backend_dependencies:
+            table.add_row("backend_dependencies", json.dumps(c.backend_dependencies))
+        table.add_row("available", _hardware_status(c.available))
+        table.add_row("compile_tested", "YES" if c.compile_tested else "NOT TESTED")
+        table.add_row("execution_tested", "[green]YES[/green]" if c.execution_tested else "[dim]NOT TESTED[/dim]")
+        table.add_row("production_validated", "[green]YES[/green]" if c.production_validated else "[dim]NOT VALIDATED[/dim]")
         if c.unavailable_reason:
             table.add_row("unavailable_reason", f"[dim]{c.unavailable_reason}[/dim]")
         console.print(table)
@@ -2282,13 +2523,23 @@ def hardware_capabilities(target_id: str | None, as_json: bool) -> None:
 @hardware.command("validate")
 @click.argument("target_id", default="cpu")
 @click.option("--json", "as_json", is_flag=True, help="Output JSON.")
-def hardware_validate(target_id: str, as_json: bool) -> None:
-    """Run environment contract checks for a backend target."""
+@click.option("--execute", is_flag=True, help="Execute and check a real minimal workload on the requested backend.")
+@click.option("--backend", "backend_name", help="Select an execution backend for the workload probe.")
+@click.option("--device-index", type=click.IntRange(min=0), default=0, show_default=True)
+def hardware_validate(
+    target_id: str, as_json: bool, execute: bool, backend_name: str | None, device_index: int,
+) -> None:
+    """Validate environment contracts; --execute additionally tests real execution."""
     from aether.backends.hardware_detector import validate_backend_environment
 
-    result = validate_backend_environment(target_id)
+    result = validate_backend_environment(
+        target_id, execute=execute, backend_name=backend_name, device_index=device_index,
+    )
+    failed = not result.all_passed or (execute and not result.execution_tested)
     if as_json:
-        console.print(RichJSON(json.dumps(result.to_dict(), indent=2, default=str)))
+        click.echo(json.dumps(result.to_dict(), indent=2, default=str))
+        if failed:
+            raise click.exceptions.Exit(1)
         return
 
     table = Table(title=f"Backend Validation: {target_id}")
@@ -2301,9 +2552,14 @@ def hardware_validate(target_id: str, as_json: bool) -> None:
     for w in result.warnings:
         table.add_row(w, "[yellow]WARN[/yellow]")
     console.print(table)
-    status = "[green]AVAILABLE[/green]" if result.all_passed else "[red]UNAVAILABLE[/red]"
+    status = "[red]VALIDATION FAILED[/red]" if failed else "[green]ENVIRONMENT READY[/green]"
     console.print(f"\nBackend {target_id!r}: {status}")
-    if not result.all_passed and result.checks_failed:
+    if result.execution_tested:
+        console.print(f"[green]Execution succeeded[/green] (scope: {result.execution_scope})")
+    else:
+        console.print("[dim]Execution: NOT TESTED. Use --execute for a real workload probe.[/dim]")
+    console.print("[dim]Production validation: NOT VALIDATED by this command.[/dim]")
+    if failed:
         raise click.ClickException(f"Backend {target_id!r} validation failed")
 
 
@@ -2319,31 +2575,31 @@ def backend_group() -> None:
 @backend_group.command("list")
 @click.option("--json", "as_json", is_flag=True, help="Output JSON.")
 def backend_list(as_json: bool) -> None:
-    """List all registered backends with availability status."""
+    """List hardware pipelines and separately report execution backend readiness."""
     from aether.backends.hardware_detector import detect_all_capabilities
 
     caps = detect_all_capabilities()
     if as_json:
-        console.print(RichJSON(json.dumps(
-            [{"target_id": c.target_id, "vendor": c.vendor, "device": c.device,
-              "available": c.available, "implemented": c.implemented,
-              "execution_tested": c.execution_tested,
-              "unavailable_reason": c.unavailable_reason}
-             for c in caps], indent=2)))
+        click.echo(json.dumps([c.to_dict() for c in caps], indent=2, default=str))
         return
 
-    table = Table(title="Aether Backend Registry")
+    table = Table(title="Hardware Pipelines and Aether Backend Readiness")
     table.add_column("Target ID", style="cyan")
     table.add_column("Vendor", style="magenta")
     table.add_column("Device", style="white")
     table.add_column("Impl", style="dim")
+    table.add_column("Runtime")
+    table.add_column("Backend")
     table.add_column("Available", style="bold")
     table.add_column("Exec Tested", style="dim")
     for c in caps:
-        impl = "[green]YES[/green]" if c.implemented else "[red]NO[/red]"
-        avail = "[green]YES[/green]" if c.available else "[red]NO[/red]"
-        tested = "[green]YES[/green]" if c.execution_tested else "[dim]NO[/dim]"
-        table.add_row(c.target_id, c.vendor, c.device[:30], impl, avail, tested)
+        table.add_row(
+            c.target_id, c.vendor, c.device[:30], _hardware_status(c.implemented),
+            _hardware_status(c.runtime_available),
+            _hardware_status(c.backend_available, unchecked="NOT CHECKED"),
+            _hardware_status(c.available),
+            "[green]YES[/green]" if c.execution_tested else "[dim]NOT TESTED[/dim]",
+        )
     console.print(table)
 
 
@@ -2352,46 +2608,60 @@ def backend_list(as_json: bool) -> None:
 # ---------------------------------------------------------------------------
 
 @cli.command("inspect")
-@click.argument("aeg_path", type=click.Path(exists=True))
+@click.argument("aeg_path")
 @click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+@click.option("--mtp", is_flag=True, help="Inspect the persisted native MTP head artifact.")
 @click.pass_context
-def inspect_aeg(ctx: click.Context, aeg_path: str, as_json: bool) -> None:
+def inspect_aeg(ctx: click.Context, aeg_path: str, as_json: bool, mtp: bool) -> None:
     """Deep inspection of a compiled AEG artifact."""
     from aether.core.aeg_format import load_aeg_package
 
-    pkg = load_aeg_package(aeg_path)
-    root = Path(aeg_path)
-    files = sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+    with _cli_runtime(_runtime_config(ctx, hf_offline=True)) as rt:
+        resolved = rt._resolve_aeg_path(aeg_path)  # noqa: SLF001
+        if resolved is None:
+            raise click.ClickException(f"model {aeg_path!r} was not found")
+        pkg = load_aeg_package(resolved)
+        root = Path(resolved)
+        files = sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
 
-    report: dict[str, Any] = {
-        "path": aeg_path,
-        "manifest": pkg.manifest.to_dict() if pkg.manifest else {},
-        "files": files,
-        "file_count": len(files),
-    }
+        report: dict[str, Any] = {
+            "path": str(root),
+            "model_id": pkg.manifest.model_id if pkg.manifest else aeg_path,
+            "manifest": pkg.manifest.to_dict() if pkg.manifest else {},
+            "files": files,
+            "file_count": len(files),
+        }
+        if mtp:
+            mtp_path = root / "speculation" / "mtp_config.json"
+            if not mtp_path.is_file():
+                raise click.ClickException(f"model {aeg_path!r} has no persisted MTP head; compile with --mtp")
+            payload = json.loads(mtp_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise click.ClickException("MTP metadata must be a JSON object")
+            report["mtp"] = payload
 
-    if as_json:
-        console.print(RichJSON(json.dumps(report, indent=2, default=str)))
-        return
+        if as_json or mtp:
+            click.echo(json.dumps(report, indent=2, default=str))
+            return
 
-    console.print(f"[bold]AEG Artifact: {aeg_path}[/bold]")
-    if pkg.manifest:
-        m = pkg.manifest
-        table = Table(title="Manifest")
-        table.add_column("Field", style="cyan")
-        table.add_column("Value", style="white")
-        d = m.to_dict()
-        for k, v in d.items():
-            if isinstance(v, dict):
-                table.add_row(k, json.dumps(v, default=str)[:80])
-            else:
-                table.add_row(k, str(v)[:80])
-        console.print(table)
-    console.print(f"\n[dim]{len(files)} files in artifact:[/dim]")
-    for f in files[:20]:
-        console.print(f"  {f}")
-    if len(files) > 20:
-        console.print(f"  [dim]... and {len(files) - 20} more[/dim]")
+        console.print(f"[bold]AEG Artifact: {aeg_path}[/bold]")
+        if pkg.manifest:
+            m = pkg.manifest
+            table = Table(title="Manifest")
+            table.add_column("Field", style="cyan")
+            table.add_column("Value", style="white")
+            d = m.to_dict()
+            for k, v in d.items():
+                if isinstance(v, dict):
+                    table.add_row(k, json.dumps(v, default=str)[:80])
+                else:
+                    table.add_row(k, str(v)[:80])
+            console.print(table)
+        console.print(f"\n[dim]{len(files)} files in artifact:[/dim]")
+        for f in files[:20]:
+            console.print(f"  {f}")
+        if len(files) > 20:
+            console.print(f"  [dim]... and {len(files) - 20} more[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -2448,7 +2718,7 @@ def sign_aeg(aeg_path: str, key_path: str | None, cert_paths: tuple[str, ...], a
         "self_signed": not cert_paths,
     }
     if as_json:
-        console.print(RichJSON(json.dumps(payload, indent=2)))
+        click.echo(json.dumps(payload, indent=2))
         return
     console.print(f"[green]Signed[/green] {aeg_path}")
     table = Table(show_header=False)
@@ -2483,7 +2753,7 @@ def verify_aeg(aeg_path: str, anchor_paths: tuple[str, ...], as_json: bool) -> N
     anchors = _load_trust_anchors(anchor_paths) if anchor_paths else None
     result = verify_c2pa_manifest(aeg_path, trust_anchors=anchors)
     if as_json:
-        console.print(RichJSON(json.dumps(result.to_dict(), indent=2)))
+        click.echo(json.dumps(result.to_dict(), indent=2))
         raise SystemExit(0 if result.integrity_valid else 1)
 
     checks = [
@@ -2548,9 +2818,9 @@ def verify_aeg(aeg_path: str, anchor_paths: tuple[str, ...], as_json: bool) -> N
               default="balanced", help="What to optimise among feasible plans.")
 @click.option("--devices", default=None,
               help="Comma-separated device list to consider, e.g. 'cuda:0,cuda:1'.")
-@click.option("--kappa", type=click.FloatRange(0.1, 1.0), default=None,
+@click.option("--kappa", type=_FiniteFloatRange(0.1, 1.0), default=None,
               help="Device-memory ceiling fraction. The only percentage in the model.")
-@click.option("--z", "z_value", type=click.FloatRange(0.0, 6.0), default=None,
+@click.option("--z", "z_value", type=_FiniteFloatRange(0.0, 6.0), default=None,
               help="One-sided quantile for the transient-peak margin. 3.0 for serving.")
 @click.option("--no-probe", is_flag=True,
               help="Skip the bandwidth and dispatch micro-benchmarks and use priors.")
@@ -2632,9 +2902,9 @@ def plan_cmd(
 @click.argument("model")
 @click.option("--prompts", "-p", multiple=True, default=["Hello, tell me about yourself."],
               help="Prompts to benchmark. Repeat for multiple prompts.")
-@click.option("--max-tokens", type=int, default=64, help="Max tokens per run.")
-@click.option("--runs", type=int, default=5, help="Number of measured runs.")
-@click.option("--warmup", type=int, default=1, help="Number of warmup runs (not measured).")
+@click.option("--max-tokens", type=click.IntRange(min=1), default=64, help="Max tokens per run.")
+@click.option("--runs", type=click.IntRange(min=1), default=5, help="Number of measured runs.")
+@click.option("--warmup", type=click.IntRange(min=0), default=1, help="Number of warmup runs (not measured).")
 @click.option("--output", "-o", type=click.Path(), default=None,
               help="Save benchmark report to JSON file.")
 @click.option("--json", "as_json", is_flag=True, help="Output JSON.")
@@ -2656,38 +2926,46 @@ def benchmark_cmd(
     """
     from aether.observability.benchmark_runner import BenchmarkRunner
 
-    rt = Runtime(RuntimeConfig(model_cache_dir=ctx.obj.get("cache_dir"), hf_offline=True))
+    rt = Runtime(_runtime_config(ctx, hf_offline=True))
+    try:
 
-    def _generate(prompt: str, max_tok: int) -> str:
-        return rt.generate(model, prompt, max_tokens=max_tok, temperature=0.0).text
+        def _generate(prompt: str, max_tok: int) -> str:
+            return rt.generate(model, prompt, max_tokens=max_tok, temperature=0.0).text
 
-    runner = BenchmarkRunner(
-        generate_fn=_generate,
-        model_id=model,
-        num_warmup_runs=warmup,
-        num_measured_runs=runs,
-    )
+        runner = BenchmarkRunner(
+            generate_fn=_generate,
+            model_id=model,
+            num_warmup_runs=warmup,
+            num_measured_runs=runs,
+            precision="artifact",
+            measurement_fn=lambda prompt, max_tok: rt.benchmark(model, prompt=prompt, max_tokens=max_tok),
+        )
 
-    with console.status(f"[bold green]Benchmarking {model} ({warmup} warmup + {runs} runs)..."):
-        report = runner.run(list(prompts), max_tokens=max_tokens, output_path=output)
+        with console.status(f"[bold green]Benchmarking {model} ({warmup} warmup + {runs} runs)..."):
+            report = runner.run(list(prompts), max_tokens=max_tokens, output_path=output)
 
-    if as_json:
-        console.print(RichJSON(json.dumps(report.to_dict(), indent=2, default=str)))
-        return
+        summary = report.to_dict()["summary"]
+        failed = summary.get("failed_runs", 0)
+        if as_json:
+            click.echo(json.dumps(report.to_dict(), indent=2, default=str))
+            if failed:
+                ctx.exit(1)
+            return
 
-    table = Table(title=f"Benchmark Results — {model}")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="white")
-    summary = report.to_dict()["summary"]
-    for k, v in summary.items():
-        vstr = f"{v:.4f}" if isinstance(v, float) else str(v)
-        table.add_row(k, vstr)
-    console.print(table)
-    if output:
-        console.print(f"[dim]Full report saved to {output}[/dim]")
-    failed = summary.get("failed_runs", 0)
-    if failed:
-        console.print(f"[yellow]Warning: {failed} run(s) failed[/yellow]")
+        table = Table(title=f"Benchmark Results — {model}")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="white")
+        for k, v in summary.items():
+            vstr = f"{v:.4f}" if isinstance(v, float) else str(v)
+            table.add_row(k, vstr)
+        console.print(table)
+        if output:
+            console.print(f"[dim]Full report saved to {output}[/dim]")
+        if failed:
+            console.print(f"[yellow]Warning: {failed} run(s) failed[/yellow]")
+            ctx.exit(1)
+    finally:
+        rt.close()
 
 
 def main() -> None:

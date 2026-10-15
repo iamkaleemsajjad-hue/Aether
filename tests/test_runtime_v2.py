@@ -21,7 +21,7 @@ import pytest
 class TestR1PEAGLEEngine:
     def _make(self, **kwargs):
         from aether.runtime.r1_peagle_engine import PEAGLEEngine
-        import torch
+        torch = pytest.importorskip("torch")
 
         engine = PEAGLEEngine(draft_K=3, mode="mtp", **kwargs)
         # Use real executable MTP projection weights.  The runtime must not

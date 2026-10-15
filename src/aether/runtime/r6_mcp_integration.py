@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 import subprocess
 import threading
@@ -48,7 +49,7 @@ from aether.utils.logging import get_logger
 logger = get_logger(__name__)
 
 # MCP protocol version supported.
-_MCP_PROTOCOL_VERSION = "2024-11-05"
+_MCP_PROTOCOL_VERSION = "2025-11-25"
 
 # JSON-RPC error codes.
 _ERR_PARSE = -32700
@@ -60,12 +61,17 @@ _ERR_TOOL_NOT_FOUND = -32001
 _ERR_TOOL_TIMEOUT = -32002
 
 
+class _MCPProtocolError(RuntimeError):
+    """A remote JSON-RPC error leaves an otherwise live transport usable."""
+
+
 class MCPToolRegistry:
     """Registry of MCP tools discovered from connected servers."""
 
     def __init__(self) -> None:
         self._tools: dict[str, dict[str, Any]] = {}  # tool_name → tool_schema
         self._server_map: dict[str, str] = {}  # tool_name → server_id
+        self._qualified_tools: dict[tuple[str, str], dict[str, Any]] = {}
         self._lock = threading.RLock()
 
     def register_server_tools(self, server_id: str, tools: list[dict]) -> int:
@@ -80,13 +86,20 @@ class MCPToolRegistry:
         """
         count = 0
         with self._lock:
+            self._qualified_tools = {key: tool for key, tool in self._qualified_tools.items() if key[0] != server_id}
             for tool in tools:
                 name = tool.get("name", "")
                 if not name:
                     continue
-                self._tools[name] = tool
-                self._server_map[name] = server_id
+                self._qualified_tools[(server_id, name)] = tool
                 count += 1
+            self._tools.clear()
+            self._server_map.clear()
+            for (server, name), tool in self._qualified_tools.items():
+                owners = [owner for owner, other in self._qualified_tools if other == name]
+                if len(owners) == 1:
+                    self._tools[name] = tool
+                    self._server_map[name] = server
         logger.debug("R6: Registered %d tools from server %r.", count, server_id)
         return count
 
@@ -102,20 +115,19 @@ class MCPToolRegistry:
             # retaining the server identity for isolation checks.
             if "/" in tool_name:
                 server_name, unqualified = tool_name.split("/", 1)
-                schema = self._tools.get(unqualified)
-                server = self._server_map.get(unqualified)
-                if schema is not None and server == server_name:
-                    return schema, server
+                schema = self._qualified_tools.get((server_name, unqualified))
+                if schema is not None:
+                    return schema, server_name
             return None, None
 
     def all_tools(self) -> list[dict]:
         """Return all registered tool schemas."""
         with self._lock:
-            return list(self._tools.values())
+            return list(self._qualified_tools.values())
 
     def tool_count(self) -> int:
         with self._lock:
-            return len(self._tools)
+            return len(self._qualified_tools)
 
 
 class MCPClient:
@@ -130,11 +142,11 @@ class MCPClient:
         server_id: str,
         transport: str = "stdio",
         endpoint: str | None = None,
-        command: str | None = None,
+        command: str | list[str] | None = None,
         timeout_s: float = 30.0,
     ) -> None:
         self.server_id = server_id
-        self.transport = transport
+        self.transport = "ws" if transport == "websocket" else transport
         self.endpoint = endpoint
         self.command = command
         self.timeout_s = timeout_s
@@ -145,6 +157,10 @@ class MCPClient:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._process: subprocess.Popen[str] | None = None
+        self._rpc_lock = threading.RLock()
+        self._ws_connection: Any = None
+        self._session_id: str | None = None
+        self._protocol_version = _MCP_PROTOCOL_VERSION
 
     def connect(self) -> bool:
         """Establish connection to the MCP server.
@@ -153,25 +169,29 @@ class MCPClient:
         For stdio transport, spawns a subprocess.
         For http/ws transport, opens a persistent connection.
         """
+        if self._connected:
+            return True
         try:
             if self.transport == "stdio":
                 command = self.command or self.server_id
                 if not command:
                     raise ValueError("stdio MCP transport requires a server command")
+                if isinstance(command, list):
+                    if not command or any(not isinstance(item, str) for item in command):
+                        raise ValueError("MCP command argv must contain strings")
+                    arguments = command
+                else:
+                    # Windows CreateProcess already parses a quoted command
+                    # line; shlex(posix=False) incorrectly retains those quotes.
+                    arguments = command if os.name == "nt" else shlex.split(command)
                 self._process = subprocess.Popen(
-                    shlex.split(command, posix=False), stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+                    arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1,
                 )
             elif self.transport in {"http", "ws"} and not self.endpoint:
                 raise ValueError(f"{self.transport} MCP transport requires an endpoint")
-            # Start dedicated event loop thread for async I/O.
-            self._loop = asyncio.new_event_loop()
-            self._loop_thread = threading.Thread(
-                target=self._loop.run_forever,
-                daemon=True,
-                name=f"mcp-{self.server_id}",
-            )
-            self._loop_thread.start()
+            elif self.transport not in {"http", "ws", "stdio"}:
+                raise ValueError(f"Unsupported MCP transport: {self.transport}")
 
             # Send MCP initialize handshake.
             init_result = self._rpc_call_sync(
@@ -179,20 +199,25 @@ class MCPClient:
                 params={
                     "protocolVersion": _MCP_PROTOCOL_VERSION,
                     "clientInfo": {"name": "aether-runtime", "version": "4.0"},
-                    "capabilities": {"roots": {}, "sampling": {}},
+                    "capabilities": {},
                 },
             )
 
-            self._connected = init_result is not None
+            self._connected = isinstance(init_result, dict) and isinstance(init_result.get("capabilities"), dict) and isinstance(init_result.get("serverInfo"), dict) and isinstance(init_result.get("protocolVersion"), str)
             if self._connected:
+                version = init_result.get("protocolVersion", _MCP_PROTOCOL_VERSION)
+                if version not in {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}:
+                    raise ValueError(f"Unsupported MCP protocol version: {version}")
+                self._protocol_version = version
+                self._notify("notifications/initialized")
                 logger.info("R6: Connected to MCP server %r (%s).", self.server_id, self.transport)
+            else:
+                self.disconnect()
             return self._connected
 
         except Exception as exc:  # noqa: BLE001
             logger.warning("R6: Failed to connect to %r: %s", self.server_id, exc)
-            if self._process is not None:
-                self._process.kill()
-                self._process = None
+            self.disconnect()
             return False
 
     def list_tools(self) -> list[dict]:
@@ -237,6 +262,46 @@ class MCPClient:
         The request is sent over the configured real transport.  There is no
         local-success simulation: absent or malformed servers return an error.
         """
+        with self._rpc_lock:
+            try:
+                return self._rpc_exchange(method, params)
+            except _MCPProtocolError:
+                raise
+            except Exception:
+                # EOF, broken pipes and closed sockets invalidate connection
+                # state. Reconnecting must create a fresh initialized transport.
+                try:
+                    self.disconnect()
+                except Exception as cleanup_error:  # noqa: BLE001
+                    logger.warning("R6: Failed to clean up disconnected transport: %s", cleanup_error)
+                raise
+
+    def _http_headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": self._protocol_version}
+        if self._session_id:
+            headers["MCP-Session-Id"] = self._session_id
+        return headers
+
+    def _notify(self, method: str) -> None:
+        payload = {"jsonrpc": "2.0", "method": method}
+        with self._rpc_lock:
+            if self.transport == "stdio":
+                if self._process is None or self._process.stdin is None:
+                    raise RuntimeError("MCP stdio client is not connected")
+                self._process.stdin.write(json.dumps(payload) + "\n")
+                self._process.stdin.flush()
+            elif self.transport == "http":
+                request = urllib.request.Request(self.endpoint or "", data=json.dumps(payload).encode("utf-8"), headers=self._http_headers(), method="POST")
+                with urllib.request.urlopen(request, timeout=self.timeout_s):
+                    pass
+            elif self.transport == "ws":
+                self._ws_connection.send(json.dumps(payload))
+
+    @staticmethod
+    def _matching_response(body: Any, call_id: str) -> bool:
+        return isinstance(body, dict) and body.get("id") == call_id and ("result" in body or "error" in body)
+
+    def _rpc_exchange(self, method: str, params: dict) -> dict | None:
         call_id = str(uuid.uuid4())
         payload = {
             "jsonrpc": "2.0",
@@ -248,43 +313,88 @@ class MCPClient:
         if self.transport == "http":
             request = urllib.request.Request(
                 self.endpoint or "", data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json", "Accept": "application/json"}, method="POST",
+                headers=self._http_headers(), method="POST",
             )
             with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
-                body = json.loads(response.read().decode("utf-8"))
+                session_id = response.headers.get("MCP-Session-Id")
+                if session_id:
+                    self._session_id = session_id
+                if "text/event-stream" in response.headers.get("Content-Type", ""):
+                    body = None
+                    deadline = time.monotonic() + self.timeout_s
+                    for line in response:
+                        if time.monotonic() > deadline:
+                            raise TimeoutError("MCP HTTP event stream timed out")
+                        line = line.decode("utf-8").strip()
+                        if line.startswith("data:") and line[5:].strip():
+                            candidate = json.loads(line[5:].strip())
+                            if self._matching_response(candidate, call_id):
+                                body = candidate
+                                break
+                    if body is None:
+                        raise RuntimeError("MCP HTTP stream ended without a matching response")
+                else:
+                    body = json.loads(response.read().decode("utf-8"))
         elif self.transport == "ws":
             try:
                 import websocket  # type: ignore[import]
             except ImportError as exc:
                 raise RuntimeError("WebSocket MCP transport requires websocket-client") from exc
-            connection = websocket.create_connection(self.endpoint or "", timeout=self.timeout_s)
-            try:
-                connection.send(json.dumps(payload))
-                body = json.loads(connection.recv())
-            finally:
-                connection.close()
+            if self._ws_connection is None:
+                self._ws_connection = websocket.create_connection(self.endpoint or "", timeout=self.timeout_s)
+            self._ws_connection.send(json.dumps(payload))
+            deadline = time.monotonic() + self.timeout_s
+            while True:
+                body = json.loads(self._ws_connection.recv())
+                if self._matching_response(body, call_id):
+                    break
+                if time.monotonic() > deadline:
+                    raise TimeoutError("MCP WebSocket response timed out")
         elif self.transport == "stdio":
             process = self._process
             if process is None or process.stdin is None or process.stdout is None:
                 raise RuntimeError("MCP stdio client is not connected")
             process.stdin.write(json.dumps(payload) + "\n")
             process.stdin.flush()
-            result_holder: list[str] = []
+            result_holder: list[Any] = []
+            errors: list[Exception] = []
 
             def read_response() -> None:
-                result_holder.append(process.stdout.readline())
+                try:
+                    while True:
+                        line = process.stdout.readline()
+                        if not line:
+                            raise EOFError("MCP server closed stdout")
+                        candidate = json.loads(line)
+                        if self._matching_response(candidate, call_id):
+                            result_holder.append(candidate)
+                            return
+                        if "method" in candidate and "id" in candidate:
+                            reply = {"jsonrpc": "2.0", "id": candidate["id"], "error": {"code": _ERR_METHOD_NOT_FOUND, "message": "Client callbacks are not supported"}}
+                            process.stdin.write(json.dumps(reply) + "\n")
+                            process.stdin.flush()
+                except Exception as exc:
+                    errors.append(exc)
 
             reader = threading.Thread(target=read_response, daemon=True)
             reader.start()
             reader.join(self.timeout_s)
-            if reader.is_alive() or not result_holder or not result_holder[0]:
+            if reader.is_alive():
+                # A blocked reader cannot safely share stdout with the next
+                # call. Terminate the transport and reap it before returning.
+                self.disconnect()
+                reader.join(timeout=1)
                 raise TimeoutError(f"MCP server {self.server_id!r} did not answer within {self.timeout_s}s")
-            body = json.loads(result_holder[0])
+            if errors:
+                raise errors[0]
+            body = result_holder[0]
         else:
             raise ValueError(f"Unsupported MCP transport: {self.transport}")
 
+        if not self._matching_response(body, call_id):
+            raise RuntimeError("MCP response has no matching JSON-RPC request id")
         if "error" in body:
-            raise RuntimeError(f"MCP JSON-RPC error: {body['error']}")
+            raise _MCPProtocolError(f"MCP JSON-RPC error: {body['error']}")
         return body.get("result")
 
     def disconnect(self) -> None:
@@ -293,8 +403,28 @@ class MCPClient:
             self._loop.call_soon_threadsafe(self._loop.stop)
         self._connected = False
         if self._process is not None:
-            self._process.terminate()
+            process = self._process
             self._process = None
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+        if self._ws_connection is not None:
+            self._ws_connection.close()
+            self._ws_connection = None
+        if self._loop_thread is not None:
+            self._loop_thread.join(timeout=1)
+            self._loop_thread = None
+        if self._loop is not None and not self._loop.is_running():
+            self._loop.close()
+            self._loop = None
+        self._session_id = None
 
     @property
     def is_connected(self) -> bool:
@@ -331,7 +461,7 @@ class MCPIntegrationLayer:
         server_id: str,
         transport: str = "stdio",
         endpoint: str | None = None,
-        command: str | None = None,
+        command: str | list[str] | None = None,
     ) -> bool:
         """Connect to an MCP server and register its tools.
 
@@ -353,10 +483,17 @@ class MCPIntegrationLayer:
         if not client.connect():
             return False
 
-        tools = client.list_tools()
-        self._registry.register_server_tools(server_id, tools)
+        try:
+            tools = client.list_tools()
+        except Exception:
+            client.disconnect()
+            raise
 
         with self._lock:
+            old = self._clients.get(server_id)
+            if old is not None:
+                old.disconnect()
+            self._registry.register_server_tools(server_id, tools)
             self._clients[server_id] = client
 
         logger.info(
@@ -429,7 +566,10 @@ class MCPIntegrationLayer:
 
         self._semaphore.acquire()
         try:
-            result = client.call_tool(tool_name, arguments)
+            # The registry namespace belongs to Aether. The server expects its
+            # advertised tool name, without an added "server/" prefix.
+            server_tool_name = schema.get("name", tool_name) if isinstance(schema, dict) else tool_name
+            result = client.call_tool(server_tool_name, arguments)
             self._total_calls += 1
             return result
         finally:

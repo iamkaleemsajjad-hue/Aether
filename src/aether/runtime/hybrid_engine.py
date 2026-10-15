@@ -16,6 +16,7 @@ from typing import Any, Iterator
 import numpy as np
 
 from aether.runtime.cpu_engine import CPUExecutionEngine, KVCache, LayerWeights, ModelWeights
+from aether.kernels.native_cpu import NativeCPUKernels
 from aether.runtime.mamba_engine import MambaCache, MambaExecutionEngine, MambaLayerWeights, MambaModelWeights
 from aether.runtime.stopping import stop_token_set
 
@@ -93,6 +94,7 @@ class HybridExecutionEngine:
         inner_size: int,
         dt_rank: int,
         conv_kernel: int,
+        kernels: NativeCPUKernels | None = None,
     ) -> None:
         if len(layer_types) != len(weights.layers):
             raise ValueError("hybrid layer schedule length does not match the weight list")
@@ -143,6 +145,7 @@ class HybridExecutionEngine:
             transformer_model,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
+            kernels=kernels,
         )
 
         mamba_layers = [layer.mamba for layer in weights.layers]

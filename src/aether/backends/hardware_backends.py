@@ -1,8 +1,9 @@
 """
 Aether Runtime — Complete Hardware Backend Implementations.
 
-Provides production-grade backend implementations for all hardware targets.
-Vendor backends report availability only when the matching runtime is present.
+Provides executable adapters and retained target-specific development code.
+Vendor adapters report availability only when their device and execution
+dependencies are present; this is not evidence of execution or production use.
 CPU reference execution remains available through the normal CPU/Torch backend;
 it is not reported as CUDA, ROCm, Metal, FPGA, or QNN production support.
 
@@ -36,11 +37,97 @@ from aether.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+class _TorchVendorAdapter:
+    """Delegate through the backend API with an explicit accelerator device."""
+
+    def _matching_torch_runtime(self) -> Any | None:
+        try:
+            runtime = getattr(self, "_torch_runtime", None)
+            if runtime is None:
+                from aether.backends.torch_backend import TorchBackend
+
+                runtime = TorchBackend()
+                self._torch_runtime = runtime
+            if not runtime.available_for_target(self.target_id):
+                self._runtime_error = (
+                    f"installed PyTorch does not provide a usable {self.target_id} runtime"
+                )
+                return None
+            self._runtime_error = None
+            return runtime
+        except Exception as exc:  # optional dependency / driver may fail to initialize
+            self._runtime_error = f"PyTorch runtime initialization failed: {exc}"
+            return None
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        if not self._hardware_available:
+            return f"no compatible device/runtime was detected for {self.target_id}"
+        if self._matching_torch_runtime() is None:
+            return self._runtime_error
+        return None
+
+    def is_available(self) -> bool:
+        return bool(self._hardware_available and self._matching_torch_runtime() is not None)
+
+    def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
+        """Compatibility entry point; errors remain visible to the caller."""
+        self.load_model(model_path, **dict(config or {}))
+        return True
+
+    def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
+        if not self.is_available():
+            raise BackendError(
+                self.unavailable_reason or f"{self.target_id} backend is unavailable",
+                backend_name=self.name,
+                details={"target": self.target_id},
+            )
+        options = dict(kwargs)
+        requested = options.pop("execution_devices", None)
+        if requested is not None and list(requested) != [self._device]:
+            raise BackendError(
+                f"{self.target_id} adapter requires execution_devices={[self._device]!r}; "
+                f"received {requested!r}",
+                backend_name=self.name,
+            )
+        options["execution_devices"] = [self._device]
+        # The optional Hugging Face frontend otherwise defaults to an
+        # automatic map that can move the entire model onto CPU. AEG engines
+        # receive the same explicit mesh through the canonical loader.
+        device_map = options.get("device_map", {"": self._device})
+        if device_map not in (self._device, {"": self._device}):
+            raise BackendError(
+                f"{self.target_id} adapter requires device_map={{'': {self._device!r}}}",
+                backend_name=self.name,
+            )
+        options["device_map"] = device_map
+        runtime = self._torch_runtime
+        # Preserve the logical model ID. Replacing it with aeg_path means
+        # subsequent generation cannot find the model it just loaded.
+        model = runtime.load_model(model_id, aeg_path=aeg_path, **options)
+        self._torch_backend = runtime
+        if not hasattr(self, "_loaded_model_ids"):
+            self._loaded_model_ids: set[str] = set()
+        self._loaded_model_ids.add(model_id)
+        return model
+
+    def unload_model(self, model_id: str) -> None:
+        if hasattr(self, "_torch_backend"):
+            self._torch_backend.unload_model(model_id)
+        getattr(self, "_loaded_model_ids", set()).discard(model_id)
+
+    def unload(self) -> None:
+        for model_id in tuple(getattr(self, "_loaded_model_ids", ())):
+            self.unload_model(model_id)
+        if hasattr(self, "_torch_backend"):
+            del self._torch_backend
+
+
 # ---------------------------------------------------------------------------
 # CUDA Backend (all sm variants)
 # ---------------------------------------------------------------------------
 
-class CUDABackend(Backend):
+class CUDABackend(_TorchVendorAdapter, Backend):
     """
     NVIDIA CUDA backend supporting sm70 through sm130.
 
@@ -70,7 +157,7 @@ class CUDABackend(Backend):
 
         info = BackendInfo(
             name=f"cuda_{sm}",
-            version="12.4.0",
+            version=AETHER_VERSION,
             supported_targets=[target_id],
             capabilities=[
                 "generate", "chat", "embed", "flash_attention",
@@ -89,6 +176,7 @@ class CUDABackend(Backend):
         self._arch_name = arch_name
         self._cuda_devices: list[Any] = []
         self._cuda_available = self._detect_cuda()
+        self._hardware_available = self._cuda_available
 
     def _detect_cuda(self) -> bool:
         """Detect NVIDIA devices without importing an ML framework."""
@@ -109,37 +197,19 @@ class CUDABackend(Backend):
             if requested in {"sm100_tee", "sm100_gb300"}:
                 compatible = str(cap.target_id).replace("cuda_", "") == requested
             else:
-                compatible = actual_sm >= requested_sm if requested_sm else True
+                # Baseline cubin compatibility is within one major SM
+                # generation and from older to newer minor revisions. Cross-
+                # generation graph materialization requires an explicit AEG
+                # portable contract in the runtime, not a numeric comparison.
+                compatible = bool(
+                    requested_sm and actual_sm // 10 == requested_sm // 10
+                    and actual_sm % 10 >= requested_sm % 10
+                )
             if compatible:
                 device_index = int(cap.extra.get("device_index", index))
                 self._device = f"cuda:{device_index}"
                 return True
         return False
-
-    def is_available(self) -> bool:
-        return self._cuda_available
-
-    def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
-        """Load a model for this CUDA target."""
-        if not self._cuda_available:
-            raise BackendError(
-                f"CUDA runtime is not available for target {self.target_id}",
-                backend_name=self.name,
-                details={"target": self.target_id},
-            )
-        try:
-            from aether.backends.torch_backend import TorchBackend
-            self._torch_backend = TorchBackend()
-            return self._torch_backend.load(model_path, config)
-        except Exception as exc:
-            logger.warning(f"CUDA backend load failed: {exc}")
-            return False
-
-    def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
-        model_path = aeg_path or model_id
-        if not self.load(model_path, kwargs or None):
-            raise BackendError(f"failed to load CUDA model {model_id!r}", backend_name=self.name)
-        return model_path
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         """Execute generation on this CUDA target."""
@@ -162,13 +232,21 @@ class CUDABackend(Backend):
         sm = self.target_id.replace("cuda_", "")
         caps = {
             "target_id": self.target_id,
-            "architecture": self._arch_name,
+            "architecture": None,
+            "target_profile_name": self._arch_name,
             "cuda_available": self._cuda_available,
             "active_device": self._device,
-            "supports_fp8": sm in ("sm89", "sm90", "sm100", "sm120", "sm130"),
-            "supports_fp4": sm in ("sm100", "sm120", "sm130"),
-            "supports_tee": "tee" in sm,
-            "warp_size": 32,
+            "backend_available": self.is_available(),
+            "unavailable_reason": self.unavailable_reason,
+            "supports_fp8": False,
+            "supports_fp4": False,
+            "supports_tee": False,
+            "warp_size": None,
+            "target_profile_capabilities": {
+                "fp8": sm in ("sm89", "sm90", "sm100", "sm120", "sm130"),
+                "fp4": sm in ("sm100", "sm120", "sm130"),
+                "tee": "tee" in sm,
+            },
         }
 
         if self._cuda_available:
@@ -182,27 +260,27 @@ class CUDABackend(Backend):
             )
             caps.update({
                 "gpu_name": device.device,
+                "architecture": device.architecture,
                 "total_memory_mb": device.memory_bytes // (1024 * 1024),
+                "memory_bytes_known": device.to_dict()["memory_bytes_known"],
                 "compute_capability": device.extra.get("compute_capability"),
                 "cuda_driver": device.driver_version,
                 "detection_method": device.runtime_version,
                 "device_count": len(self._cuda_devices),
                 "framework_free_detection": True,
+                "supports_fp8": device.supports_fp8,
+                "supports_fp4": device.supports_fp4,
+                "supports_tee": device.supports_tee,
+                "warp_size": device.warp_or_wavefront_size,
             })
         return caps
-
-    def unload(self) -> None:
-        """Unload the model from memory."""
-        if hasattr(self, "_torch_backend"):
-            self._torch_backend.unload()
-            del self._torch_backend
 
 
 # ---------------------------------------------------------------------------
 # ROCm Backend
 # ---------------------------------------------------------------------------
 
-class ROCmBackend(Backend):
+class ROCmBackend(_TorchVendorAdapter, Backend):
     """
     AMD ROCm/HIP backend supporting RDNA3 and CDNA3/MI300X.
 
@@ -214,7 +292,7 @@ class ROCmBackend(Backend):
         self.target_id = target_id
         info = BackendInfo(
             name=f"rocm_{target_id}",
-            version="6.2.0",
+            version=AETHER_VERSION,
             supported_targets=[target_id],
             capabilities=["generate", "chat", "embed", "hip_kernels", "wmma"],
         )
@@ -224,6 +302,7 @@ class ROCmBackend(Backend):
         self._device = "cpu"
         self._rocm_devices: list[Any] = []
         self._rocm_available = self._detect_rocm()
+        self._hardware_available = self._rocm_available
 
     def _detect_rocm(self) -> bool:
         """Detect AMD devices using ROCm system interfaces, not PyTorch."""
@@ -234,8 +313,9 @@ class ROCmBackend(Backend):
             logger.debug("framework-free ROCm detection failed: %s", exc)
             detected = []
         self._rocm_devices = detected
-        if detected:
-            index = int(detected[0].extra.get("device_index", 0))
+        compatible = next((cap for cap in detected if cap.target_id == self.target_id), None)
+        if compatible is not None:
+            index = int(compatible.extra.get("device_index", 0))
             # Explicit Torch HIP execution, when installed, addresses HIP
             # tensors through ``cuda:<index>``. Detection remains framework-free.
             self._device = f"cuda:{index}"
@@ -251,32 +331,19 @@ class ROCmBackend(Backend):
         if torch is not None and getattr(getattr(torch, "version", None), "hip", None):
             cuda = getattr(torch, "cuda", None)
             if cuda is not None and bool(cuda.is_available()):
-                self._device = "cuda:0"
-                return True
+                try:
+                    from aether.backends.hardware_detector import _rocm_target_id
+
+                    for index in range(int(cuda.device_count())):
+                        name = str(cuda.get_device_name(index))
+                        properties = cuda.get_device_properties(index)
+                        architecture = str(getattr(properties, "gcnArchName", ""))
+                        if _rocm_target_id(f"{name} {architecture}") == self.target_id:
+                            self._device = f"cuda:{index}"
+                            return True
+                except Exception as exc:
+                    logger.debug("initialized HIP runtime enumeration failed: %s", exc)
         return False
-
-    def is_available(self) -> bool:
-        return self._rocm_available
-
-    def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
-        if not self._rocm_available:
-            raise BackendError(
-                f"ROCm runtime is not available for target {self.target_id}",
-                backend_name=self.name,
-                details={"target": self.target_id},
-            )
-        try:
-            from aether.backends.torch_backend import TorchBackend
-            self._torch_backend = TorchBackend()
-            return self._torch_backend.load(model_path, config)
-        except Exception:  # noqa: BLE001
-            return False
-
-    def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
-        model_path = aeg_path or model_id
-        if not self.load(model_path, kwargs or None):
-            raise BackendError(f"failed to load ROCm model {model_id!r}", backend_name=self.name)
-        return model_path
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         if hasattr(self, "_torch_backend"):
@@ -315,17 +382,11 @@ __global__ void aether_{op_name.replace('.', '_')}(float* out, const float* in, 
 }}
 """
 
-    def unload(self) -> None:
-        if hasattr(self, "_torch_backend"):
-            self._torch_backend.unload()
-            del self._torch_backend
-
-
 # ---------------------------------------------------------------------------
 # Metal Backend (Apple Silicon)
 # ---------------------------------------------------------------------------
 
-class MetalBackend(Backend):
+class MetalBackend(_TorchVendorAdapter, Backend):
     """
     Apple Metal backend for M1/M2/M3/M4/M5 Silicon.
 
@@ -337,7 +398,7 @@ class MetalBackend(Backend):
         self.target_id = target_id
         info = BackendInfo(
             name=f"metal_{target_id}",
-            version="3.2",
+            version=AETHER_VERSION,
             supported_targets=[target_id],
             capabilities=["generate", "chat", "embed", "metal_shaders", "unified_memory"],
         )
@@ -347,6 +408,7 @@ class MetalBackend(Backend):
         self._device = "cpu"
         self._metal_device: Any | None = None
         self._mps_available = self._detect_mps()
+        self._hardware_available = self._mps_available
 
     def _detect_mps(self) -> bool:
         """Detect Apple Silicon/Metal without importing PyTorch."""
@@ -356,34 +418,14 @@ class MetalBackend(Backend):
         except Exception as exc:  # noqa: BLE001
             logger.debug("framework-free Metal detection failed: %s", exc)
             return False
-        if detected.available:
+        if detected.available and (
+            detected.target_id == self.target_id
+            or (self.target_id == "metal_m1" and detected.target_id == "metal_m3")
+        ):
             self._metal_device = detected
             self._device = "mps"
             return True
         return False
-
-    def is_available(self) -> bool:
-        return self._mps_available
-
-    def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
-        if not self._mps_available:
-            raise BackendError(
-                f"Metal/MPS runtime is not available for target {self.target_id}",
-                backend_name=self.name,
-                details={"target": self.target_id},
-            )
-        try:
-            from aether.backends.torch_backend import TorchBackend
-            self._torch_backend = TorchBackend()
-            return self._torch_backend.load(model_path, config)
-        except Exception:  # noqa: BLE001
-            return False
-
-    def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
-        model_path = aeg_path or model_id
-        if not self.load(model_path, kwargs or None):
-            raise BackendError(f"failed to load Metal model {model_id!r}", backend_name=self.name)
-        return model_path
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         if hasattr(self, "_torch_backend"):
@@ -425,12 +467,6 @@ kernel void aether_{op_name.replace('.', '_')}(
 }}
 """
 
-    def unload(self) -> None:
-        if hasattr(self, "_torch_backend"):
-            self._torch_backend.unload()
-            del self._torch_backend
-
-
 # ---------------------------------------------------------------------------
 # TensorRT-LLM Backend
 # ---------------------------------------------------------------------------
@@ -445,16 +481,17 @@ class TensorRTLLMBackend(Backend):
     def __init__(self) -> None:
         info = BackendInfo(
             name="tensorrt_llm",
-            version="0.13.0",
+            version=AETHER_VERSION,
             supported_targets=["cuda_sm80", "cuda_sm89", "cuda_sm90", "cuda_sm100"],
-            capabilities=[
-                "generate", "chat", "flash_attention", "paged_kv_cache",
-                "tensor_parallelism", "inflight_batching", "quantization_int4_awq",
-            ],
+            capabilities=["engine_artifact_metadata"],
         )
         super().__init__(info)
         self._trtllm_available = self._detect_trtllm()
         self._engine_path: str | None = None
+        self.unavailable_reason = (
+            f"TensorRT-LLM package {'detected' if self._trtllm_available else 'not detected'}; "
+            "inference is unavailable because a real engine runner is not implemented"
+        )
 
     def _detect_trtllm(self) -> bool:
         try:
@@ -464,7 +501,7 @@ class TensorRTLLMBackend(Backend):
             return False
 
     def is_available(self) -> bool:
-        return self._trtllm_available
+        return False
 
     def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
         if not self._trtllm_available:
@@ -479,11 +516,7 @@ class TensorRTLLMBackend(Backend):
         return True
 
     def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
-        engine_path = kwargs.get("engine_path")
-        model_path = str(engine_path or aeg_path or model_id)
-        if not self.load(model_path, kwargs or None):
-            raise BackendError(f"failed to load TensorRT-LLM model {model_id!r}", backend_name=self.name)
-        return model_path
+        raise BackendError(self.unavailable_reason, backend_name=self.name)
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         raise BackendError(
@@ -527,11 +560,15 @@ class RISCVNPUBackend(Backend):
             name=f"riscv_{target_id}",
             version=AETHER_VERSION,
             supported_targets=[target_id],
-            capabilities=["generate", "edge_inference", "sub_10w", "onnx_runtime"],
+            capabilities=["compile_riscv_ir"],
         )
         super().__init__(info)
         self._vendor = self._detect_vendor(target_id)
         self._ort_available = self._detect_ort()
+        self.unavailable_reason = (
+            f"ONNX Runtime {'detected' if self._ort_available else 'not detected'}; "
+            "RISC-V target IR compilation is available, but no vendor NPU execution adapter is implemented"
+        )
 
     def _detect_vendor(self, target_id: str) -> str:
         if "mips" in target_id:
@@ -552,34 +589,15 @@ class RISCVNPUBackend(Backend):
             return False
 
     def is_available(self) -> bool:
-        # ONNX Runtime alone is not evidence that a RISC-V NPU exists.  A
-        # portable host may compile an IR plan, but execution requires the
-        # matching ISA/vendor runtime on a RISC-V machine.
-        machine = platform.machine().lower()
-        return self._ort_available and ("riscv" in machine or "risc-v" in machine)
-
-    def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
-        if not self._ort_available:
-            raise BackendError(
-                f"ONNX Runtime is required for RISC-V NPU target {self.target_id}",
-                backend_name=self.name,
-            )
-        if self._ort_available:
-            try:
-                from aether.backends.onnx_backend import ONNXBackend
-                self._onnx_backend = ONNXBackend()
-                onnx_path = Path(model_path) / "kernels" / f"{self._vendor}" / "model.onnx"
-                if onnx_path.exists():
-                    return self._onnx_backend.load(str(onnx_path), config)
-            except Exception:  # noqa: BLE001
-                pass
+        # CPU architecture and a generic ONNX Runtime package cannot supply
+        # the missing target-specific NPU execution adapter.
         return False
 
+    def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
+        raise BackendError(self.unavailable_reason, backend_name=self.name)
+
     def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
-        model_path = aeg_path or model_id
-        if not self.load(model_path, kwargs or None):
-            raise BackendError(f"failed to load RISC-V NPU model {model_id!r}", backend_name=self.name)
-        return model_path
+        raise BackendError(self.unavailable_reason, backend_name=self.name)
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         if hasattr(self, "_onnx_backend"):
@@ -635,18 +653,17 @@ class FPGABackend(Backend):
             name=f"fpga_{target_id}",
             version=AETHER_VERSION,
             supported_targets=[target_id],
-            capabilities=["generate", "low_power", "decode_only"],
+            capabilities=[],
         )
-        if "ternary" in target_id:
-            info.capabilities.extend(["ternary_arithmetic", "sub2bit"])
         super().__init__(info)
+        self.unavailable_reason = f"FPGA execution adapter is not implemented for target {self.target_id}"
 
     def is_available(self) -> bool:
         return False
 
     def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
         raise BackendError(
-            f"FPGA runtime integration is not available for target {self.target_id}",
+            self.unavailable_reason,
             backend_name=self.name,
         )
 
@@ -688,12 +705,16 @@ class QualcommBackend(Backend):
         self.target_id = target_id
         info = BackendInfo(
             name=f"qualcomm_{target_id}",
-            version="2.25.0",
+            version=AETHER_VERSION,
             supported_targets=[target_id, "qualcomm_qnn"],
-            capabilities=["generate", "chat", "edge_inference", "onnx_runtime"],
+            capabilities=[],
         )
         super().__init__(info)
         self._qnn_available = self._detect_qnn()
+        self.unavailable_reason = (
+            f"Qualcomm QNN SDK directory {'found' if self._qnn_available else 'not found'}; "
+            "the target execution adapter is not implemented"
+        )
 
     def _detect_qnn(self) -> bool:
         # Check for Qualcomm Neural Network SDK
@@ -701,21 +722,13 @@ class QualcommBackend(Backend):
         return any(Path(p).exists() for p in qnn_paths if p)
 
     def is_available(self) -> bool:
-        return self._qnn_available
+        return False
 
     def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
-        if not self._qnn_available:
-            raise BackendError(
-                f"Qualcomm QNN SDK is not available for target {self.target_id}",
-                backend_name=self.name,
-            )
-        raise BackendError(
-            f"Qualcomm QNN execution is not wired for target {self.target_id}",
-            backend_name=self.name,
-        )
+        raise BackendError(self.unavailable_reason, backend_name=self.name)
 
     def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
-        self.load(aeg_path or model_id, kwargs or None)
+        raise BackendError(self.unavailable_reason, backend_name=self.name)
 
     def get_capabilities(self) -> list[str]:
         return self.info.capabilities
@@ -738,11 +751,11 @@ class QualcommBackend(Backend):
 
 
 class OpenVINOBackend(Backend):
-    """Intel OpenVINO execution adapter with real NPU capability detection.
+    """Intel OpenVINO graph compiler with a reserved inference adapter.
 
     Aether does not convert an AEG into an arbitrary OpenVINO graph at load
-    time.  This adapter accepts a pre-emitted ONNX/OpenVINO model bundle and
-    fails clearly for an AEG that has no such target artifact.
+    time. The low-level ``load`` method compiles a pre-emitted ONNX/OpenVINO
+    bundle. Generation remains unavailable until a task-specific runner exists.
     """
 
     def __init__(self, target_id: str = "openvino_npu") -> None:
@@ -752,12 +765,9 @@ class OpenVINOBackend(Backend):
         self._device_name = "NPU" if target_id == "openvino_npu" else "GPU"
         super().__init__(BackendInfo(
             name="openvino",
-            version="runtime",
+            version=AETHER_VERSION,
             supported_targets=[target_id],
-            capabilities=[
-                "generate", "onnx_runtime",
-                "intel_npu" if target_id == "openvino_npu" else "intel_gpu",
-            ],
+            capabilities=["compile_model", "openvino_artifact"],
         ))
         self._core = None
         self._available = False
@@ -767,9 +777,13 @@ class OpenVINOBackend(Backend):
             self._available = self._device_name in list(self._core.available_devices)
         except Exception:
             self._available = False
+        self.unavailable_reason = (
+            f"OpenVINO {self._device_name} device {'detected' if self._available else 'not detected'}; "
+            "graph compilation is supported, but the task-specific generation runner is not implemented"
+        )
 
     def is_available(self) -> bool:
-        return self._available
+        return False
 
     def load(self, model_path: str, config: dict[str, Any] | None = None) -> bool:
         if not self._available or self._core is None:
@@ -788,8 +802,7 @@ class OpenVINOBackend(Backend):
         return True
 
     def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
-        self.load(aeg_path or model_id, kwargs or None)
-        return aeg_path or model_id
+        raise BackendError(self.unavailable_reason, backend_name=self.name)
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         raise BackendError("OpenVINO generation adapter requires a task-specific compiled model runner", backend_name=self.name)

@@ -264,6 +264,7 @@ class TorchAEGEngine:
     #: default for any path that did not stream (a sharded executor uploads its own
     #: slices), and ``release_host_weights`` adds it to what it reclaims.
     host_bytes_streamed: int = 0
+    retain_host_weights: bool = False
 
     #: Reusable pinned staging slots for sampled-token readback, or ``None`` when
     #: this device cannot stage asynchronously.  ``False`` means "not yet probed";
@@ -295,12 +296,13 @@ class TorchAEGEngine:
     _projection_rows: "tuple[int, str] | None" = None
     _strategies: "Any | None" = None
 
-    def __init__(self, cpu_engine: Any, device: str) -> None:
+    def __init__(self, cpu_engine: Any, device: str, *, retain_host_weights: bool = False) -> None:
         try:
             import torch
         except ImportError as exc:  # pragma: no cover - guarded by backend
             raise RuntimeError("PyTorch is required for portable AEG execution") from exc
         self.torch = torch
+        self.retain_host_weights = retain_host_weights
         # Resolve the device index up front: an index-less ``cuda`` never
         # compares equal to a tensor's ``cuda:0``, which would defeat every
         # "already on my device?" check in the decode path.
@@ -2509,6 +2511,7 @@ class TorchAEGEngine:
         stream = (
             distinct
             and host_weights_reclaimable()
+            and not self.retain_host_weights
             and not self.device_tensors_alias_host()
         )
         converted: list[Any] = []

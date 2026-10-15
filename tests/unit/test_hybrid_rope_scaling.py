@@ -115,6 +115,23 @@ def _tensor(scaling: dict | None):
     return TorchHybridAEGEngine(_reference(scaling), "cpu")
 
 
+def test_explicit_reference_provider_skips_unused_native_compiler_lookup(monkeypatch):
+    from aether.kernels.native_cpu import NativeCPUKernels
+    from aether.runtime.hybrid_engine import HybridExecutionEngine
+    reference = NativeCPUKernels.reference()
+    def unused(*args, **kwargs):
+        pytest.fail("hybrid accelerator bootstrap discovered unused native CPU kernels")
+    monkeypatch.setattr("aether.runtime.cpu_engine.get_native_kernels", unused)
+    monkeypatch.setattr("aether.kernels.native_cpu.detect_toolchain", unused)
+    engine = HybridExecutionEngine(_weights(None), layer_types=["ssm", "attention"],
+        num_heads=HEADS, num_kv_heads=KV_HEADS, state_size=STATE, inner_size=INNER,
+        dt_rank=DT_RANK, conv_kernel=CONV, kernels=reference)
+    assert engine._transformer.kernels is reference
+    logits, cache = engine.forward(np.array([1, 2]))
+    decoded, cache = engine.forward(np.array([3]), cache)
+    assert np.isfinite(logits).all() and np.isfinite(decoded).all() and cache.length == 3
+
+
 def _expected(length: int, position: int = 1) -> np.ndarray:
     """Row ``position`` of the cos table the contract calls for at ``length``.
 

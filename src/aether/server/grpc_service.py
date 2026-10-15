@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from concurrent import futures
 from pathlib import Path
+import threading
 from typing import Any, Iterable, Mapping
 
 from aether.core.exceptions import AetherError
@@ -151,6 +152,20 @@ def add_grpc_service(server: Any, runtime: Any, auth_token: str | None = None) -
     return service
 
 
+def shutdown_grpc_server(server: Any) -> None:
+    """Stop handlers and release an Aether-owned executor using public APIs.
+
+    Ordinary externally supplied gRPC servers retain their existing ownership
+    contract: this helper stops/waits but does not inspect private gRPC state.
+    The shared Runtime belongs to the caller and is never unloaded here.
+    """
+    shutdown = getattr(server, "aether_shutdown", None)
+    if callable(shutdown):
+        shutdown()
+    else:
+        server.stop(0).wait()
+
+
 def start_grpc_server(
     runtime: Any,
     host: str = "127.0.0.1",
@@ -178,25 +193,50 @@ def start_grpc_server(
         raise ValueError("server_private_key and server_certificate_chain must be supplied together")
     if require_client_auth and ca is None:
         raise ValueError("client_ca is required when require_client_auth=True")
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
-    add_grpc_service(server, runtime, auth_token=auth_token)
-    if private_key is not None and certificate_chain is not None:
-        credentials = grpc.ssl_server_credentials(
-            ((private_key, certificate_chain),),
-            root_certificates=ca,
-            require_client_auth=require_client_auth,
-        )
-        bound_port = server.add_secure_port(f"{host}:{port}", credentials)
-        transport = "tls" if not require_client_auth else "mtls"
-    else:
-        bound_port = server.add_insecure_port(f"{host}:{port}")
-        transport = "insecure"
-    if bound_port == 0:
-        raise OSError(f"could not bind gRPC listener on {host}:{port}")
-    server.start()
-    setattr(server, "aether_port", bound_port)
-    setattr(server, "aether_transport", transport)
-    return server
+    executor = futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="aether-grpc")
+    server = None
+    shutdown_lock = threading.RLock()
+    stopped = False
+
+    def shutdown_owned() -> None:
+        nonlocal stopped
+        with shutdown_lock:
+            if stopped:
+                return
+            try:
+                if server is not None:
+                    server.stop(0).wait()
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
+            stopped = True
+
+    try:
+        server = grpc.server(executor)
+        add_grpc_service(server, runtime, auth_token=auth_token)
+        if private_key is not None and certificate_chain is not None:
+            credentials = grpc.ssl_server_credentials(
+                ((private_key, certificate_chain),),
+                root_certificates=ca,
+                require_client_auth=require_client_auth,
+            )
+            bound_port = server.add_secure_port(f"{host}:{port}", credentials)
+            transport = "tls" if not require_client_auth else "mtls"
+        else:
+            bound_port = server.add_insecure_port(f"{host}:{port}")
+            transport = "insecure"
+        if bound_port == 0:
+            raise OSError(f"could not bind gRPC listener on {host}:{port}")
+        server.start()
+        setattr(server, "aether_port", bound_port)
+        setattr(server, "aether_transport", transport)
+        setattr(server, "aether_shutdown", shutdown_owned)
+        return server
+    except BaseException as exc:
+        try:
+            shutdown_owned()
+        except BaseException as cleanup:
+            raise RuntimeError(f"gRPC startup failed: {exc}; resource cleanup failed: {cleanup}") from exc
+        raise
 
 
 class AetherGrpcClient:
@@ -280,4 +320,5 @@ __all__ = [
     "AetherGrpcService",
     "add_grpc_service",
     "start_grpc_server",
+    "shutdown_grpc_server",
 ]

@@ -18,6 +18,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -53,6 +54,11 @@ CUDA_KERNEL_SOURCE = r"""
 
 #define BLOCK_DIM 16
 #define WARP_SIZE 32
+#ifdef _WIN32
+#define AETHER_CUDA_EXPORT __declspec(dllexport)
+#else
+#define AETHER_CUDA_EXPORT
+#endif
 
 extern "C" {
 
@@ -426,26 +432,26 @@ __global__ void aether_cuda_argmax_kernel(
 }
 
 // C wrapper launch exports for ctypes
-int launch_rmsnorm(const float* x, const float* w, float* out, int rows, int cols, float eps, cudaStream_t stream) {
+AETHER_CUDA_EXPORT int launch_rmsnorm(const float* x, const float* w, float* out, int rows, int cols, float eps, cudaStream_t stream) {
     int threads = (cols < 256) ? cols : 256;
     aether_cuda_rmsnorm_kernel<<<rows, threads, 0, stream>>>(x, w, out, rows, cols, eps);
     return (int)cudaGetLastError();
 }
 
-int launch_swiglu(const float* x, const float* gate, float* out, size_t size, cudaStream_t stream) {
+AETHER_CUDA_EXPORT int launch_swiglu(const float* x, const float* gate, float* out, size_t size, cudaStream_t stream) {
     int threads = 256;
     int blocks = (size + threads - 1) / threads;
     aether_cuda_swiglu_kernel<<<blocks, threads, 0, stream>>>(x, gate, out, size);
     return (int)cudaGetLastError();
 }
 
-int launch_softmax(const float* x, float* out, int rows, int cols, cudaStream_t stream) {
+AETHER_CUDA_EXPORT int launch_softmax(const float* x, float* out, int rows, int cols, cudaStream_t stream) {
     int threads = (cols < 256) ? cols : 256;
     aether_cuda_softmax_kernel<<<rows, threads, 0, stream>>>(x, out, rows, cols);
     return (int)cudaGetLastError();
 }
 
-int launch_rope(float* qk, const float* cos_tbl, const float* sin_tbl, int num_heads, int seq_len, int head_dim, int pos_offset, cudaStream_t stream) {
+AETHER_CUDA_EXPORT int launch_rope(float* qk, const float* cos_tbl, const float* sin_tbl, int num_heads, int seq_len, int head_dim, int pos_offset, cudaStream_t stream) {
     int half_dim = head_dim / 2;
     int threads = (half_dim < 128) ? half_dim : 128;
     dim3 grid((half_dim + threads - 1) / threads, seq_len, num_heads);
@@ -453,14 +459,14 @@ int launch_rope(float* qk, const float* cos_tbl, const float* sin_tbl, int num_h
     return (int)cudaGetLastError();
 }
 
-int launch_sgemm(const float* A, const float* B, const float* bias, float* C, int M, int N, int K, cudaStream_t stream) {
+AETHER_CUDA_EXPORT int launch_sgemm(const float* A, const float* B, const float* bias, float* C, int M, int N, int K, cudaStream_t stream) {
     dim3 threads(BLOCK_DIM, BLOCK_DIM);
     dim3 grid((N + BLOCK_DIM - 1) / BLOCK_DIM, (M + BLOCK_DIM - 1) / BLOCK_DIM);
     aether_cuda_sgemm_kernel<<<grid, threads, 0, stream>>>(A, B, bias, C, M, N, K);
     return (int)cudaGetLastError();
 }
 
-int launch_flash_attention(
+AETHER_CUDA_EXPORT int launch_flash_attention(
     const float* Q, const float* K, const float* V, float* Out,
     int batch_size, int num_heads, int num_kv_heads, int seq_len, int kv_len, int head_dim, float scale, int is_causal,
     cudaStream_t stream
@@ -471,14 +477,14 @@ int launch_flash_attention(
     return (int)cudaGetLastError();
 }
 
-int launch_ternary_gemm(const float* A, const uint8_t* packed_w, const float* scales, float* C, int M, int N, int K, cudaStream_t stream) {
+AETHER_CUDA_EXPORT int launch_ternary_gemm(const float* A, const uint8_t* packed_w, const float* scales, float* C, int M, int N, int K, cudaStream_t stream) {
     dim3 threads(BLOCK_DIM, BLOCK_DIM);
     dim3 grid((N + BLOCK_DIM - 1) / BLOCK_DIM, (M + BLOCK_DIM - 1) / BLOCK_DIM);
     aether_cuda_ternary_gemm_kernel<<<grid, threads, 0, stream>>>(A, packed_w, scales, C, M, N, K);
     return (int)cudaGetLastError();
 }
 
-int launch_argmax(const float* logits, int64_t* out_idx, int vocab_size, cudaStream_t stream) {
+AETHER_CUDA_EXPORT int launch_argmax(const float* logits, int64_t* out_idx, int vocab_size, cudaStream_t stream) {
     int threads = (vocab_size < 1024) ? vocab_size : 1024;
     aether_cuda_argmax_kernel<<<1, threads, 0, stream>>>(logits, out_idx, vocab_size);
     return (int)cudaGetLastError();
@@ -492,6 +498,7 @@ int launch_argmax(const float* logits, int64_t* out_idx, int vocab_size, cudaStr
 # CUDA Compiler Toolchain Detection
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class CUDACompilerToolchain:
     """Detected host NVIDIA CUDA compiler (nvcc) and build flags."""
@@ -499,7 +506,9 @@ class CUDACompilerToolchain:
     name: str
     executable: str
     arch_flags: tuple[str, ...] = ("-arch=sm_80",)
-    shared_flags: tuple[str, ...] = ("--shared", "-Xcompiler", "-fPIC" if os.name != "nt" else "")
+    shared_flags: tuple[str, ...] = (
+        ("--shared",) if os.name == "nt" else ("--shared", "-Xcompiler", "-fPIC")
+    )
     output_flag: str = "-o"
 
     @property
@@ -518,29 +527,57 @@ class CUDACompilerToolchain:
         ]
 
 
-def detect_cuda_toolchain() -> CUDACompilerToolchain | None:
-    """Find installed nvcc compiler."""
-    nvcc = shutil.which("nvcc")
-    if nvcc is None:
-        # Check standard CUDA paths
-        cuda_paths = [
-            os.environ.get("CUDA_PATH", ""),
-            os.environ.get("CUDA_HOME", ""),
-            "/usr/local/cuda/bin/nvcc",
-            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\nvcc.exe",
-            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0\bin\nvcc.exe",
-        ]
-        for p in cuda_paths:
-            if p and Path(p).exists():
-                nvcc = str(Path(p) / "bin" / "nvcc.exe") if (Path(p) / "bin" / "nvcc.exe").exists() else p
-                break
+def detect_cuda_toolchain(target_id: str = "cuda_sm80") -> CUDACompilerToolchain | None:
+    """Find a working nvcc executable and compile for the requested baseline SM.
 
-    if nvcc and Path(nvcc).exists():
+    CUDA_PATH/CUDA_HOME may name a toolkit root, bin directory, or executable.
+    An existing directory is never mistaken for an executable, and a broken
+    first candidate does not prevent checking the remaining installations.
+    """
+    target = re.fullmatch(r"cuda_sm(\d+)(?:_(?:tee|gb300))?", target_id)
+    if target is None:
+        raise ValueError(f"unsupported native CUDA target {target_id!r}")
+    arch_flags = (f"-arch=sm_{target.group(1)}",)
+    candidates: list[Path] = []
+    path_nvcc = shutil.which("nvcc")
+    if path_nvcc:
+        candidates.append(Path(path_nvcc))
+    roots = [
+        os.environ.get("CUDA_PATH", ""),
+        os.environ.get("CUDA_HOME", ""),
+        *(value for name, value in os.environ.items() if name.startswith("CUDA_PATH_")),
+    ]
+    standard_roots = (
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        / "NVIDIA GPU Computing Toolkit"
+        / "CUDA"
+        if os.name == "nt"
+        else Path("/usr/local")
+    )
+    if standard_roots.is_dir():
+        pattern = "v*" if os.name == "nt" else "cuda*"
+        installations = sorted(
+            standard_roots.glob(pattern),
+            key=lambda path: tuple(int(part) for part in re.findall(r"\d+", path.name)),
+            reverse=True,
+        )
+        roots.extend(str(path) for path in installations)
+    executable = "nvcc.exe" if os.name == "nt" else "nvcc"
+    for value in roots:
+        if value:
+            root = Path(value)
+            candidates.extend((root, root / executable, root / "bin" / executable))
+    seen: set[str] = set()
+    for candidate in candidates:
+        nvcc = str(candidate)
+        if nvcc in seen or not candidate.is_file():
+            continue
+        seen.add(nvcc)
         try:
             res = subprocess.run([nvcc, "--version"], capture_output=True, text=True, timeout=5)
             if res.returncode == 0:
                 logger.debug(f"Detected CUDA nvcc toolchain at {nvcc}")
-                return CUDACompilerToolchain(name="nvcc", executable=nvcc)
+                return CUDACompilerToolchain(name="nvcc", executable=nvcc, arch_flags=arch_flags)
         except Exception:
             pass
     return None
@@ -550,6 +587,7 @@ def detect_cuda_toolchain() -> CUDACompilerToolchain | None:
 # Native CUDA Kernels Class
 # ---------------------------------------------------------------------------
 
+
 class NativeCUDAKernels:
     """
     Native NVIDIA CUDA kernel loader, memory manager, and execution engine.
@@ -557,7 +595,7 @@ class NativeCUDAKernels:
 
     def __init__(self, target_id: str = "cuda_sm80") -> None:
         self.target_id = target_id
-        self._toolchain = detect_cuda_toolchain()
+        self._toolchain = detect_cuda_toolchain(target_id)
         self._library: ctypes.CDLL | None = None
         self._library_path: Path | None = None
         self._compiled = False
@@ -567,32 +605,26 @@ class NativeCUDAKernels:
     def _probe_cuda_device(self) -> bool:
         """Check if CUDA device and driver are actually present on this machine."""
         try:
-            # Check CUDA driver via ctypes
-            libname = "nvcuda.dll" if os.name == "nt" else "libcuda.so"
-            cuda_driver = ctypes.CDLL(libname)
-            init_fn = getattr(cuda_driver, "cuInit", None)
-            if init_fn:
-                res = init_fn(0)
-                if res == 0:
-                    count = ctypes.c_int()
-                    if cuda_driver.cuDeviceGetCount(ctypes.byref(count)) == 0 and count.value > 0:
-                        return True
-        except Exception:
-            pass
+            from aether.backends.hardware_detector import detect_cuda_devices
 
-        # Check via torch if available
-        try:
-            import torch
-            if torch.cuda.is_available():
-                return True
+            # PyTorch HIP also exposes torch.cuda; it cannot establish the
+            # presence of a NVIDIA device for this native CUDA compiler.
+            return any(cap.available for cap in detect_cuda_devices())
         except Exception:
-            pass
-
-        return False
+            return False
 
     @property
     def is_available(self) -> bool:
+        """Whether a usable CUDA device/driver was detected, without execution."""
         return self._device_available
+
+    @property
+    def compiled(self) -> bool:
+        return self._compiled
+
+    @property
+    def build_error(self) -> str | None:
+        return self._build_error
 
     def available_kernels(self) -> list[str]:
         return [
@@ -608,6 +640,8 @@ class NativeCUDAKernels:
 
     def compile(self, force: bool = False) -> bool:
         """Compile CUDA kernels to a native shared library."""
+        self._compiled = False
+        self._build_error = None
         if not self._toolchain:
             self._build_error = "nvcc compiler not found on this system"
             return False
@@ -616,7 +650,10 @@ class NativeCUDAKernels:
             self._build_error = "No NVIDIA CUDA GPU hardware detected on this host"
             return False
 
-        source_hash = hashlib.sha256(CUDA_KERNEL_SOURCE.encode()).hexdigest()[:16]
+        build_input = CUDA_KERNEL_SOURCE + repr(
+            (self._toolchain.arch_flags, self._toolchain.shared_flags)
+        )
+        source_hash = hashlib.sha256(build_input.encode()).hexdigest()[:16]
         cache_dir = Path(tempfile.gettempdir()) / "aether_cuda_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         dll_name = f"aether_cuda_{self.target_id}_{source_hash}{self._toolchain.library_suffix}"
@@ -653,6 +690,7 @@ class NativeCUDAKernels:
 
 
 _GLOBAL_CUDA_KERNELS: NativeCUDAKernels | None = None
+
 
 def get_native_cuda_kernels(target_id: str = "cuda_sm80") -> NativeCUDAKernels:
     global _GLOBAL_CUDA_KERNELS

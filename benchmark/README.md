@@ -1,5 +1,12 @@
 # Aether Runtime vs Hugging Face Transformers — Benchmark
 
+For the **MacBook / Aether vs ONNX Runtime / Qwen3-8B only** workflow,
+use [`docs/benchmark-macbook.md`](../docs/benchmark-macbook.md). It includes source
+build commands, model preparation, isolated batch/token sweeps, and HTML/Markdown,
+CSV/JSON and graph generation via `python -m benchmark.macbook`. The runbook
+documents why the current Aether 8B CPU path cannot fit approximately 16 GB RAM,
+and why true batches above 1 are explicitly marked unsupported.
+
 > **Two benchmarks live here.** This document describes the controlled two-runtime
 > A/B (`python benchmark/run_benchmark.py`), which measures Aether against
 > Transformers in one process with execution order alternated per cell. The

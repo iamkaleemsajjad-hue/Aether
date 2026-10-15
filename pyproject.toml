@@ -95,6 +95,7 @@ pytorch = [
 transformers-frontend = [
     "torch>=2.5.0",
     "transformers>=4.48.0",
+    "accelerate>=0.30.0",
     "tokenizers>=0.19.0",
     "sentencepiece>=0.2.0",
 ]
@@ -132,6 +133,7 @@ trtllm = [
 ]
 mlx = [
     "mlx>=0.16.0; sys_platform == 'darwin'",
+    "mlx-lm>=0.21.0; sys_platform == 'darwin'",
 ]
 onnxruntime = [
     # IMPORTANT: onnxruntime (CPU build) and onnxruntime-gpu CANNOT coexist.
@@ -145,6 +147,12 @@ onnxruntime = [
     # If onnxruntime is already installed on a Linux host, uninstall it first.
     "onnxruntime>=1.18.0; sys_platform != 'linux'",
     "onnxruntime-gpu>=1.18.0; sys_platform == 'linux'",
+]
+directml = [
+    # Install in a separate Windows environment from the CPU/CUDA ORT wheels:
+    # these distributions provide the same onnxruntime import package.
+    "onnxruntime-directml>=1.18.0; sys_platform == 'win32'",
+    "onnx>=1.16.0",
 ]
 triton = [
     "triton>=2.3.0; sys_platform == 'linux'",
@@ -165,6 +173,10 @@ test = [
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=5.0.0",
     "pytest-xdist>=3.6.0",
+    "pytest-timeout>=2.3.0",
+    "fastapi>=0.115.6",
+    "uvicorn>=0.30.0",
+    "matplotlib>=3.7.0",
     "responses>=0.25.0",
     "requests>=2.32.0",
     "openai>=1.35.0",

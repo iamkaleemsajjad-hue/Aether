@@ -17,7 +17,7 @@ Implemented merging methods:
    Reduces interference between task vectors.  Default p=0.9 (90% dropout).
 
 3. **TIES-Merging** (Yadav et al., NeurIPS 2023):
-   Trim small deltas, Elect sign by majority vote, merge only consistent signs.
+   Trim small deltas, elect sign by weighted magnitude, merge consistent signs.
    Resolves sign conflicts that cause interference.
 
 4. **FREE-Merging** (2026):
@@ -102,13 +102,18 @@ class ModelMergingPass(BasePass):
 
         method = config.model_merging_method
         if method not in _SUPPORTED_MERGING_METHODS:
-            logger.warning("Pass 12: Unknown merging method %r. Using task_arithmetic.", method)
-            method = "task_arithmetic"
+            report.status = "failed"
+            report.details["error"] = f"Unsupported model merge method: {method}"
+            return graph, report
 
         try:
             # Determine coefficients.
             coefficients = list(config.model_merging_coefficients)
-            if len(coefficients) != len(sources):
+            if coefficients and len(coefficients) != len(sources):
+                raise ValueError("Provide one coefficient per requested merging source")
+            if not all(math.isfinite(value) for value in coefficients):
+                raise ValueError("Merge coefficients must be finite")
+            if not coefficients:
                 # Default: uniform 1/N scaling.
                 coefficients = [1.0 / len(sources)] * len(sources)
                 logger.info(
@@ -141,17 +146,13 @@ class ModelMergingPass(BasePass):
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("  Failed to load source %r: %s. Skipping.", src_path, exc)
 
-            if not source_weights_list:
-                report.status = "skipped"
-                report.details["reason"] = "all_sources_failed_to_load"
-                return graph, report
+            if len(source_weights_list) != len(sources):
+                raise ValueError("Every requested merge source must load; partial merges are not allowed")
 
             # Compute task vectors.
             task_vectors = _compute_task_vectors(base_weights, source_weights_list)
-            if not any(task_vectors):
-                report.status = "skipped"
-                report.details["reason"] = "sources_have_no_overlapping_tensors"
-                return graph, report
+            if any(not vector for vector in task_vectors):
+                raise ValueError("Every merge source must contain at least one matching base tensor")
             logger.info("Pass 12: Computed %d task vectors.", len(task_vectors))
 
             # Apply merging method.
@@ -166,7 +167,11 @@ class ModelMergingPass(BasePass):
             merged_weights = _apply_delta(base_weights, merged_delta)
 
             # Write merged weights into graph.
-            n_updated = _update_graph_weights(graph, merged_weights)
+            n_updated = _update_graph_weights(
+                graph, {name: merged_weights[name] for name in merged_delta}
+            )
+            if n_updated <= 0:
+                raise ValueError("Model merging did not update any graph weights")
 
             # Write merge manifest.
             if hasattr(graph, "output_dir") and graph.output_dir is not None:
@@ -176,10 +181,7 @@ class ModelMergingPass(BasePass):
                     sources=sources,
                     method=method,
                     coefficients=coefficients,
-                    n_params=sum(
-                        math.prod(v) if isinstance(v, list) else len(v)
-                        for v in merged_delta.values()
-                    ),
+                    n_params=sum(len(v) for v in merged_delta.values()),
                 )
 
             elapsed = time.perf_counter() - start
@@ -188,10 +190,14 @@ class ModelMergingPass(BasePass):
             report.details = {
                 "method": method,
                 "n_sources": len(source_weights_list),
+                "sources": list(sources),
                 "coefficients": coefficients,
                 "n_tensors_updated": n_updated,
                 "task_vector_keys": list(merged_delta.keys())[:20],
+                "quality_validated": False,
             }
+            if hasattr(graph, "set_metadata"):
+                graph.set_metadata("model_merging", dict(report.details))
             logger.info(
                 "Pass 12 complete: %d tensors merged via %s in %.3fs.",
                 n_updated,
@@ -208,6 +214,106 @@ class ModelMergingPass(BasePass):
 
 
 # ── Task vector arithmetic ────────────────────────────────────────────────────
+
+
+_PARAMETER_ATTRIBUTES = {
+    "weight": "", "up_weight": "_up", "bias": "_bias",
+    "q_weight": "_q", "k_weight": "_k", "v_weight": "_v",
+    "q_bias": "_q_bias", "k_bias": "_k_bias", "v_bias": "_v_bias",
+}
+
+
+def _graph_parameter_slots(graph: Any):
+    """Visit the same real projection/scale/bias arrays consumed by packing."""
+    nodes = graph.nodes.values() if hasattr(graph.nodes, "values") else graph.nodes
+    for node in nodes:
+        attributes = getattr(node, "attributes", {})
+        if not isinstance(attributes, dict):
+            continue
+        for attribute, suffix in _PARAMETER_ATTRIBUTES.items():
+            if attributes.get(attribute) is not None:
+                yield f"{node.id}{suffix}", node, attribute
+
+
+def _load_source_graph_weights(source_path: str, base_graph: Any) -> dict[str, list[float]]:
+    """Reuse ingestion's architecture/layout binding before comparing shapes.
+
+    Keeping shaped arrays until this comparison prevents equal-sized transposed
+    or reshaped tensors from being treated as the same parameter coordinates.
+    A source may contain a matching subset; unrelated coordinates are omitted.
+    """
+    import numpy as np
+    from aether.compiler.stage1_ingestion.ingestion import IngestionPipeline
+
+    source = IngestionPipeline().ingest(source_path, base_graph.architecture)
+    expected = {
+        name: np.asarray(node.attributes[attribute]).shape
+        for name, node, attribute in _graph_parameter_slots(base_graph)
+    }
+    result = {}
+    for name, node, attribute in _graph_parameter_slots(source):
+        if name not in expected:
+            continue
+        tensor = np.asarray(node.attributes[attribute], dtype=np.float32)
+        if tensor.shape != expected[name]:
+            raise ValueError(f"Merge tensor {name!r} shape {tensor.shape} differs from base {expected[name]}")
+        result[name] = tensor.reshape(-1).tolist()
+    return result
+
+
+def _source_graph_store_arrays(graph: Any) -> dict[str, Any]:
+    """Use weight-packing coordinates without low-precision source rounding."""
+    import numpy as np
+    from aether.compiler.weight_quantizer import GraphWeightQuantizer
+    from aether.quantization.formats import dequantize_tensor
+
+    packer = GraphWeightQuantizer(default_precision="FP32")
+    result = {}
+    for node in graph.nodes.values():
+        attributes = node.attributes
+        weight = packer._extract_weight(node)
+        if weight is None:
+            continue
+        if node.op_type == "qkv_proj" or node.id.endswith("_qkv"):
+            split = packer._split_qkv(node, weight, "FP32", node.layer_index)
+            result.update({name: dequantize_tensor(tensor) for name, tensor in split.items()})
+            for projection in ("q", "k", "v"):
+                bias = attributes.get(f"{projection}_bias")
+                if bias is not None:
+                    result[f"layer_{node.layer_index}_{projection}_proj_bias"] = np.asarray(bias, dtype=np.float32)
+        else:
+            name = packer._weight_name(node.id, node.op_type, node.layer_index)
+            if name is None:
+                continue
+            result[name] = np.asarray(weight, dtype=np.float32)
+            if attributes.get("bias") is not None:
+                result[f"{name}_bias"] = np.asarray(attributes["bias"], dtype=np.float32)
+            if attributes.get("up_weight") is not None and node.id.endswith("_gate_proj"):
+                result[f"layer_{node.layer_index}_up_proj"] = np.asarray(attributes["up_weight"], dtype=np.float32)
+    return result
+
+
+def _finish_source_tensors(tensors: dict[str, Any], base_graph: Any, source_path: str) -> dict[str, list[float]]:
+    """Preserve exact source shapes when aligning to an AEG weight index."""
+    import numpy as np
+
+    if callable(getattr(base_graph, "weight_store", None)) and getattr(base_graph, "manifest", None) is not None:
+        entries = base_graph.weight_store().entries
+        if tensors and not any(name in entries for name in tensors):
+            from aether.compiler.stage1_ingestion.ingestion import IngestionPipeline
+
+            graph = IngestionPipeline().ingest(source_path, base_graph.manifest.architecture)
+            tensors = _source_graph_store_arrays(graph)
+        result = {}
+        for name, value in tensors.items():
+            if name not in entries:
+                continue
+            array = np.asarray(value, dtype=np.float32)
+            if array.shape != entries[name].shape:
+                raise ValueError(f"Merge tensor {name!r} shape {array.shape} differs from base {entries[name].shape}")
+            result[name] = array.reshape(-1).tolist()
+        return result
+    return {name: np.asarray(value, dtype=np.float32).reshape(-1).tolist() for name, value in tensors.items()}
 
 
 def _extract_weights(graph: Any, role: str = "base") -> dict[str, list[float]]:
@@ -230,19 +336,9 @@ def _extract_weights(graph: Any, role: str = "base") -> dict[str, list[float]]:
             for name, tensor in store.items():
                 weights[name] = list(tensor) if hasattr(tensor, "__iter__") else [float(tensor)]
     elif hasattr(graph, "nodes"):
-        nodes = graph.nodes.values() if hasattr(graph.nodes, "values") else graph.nodes
-        for node in nodes:
-            node_id = str(getattr(node, "id", "weight"))
-            attributes = getattr(node, "attributes", {})
-            if isinstance(attributes, dict):
-                for key in ("weight", "up_weight"):
-                    val = attributes.get(key)
-                    if val is not None:
-                        k = node_id if key == "weight" else f"{node_id}_up"
-                        if hasattr(val, "tolist"):
-                            weights[k] = val.reshape(-1).tolist()
-                        elif isinstance(val, (list, tuple)):
-                            weights[k] = list(val)
+        import numpy as np
+        for name, node, attribute in _graph_parameter_slots(graph):
+            weights[name] = np.asarray(node.attributes[attribute], dtype=np.float32).reshape(-1).tolist()
     elif isinstance(graph, dict):
         for name, val in graph.items():
             if isinstance(val, (list, tuple)):
@@ -271,35 +367,28 @@ def _load_source_weights(source_path: str, base_graph: Any) -> dict[str, list[fl
             from aether.core.aeg_format import AEGPackage
 
             package = AEGPackage(p).load()
+            package.verify_integrity()
             if not package.has_weights:
                 return {}
-            return {
-                name: tensor.reshape(-1).astype("float32").tolist()
-                for name, tensor in package.weight_store().dequantize_all().items()
-            }
+            return _finish_source_tensors(package.weight_store().dequantize_all(), base_graph, source_path)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("AEG source load failed: %s", exc)
-            return {}
+            raise ValueError(f"AEG merge source {source_path!r} failed integrity/load validation: {exc}") from exc
+
+    if hasattr(base_graph, "nodes") and getattr(base_graph, "architecture", None) is not None:
+        # Checkpoint names/layouts follow the ordinary compilation contract,
+        # including shards, QKV packing and GPT Conv1D layout conversion.
+        return _load_source_graph_weights(source_path, base_graph)
 
     # Try safetensors with numpy (Torch-independent).
-    if p.suffix == ".safetensors" or (p.is_dir() and (p / "model.safetensors").exists()):
-        sf_path = p if p.suffix == ".safetensors" else p / "model.safetensors"
+    if p.suffix == ".safetensors" or (p.is_dir() and any(p.glob("*.safetensors"))):
         try:
-            from safetensors import safe_open
+            from aether.compiler.stage1_ingestion.safetensors_loader import SafeTensorsLoader
 
-            tensors_dict: dict[str, list[float]] = {}
-            with safe_open(str(sf_path), framework="numpy", device="cpu") as f:
-                for k in f.keys():
-                    tensors_dict[k] = f.get_tensor(k).astype(np.float32).reshape(-1).tolist()
-            return tensors_dict
-        except Exception:
-            try:
-                import safetensors.torch as st  # type: ignore[import]
-
-                tensors = st.load_file(str(sf_path))
-                return {k: v.float().reshape(-1).tolist() for k, v in tensors.items()}
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("safetensors load failed: %s", exc)
+            tensors = SafeTensorsLoader(p).load()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("safetensors load failed: %s", exc)
+        else:
+            return _finish_source_tensors(tensors, base_graph, source_path)
 
     # Try GGUF.
     if p.suffix.lower() in (".gguf", ".ggml") or (p.is_dir() and list(p.glob("*.gguf"))):
@@ -308,10 +397,7 @@ def _load_source_weights(source_path: str, base_graph: Any) -> dict[str, list[fl
             from aether.compiler.stage1_ingestion.gguf_loader import GGUFReader
 
             reader = GGUFReader(gguf_path)
-            return {
-                name: reader.dequantize(name).reshape(-1).tolist()
-                for name in reader.tensors
-            }
+            return _finish_source_tensors({name: reader.dequantize(name) for name in reader.tensors}, base_graph, source_path)
         except Exception as exc:  # noqa: BLE001
             logger.debug("GGUF source load failed: %s", exc)
 
@@ -328,7 +414,7 @@ def _load_source_weights(source_path: str, base_graph: Any) -> dict[str, list[fl
                 "support; upgrade PyTorch or provide safetensors inputs"
             )
         if isinstance(sd, dict):
-            return {k: v.float().reshape(-1).tolist() for k, v in sd.items() if hasattr(v, "float")}
+            return _finish_source_tensors({k: v.float().numpy() for k, v in sd.items() if hasattr(v, "float")}, base_graph, source_path)
     except ImportError:
         pass
     except Exception as exc:  # noqa: BLE001
@@ -349,9 +435,11 @@ def _compute_task_vectors(
             if name in src_weights:
                 base_vals = base_weights[name]
                 src_vals = src_weights[name]
-                # Element-wise subtraction; handle size mismatches gracefully.
-                min_len = min(len(base_vals), len(src_vals))
-                delta[name] = [src_vals[i] - base_vals[i] for i in range(min_len)]
+                if len(base_vals) != len(src_vals):
+                    raise ValueError(f"Merge tensor {name!r} has mismatched element counts")
+                if not all(math.isfinite(value) for value in base_vals) or not all(math.isfinite(value) for value in src_vals):
+                    raise ValueError(f"Merge tensor {name!r} must contain finite coordinates")
+                delta[name] = [src_vals[i] - base_vals[i] for i in range(len(base_vals))]
         task_vectors.append(delta)
     return task_vectors
 
@@ -365,8 +453,12 @@ def _apply_delta(
     for name, delta_vals in merged_delta.items():
         if name in merged:
             base_vals = merged[name]
-            min_len = min(len(base_vals), len(delta_vals))
-            merged[name] = [base_vals[i] + delta_vals[i] for i in range(min_len)]
+            if len(base_vals) != len(delta_vals):
+                raise ValueError(f"Merge delta {name!r} has mismatched element counts")
+            result = [base_vals[i] + delta_vals[i] for i in range(len(base_vals))]
+            if not all(math.isfinite(value) for value in result):
+                raise ValueError(f"Merge tensor {name!r} overflowed or contains nonfinite coordinates")
+            merged[name] = result
     return merged
 
 
@@ -377,34 +469,17 @@ def _update_graph_weights(graph: Any, merged_weights: dict[str, list[float]]) ->
         graph.weight_store.update(merged_weights)
         n_updated = len(merged_weights)
     elif hasattr(graph, "nodes"):
-        nodes = graph.nodes.values() if hasattr(graph.nodes, "values") else graph.nodes
         import numpy as np
-
-        for node in nodes:
-            node_id = str(getattr(node, "id", "weight"))
-            attributes = getattr(node, "attributes", {})
-            if isinstance(attributes, dict):
-                if node_id in merged_weights and "weight" in attributes:
-                    orig = attributes["weight"]
-                    arr = np.asarray(merged_weights[node_id], dtype=np.float32)
-                    if hasattr(orig, "shape"):
-                        arr = arr.reshape(orig.shape)
-                    if hasattr(node, "add_attribute"):
-                        node.add_attribute("weight", arr)
-                    else:
-                        attributes["weight"] = arr
-                    n_updated += 1
-                up_key = f"{node_id}_up"
-                if up_key in merged_weights and "up_weight" in attributes:
-                    orig = attributes["up_weight"]
-                    arr = np.asarray(merged_weights[up_key], dtype=np.float32)
-                    if hasattr(orig, "shape"):
-                        arr = arr.reshape(orig.shape)
-                    if hasattr(node, "add_attribute"):
-                        node.add_attribute("up_weight", arr)
-                    else:
-                        attributes["up_weight"] = arr
-                    n_updated += 1
+        for name, node, attribute in _graph_parameter_slots(graph):
+            if name not in merged_weights:
+                continue
+            original = np.asarray(node.attributes[attribute])
+            array = np.asarray(merged_weights[name], dtype=np.float32).reshape(original.shape)
+            if hasattr(node, "add_attribute"):
+                node.add_attribute(attribute, array)
+            else:
+                node.attributes[attribute] = array
+            n_updated += 1
     elif hasattr(graph, "parameters") and callable(graph.parameters):
         try:
             import torch  # type: ignore[import]
@@ -429,6 +504,33 @@ def _update_graph_weights(graph: Any, merged_weights: dict[str, list[float]]) ->
 # ── Merging method implementations ────────────────────────────────────────────
 
 
+def _validate_task_vector_inputs(
+    task_vectors: list[dict[str, list[float]]],
+    coefficients: list[float],
+    *,
+    nonnegative: bool = False,
+) -> None:
+    """Validate coordinates before arithmetic, including partial adapter keys.
+
+    Sources may target different subsets of base parameters. For each shared
+    key, however, every supplied coordinate list must have the same length.
+    """
+    if len(coefficients) != len(task_vectors):
+        raise ValueError("Provide one coefficient per task vector")
+    if not all(math.isfinite(value) for value in coefficients):
+        raise ValueError("Merge coefficients must be finite")
+    if nonnegative and any(value < 0 for value in coefficients):
+        raise ValueError("TIES disjoint-mean coefficients must be nonnegative")
+    lengths: dict[str, int] = {}
+    for vector in task_vectors:
+        for name, values in vector.items():
+            if not values or not all(math.isfinite(value) for value in values):
+                raise ValueError(f"Merge tensor {name!r} must contain finite coordinates")
+            if name in lengths and lengths[name] != len(values):
+                raise ValueError(f"Merge tensor {name!r} has mismatched element counts")
+            lengths[name] = len(values)
+
+
 class _BaseMerger:
     """Abstract base for merging algorithms."""
 
@@ -445,6 +547,7 @@ class _TaskArithmeticMerger(_BaseMerger):
     """Task Arithmetic: θ_merged = θ_base + Σᵢ λᵢ · δθᵢ."""
 
     def merge(self, task_vectors, coefficients, config):
+        _validate_task_vector_inputs(task_vectors, coefficients)
         if not task_vectors:
             return {}
         all_keys = set().union(*[set(tv.keys()) for tv in task_vectors])
@@ -458,11 +561,13 @@ class _TaskArithmeticMerger(_BaseMerger):
             ]
             if not key_deltas:
                 continue
-            length = min(len(d) for _, d in key_deltas)
+            length = len(key_deltas[0][1])
             result = [0.0] * length
             for lam, delta in key_deltas:
                 for j in range(length):
                     result[j] += lam * delta[j]
+            if not all(math.isfinite(value) for value in result):
+                raise ValueError(f"Merge tensor {key!r} overflowed")
             merged[key] = result
         return merged
 
@@ -471,12 +576,15 @@ class _DAREMerger(_BaseMerger):
     """DARE (Drop And REscale): randomly zero-out p% of each δθᵢ, rescale by 1/(1-p)."""
 
     def __init__(self, drop_prob: float = _DARE_DEFAULT_DROP_PROB, seed: int = 42) -> None:
+        if not math.isfinite(drop_prob) or not 0 <= drop_prob < 1:
+            raise ValueError("DARE drop probability must be finite and in [0, 1)")
         self.drop_prob = drop_prob
         self.seed = seed
 
     def merge(self, task_vectors, coefficients, config):
+        _validate_task_vector_inputs(task_vectors, coefficients)
         rng = random.Random(self.seed)
-        rescale = 1.0 / (1.0 - self.drop_prob) if self.drop_prob < 1.0 else 1.0
+        rescale = 1.0 / (1.0 - self.drop_prob)
         # Apply drop-and-rescale to each task vector.
         sparsified = []
         for tv in task_vectors:
@@ -496,6 +604,7 @@ class _TIESMerger(_BaseMerger):
     """TIES-Merging: Trim→Elect→Merge with sign conflict resolution."""
 
     def merge(self, task_vectors, coefficients, config):
+        _validate_task_vector_inputs(task_vectors, coefficients, nonnegative=True)
         if not task_vectors:
             return {}
         all_keys = set().union(*[set(tv.keys()) for tv in task_vectors])
@@ -505,24 +614,23 @@ class _TIESMerger(_BaseMerger):
             key_deltas = [(coefficients[i], tv[key]) for i, tv in enumerate(task_vectors) if key in tv]
             if not key_deltas:
                 continue
-            length = min(len(d) for _, d in key_deltas)
+            length = len(key_deltas[0][1])
 
             # STEP 1: Trim — zero out small magnitudes below TIES_TRIM_FRACTION.
             trimmed = []
             for lam, delta in key_deltas:
-                vals = delta[:length]
+                vals = delta
                 threshold = sorted([abs(v) for v in vals], reverse=True)[
-                    max(0, int(len(vals) * _TIES_TRIM_FRACTION) - 1)
+                    max(0, math.ceil(len(vals) * _TIES_TRIM_FRACTION) - 1)
                 ] if vals else 0.0
                 trimmed_vals = [v if abs(v) >= threshold else 0.0 for v in vals]
                 trimmed.append((lam, trimmed_vals))
 
-            # STEP 2: Elect — majority vote on sign per element.
+            # STEP 2: Elect by weighted signed magnitude per element.
             result = [0.0] * length
             for j in range(length):
-                pos = sum(1 for _, v in trimmed if len(v) > j and v[j] > 0)
-                neg = sum(1 for _, v in trimmed if len(v) > j and v[j] < 0)
-                elected_sign = 1 if pos >= neg else -1
+                magnitude = sum(lam * v[j] for lam, v in trimmed if len(v) > j)
+                elected_sign = math.copysign(1, magnitude) if magnitude else 0
 
                 # STEP 3: Merge only consistent-sign contributions.
                 total_w = 0.0
@@ -534,6 +642,8 @@ class _TIESMerger(_BaseMerger):
                 result[j] = total_v / total_w if total_w > 0 else 0.0
 
             merged[key] = result
+            if not all(math.isfinite(value) for value in result):
+                raise ValueError(f"Merge tensor {key!r} overflowed")
         return merged
 
 
@@ -603,14 +713,17 @@ class _ModelSoupMerger(_BaseMerger):
 
 def _get_merger(method: str) -> _BaseMerger:
     """Return the appropriate merger instance for the given method name."""
-    return {
+    methods = {
         "task_arithmetic": _TaskArithmeticMerger(),
         "dare": _DAREMerger(),
         "ties": _TIESMerger(),
         "free": _FREEMerger(),
         "evolutionary": _FREEMerger(n_iterations=200, sigma=0.05),  # heavier FREE
         "soup": _ModelSoupMerger(),
-    }.get(method, _TaskArithmeticMerger())
+    }
+    if method not in methods:
+        raise ValueError(f"Unsupported model merge method: {method}")
+    return methods[method]
 
 
 # ── AEG blob writer ───────────────────────────────────────────────────────────

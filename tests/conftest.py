@@ -145,7 +145,6 @@ def tiny_local_safetensors_model(tmp_path: Path) -> Path:
     """Write a real, offline, tokenizer-backed tiny Llama checkpoint."""
     safetensors = pytest.importorskip("safetensors.numpy")
     tokenizers = pytest.importorskip("tokenizers")
-    transformers = pytest.importorskip("transformers")
     path = tmp_path / "tiny-llama"
     path.mkdir()
     vocab_size, hidden, intermediate = 32, 16, 32
@@ -178,7 +177,13 @@ def tiny_local_safetensors_model(tmp_path: Path) -> Path:
     tokenizer = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocab=vocab, unk_token="<unk>"))
     tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
     tokenizer.save(str(path / "tokenizer.json"))
-    transformers.PreTrainedTokenizerFast(tokenizer_file=str(path / "tokenizer.json"), unk_token="<unk>").save_pretrained(str(path))
+    (path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": "PreTrainedTokenizerFast", "unk_token": "<unk>",
+        "model_max_length": 128,
+    }), encoding="utf-8")
+    (path / "special_tokens_map.json").write_text(
+        json.dumps({"unk_token": "<unk>"}), encoding="utf-8",
+    )
     return path
 
 

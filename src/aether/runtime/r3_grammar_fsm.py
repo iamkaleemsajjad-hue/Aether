@@ -228,6 +228,13 @@ class _FSMSession:
         self._current_state = self._fsa.initial_state
         self._step_count = 0
 
+    def clone(self) -> _FSMSession:
+        """Fork proposal state while sharing the immutable FSA and isolating counters."""
+        cloned = _FSMSession(self._fsa, _FSMStats())
+        cloned._current_state = self._current_state
+        cloned._step_count = self._step_count
+        return cloned
+
     def get_token_mask(self) -> bytearray:
         """Return the bitmask of valid next tokens for the current FSA state.
 

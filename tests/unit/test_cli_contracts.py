@@ -145,6 +145,9 @@ def test_eval_accepts_local_dataset_mapping(monkeypatch, tmp_path) -> None:
         def __init__(self, config) -> None:
             self.config = config
 
+        def close(self):
+            pass
+
         def generate(self, model, prompt, *, max_tokens, temperature):
             return SimpleNamespace(text="B")
 

@@ -39,7 +39,7 @@ changed.**
   (`is_static()` returns `all(d is not None for d in self.dims)`).
 - The compiler declares `kernels.portable_backends = ["aether_cpu", "pytorch"]`
   (`compiler.py:1347`). Both are **eager tensor interpreters**: they materialize
-  authenticated weights and evaluate the transformer equations op by op. Neither
+  integrity-checked weights and evaluate the transformer equations op by op. Neither
   executes a shape-specialized compiled kernel emitted at compile time.
 
 Consequences, and they are the load-bearing decisions of this ADR:
@@ -228,7 +228,7 @@ This is true of every batched runtime, Transformers included. Greedy decoding
   `tests/unit/test_batched_inference.py` is the single-device batched executor.
 - The NumPy CPU executor keeps its sequence-major kernels; they remain the faster
   path for one sequence, and single-sequence CPU requests are unchanged. A batched
-  request on a CPU host is served by promoting the same authenticated weights onto
+  request on a CPU host is served by promoting the same integrity-checked weights onto
   the portable tensor executor at `device="cpu"` — same artifact, same equations,
   different kernel provider. `aether.backends.batched_generation` does this lazily,
   at most once per loaded handle, and only when a batch is actually asked for,

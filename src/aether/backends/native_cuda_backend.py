@@ -1,23 +1,22 @@
 """
-Native CUDA execution backend for compiled AEG artifacts.
+Development native CUDA engine and readiness gate for compiled AEG artifacts.
 
-This backend uses the JIT-compiled CUDA kernels from
-:mod:`aether.kernels.native_cuda` to run a transformer forward pass
-entirely via the CUDA Driver API, without requiring PyTorch.
+The retained engine below describes the intended framework-free CUDA execution
+path. Its required memory/operator interface is currently incomplete, so the
+backend reports unavailable with an explicit reason. Standalone CUDA source/JIT
+compilation remains accessible in :mod:`aether.kernels.native_cuda`. Current
+AEG accelerator execution uses the optional, matching PyTorch CUDA runtime.
 
 Design
 ------
-* **No PyTorch required.** All tensor math is performed by Aether's own
-  CUDA kernels, loaded at runtime via ctypes.  PyTorch is never imported.
-* **GPU memory managed by Aether.** Weights are uploaded to device memory
-  using ``cudaMalloc``/``cudaMemcpy`` called through ctypes.  The runtime
-  owns these allocations for the lifetime of the engine.
-* **CPU fallback.** If no CUDA toolkit is detected (no nvcc, or the GPU is
-  absent), the backend refuses to load, and the registry falls back to the
-  next available backend (NativeCPU, TorchBackend, etc.).
+* The intended math and device allocation interface uses Aether's CUDA kernels
+  through ctypes and does not require a PyTorch frontend.
+* Readiness requires the entire interface, successful compilation, and a usable
+  CUDA device/driver. Each missing requirement is reported without execution
+  or production validation claims.
 
-Call graph
-----------
+Intended call graph (not yet executable)
+--------------------------------------
     NativeCUDABackend.generate()
         → AetherCUDAEngine.generate_with_cache()
             → AetherCUDAEngine.forward()
@@ -30,11 +29,9 @@ Call graph
 
 GPU validation
 --------------
-This module is written for future GPU execution.  Tests marked
-``@pytest.mark.gpu`` in ``tests/gpu/`` verify correct output on CUDA
-hardware once available.  On CPU-only machines the module imports cleanly
-but ``is_available()`` returns False and ``load_model()`` raises
-``BackendError``.
+Readiness regression tests verify fail-closed behavior. They do not provide
+physical GPU execution evidence. Completing this interface still requires real
+GPU numerical and model tests before native CUDA inference can be validated.
 """
 
 from __future__ import annotations
@@ -48,6 +45,7 @@ from typing import Any
 import numpy as np
 
 from aether.backends.base import Backend, BackendInfo, GenerationRequest, GenerationResult
+from aether.core.constants import AETHER_VERSION
 from aether.core.exceptions import BackendError
 from aether.utils.logging import get_logger
 
@@ -57,6 +55,7 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # AetherCUDAEngine
 # ---------------------------------------------------------------------------
+
 
 class AetherCUDAEngine:
     """
@@ -74,8 +73,8 @@ class AetherCUDAEngine:
 
     def __init__(
         self,
-        weights: Any,             # ModelWeights-like object (same as cpu_engine)
-        cuda_kernels: Any,        # NativeCUDAKernels instance
+        weights: Any,  # ModelWeights-like object (same as cpu_engine)
+        cuda_kernels: Any,  # NativeCUDAKernels instance
         device_id: int = 0,
     ) -> None:
         self.weights = weights
@@ -107,9 +106,17 @@ class AetherCUDAEngine:
             )
             # Upload per-layer weights
             for layer_idx, layer in enumerate(self.weights.layers):
-                for attr in ("q_proj", "k_proj", "v_proj", "o_proj",
-                             "gate_proj", "up_proj", "down_proj",
-                             "input_layernorm", "post_attention_layernorm"):
+                for attr in (
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                    "input_layernorm",
+                    "post_attention_layernorm",
+                ):
                     w = getattr(layer, attr, None)
                     if w is not None:
                         key = f"layer_{layer_idx}_{attr}"
@@ -128,7 +135,8 @@ class AetherCUDAEngine:
             self._weights_on_device = True
             logger.info(
                 "AetherCUDAEngine: uploaded %d weight tensors to GPU %d",
-                len(self._gpu_weights), self.device_id,
+                len(self._gpu_weights),
+                self.device_id,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("GPU weight upload failed: %s; forward() will fail", exc)
@@ -193,6 +201,7 @@ class AetherCUDAEngine:
 
         # ── KV cache ─────────────────────────────────────────────────────────
         from aether.runtime.cpu_engine import KVCache  # reuse CPU cache structure
+
         cache = cache or KVCache(num_layers=self.weights.num_layers)
 
         # ── Transformer layers ────────────────────────────────────────────────
@@ -202,98 +211,148 @@ class AetherCUDAEngine:
             # Pre-attention RMSNorm (GPU)
             norm_w_gpu = self._gpu_weights.get(f"layer_{layer_idx}_input_layernorm")
             normed_gpu = self._kernels.rmsnorm(
-                hidden_gpu, norm_w_gpu, seq_len,
-                int(self.weights.hidden_size), float(self.weights.norm_eps),
+                hidden_gpu,
+                norm_w_gpu,
+                seq_len,
+                int(self.weights.hidden_size),
+                float(self.weights.norm_eps),
             )
 
             # Q, K, V projections (GPU SGEMM)
             q_w = self._gpu_weights.get(f"layer_{layer_idx}_q_proj")
             k_w = self._gpu_weights.get(f"layer_{layer_idx}_k_proj")
             v_w = self._gpu_weights.get(f"layer_{layer_idx}_v_proj")
-            q_gpu = self._kernels.sgemm(normed_gpu, q_w, seq_len,
-                                         self.weights.hidden_size,
-                                         self.weights.num_heads * self.weights.head_dim)
-            k_gpu = self._kernels.sgemm(normed_gpu, k_w, seq_len,
-                                         self.weights.hidden_size,
-                                         self.weights.num_kv_heads * self.weights.head_dim)
-            v_gpu = self._kernels.sgemm(normed_gpu, v_w, seq_len,
-                                         self.weights.hidden_size,
-                                         self.weights.num_kv_heads * self.weights.head_dim)
+            q_gpu = self._kernels.sgemm(
+                normed_gpu,
+                q_w,
+                seq_len,
+                self.weights.hidden_size,
+                self.weights.num_heads * self.weights.head_dim,
+            )
+            k_gpu = self._kernels.sgemm(
+                normed_gpu,
+                k_w,
+                seq_len,
+                self.weights.hidden_size,
+                self.weights.num_kv_heads * self.weights.head_dim,
+            )
+            v_gpu = self._kernels.sgemm(
+                normed_gpu,
+                v_w,
+                seq_len,
+                self.weights.hidden_size,
+                self.weights.num_kv_heads * self.weights.head_dim,
+            )
 
             # RoPE (GPU)
             if hasattr(self._kernels, "rope"):
-                q_gpu, k_gpu = self._kernels.rope(q_gpu, k_gpu, past, seq_len,
-                                                    self.weights.head_dim)
+                q_gpu, k_gpu = self._kernels.rope(
+                    q_gpu, k_gpu, past, seq_len, self.weights.head_dim
+                )
 
             # Download K, V to CPU for KV cache append (GPU paged attention pending)
             # TODO: replace with GPU-resident paged attention once NativeCUDAKernels
             # exposes paged_attn() — see docs/audit/KV_CACHE_AUDIT.md
-            k_cpu = self._kernels.download_tensor(k_gpu, (seq_len, self.weights.num_kv_heads, self.weights.head_dim))
-            v_cpu = self._kernels.download_tensor(v_gpu, (seq_len, self.weights.num_kv_heads, self.weights.head_dim))
+            k_cpu = self._kernels.download_tensor(
+                k_gpu, (seq_len, self.weights.num_kv_heads, self.weights.head_dim)
+            )
+            v_cpu = self._kernels.download_tensor(
+                v_gpu, (seq_len, self.weights.num_kv_heads, self.weights.head_dim)
+            )
             cache.append_kv(layer_idx, k_cpu, v_cpu)
 
             # Full K, V (past + present) — upload accumulated cache to GPU
-            k_full = np.concatenate(
-                [cache.keys[layer_idx][:-seq_len], k_cpu], axis=0
-            ) if cache.length > seq_len else k_cpu
-            v_full = np.concatenate(
-                [cache.values[layer_idx][:-seq_len], v_cpu], axis=0
-            ) if cache.length > seq_len else v_cpu
+            k_full = (
+                np.concatenate([cache.keys[layer_idx][:-seq_len], k_cpu], axis=0)
+                if cache.length > seq_len
+                else k_cpu
+            )
+            v_full = (
+                np.concatenate([cache.values[layer_idx][:-seq_len], v_cpu], axis=0)
+                if cache.length > seq_len
+                else v_cpu
+            )
             k_full_gpu = self._kernels.upload_tensor(k_full.astype(np.float16))
             v_full_gpu = self._kernels.upload_tensor(v_full.astype(np.float16))
 
             # FlashAttention (GPU)
             attn_gpu = self._kernels.flash_attn(
-                q_gpu, k_full_gpu, v_full_gpu,
-                seq_len, cache.length, self.weights.num_heads,
-                self.weights.num_kv_heads, self.weights.head_dim,
+                q_gpu,
+                k_full_gpu,
+                v_full_gpu,
+                seq_len,
+                cache.length,
+                self.weights.num_heads,
+                self.weights.num_kv_heads,
+                self.weights.head_dim,
             )
 
             # Output projection (GPU)
             o_w = self._gpu_weights.get(f"layer_{layer_idx}_o_proj")
-            attn_out_gpu = self._kernels.sgemm(attn_gpu, o_w, seq_len,
-                                                self.weights.num_heads * self.weights.head_dim,
-                                                self.weights.hidden_size)
+            attn_out_gpu = self._kernels.sgemm(
+                attn_gpu,
+                o_w,
+                seq_len,
+                self.weights.num_heads * self.weights.head_dim,
+                self.weights.hidden_size,
+            )
 
             # Residual (GPU)
-            hidden_gpu = self._kernels.add(hidden_gpu, attn_out_gpu, seq_len * self.weights.hidden_size)
+            hidden_gpu = self._kernels.add(
+                hidden_gpu, attn_out_gpu, seq_len * self.weights.hidden_size
+            )
 
             # Post-attention RMSNorm (GPU)
             post_norm_w_gpu = self._gpu_weights.get(f"layer_{layer_idx}_post_attention_layernorm")
             ffn_in_gpu = self._kernels.rmsnorm(
-                hidden_gpu, post_norm_w_gpu, seq_len,
-                int(self.weights.hidden_size), float(self.weights.norm_eps),
+                hidden_gpu,
+                post_norm_w_gpu,
+                seq_len,
+                int(self.weights.hidden_size),
+                float(self.weights.norm_eps),
             )
 
             # SwiGLU FFN (GPU)
             gate_w = self._gpu_weights.get(f"layer_{layer_idx}_gate_proj")
-            up_w   = self._gpu_weights.get(f"layer_{layer_idx}_up_proj")
+            up_w = self._gpu_weights.get(f"layer_{layer_idx}_up_proj")
             down_w = self._gpu_weights.get(f"layer_{layer_idx}_down_proj")
-            intermediate = getattr(layer, "intermediate_size", None) or \
-                           int(self.weights.hidden_size * 8 / 3)
-            gate_gpu = self._kernels.sgemm(ffn_in_gpu, gate_w, seq_len,
-                                            self.weights.hidden_size, intermediate)
-            up_gpu   = self._kernels.sgemm(ffn_in_gpu, up_w, seq_len,
-                                            self.weights.hidden_size, intermediate)
+            intermediate = getattr(layer, "intermediate_size", None) or int(
+                self.weights.hidden_size * 8 / 3
+            )
+            gate_gpu = self._kernels.sgemm(
+                ffn_in_gpu, gate_w, seq_len, self.weights.hidden_size, intermediate
+            )
+            up_gpu = self._kernels.sgemm(
+                ffn_in_gpu, up_w, seq_len, self.weights.hidden_size, intermediate
+            )
             swiglu_gpu = self._kernels.swiglu(gate_gpu, up_gpu, seq_len * intermediate)
-            ffn_out_gpu = self._kernels.sgemm(swiglu_gpu, down_w, seq_len,
-                                               intermediate, self.weights.hidden_size)
+            ffn_out_gpu = self._kernels.sgemm(
+                swiglu_gpu, down_w, seq_len, intermediate, self.weights.hidden_size
+            )
 
             # Residual (GPU)
-            hidden_gpu = self._kernels.add(hidden_gpu, ffn_out_gpu, seq_len * self.weights.hidden_size)
+            hidden_gpu = self._kernels.add(
+                hidden_gpu, ffn_out_gpu, seq_len * self.weights.hidden_size
+            )
 
         # ── Final RMSNorm (GPU) ───────────────────────────────────────────────
         final_norm_w_gpu = self._gpu_weights.get("final_norm")
         hidden_gpu = self._kernels.rmsnorm(
-            hidden_gpu, final_norm_w_gpu, seq_len,
-            int(self.weights.hidden_size), float(self.weights.norm_eps),
+            hidden_gpu,
+            final_norm_w_gpu,
+            seq_len,
+            int(self.weights.hidden_size),
+            float(self.weights.norm_eps),
         )
 
         # ── LM head (GPU SGEMM) ───────────────────────────────────────────────
         lm_head_gpu = self._gpu_weights.get("lm_head")
         logits_gpu = self._kernels.sgemm(
-            hidden_gpu, lm_head_gpu,
-            seq_len, self.weights.hidden_size, self.weights.vocab_size,
+            hidden_gpu,
+            lm_head_gpu,
+            seq_len,
+            self.weights.hidden_size,
+            self.weights.vocab_size,
         )
 
         # ── Download logits to CPU for sampling ───────────────────────────────
@@ -318,8 +377,12 @@ class AetherCUDAEngine:
         **kwargs: Any,
     ) -> list[int]:
         generated, _ = self.generate_with_cache(
-            prompt_ids, max_tokens=max_tokens, temperature=temperature,
-            top_k=top_k, top_p=top_p, eos_token_id=eos_token_id,
+            prompt_ids,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
         )
         return generated
 
@@ -389,6 +452,7 @@ class AetherCUDAEngine:
 # NativeCUDABackend
 # ---------------------------------------------------------------------------
 
+
 class NativeCUDABackend(Backend):
     """
     Backend adapter for AetherCUDAEngine.
@@ -402,52 +466,89 @@ class NativeCUDABackend(Backend):
     name: str = "aether_cuda"
 
     def __init__(self) -> None:
+        super().__init__(
+            BackendInfo(
+                name=self.name,
+                version=AETHER_VERSION,
+                capabilities=["kernel_source", "jit_compilation", "pytorch_free"],
+            )
+        )
         self._kernels: Any = None
         self._models: dict[str, AetherCUDAEngine] = {}
         self._available: bool = False
+        self._unavailable_reason: str | None = None
+        self._missing_execution_methods: list[str] = []
         self._init_kernels()
 
     def get_capabilities(self) -> list[str]:
         """Return backend capabilities."""
-        caps = ["native_cuda", "jit_compiled", "pytorch_free"]
+        caps = list(self.info.capabilities)
         if self._available:
-            caps.append("cuda_available")
+            caps.extend(["native_cuda", "jit_compiled", "cuda_available"])
         return caps
 
     def _init_kernels(self) -> None:
         try:
             from aether.kernels.native_cuda import NativeCUDAKernels, detect_cuda_toolchain
+
+            required = (
+                "upload_tensor",
+                "download_tensor",
+                "rmsnorm",
+                "sgemm",
+                "rope",
+                "flash_attn",
+                "add",
+                "swiglu",
+            )
+            self._missing_execution_methods = [
+                name for name in required if not callable(getattr(NativeCUDAKernels, name, None))
+            ]
+            if self._missing_execution_methods:
+                self._unavailable_reason = (
+                    "native CUDA inference interface is incomplete; missing methods: "
+                    + ", ".join(self._missing_execution_methods)
+                    + ". Kernel source/JIT compilation remains available independently."
+                )
+                logger.debug("NativeCUDABackend: %s", self._unavailable_reason)
+                return
             toolchain = detect_cuda_toolchain()
             if toolchain is None:
+                self._unavailable_reason = "nvcc compiler was not found"
                 logger.debug("NativeCUDABackend: no nvcc found; backend unavailable")
                 return
             self._kernels = NativeCUDAKernels()
-            self._kernels.compile()   # JIT-compile CUDA_KERNEL_SOURCE via nvcc
-            self._available = self._kernels.is_available()
+            if not self._kernels.is_available:
+                self._unavailable_reason = "no usable NVIDIA CUDA device/driver was detected"
+                return
+            if not self._kernels.compile():
+                self._unavailable_reason = "native CUDA kernel compilation failed: " + str(
+                    self._kernels.build_error or "unknown compiler error"
+                )
+                return
+            self._available = True
             if self._available:
                 logger.info("NativeCUDABackend: CUDA kernels compiled and loaded")
-            else:
-                logger.debug("NativeCUDABackend: compiled but GPU not detected at runtime")
         except Exception as exc:  # noqa: BLE001
+            self._unavailable_reason = f"native CUDA initialization failed: {exc}"
             logger.debug("NativeCUDABackend init failed: %s", exc)
 
     def is_available(self) -> bool:
         return self._available
 
-    def info(self) -> BackendInfo:
-        return BackendInfo(
-            name=self.name,
-            version="1.3.0",
-            description="Aether native CUDA backend (JIT-compiled, no PyTorch)",
-            supports_streaming=False,
-            supports_batching=False,
-            requires_gpu=True,
-        )
+    @property
+    def unavailable_reason(self) -> str | None:
+        return self._unavailable_reason
+
+    @property
+    def missing_execution_methods(self) -> tuple[str, ...]:
+        return tuple(self._missing_execution_methods)
 
     def load_model(self, model_id: str, **kwargs: Any) -> None:
         if not self._available:
             raise BackendError(
-                "NativeCUDABackend: CUDA toolkit or GPU not available",
+                "NativeCUDABackend: "
+                + (self.unavailable_reason or "CUDA toolkit or GPU unavailable"),
                 backend_name=self.name,
             )
         aeg_path = kwargs.get("aeg_path")
@@ -455,6 +556,7 @@ class NativeCUDABackend(Backend):
             raise BackendError("aeg_path required for NativeCUDABackend", backend_name=self.name)
 
         from aether.runtime.aeg_loader import load_engine_from_path
+
         # load_engine_from_path returns a CPUExecutionEngine; we reuse its weights
         cpu_engine = load_engine_from_path(aeg_path)
         self._models[model_id] = AetherCUDAEngine(
@@ -471,15 +573,15 @@ class NativeCUDABackend(Backend):
 
         # Tokenise (re-use AEG packaged tokenizer via CPU backend handle)
         from aether.runtime.aeg_loader import load_engine_from_path
+
         aeg_path = request.extra.get("aeg_path", "")
         from aether.backends.native_cpu_backend import PackagedTokenizer
+
         tokenizer_path = Path(aeg_path) / "tokenizer" / "tokenizer.json"
         tokenizer = PackagedTokenizer(tokenizer_path)
 
         text = request.prompt or ""
-        prompt_ids = np.asarray(
-            tokenizer.encode(text).ids, dtype=np.int64
-        )
+        prompt_ids = np.asarray(tokenizer.encode(text).ids, dtype=np.int64)
 
         start = time.perf_counter()
         generated, _ = engine.generate_with_cache(

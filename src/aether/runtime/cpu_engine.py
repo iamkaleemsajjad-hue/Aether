@@ -20,7 +20,7 @@ decode is O(1) in past length rather than re-running the full prefill each step.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 import numpy as np
@@ -135,12 +135,17 @@ class LayerWeights:
     num_activated_experts: int = 1
     #: Per-projection quantization metadata: maps projection name
     #: (e.g. ``"q_proj"``) to a tuple of ``(precision, scales, zeros)``.
-    #: Populated by :func:`~aether.runtime.aeg_loader.load_engine_from_package`
-    #: when the AEG artifact stores quantized weights.  When present,
+    #: Applies only when the corresponding projection array holds encoded
+    #: values. When present,
     #: :meth:`~CPUExecutionEngine._linear` uses the stored precision/scales to
     #: dispatch to :class:`~aether.kernels.quantized_linear.QuantizedLinear`
     #: without the caller needing to specify precision explicitly.
     quant_meta: "dict[str, tuple[str, Any, Any]] | None" = None
+    #: Original AEG storage format/scales/zeroes for already decoded projection
+    #: matrices. This is provenance, not an instruction to decode them again.
+    #: The artifact retains the complete codec/block layout; execution tensors
+    #: are materialized once by the loader and use ordinary CPU SGEMM.
+    storage_quant_meta: "dict[str, tuple[str, Any, Any]] | None" = None
 
     def validate(self, layer_index: int, hidden_size: int) -> None:
         """Check that the projections compose into a valid layer."""
@@ -726,95 +731,77 @@ class CPUExecutionEngine:
 
         The base engine is never mutated, so concurrent requests retain
         isolated model state.  This is intentionally an explicit copy-on-write
-        operation: a caller can only obtain it after loading authenticated AEG
-        task-vector payloads, and malformed names/shapes fail before decode.
+        operation: validated task-vector payloads replace only their named
+        tensors, and malformed names/shapes fail before decode. All remaining
+        tensors and the complete execution-numerics contract are preserved.
         """
         if not deltas:
             return self
 
-        def updated(name: str, value: np.ndarray | None) -> np.ndarray | None:
+        remaining = set(deltas)
+
+        def updated(name: str, value: np.ndarray | None) -> np.ndarray:
             if value is None:
-                if name in deltas:
-                    raise ValueError(f"task delta {name!r} targets a missing base tensor")
-                return None
-            delta = deltas.get(name)
-            if delta is None:
-                return np.array(value, dtype=np.float32, copy=True)
-            candidate = np.asarray(delta, dtype=np.float32)
+                raise ValueError(f"task delta {name!r} targets a missing base tensor")
+            if not isinstance(value, np.ndarray):
+                raise ValueError(f"task delta {name!r} does not target a tensor")
+            if not np.issubdtype(value.dtype, np.floating):
+                raise ValueError(f"task delta {name!r} requires decoded floating weights")
+            try:
+                with np.errstate(over="raise", invalid="raise"):
+                    candidate = np.asarray(deltas[name], dtype=np.float32)
+            except (FloatingPointError, OverflowError, TypeError) as exc:
+                raise ValueError(
+                    f"task delta {name!r} must contain finite FP32 coordinates"
+                ) from exc
             if candidate.shape != value.shape:
                 raise ValueError(
                     f"task delta {name!r} shape {candidate.shape} does not match base {value.shape}"
                 )
-            return np.ascontiguousarray(value.astype(np.float32) + candidate, dtype=np.float32)
+            if not np.isfinite(candidate).all():
+                raise ValueError(f"task delta {name!r} must contain finite FP32 coordinates")
+            try:
+                with np.errstate(over="raise", invalid="raise"):
+                    result = np.add(value, candidate, dtype=np.float32)
+            except FloatingPointError as exc:
+                raise ValueError(f"task delta {name!r} overflowed its FP32 output") from exc
+            if not np.isfinite(result).all():
+                raise ValueError(f"task delta {name!r} overflowed its FP32 output")
+            remaining.remove(name)
+            return np.ascontiguousarray(result)
+
+        def replacements(
+            record: Any, prefix: str = "", aliases: dict[str, str] | None = None
+        ) -> dict[str, Any]:
+            """Resolve declared tensor names without reconstructing scalar defaults."""
+            changes = {}
+            for item in fields(record):
+                name = prefix + (aliases or {}).get(item.name, item.name)
+                if name in deltas:
+                    changes[item.name] = updated(name, getattr(record, item.name))
+            return changes
 
         layers: list[LayerWeights] = []
         for index, layer in enumerate(self.weights.layers):
-            fields = {
-                field_name: updated(
-                    f"layer_{index}_{field_name}",
-                    getattr(layer, field_name),
-                )
-                for field_name in (
-                    "attention_norm", "q_proj", "k_proj", "v_proj", "o_proj",
-                "ffn_norm", "gate_proj", "up_proj", "down_proj",
-                "attention_norm_bias", "ffn_norm_bias",
-                "q_proj_bias", "k_proj_bias", "v_proj_bias", "o_proj_bias",
-                "gate_proj_bias", "up_proj_bias", "down_proj_bias",
-                )
-            }
-            if layer.experts:
-                fields["router"] = updated(f"layer_{index}_moe_router", layer.router)
-                fields["experts"] = [
-                    ExpertWeights(
-                        gate_proj=updated(
-                            f"layer_{index}_expert_{expert_index}_gate_proj",
-                            expert.gate_proj,
-                        ),
-                        up_proj=updated(
-                            f"layer_{index}_expert_{expert_index}_up_proj",
-                            expert.up_proj,
-                        ),
-                        down_proj=updated(
-                            f"layer_{index}_expert_{expert_index}_down_proj",
-                            expert.down_proj,
-                        ),
+            for projection in layer.quant_meta or {}:
+                name = f"layer_{index}_{projection}"
+                if name in deltas:
+                    raise ValueError(
+                        f"task delta {name!r} targets encoded quantized weights; "
+                        "decode the projection before applying task deltas"
                     )
+            changes = replacements(layer, f"layer_{index}_", {"router": "moe_router"})
+            if layer.experts:
+                changes["experts"] = [
+                    replace(expert, **replacements(expert, f"layer_{index}_expert_{expert_index}_"))
                     for expert_index, expert in enumerate(layer.experts)
                 ]
-                fields["num_activated_experts"] = layer.num_activated_experts
-            layers.append(LayerWeights(**fields))
-        weights = ModelWeights(
-            embedding=updated("embedding", self.weights.embedding),
-            layers=layers,
-            final_norm=updated("final_norm", self.weights.final_norm),
-            lm_head=updated("lm_head", self.weights.lm_head),
-            position_embedding=(
-                updated("position_embedding", self.weights.position_embedding)
-                if self.weights.position_embedding is not None
-                else None
-            ),
-            embedding_norm=(
-                updated("embedding_norm", self.weights.embedding_norm)
-                if self.weights.embedding_norm is not None else None
-            ),
-            embedding_norm_bias=(
-                updated("embedding_norm_bias", self.weights.embedding_norm_bias)
-                if self.weights.embedding_norm_bias is not None else None
-            ),
-            final_norm_bias=(
-                updated("final_norm_bias", self.weights.final_norm_bias)
-                if self.weights.final_norm_bias is not None
-                else None
-            ),
-            rope_theta=self.weights.rope_theta,
-            norm_eps=self.weights.norm_eps,
-            norm_type=self.weights.norm_type,
-            ffn_type=self.weights.ffn_type,
-            position_type=self.weights.position_type,
-            parallel_residual=self.weights.parallel_residual,
-            attention_layers=self.weights.attention_layers,
-            attention_window=self.weights.attention_window,
-        )
+            layers.append(replace(layer, **changes))
+        changes = replacements(self.weights)
+        changes["layers"] = layers
+        if remaining:
+            raise ValueError(f"task deltas reference unknown tensors: {sorted(remaining)!r}")
+        weights = replace(self.weights, **changes)
         return CPUExecutionEngine(
             weights,
             num_heads=self.num_heads,
@@ -1049,7 +1036,8 @@ class CPUExecutionEngine:
 
         # ── Auto-resolve quantization from LayerWeights.quant_meta ───────────
         # When precision is not passed explicitly, check if the active layer has
-        # per-projection quantization metadata from the AEG compile plan.
+        # per-projection metadata for actual encoded input arrays. Source AEG
+        # storage provenance is separate and must not activate this path.
         # target is (layer_index, proj_name) — used to locate the right layer.
         if precision is None and target is not None and len(target) == 2:
             layer_idx, proj_name = target[0], target[1]
@@ -1096,8 +1084,10 @@ class CPUExecutionEngine:
                 )
                 return np.ascontiguousarray(output + delta * np.float32(scale), dtype=np.float32)
             except Exception as _exc:  # noqa: BLE001
-                # Fall through to FP32 sgemm on any quantized dispatch failure.
-                logger.debug("quantized dispatch failed (%s); falling back to sgemm", _exc)
+                # QuantizedLinear already supplies a correctly dequantized
+                # reference fallback. Casting integer codes directly to FP32
+                # here would discard scales/zero points and change the model.
+                raise RuntimeError(f"quantized projection {target!r} could not execute: {_exc}") from _exc
 
         # ── FP32 sgemm path (default) ─────────────────────────────────────────
         matrix = np.asarray(weight, dtype=np.float32)

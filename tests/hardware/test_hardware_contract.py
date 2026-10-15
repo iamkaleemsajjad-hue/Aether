@@ -85,21 +85,21 @@ class TestHardwareCapabilitiesContract:
         assert cpu.vendor == "CPU"
         assert cpu.target_id.startswith("cpu")
 
-    def test_available_accelerator_targets_are_canonical(self) -> None:
-        """Detection must return IDs understood by the compiler target registry."""
-        from aether.backends.hardware_detector import detect_all_capabilities
+    def test_automatic_targets_are_canonical(self) -> None:
+        """Raw auxiliary device evidence must not invent a compilable target."""
         from aether.core.types import HardwareTarget
+        from aether.runtime.hardware import HardwareDetector
 
         known = {member.value for member in HardwareTarget}
-        for capability in detect_all_capabilities():
-            if capability.available:
-                assert capability.target_id in known, capability.to_dict()
+        fingerprint = HardwareDetector().detect()
+        assert fingerprint.target_id in known
+        assert set(fingerprint.attributes["available_targets"]).issubset(known)
 
     @pytest.mark.parametrize(
         ("device_name", "expected"),
         [
             ("AMD Instinct MI300X", "rocm_cdna3"),
-            ("AMD Instinct MI250", "rocm_cdna3"),
+            ("AMD Instinct MI250", "rocm_gfx90a"),
             ("AMD Radeon RX 7900 XTX", "rocm_rdna3"),
             ("AMD MI350X", "amd_mi350x"),
             ("AMD MI455X CDNA5", "rocm_cdna5_mi455x"),
@@ -131,22 +131,17 @@ class TestHardwareCapabilitiesContract:
         result = cpu.validate_precision("fp8")
         assert isinstance(result, bool)
 
-    def test_no_cuda_claimed_without_cuda(self) -> None:
-        """On CPU-only host, no CUDA target may claim available=True."""
-        try:
-            import torch
-            has_cuda = torch.cuda.is_available()
-        except ImportError:
-            has_cuda = False
-
-        if has_cuda:
-            pytest.skip("CUDA is available on this host")
-
+    def test_cuda_discovery_is_distinct_from_framework_availability(self) -> None:
+        """Driver detection need not depend on a CUDA-enabled PyTorch wheel."""
         from aether.backends.hardware_detector import detect_cuda_devices
         cuda_caps = detect_cuda_devices()
         for c in cuda_caps:
-            assert c.available is False, \
-                f"CUDA {c.target_id} claims available=True but torch.cuda.is_available()=False"
+            assert isinstance(c.available, bool)
+            assert c.execution_tested is False
+            assert c.production_validated is False
+            if c.available:
+                assert c.vendor == "NVIDIA"
+                assert c.extra.get("compute_capability")
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +199,7 @@ class TestBackendInterfaceContract:
         from aether.backends.torch_backend import TorchBackend
 
         backend = TorchBackend()
-        assert backend.available_for_target("cpu_avx2")
+        assert backend.available_for_target("cpu_avx2") is backend.is_available()
         if backend._runtime_family == "cpu":  # noqa: SLF001 - contract probe
             assert not backend.available_for_target("cuda_sm90")
             assert not backend.available_for_target("rocm_cdna3")
@@ -212,12 +207,15 @@ class TestBackendInterfaceContract:
 
     def test_cuda_and_rocm_backends_do_not_cross_claim_hip_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """PyTorch's CUDA-compatible HIP namespace must be classified as ROCm."""
-        import torch
+        torch = pytest.importorskip("torch")
         from aether.backends.hardware_backends import CUDABackend, ROCmBackend
 
         monkeypatch.setattr(torch.version, "hip", "6.2", raising=False)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
         monkeypatch.setattr(torch.cuda, "get_device_name", lambda _index: "AMD Instinct MI300X")
+        from types import SimpleNamespace
+        monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _index: SimpleNamespace(gcnArchName="gfx942"))
 
         assert not CUDABackend("cuda_sm90").is_available()
         assert ROCmBackend("rocm_cdna3").is_available()

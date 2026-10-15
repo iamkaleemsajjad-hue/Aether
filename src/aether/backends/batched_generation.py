@@ -176,6 +176,33 @@ def generate_batch(
             backend_name=backend_name,
         )
 
+    from aether.runtime.session_contract import validate_task_weights
+
+    descriptor = getattr(handle, "metadata", {}).get("task_vectors", {})
+    vectors = descriptor.get("vectors", []) if isinstance(descriptor, dict) else []
+    available = {item.get("name") for item in vectors if isinstance(item, dict)} if isinstance(vectors, list) else set()
+    for request in requests:
+        try:
+            coefficients = validate_task_weights(request.extra.get("task_weights"), available=available)
+        except ValueError as exc:
+            raise BackendError(str(exc), backend_name=backend_name) from exc
+        active = [name for name in (
+            "adapter_id", "adapter_name", "ttt_engine", "ttt_slots", "peagle_engine",
+            "spec_draft_engine", "_explicit_draft_engine", "grammar_session",
+            "aether_kv_session_id", "multi_agent_kv_coordinator",
+        ) if request.extra.get(name) is not None]
+        if coefficients:
+            active.append("task_weights")
+        features = request.extra.get("_execution_features")
+        if getattr(getattr(features, "config", None), "disaggregate_prefill_decode", False):
+            active.append("disaggregate_prefill_decode")
+        if active:
+            raise BackendError(
+                "batched executor has no active execution contract for unsupported hooks "
+                f"{sorted(active)}; submit these requests individually",
+                backend_name=backend_name,
+            )
+
     settings = {
         (float(request.temperature), float(request.top_p), int(request.top_k))
         for request in requests

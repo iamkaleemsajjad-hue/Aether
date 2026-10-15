@@ -1441,7 +1441,7 @@ def test_the_dispatch_probe_is_reproducible_enough_not_to_trip_its_own_guard() -
     first = measure_dispatch_seconds("cpu")
     second = measure_dispatch_seconds("cpu")
     if first <= 0 or second <= 0:
-        pytest.skip("no framework available to probe host dispatch cost")
+        pytest.skip("dispatch timing unavailable or did not settle")
     spread = max(first / second, second / first)
     assert spread < DISPATCH_STALE_RATIO, (
         f"consecutive probes differ by {spread:.2f}x, which would thrash the ledger"

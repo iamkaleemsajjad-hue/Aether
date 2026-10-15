@@ -31,6 +31,8 @@ jobs:
         run: ruff format --check src tests examples benchmarks scripts || true
       - name: Run mypy typecheck
         run: mypy src/aether || true
+      - name: Verify public API stub exports
+        run: python scripts/generate_stubs.py --check
 
   # ── Unit tests (core) ──────────────────────────────────────────────────────
   unit-tests:
@@ -55,7 +57,7 @@ jobs:
           pip install --retries 5 -e ".[test]"
       - name: Run unit tests
         run: |
-          pytest tests/unit/test_native_cpu_kernels.py -v -m "not slow" --no-cov
+          pytest tests -q -m "not slow and not network and not gpu and not cuda and not metal and not rocm" --no-cov --junitxml=test-results-core.xml
         continue-on-error: false
       - name: Upload test results
         uses: actions/upload-artifact@v4

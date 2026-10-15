@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
+from aether.runtime.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,8 @@ __all__ = [
     "SpeculativeStats",
     "SpeculativeConfig",
     "make_speculative_decoder",
+    "SpeculativeGenerationAdapter",
+    "SpeculativeSessionCache",
 ]
 
 
@@ -119,8 +122,8 @@ class SpeculativeConfig:
     # Temperature for draft sampling (0 = greedy)
     draft_temperature: float = 0.0
 
-    # If True, use greedy acceptance (faster but slightly biased)
-    # If False, use exact acceptance (Algorithm 1 - unbiased)
+    # If True, the target distribution is the exact greedy delta distribution.
+    # False defaults to temperature-one stochastic target sampling.
     greedy_acceptance: bool = False
 
     # Medusa-specific: number of heads
@@ -128,6 +131,24 @@ class SpeculativeConfig:
 
     # Self-speculative: which layer index to exit for draft
     early_exit_layer: int | None = None
+
+    target_temperature: float | None = None
+    top_k: int = 0
+    top_p: float = 1.0
+    seed: int | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.gamma) is not int or not 1 <= self.gamma <= 128:
+            raise ValueError("speculative gamma must be an integer in [1, 128]")
+        SamplingConfig(self.draft_temperature, self.top_k, self.top_p)
+        target = self.target_temperature if self.target_temperature is not None else (0.0 if self.greedy_acceptance else 1.0)
+        SamplingConfig(target, self.top_k, self.top_p)
+        if self.greedy_acceptance and target != 0:
+            raise ValueError("greedy acceptance requires target temperature zero")
+        if not 0 <= self.min_acceptance_rate <= 1 or not np.isfinite(self.min_acceptance_rate):
+            raise ValueError("minimum acceptance rate must be finite and in [0, 1]")
+        if type(self.warmup_steps) is not int or self.warmup_steps < 0:
+            raise ValueError("speculative warmup steps must be a nonnegative integer")
 
 
 @dataclass
@@ -141,30 +162,30 @@ class SpeculativeStats:
     target_forward_passes: int = 0
     fallback_steps: int = 0
     total_time_ms: float = 0.0
+    draft_tokens_proposed: int = 0
 
     @property
     def acceptance_rate(self) -> float:
         """Draft token acceptance rate.
 
-        Computed as ``tokens_accepted / tokens_generated`` where
-        ``tokens_generated`` counts the non-draft tokens produced by the target
-        (bonus tokens when all drafts accepted, or rejection-correction samples).
+        Computed as ``tokens_accepted / draft_tokens_proposed``. Output counts
+        include accepted candidates, corrections and bonus tokens separately.
         A value of 1.0 means all draft tokens were accepted on every step.
         """
         if self.steps == 0:
             return 0.0
-        return self.tokens_accepted / max(1, self.tokens_generated)
+        denominator = self.draft_tokens_proposed or self.tokens_generated
+        return min(1.0, self.tokens_accepted / max(1, denominator))
 
     @property
     def speedup_estimate(self) -> float:
         """
-        Theoretical speedup: E[accepted tokens + 1] / 1 target call.
-        At 100% acceptance rate, speedup = gamma + 1.
-        At 0% rate, speedup = 1 (same as standard decode).
+        Tokens emitted per actual target forward call, not measured speedup.
+        Cache commit/replay calls are counted; latency also includes draft work.
         """
         if self.target_forward_passes == 0:
             return 1.0
-        total = self.tokens_accepted + self.steps  # +1 bonus per step
+        total = self.tokens_generated
         return total / max(1, self.target_forward_passes)
 
     def report(self) -> dict:
@@ -172,6 +193,7 @@ class SpeculativeStats:
             "steps": self.steps,
             "tokens_accepted": self.tokens_accepted,
             "tokens_generated": self.tokens_generated,
+            "draft_tokens_proposed": self.draft_tokens_proposed,
             "acceptance_rate": round(self.acceptance_rate, 4),
             "speedup_estimate": round(self.speedup_estimate, 3),
             "draft_forward_passes": self.draft_forward_passes,
@@ -225,10 +247,12 @@ class DraftTargetSpecDecoder:
 
     Algorithm 1 from Leviathan et al. (2023):
     1. Draft model generates gamma candidate tokens auto-regressively.
-    2. Target model verifies all gamma+1 positions in ONE forward pass.
+    2. Target model verifies candidates in one causal forward pass.
     3. Accept each draft token i with probability min(1, p_target(xi) / p_draft(xi)).
     4. On rejection, sample corrected token from (p_target - p_draft)⁺.
-    5. Always emit at least one token (the bonus sample from target logits).
+    5. Emit a correction on rejection or a bonus after complete acceptance,
+       subject to the requested output limit and stopping criteria. Cache
+       commit/rollback can require an additional actual forward call.
 
     This provably samples from the target distribution exactly.
     No approximation is made except floating-point rounding.
@@ -246,145 +270,36 @@ class DraftTargetSpecDecoder:
         self.target = target_engine
         self.config = config or SpeculativeConfig()
         self._stats = SpeculativeStats()
+        self._rng = np.random.default_rng(self.config.seed)
 
     def generate_step(
         self,
         token_ids: list[int],
         draft_cache: Any,
         target_cache: Any,
+        *,
+        max_tokens: int | None = None,
+        eos_token_id: Any = None,
+        grammar_session: Any = None,
     ) -> tuple[list[int], Any, Any, SpeculativeStats]:
+        """Verify a real draft using incremental suffixes and owned rollback state.
+
+        token_ids is the complete logical prefix; cache.length identifies the
+        already consumed part. Rejected candidates never survive in either
+        returned cache. The output bound and stop/grammar criteria are applied
+        before state is committed, rather than slicing a speculative result.
         """
-        Execute one speculative decoding step.
-
-        Args:
-            token_ids:    Full prompt + previously generated tokens.
-            draft_cache:  Draft model KV cache.
-            target_cache: Target model KV cache.
-
-        Returns:
-            (new_tokens, draft_cache, target_cache, stats)
-            new_tokens: 1 to gamma+1 tokens from the target distribution.
-        """
-        t0 = time.perf_counter()
-        gamma = self.config.gamma
-        temp = self.config.draft_temperature
-
-        # ── Step 1: Draft generates gamma tokens ──────────────────────
-        draft_tokens: list[int] = []
-        draft_probs: list[np.ndarray] = []
-        current_ids = list(token_ids)
-
-        for _ in range(gamma):
-            logits, draft_cache = self.draft.forward_step(
-                current_ids, draft_cache, return_all_logits=False
-            )
-            logits_np = np.asarray(logits, dtype=np.float64).reshape(-1)
-            probs = _softmax(logits_np, temperature=temp)
-            token = _sample(probs) if temp > 0 else _greedy(logits_np)
-            draft_tokens.append(token)
-            draft_probs.append(probs)
-            current_ids = current_ids + [token]
-            self._stats.draft_forward_passes += 1
-
-        # ── Step 2: Target verifies gamma+1 positions at once ─────────
-        # Feed the original context + all draft tokens; get logits at
-        # all draft positions plus the position after the last draft token.
-        verify_ids = list(token_ids) + draft_tokens
-        target_logits, target_cache = self.target.forward_step(
-            verify_ids, target_cache, return_all_logits=True
+        from aether.runtime.spec_decode import speculative_step
+        began = time.perf_counter()
+        tokens, draft_cache, target_cache = speculative_step(
+            self, list(token_ids), draft_cache, target_cache,
+            max_tokens=max_tokens, eos_token_id=eos_token_id,
+            grammar_session=grammar_session,
         )
-        self._stats.target_forward_passes += 1
-
-        target_logits_np = np.asarray(target_logits, dtype=np.float64)
-        # target_logits_np shape: (len(verify_ids), vocab) or (vocab,)
-        # We need logits at positions [len(token_ids)-1 : len(token_ids)+gamma]
-        # = the gamma draft positions + the bonus position
-        if target_logits_np.ndim == 1:
-            # Engine returned only last token logits — this engine doesn't
-            # support return_all_logits; fall back to standard decode
-            logger.debug("Target engine does not support return_all_logits; "
-                         "falling back to standard step")
-            self._stats.fallback_steps += 1
-            bonus_probs = _softmax(target_logits_np)
-            bonus_token = _sample(bonus_probs)
+        if tokens:
             self._stats.steps += 1
-            self._stats.tokens_generated += 1
-            self._stats.total_time_ms += (time.perf_counter() - t0) * 1000
-            return [bonus_token], draft_cache, target_cache, self._stats
-
-        # Extract per-position target probabilities for draft positions
-        # Position j in verify_ids gets logits at row (j-1) of the output
-        # (because causal: output[j] predicts input[j+1]).
-        # So for draft_token[i] at position len(token_ids)+i in verify_ids,
-        # the TARGET's probability comes from output row len(token_ids)-1+i.
-        start = len(token_ids) - 1
-        target_probs_list: list[np.ndarray] = []
-        for i in range(gamma):
-            row = min(start + i, target_logits_np.shape[0] - 1)
-            target_probs_list.append(_softmax(target_logits_np[row]))
-
-        # Bonus: target's prediction from the last verify position
-        bonus_row = min(start + gamma, target_logits_np.shape[0] - 1)
-        bonus_logits = target_logits_np[bonus_row]
-
-        # ── Step 3: Accept / Reject (Algorithm 1) ─────────────────────
-        accepted_tokens: list[int] = []
-        for i, (draft_tok, d_probs, t_probs) in enumerate(
-            zip(draft_tokens, draft_probs, target_probs_list)
-        ):
-            if self.config.greedy_acceptance:
-                # Greedy: accept if target's argmax == draft token
-                if _greedy(t_probs) == draft_tok:
-                    accepted_tokens.append(draft_tok)
-                    self._stats.tokens_accepted += 1
-                else:
-                    # Reject: sample from target
-                    corrected = t_probs.copy()
-                    corrected = np.maximum(corrected, 0.0)
-                    corrected /= max(corrected.sum(), 1e-12)
-                    accepted_tokens.append(_sample(corrected))
-                    self._stats.tokens_generated += 1
-                    break
-            else:
-                # Exact: accept with probability min(1, p_t(x) / p_d(x))
-                d_prob_xi = float(d_probs[draft_tok])
-                t_prob_xi = float(t_probs[draft_tok])
-                ratio = min(1.0, t_prob_xi / max(d_prob_xi, 1e-12))
-                u = float(np.random.uniform(0.0, 1.0))
-                if u < ratio:
-                    accepted_tokens.append(draft_tok)
-                    self._stats.tokens_accepted += 1
-                else:
-                    # Rejection: sample from corrected distribution (t - d)⁺
-                    corrected = np.maximum(t_probs - d_probs, 0.0)
-                    total = corrected.sum()
-                    if total > 0:
-                        corrected /= total
-                    else:
-                        corrected = t_probs / max(t_probs.sum(), 1e-12)
-                    accepted_tokens.append(_sample(corrected))
-                    self._stats.tokens_generated += 1
-                    break
-
-        # ── Step 4: Bonus token from target ───────────────────────────
-        # Always sample one extra token from the target at the bonus position.
-        # This is the +1 in "gamma+1 tokens generated per step".
-        if len(accepted_tokens) == gamma:
-            # All draft tokens were accepted: bonus from target's next position
-            bonus_probs = _softmax(bonus_logits)
-            bonus_token = _sample(bonus_probs)
-            accepted_tokens.append(bonus_token)
-            self._stats.tokens_generated += 1
-
-        self._stats.steps += 1
-        self._stats.total_time_ms += (time.perf_counter() - t0) * 1000
-        logger.debug(
-            "SpecDecode step: accepted %d/%d draft tokens (total so far: %.1f%%)",
-            len(accepted_tokens) - 1 if len(accepted_tokens) > gamma else len(accepted_tokens),
-            gamma,
-            100 * self._stats.acceptance_rate,
-        )
-        return accepted_tokens, draft_cache, target_cache, self._stats
+            self._stats.total_time_ms += (time.perf_counter() - began) * 1000
+        return tokens, draft_cache, target_cache, self._stats
 
     def reset_stats(self) -> None:
         self._stats = SpeculativeStats()
@@ -650,3 +565,6 @@ def make_speculative_decoder(
         f"Unknown speculative decoding mode: {mode!r}. "
         "Valid modes: 'draft_target', 'self', 'medusa'."
     )
+
+
+from aether.runtime.spec_generation import SpeculativeGenerationAdapter, SpeculativeSessionCache

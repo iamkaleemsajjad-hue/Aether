@@ -451,7 +451,7 @@ def _worker_all_reduce(rank, world_size, results_dict):
 class TestMultiProcessDistributed:
     """Tests that actually spawn multiple processes."""
 
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(60)
     def test_single_process_all_reduce(self):
         """Single-process case should work without any network setup."""
         # Use an explicit spawn context on Windows.  The implicit Manager
@@ -462,17 +462,23 @@ class TestMultiProcessDistributed:
             manager = context.Manager()
         except PermissionError as exc:
             pytest.skip(f"process IPC is unavailable in this Windows environment: {exc}")
-        results = manager.dict()
-
-        p = context.Process(
-            target=_worker_all_reduce,
-            args=(0, 1, results)
-        )
-        p.start()
-        p.join(timeout=10)
-        assert p.exitcode == 0
-        assert 0 in results
-        assert results[0] == [1.0, 1.0, 1.0, 1.0]
+        with manager:
+            results = manager.dict()
+            p = context.Process(target=_worker_all_reduce, args=(0, 1, results))
+            p.start()
+            try:
+                # Spawn imports the test module and NumPy in a fresh interpreter.
+                # Allow that startup under parallel, coverage-enabled Windows CI.
+                p.join(timeout=30)
+                assert not p.is_alive(), "single-rank worker did not finish"
+                assert p.exitcode == 0
+                assert 0 in results
+                assert results[0] == [1.0, 1.0, 1.0, 1.0]
+            finally:
+                if p.is_alive():
+                    p.terminate()
+                p.join(timeout=5)
+                p.close()
 
     @pytest.mark.timeout(90)
     @pytest.mark.parametrize("world_size", [2, 4])

@@ -376,17 +376,16 @@ class TestPagedKVCacheStorage:
 class TestAEGFormatPyTorchFree:
     def test_aeg_format_imports_without_torch(self):
         """aeg_format.py must be importable without torch."""
-        original = sys.modules.get("torch")
-        sys.modules["torch"] = None  # type: ignore[assignment]
-        try:
-            if "aether.core.aeg_format" in sys.modules:
-                del sys.modules["aether.core.aeg_format"]
-            import aether.core.aeg_format  # noqa: F401
-        finally:
-            if original is None:
-                del sys.modules["torch"]
-            else:
-                sys.modules["torch"] = original
+        import subprocess
+
+        # A fresh interpreter verifies import-time independence without
+        # replacing AEG classes held by other tests in this process.
+        result = subprocess.run(
+            [sys.executable, "-c", "import sys; sys.modules['torch'] = None; import aether.core.aeg_format; assert sys.modules['torch'] is None"],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +418,9 @@ class TestBackendRegistry:
         """TorchBackend must be the last fallback, not the first selection."""
         from aether.backends.registry import BackendRegistry
         reg = BackendRegistry()
-        names = list(reg._backends.keys())
+        # Discovery is lazy; factory order, rather than constructed instances,
+        # records the fallback priority before any optional imports occur.
+        names = list(reg._factories)
         torch_idx = next((i for i, n in enumerate(names) if "torch" in n), None)
         cuda_idx  = next((i for i, n in enumerate(names) if "cuda" in n), None)
         cpu_idx   = next((i for i, n in enumerate(names) if "cpu" in n), None)

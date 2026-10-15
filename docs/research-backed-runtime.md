@@ -1,5 +1,11 @@
 # Research-backed execution contracts
 
+The subsequent [runtime integration guide](runtime-feature-integration.md)
+documents executing prefill/decode workers, lossless persistence and probability-correct
+draft verification, with primary DistServe/PagedAttention/CacheGen/speculation
+references and actual CPU/Intel DirectML evidence. Research results from other
+systems are not claimed as Aether speedups.
+
 This page records the equations that are implemented in the runtime. A PRD
 statement is not treated as experimental evidence: a speedup is reported only
 when a benchmark measures it on the selected hardware.
@@ -83,8 +89,28 @@ contracts. A model-family name in a registry is not treated as proof that every
 checkpoint variant is executable. Unsupported graph operators, missing
 weights, unavailable vendor runtimes, and failed quality gates fail closed.
 
+## Artifact dispatch
+
+TVM separates graph computation from target-specific schedules and packages
+the graph, operators, and parameters for deployment. MLIR preserves semantics
+while progressively lowering through hardware abstractions. Applying these
+principles here is an engineering choice: an AEG's portable graph contract,
+emitted executable variants, detected devices, and installed backends are
+separate inputs to runtime selection. The host's preferred accelerator alone
+does not authorize executing an artifact on that accelerator.
+
+The runtime first tries ready accelerators authorized by an emitted variant or
+declared portable contract, then compatible CPU execution. Explicit devices and
+backends constrain this search. A CPU artifact therefore runs on a GPU laptop
+without PyTorch, and an explicit unavailable
+accelerator request fails. Dispatch does not change model tensors or silently
+enable lossy quantization; an explicit `precision` is persisted through the
+compiler's existing assignment and serialization path.
+
 ## Primary references
 
+- [TVM: An Automated End-to-End Optimizing Compiler for Deep Learning](https://www.usenix.org/system/files/osdi18-chen.pdf)
+- [MLIR: A Compiler Infrastructure for the End of Moore's Law](https://arxiv.org/pdf/2002.11054)
 - [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053)
 - [Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM](https://arxiv.org/abs/2104.04473)
 - [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054)

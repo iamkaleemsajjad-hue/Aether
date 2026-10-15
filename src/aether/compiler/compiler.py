@@ -1363,6 +1363,13 @@ class Compiler:
                 elif not profile.target_id.startswith("cpu_"):
                     kernels.variant_status[profile.target_id] = "plan_only"
         package.manifest.kernels = kernels
+        # Authorize semantic ONNX materialization only for graphs the exporter
+        # implements. This is a format contract, not vendor execution evidence.
+        if portable_decoder:
+            from aether.runtime.onnx_export import onnx_export_eligibility
+
+            if onnx_export_eligibility(package)["supported"]:
+                kernels.portable_backends.append("onnx")
 
         # Embed the real native CPU library when a host toolchain is available.
         # The file is copied before package.save(), so AEG artifact hashing
@@ -1392,6 +1399,7 @@ class Compiler:
                             "sha256": artifact.sha256,
                             "symbols": list(artifact.symbols),
                             "backend": artifact.backend,
+                            "build_identity": native.build_identity(),
                         }
                     )
         except (KernelError, OSError) as exc:

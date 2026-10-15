@@ -281,9 +281,8 @@ class TestAetherHubServer:
 
     def test_default_admin_created(self):
         """Default admin user should be created on init."""
-        admin = self.hub.storage.find_user_by_api_key(
-            "aether_admin_" + hashlib.sha256(b"default_admin").hexdigest()[:32]
-        )
+        stored = json.loads((self.hub.storage.metadata_dir / "user_admin_001.json").read_text(encoding="utf-8"))
+        admin = self.hub.storage.find_user_by_api_key(stored["api_key"])
         assert admin is not None
         assert admin.role == "admin"
 

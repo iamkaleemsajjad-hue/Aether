@@ -265,3 +265,24 @@ def test_pull_does_not_reintroduce_its_own_path(tmp_path: Path) -> None:
 
     source = inspect.getsource(Runtime.pull)
     assert "safe_model_id_path" not in source
+
+
+def test_long_source_references_compact_without_collisions_or_legacy_orphans(tmp_path):
+    first = "org/" + "long-model-name-" * 10 + "first"
+    second = "org/" + "long-model-name-" * 10 + "second"
+    first_name = aeg_artifact_name(first)
+    second_name = aeg_artifact_name(second)
+    assert len(first_name.encode("utf-8")) <= 64
+    assert first_name != second_name
+    assert first_name == aeg_artifact_name(first)
+    assert aeg_cache_candidates(first, tmp_path)[0] == aeg_cache_path(first, tmp_path)
+    old_name = first.replace("/", "--") + ".aeg"
+    assert old_name in [path.name for path in aeg_cache_candidates(first, tmp_path)]
+    _fake_artifact(tmp_path, first_name, model_id=first)
+    assert Path(_runtime(tmp_path)._resolve_aeg_path(first)).name == first_name
+
+
+def test_long_unicode_reference_is_portable_by_bytes():
+    name = aeg_artifact_name("org/" + "模型" * 100)
+    assert len(name.encode("utf-8")) <= 64
+    assert "/" not in name and "\\" not in name

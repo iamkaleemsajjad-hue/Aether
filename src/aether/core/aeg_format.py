@@ -38,7 +38,7 @@ def _has_portable_target(target_id: str) -> bool:
     return bool(
         target_id in SUPPORTED_TARGET_IDS
         and target_id != "cuda_sm100_tee"
-        and target_id.startswith(("cuda_", "rocm_", "metal_"))
+        and (target_id == "metal" or target_id.startswith(("cuda_", "rocm_", "amd_mi", "metal_")))
     )
 
 
@@ -1290,8 +1290,8 @@ class AEGPackage:
             return None
         return self.manifest.kernels.backend_plans.get(target_id)
 
-    def supports_runtime_target(self, target_id: str) -> bool:
-        """Return whether this artifact contains a variant for ``target_id``.
+    def supports_declared_runtime_target(self, target_id: str) -> bool:
+        """Return whether an emitted variant can execute on ``target_id``.
 
         AEG is portable at the IR/weight level, but executable kernel and
         backend variants remain target-specific.  CPU variants share the
@@ -1323,6 +1323,24 @@ class AEGPackage:
         elif target_id.startswith("cpu_") and any(item.startswith("cpu_") for item in targets):
             return True
 
+        return False
+
+    def supports_runtime_target(self, target_id: str) -> bool:
+        """Include optional portable backend contracts in target compatibility.
+
+        A portable contract authorizes materializing the graph on another
+        compatible device. Runtime selection may prefer a ready accelerator
+        while preserving explicit backend/device requests and CPU-only contracts.
+        """
+        if self.supports_declared_runtime_target(target_id):
+            return True
+        if not self.manifest:
+            return False
+        if (
+            self.supports_portable_backend("aether_cpu")
+            and target_id in SUPPORTED_TARGET_IDS and target_id.startswith("cpu_")
+        ):
+            return True
         # The graph/weight contract can be materialized by a real PyTorch
         # installation on CUDA, ROCm, or Apple MPS.  This is deliberately
         # limited to those device families; it must never make an NPU/FPGA/
@@ -1330,7 +1348,9 @@ class AEGPackage:
         # A portable contract still has to name a target that Aether knows how
         # to map to a real device runtime.  Prefix matching alone would make
         # arbitrary values such as ``cuda_fake`` appear executable.
-        if "pytorch" in kernels.portable_backends and _has_portable_target(target_id):
+        if self.supports_portable_backend("pytorch") and _has_portable_target(target_id):
+            return True
+        if self.supports_portable_backend("onnx") and target_id in {"directml", "openvino_gpu", "openvino_npu"}:
             return True
         return False
 

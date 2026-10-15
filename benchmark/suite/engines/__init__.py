@@ -32,6 +32,16 @@ from benchmark.suite.engines import (
     base,
     hf_transformers,
     pytorch_native,
+    deepspeed_engine,
+    exllamav2_engine,
+    llama_cpp_engine,
+    mlc_engine,
+    onnxruntime_engine,
+    openvino_engine,
+    sglang_engine,
+    tensorrt_llm_engine,
+    torch_compile,
+    vllm_engine,
 )
 
 #: Every engine module, in report order.
@@ -53,9 +63,20 @@ SUBJECT = aether_engine.SPEC.key
 BY_KEY: dict[str, Any] = {module.SPEC.key: module for module in MODULES}
 KEYS: tuple[str, ...] = tuple(BY_KEY)
 
+# Retained adapters remain inspectable and probeable without broadening the
+# active benchmark field. The CLI charter and default report use KEYS only.
+REFERENCE_MODULES: tuple[Any, ...] = (
+    torch_compile, onnxruntime_engine, llama_cpp_engine, openvino_engine,
+    vllm_engine, sglang_engine, deepspeed_engine, tensorrt_llm_engine,
+    exllamav2_engine, mlc_engine,
+)
+REFERENCE_BY_KEY = {module.SPEC.key: module for module in REFERENCE_MODULES}
+
 
 def module_for(key: str) -> Any:
     """The engine module registered under ``key``."""
+    if key in REFERENCE_BY_KEY:
+        return REFERENCE_BY_KEY[key]
     if key not in BY_KEY:
         raise KeyError(f"unknown engine {key!r}; known: {', '.join(KEYS)}")
     return BY_KEY[key]

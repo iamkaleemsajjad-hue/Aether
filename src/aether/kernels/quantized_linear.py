@@ -97,6 +97,14 @@ def _torch():
         return None
 
 
+def _is_torch_tensor(value: Any) -> bool:
+    """NumPy 2 arrays also expose ``device``; only torch tensors use its API."""
+    if isinstance(value, np.ndarray):
+        return False
+    torch = _torch()
+    return torch is not None and isinstance(value, torch.Tensor)
+
+
 def _has_cuda_device(torch_module: Any) -> bool:
     try:
         return bool(torch_module.cuda.is_available())
@@ -226,12 +234,12 @@ def dequant_fallback(
     meta = ExecutionMetadata(
         format=fmt,
         execution_mode="dequant_fallback",
-        backend="numpy_matmul" if not hasattr(x, "device") else "torch.nn.functional.linear",
+        backend="torch.nn.functional.linear" if _is_torch_tensor(x) else "numpy_matmul",
         fallback_reason=reason,
     )
     last_execution = meta
 
-    if hasattr(x, "device"):
+    if _is_torch_tensor(x):
         # PyTorch tensor path
         torch = _torch()
         assert torch is not None
@@ -278,7 +286,7 @@ def fp8_linear(
     global last_execution
     torch = _torch()
 
-    if torch is None or not hasattr(x, "device"):
+    if not _is_torch_tensor(x):
         # CPU-only / no torch: always dequant fallback
         w_fp32 = _dequant_fp8(weight_fp8, scale_weight)
         return dequant_fallback(x, None, bias, w_fp32, "fp8_e4m3", "torch_unavailable")
@@ -352,7 +360,7 @@ def int8_linear(
         else _dequant_int8_asymmetric(weight_int8, scale, zero_point)
     )
 
-    if torch is None or not hasattr(x, "device"):
+    if not _is_torch_tensor(x):
         return dequant_fallback(x, None, bias, w_fp32, "int8", "torch_unavailable")
 
     dev = x.device if device is None else device
@@ -410,7 +418,7 @@ def nf4_linear(
     torch = _torch()
 
     # Attempt bitsandbytes fused NF4 GEMM
-    if torch is not None and hasattr(x, "device"):
+    if _is_torch_tensor(x):
         dev = x.device if device is None else device
         try:
             import bitsandbytes as bnb
@@ -536,7 +544,7 @@ def dispatch_quantized_linear(
     meta = ExecutionMetadata(format=fmt, execution_mode="reference", backend="torch.nn.functional.linear")
     last_execution = meta
     torch = _torch()
-    if torch is not None and hasattr(x, "device"):
+    if _is_torch_tensor(x):
         dev = x.device if device is None else device
         w = torch.as_tensor(np.asarray(weight, dtype=np.float32), device=dev, dtype=x.dtype)
         return torch.nn.functional.linear(x, w, bias), meta

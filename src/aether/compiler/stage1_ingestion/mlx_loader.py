@@ -78,7 +78,7 @@ class MLXLoader:
     def _load_safetensors_shards(self, files: list[Path]) -> dict[str, Any]:
         """Load one or more safetensors shards."""
         try:
-            from safetensors.numpy import load_file
+            from aether.compiler.stage1_ingestion.safetensors_loader import SafeTensorsLoader
         except ImportError:
             msg = "safetensors package required for MLX safetensors loading"
             raise UnsupportedFormatError(msg)
@@ -86,11 +86,11 @@ class MLXLoader:
         weights: dict[str, np.ndarray] = {}
         for f in files:
             try:
-                shard = load_file(str(f))
+                shard = SafeTensorsLoader(f).load()
                 for name, arr in shard.items():
                     weights[name] = self._to_float32(arr)
             except Exception as exc:
-                logger.warning("Could not load MLX shard %s: %s", f, exc)
+                raise IngestionError(f"Could not load MLX shard {f}: {exc}") from exc
 
         logger.info(
             "Loaded MLX model (safetensors)",
@@ -109,11 +109,11 @@ class MLXLoader:
         weights: dict[str, np.ndarray] = {}
         for f in files:
             try:
-                npz = np.load(str(f), allow_pickle=False)
-                for name in npz.files:
-                    weights[name] = self._to_float32(npz[name])
+                with np.load(str(f), allow_pickle=False) as npz:
+                    for name in npz.files:
+                        weights[name] = self._to_float32(npz[name])
             except Exception as exc:
-                logger.warning("Could not load MLX npz shard %s: %s", f, exc)
+                raise IngestionError(f"Could not load MLX npz shard {f}: {exc}") from exc
 
         logger.info(
             "Loaded MLX model (npz)",
@@ -159,7 +159,7 @@ class MLXLoader:
     @staticmethod
     def _to_float32(arr: np.ndarray) -> np.ndarray:
         """Convert any array to float32, handling bfloat16 specially."""
-        if arr.dtype == np.dtype("bfloat16") or str(arr.dtype) in ("bfloat16", "bf16"):
+        if str(arr.dtype) in ("bfloat16", "bf16"):
             # NumPy has no native bfloat16; reinterpret as uint16 and shift
             u16 = arr.view(np.uint16) if arr.itemsize == 2 else arr.astype(np.uint16)
             u32 = u16.astype(np.uint32) << 16

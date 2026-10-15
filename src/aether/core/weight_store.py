@@ -23,6 +23,7 @@ and much less friendly to page cache.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -156,7 +157,7 @@ class WeightStore:
 
     # ── Write ────────────────────────────────────────────────────────────────
 
-    def save(self, tensors: dict[str, QuantizedTensor]) -> int:
+    def save(self, tensors: Mapping[str, QuantizedTensor]) -> int:
         """Write quantized tensors to the blob and index.
 
         Args:

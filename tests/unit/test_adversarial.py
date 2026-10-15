@@ -408,6 +408,7 @@ class TestBackendSelection:
 
     def test_pytorch_backend_does_not_require_transformers(self) -> None:
         """Compiled AEG GPU dispatch only needs the optional Torch runtime."""
+        pytest.importorskip("torch")
         code = (
             "import sys\n"
             "class _Block:\n"

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import numpy as np
-import onnx
+import pytest
+
+onnx = pytest.importorskip("onnx")
+onnxruntime = pytest.importorskip("onnxruntime")
 import onnx.helper as oh
-import onnxruntime
 
 from aether.backends.base import GenerationRequest
 from aether.backends.onnx_backend import ONNXBackend

@@ -1,9 +1,9 @@
 """
 TensorRT-LLM backend for NVIDIA compiled engines.
 
-This backend wraps TensorRT-LLM for production NVIDIA inference. It is the
-preferred backend when a pre-built TensorRT engine is available for the target
-hardware.
+This interface reserves the TensorRT-LLM integration. Engine loading and the
+inference runner are not implemented; an installed SDK or an engine artifact
+does not make this backend ready for inference.
 """
 
 from __future__ import annotations
@@ -23,24 +23,21 @@ class TensorRTLLMBackend(Backend):
             name="trtllm",
             version=AETHER_VERSION,
             supported_targets=["cuda_sm80", "cuda_sm89", "cuda_sm90", "cuda_sm100"],
-            capabilities=["generate", "chat", "fp8", "compiled_engine"],
+            capabilities=[],
         )
         super().__init__(info)
         self._engines: dict[str, Any] = {}
+        self.unavailable_reason = (
+            "TensorRT-LLM inference is unavailable: the engine loading/runner integration "
+            "is not implemented; package or compiled-engine presence is not inference readiness"
+        )
 
     def is_available(self) -> bool:
-        try:
-            import tensorrt_llm  # noqa: F401
-            return True
-        except ImportError:
-            return False
+        return False
 
     def load_model(self, model_id: str, aeg_path: str | None = None, **kwargs: Any) -> Any:
         """Load a TensorRT-LLM engine or build one from the AEG."""
-        if model_id in self._engines:
-            return self._engines[model_id]
-        msg = "TensorRT-LLM engine loading requires a supported pre-built engine path in kwargs['engine_path']"
-        raise BackendError(msg, backend_name=self.name)
+        raise BackendError(self.unavailable_reason, backend_name=self.name)
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         """Generate text using TensorRT-LLM."""

@@ -468,11 +468,20 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
     assert package.manifest.kernels.variant_status["metal_m3"] == "portable"
     assert package.manifest.kernels.variant_status["openvino_npu"] == "plan_only"
     assert "pytorch" in package.manifest.kernels.portable_backends
+    assert "onnx" in package.manifest.kernels.portable_backends
     assert package.supports_runtime_target("cpu_avx512")
     assert package.supports_runtime_target("cuda_sm90")
     assert package.supports_runtime_target("rocm_cdna3")
     assert package.supports_runtime_target("metal_m3")
-    assert not package.supports_runtime_target("openvino_npu")
+    # The native target remains a plan. A separate portable ONNX contract
+    # authorizes this semantic export; it does not install or execute an NPU EP.
+    assert package.supports_runtime_target("openvino_npu")
+    from copy import deepcopy
+
+    without_onnx = AEGPackage(package.root)
+    without_onnx.manifest = deepcopy(package.manifest)
+    without_onnx.manifest.kernels.portable_backends.remove("onnx")
+    assert not without_onnx.supports_runtime_target("openvino_npu")
 
     archive = tmp_path / "tiny.aeg.tar.gz"
     package.save_as_archive(archive)
@@ -491,7 +500,15 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
     if packaged_kernels:
         packaged_path = artifact / packaged_kernels[0]["path"]
         assert packaged_path.is_file()
-        assert Path(engine.kernels.library_path).resolve() == packaged_path.resolve()
+        loaded_path = Path(engine.kernels.library_path).resolve()
+        if os.name == "nt":
+            import hashlib
+
+            assert loaded_path != packaged_path.resolve()
+            assert loaded_path.name.startswith("aether_packaged_")
+            assert hashlib.sha256(loaded_path.read_bytes()).hexdigest() == hashlib.sha256(packaged_path.read_bytes()).hexdigest()
+        else:
+            assert loaded_path == packaged_path.resolve()
 
     runtime = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=3))
     response = runtime.generate(str(artifact), prompt="hello world", max_tokens=3, temperature=0.0)
@@ -1160,6 +1177,8 @@ def test_cli_serve_exposes_real_tcp_api_for_local_aeg(
 
     environment = os.environ.copy()
     environment["AETHER_HF_OFFLINE"] = "1"
+    log_path = tmp_path / "server.log"
+    server_log = log_path.open("w", encoding="utf-8")
     process = subprocess.Popen(
         [
             sys.executable,
@@ -1174,18 +1193,18 @@ def test_cli_serve_exposes_real_tcp_api_for_local_aeg(
         ],
         cwd=str(Path(__file__).resolve().parents[2]),
         env=environment,
-        stdout=subprocess.PIPE,
+        stdout=server_log,
         stderr=subprocess.STDOUT,
         text=True,
     )
     try:
         base_url = f"http://127.0.0.1:{port}"
-        deadline = time.monotonic() + 20.0
+        deadline = time.monotonic() + 60.0
         last_error = "server did not become ready"
         with httpx.Client(timeout=httpx.Timeout(60.0, connect=5.0)) as client:
             while time.monotonic() < deadline:
                 if process.poll() is not None:
-                    output = process.stdout.read() if process.stdout is not None else ""
+                    output = log_path.read_text(encoding="utf-8")
                     raise AssertionError(f"aether serve exited early: {output}")
                 try:
                     health = client.get(f"{base_url}/health")
@@ -1196,7 +1215,9 @@ def test_cli_serve_exposes_real_tcp_api_for_local_aeg(
                     last_error = str(exc)
                 time.sleep(0.1)
             else:
-                output = process.stdout.read() if process.stdout is not None else ""
+                # Reading a live subprocess pipe here waits for EOF forever.
+                # A file gives a diagnostic snapshot without blocking cleanup.
+                output = log_path.read_text(encoding="utf-8")
                 raise AssertionError(f"{last_error}; server output: {output}")
 
             response = client.post(
@@ -1213,17 +1234,13 @@ def test_cli_serve_exposes_real_tcp_api_for_local_aeg(
         assert body["text"]
         assert body["usage"]["completion_tokens"] == 2
     finally:
-        if process.stdout:
-            try:
-                process.stdout.close()
-            except Exception:
-                pass
         if process.poll() is None:
             process.kill()
             try:
                 process.wait(timeout=5)
             except Exception:
                 pass
+        server_log.close()
 
 
 @pytest.mark.integration

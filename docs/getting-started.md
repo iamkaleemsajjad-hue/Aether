@@ -1,305 +1,78 @@
-# Getting Started with Aether
+# Getting started with Aether
 
-This guide walks you through installing Aether, compiling your first model, and running it on your hardware.
+The [complete installation and execution guide](../GETTING_STARTED.md) covers
+CPU and accelerator execution, precision, streaming, benchmarking, and serving.
 
-## System Requirements
-
-| Component | Minimum | Recommended |
-|---|---|---|
-| Python | 3.10 | 3.11+ |
-| RAM | 4 GB | 16 GB+ |
-| Disk | 5 GB | 50 GB |
-| OS | Linux, macOS, Windows | Linux |
-| GPU | None (CPU fallback) | NVIDIA Ampere / Apple M2+ |
-
-## Installation
-
-### One-click install (Linux/macOS)
+## Install and verify
 
 ```bash
-git clone https://github.com/iamkaleemsajjad-hue/Aether
-cd aether-runtime
-./scripts/install.sh        # auto-detects CUDA/ROCm/MPS
-# or with options:
-./scripts/install.sh --dev  # include dev/test dependencies
-```
-
-### One-click install (Windows)
-
-```powershell
-git clone https://github.com/iamkaleemsajjad-hue/Aether
-cd aether-runtime
-.\scripts\install.ps1        # auto-detects CUDA
-.\scripts\install.ps1 -Dev   # include dev/test dependencies
-```
-
-### Manual install
-
-```bash
-# Create a virtual environment
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
-
-# Install base package
-pip install -e .
-
-# Install with CUDA extras (NVIDIA)
-pip install -e .[cuda]
-
-# Install with Apple Silicon extras
-pip install -e .[apple]
-
-# Install all dev tools
-pip install -e .[dev]
-```
-
-### Install from PyPI
-
-```bash
-pip install aether-runtime
-
-# With extras:
-pip install aether-runtime[cuda]    # NVIDIA
-pip install aether-runtime[mlx]     # Apple Silicon
-pip install aether-runtime[dev]     # Development
-```
-
-## Verify Installation
-
-```bash
+python -m pip install aether-runtime
 aether version
+aether doctor --json
+aether hardware detect --json
 ```
 
-Run the environment check to verify all components:
+The base package compiles supported SafeTensors models and executes CPU AEGs
+without PyTorch or Transformers. Native CPU kernels use a C++ compiler when
+available; otherwise the NumPy reference path remains functional. Install
+`aether-runtime[pytorch]` for portable accelerator AEG execution and
+`aether-runtime[server]` for API serving.
+
+## Compile, inspect, and run
 
 ```bash
-python scripts/check_env.py
+aether compile HuggingFaceTB/SmolLM2-135M-Instruct --target cpu_avx2 --output smollm2.aeg
+aether inspect smollm2.aeg
+aether run smollm2.aeg --prompt "Explain quantum entanglement." --max-tokens 128
+aether run smollm2.aeg --prompt "Tell me a story." --max-tokens 128 --stream
+aether bench smollm2.aeg --max-tokens 128 --output results.json
 ```
 
-Expected output:
-```
-[OK] Python 3.11.x
-[OK] PyTorch 2.5.x
-[OK] aether-runtime 1.2.8a0
-[OK] SafeTensors
-[OK] GGUF reader
-[OK] ONNX
-[OK] FastAPI
-[OK] gRPC
-Hardware: CPU (AVX512)
-```
+Use `cpu_neon` on ARM. Use the accelerator target reported by hardware
+detection when requesting an accelerator variant. Automatic selection prefers a
+ready GPU compatible with the artifact's executable or portable contracts and
+otherwise uses CPU. A CPU-only contract stays on CPU. Explicit backend or device
+requests constrain selection. Repeat `--target` for multiple variants.
 
-## Compile Your First Model
+Add `--precision q4_k_m` or `--precision q8_0` to request lossy layer
+quantization explicitly, and evaluate model quality afterward. Automatic
+precision assignment is the default. `aether compile --help` lists the
+supported precision choices.
 
-### From a local HuggingFace checkpoint
-
-```bash
-# Download and compile Qwen3-0.6B
-aether compile Qwen/Qwen3-0.6B
-
-# Show what would happen without compiling (dry run)
-aether compile Qwen/Qwen3-0.6B --dry-run
-
-# Compile with explicit target
-aether compile Qwen/Qwen3-0.6B --target cpu
-
-# Compile with stricter quality budget (less aggressive quantization)
-aether compile Qwen/Qwen3-0.6B --quality-budget 0.01
-```
-
-Aether will:
-1. Download the model weights from HuggingFace.
-2. Detect the architecture (family, layers, attention heads, etc.).
-3. Trace the graph and produce AEG-IR.
-4. Run all 22 optimizer passes.
-5. Select backend plans for your hardware.
-6. Save a `.aeg` artifact to `~/.cache/aether/models/`.
-
-### From a local path
-
-```bash
-aether compile ./my-model-dir/
-aether compile ./my-model.gguf
-aether compile ./my-model.onnx
-```
-
-### Inspect the compiled artifact
-
-```bash
-aether info Qwen/Qwen3-0.6B
-aether graph Qwen/Qwen3-0.6B     # print the AEG-IR graph
-```
-
-## Run a Model
-
-### CLI
-
-```bash
-aether run Qwen/Qwen3-0.6B --prompt "What is the AEG format?" --max-tokens 128
-
-# Stream tokens as they are generated
-aether run Qwen/Qwen3-0.6B --prompt "Tell me about AI" --stream
-
-# Chat mode
-aether run Qwen/Qwen3-0.6B --chat
-```
-
-### Python SDK
+## Python
 
 ```python
-from aether import Runtime, RuntimeConfig
+from aether import Compiler, CompilerConfig, Runtime
 
-# Create runtime with defaults (auto-selects best backend)
-rt = Runtime()
-
-# Simple text generation
-response = rt.generate(
-    model_id="Qwen/Qwen3-0.6B",
-    prompt="Explain the AEG format in one paragraph.",
-    max_tokens=128,
-    temperature=0.7,
+artifact = Compiler(CompilerConfig(targets=["cpu_avx2"])).compile(
+    "./my-model-directory", output_path="model.aeg"
+)
+response = Runtime().generate(
+    str(artifact.root), "Hello!", max_tokens=64, apply_chat_template=True,
 )
 print(response.text)
-print(f"Throughput: {response.metrics.throughput_tps:.1f} tok/s")
-print(f"TTFT: {response.metrics.ttft_ms:.1f} ms")
-
-# Chat completion
-response = rt.chat(
-    model_id="Qwen/Qwen3-0.6B",
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "What is speculative decoding?"},
-    ],
-    max_tokens=256,
-)
-print(response.text)
-
-# Streaming
-for chunk in rt.generate(
-    model_id="Qwen/Qwen3-0.6B",
-    prompt="Count from 1 to 10.",
-    stream=True,
-):
-    print(chunk.text, end="", flush=True)
-print()
-
-# Embeddings
-embeddings = rt.embed("Qwen/Qwen3-0.6B", ["Hello world", "Goodbye world"])
-print(f"Embedding dim: {len(embeddings[0])}")
+print(response.metrics.to_dict())
 ```
 
-### Compile Programmatically
+Use `Runtime.generate_stream()` for text deltas. Direct backend access is
+available through `from aether.backends import GenerationRequest, get_backend`.
 
-```python
-from aether import Compiler, CompilerConfig
-
-config = CompilerConfig(
-    quality_budget=0.02,          # Max 2% perplexity degradation
-    calibration_dataset="wikitext-2",
-    targets=["auto"],             # Auto-detect hardware
-    optimization_level=2,
-    enable_fusion=True,
-    enable_sensitivity=True,
-    enable_precision_assignment=True,
-    enable_kv_cache_structuring=True,
-    enable_moe_routing=True,
-    enable_parallelism_discovery=True,
-)
-
-compiler = Compiler(config)
-
-# Show compilation plan
-plan = compiler.plan("Qwen/Qwen3-0.6B")
-print(plan)
-
-# Compile
-aeg = compiler.compile("Qwen/Qwen3-0.6B")
-print(f"Compiled: {aeg.path}")
-print(f"Size: {aeg.size_mb:.1f} MB")
-```
-
-## Serve a Model
-
-### Start the OpenAI-compatible server
+## Serving and tests
 
 ```bash
-aether serve Qwen/Qwen3-0.6B --port 11434
+python -m pip install "aether-runtime[server]"
+aether serve smollm2.aeg --host 127.0.0.1 --port 8080
 ```
 
-### Use any OpenAI SDK client
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:11434/v1", api_key="aether")
-
-# Chat completion
-response = client.chat.completions.create(
-    model="Qwen/Qwen3-0.6B",
-    messages=[{"role": "user", "content": "Hello!"}],
-    max_tokens=128,
-)
-print(response.choices[0].message.content)
-
-# Streaming
-for chunk in client.chat.completions.create(
-    model="Qwen/Qwen3-0.6B",
-    messages=[{"role": "user", "content": "Count from 1 to 5."}],
-    stream=True,
-):
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="", flush=True)
-```
-
-### REST API (direct HTTP)
+For an editable checkout:
 
 ```bash
-# Text generation
-curl http://localhost:11434/v1/generate \
-  -H "Content-Type: application/json" \
-  -d '{"model": "Qwen/Qwen3-0.6B", "prompt": "Hello!", "max_tokens": 50}'
-
-# Chat
-curl http://localhost:11434/v1/chat \
-  -H "Content-Type: application/json" \
-  -d '{"model": "Qwen/Qwen3-0.6B", "messages": [{"role": "user", "content": "Hi"}]}'
-
-# Health check
-curl http://localhost:11434/v1/health
+python -m pip install -e ".[test]"
+python -m pytest
 ```
 
-## Benchmark a Model
+The test extra includes pytest-timeout and API test dependencies. Optional
+framework and hardware tests skip when their dependencies are absent.
 
-```bash
-# Quick benchmark
-aether bench Qwen/Qwen3-0.6B
-
-# Compare two models
-aether bench Qwen/Qwen3-0.6B --compare meta-llama/Llama-3.2-1B
-
-# Run standard evaluation suite
-aether eval Qwen/Qwen3-0.6B --dataset hellaswag
-```
-
-## Supported Model Formats
-
-| Format | Command |
-|---|---|
-| SafeTensors (HuggingFace) | `aether compile Qwen/Qwen3-0.6B` |
-| GGUF (llama.cpp) | `aether compile ./model.gguf` |
-| ONNX | `aether compile ./model.onnx` |
-| PyTorch `.pt` / `.bin` | `aether compile ./model.pt` |
-| MLX (Apple) | `aether compile ./model.mlx` |
-| VLM (LLaVA, Qwen-VL…) | `aether compile ./llava-model-dir/` |
-| Video (Video-LLaMA2…) | `aether compile ./video-model-dir/` |
-| MoE (Mixtral, Qwen-MoE…) | `aether compile ./mixtral-dir/` |
-| MLA (DeepSeek V2/V3/R1) | `aether compile ./deepseek-dir/` |
-| SSM (Mamba, Jamba…) | `aether compile ./mamba-dir/` |
-
-## Next Steps
-
-- [Architecture overview](architecture.md) — how the 5-stage compiler works
-- [AEG format](aeg-format.md) — the Aether Execution Graph format
-- [Optimizer passes](optimizer-passes.md) — all 22 optimization passes
-- [API reference](api-reference.md) — complete SDK / REST / CLI reference
-- [Performance benchmarking](performance-benchmarking.md) — how to benchmark
+See the [runtime](runtime.md), [API reference](api-reference.md), and
+[execution contracts](research-backed-runtime.md) for details.

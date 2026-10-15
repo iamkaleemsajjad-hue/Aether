@@ -21,12 +21,17 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sysconfig
 import tempfile
-from dataclasses import dataclass, field
+import threading
+import struct
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +45,8 @@ __all__ = [
     "CompilerToolchain",
     "NativeKernelError",
     "detect_toolchain",
+    "compiler_probe_failures",
+    "library_compatibility_error",
     "NativeCPUKernels",
     "get_native_kernels",
     "CPU_KERNEL_SOURCE",
@@ -64,6 +71,12 @@ class CompilerToolchain:
     output_flag: str = "-o"
     #: True for MSVC, whose command line differs structurally from GCC's.
     is_msvc: bool = False
+    #: Compiler-specific environment obtained from a Visual Studio developer setup.
+    environment: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+
+    def subprocess_environment(self) -> dict[str, str] | None:
+        """Use discovered SDK variables without mutating the caller's environment."""
+        return dict(os.environ, **dict(self.environment)) if self.environment else None
 
     @property
     def library_suffix(self) -> str:
@@ -80,6 +93,7 @@ class CompilerToolchain:
                 "/nologo",
                 "/O2",
                 "/LD",
+                *self.base_flags,
                 str(source),
                 f"/Fe:{output}",
             ]
@@ -97,9 +111,7 @@ def _is_macos() -> bool:
     return sysconfig.get_platform().startswith("macosx")
 
 
-def _open_shared_library(
-    path: Path, toolchain: "CompilerToolchain | None" = None
-) -> ctypes.CDLL:
+def _open_shared_library(path: Path, toolchain: "CompilerToolchain | None" = None) -> ctypes.CDLL:
     """Load a compiled kernel library, resolving its transitive dependencies.
 
     A MinGW build of the kernel source imports ``libgomp-1.dll`` for the OpenMP
@@ -174,6 +186,76 @@ _CANDIDATES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("c++", ("-O2", "-fPIC", "-std=c++17")),
 )
 
+_PROBE_FAILURES: dict[str, str] = {}
+
+
+def compiler_probe_failures() -> dict[str, str]:
+    """Diagnostic evidence for discovered compilers which failed their probe."""
+    return dict(_PROBE_FAILURES)
+
+
+# Portable vector code generation names every extension it can use. Dependencies
+# must also be OS-usable: asking GCC for AVX2 implicitly enables AVX, for example.
+_EXPLICIT_X86_ISA = (
+    ("sse2", "-msse2", ()),
+    ("sse3", "-msse3", ("sse2",)),
+    ("ssse3", "-mssse3", ("sse2", "sse3")),
+    ("sse41", "-msse4.1", ("sse2", "sse3", "ssse3")),
+    ("sse42", "-msse4.2", ("sse2", "sse3", "ssse3", "sse41")),
+    ("popcnt", "-mpopcnt", ()),
+    ("avx", "-mavx", ()),
+    ("avx2", "-mavx2", ("avx",)),
+    ("fma3", "-mfma", ("avx",)),
+    ("f16c", "-mf16c", ("avx",)),
+    ("avx512f", "-mavx512f", ("avx", "avx2")),
+    ("avx512cd", "-mavx512cd", ("avx", "avx2", "avx512f")),
+    ("avx512bw", "-mavx512bw", ("avx", "avx2", "avx512f")),
+    ("avx512dq", "-mavx512dq", ("avx", "avx2", "avx512f")),
+    ("avx512vl", "-mavx512vl", ("avx", "avx2", "avx512f")),
+)
+
+
+def _process_codegen_flags(flags: tuple[str, ...]) -> tuple[str, ...]:
+    """Constrain native CPU code generation to confirmed process-usable SIMD."""
+    if "-march=native" not in flags and "-mcpu=native" not in flags:
+        return flags
+    from aether.backends.capabilities import cpu_runtime_features
+
+    features = cpu_runtime_features()
+    machine = _normalized_machine()
+    if not features or _host_cpu_signature(features) is None:
+        # An architecture name such as "x86_64" is not a CPU identity. Native
+        # compiler output can contain extensions NumPy does not enumerate, so
+        # anonymous hosts use explicit, checked extensions instead. Keep SIMD
+        # speed without claiming that two anonymous CPUs are the same model.
+        portable = tuple(flag for flag in flags if flag not in {"-march=native", "-mcpu=native"})
+        if machine in {"x86_64", "x86"}:
+            baseline = "-march=x86-64" if machine == "x86_64" else "-march=i686"
+            enabled = tuple(
+                option
+                for feature, option, dependencies in _EXPLICIT_X86_ISA
+                if features.get(feature, False)
+                and all(features.get(name, False) for name in dependencies)
+            )
+            return portable + (baseline,) + enabled
+        if machine == "arm64":
+            return portable + ("-march=armv8-a",)
+        return portable
+    if machine in {"x86_64", "x86"}:
+        disabled = tuple(
+            option
+            for feature, option in (
+                ("avx", "-mno-avx"),
+                ("avx2", "-mno-avx2"),
+                ("avx512f", "-mno-avx512f"),
+                ("fma3", "-mno-fma"),
+                ("f16c", "-mno-f16c"),
+            )
+            if not features.get(feature, False)
+        )
+        return flags + tuple(option for option in disabled if option not in flags)
+    return flags
+
 
 def _find_executable(name: str) -> str | None:
     """Locate a compiler by name, searching ``PATH`` then known install roots.
@@ -197,6 +279,8 @@ def _find_executable(name: str) -> str | None:
         Path("C:/mingw64/bin"),
         Path("C:/Qt/Tools"),
         Path("C:/Strawberry/c/bin"),
+        Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "LLVM" / "bin",
+        Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "LLVM" / "bin",
     ]
     for root in roots:
         if not root.is_dir():
@@ -218,6 +302,118 @@ def _find_executable(name: str) -> str | None:
     return None
 
 
+def _visual_studio_environments() -> list[tuple[Path, tuple[tuple[str, str], ...]]]:
+    """Discover installed MSVC toolsets and capture their supported SDK setup.
+
+    A Visual Studio executable alone is insufficient: INCLUDE, LIB and PATH
+    must describe the matching architecture and Windows SDK. The standard
+    VsDevCmd script prepares only a child process; no global PATH is changed.
+    """
+    installer = Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)"))
+    vswhere = shutil.which("vswhere") or str(
+        installer / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    )
+    installations: list[Path] = []
+    if Path(vswhere).is_file():
+        try:
+            discovered = subprocess.run(
+                [
+                    vswhere,
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-format",
+                    "json",
+                    "-utf8",
+                ],
+                capture_output=True,
+                timeout=15,
+                check=False,
+                encoding="utf-8",
+            )
+            if discovered.returncode == 0:
+                installations.extend(
+                    Path(item["installationPath"])
+                    for item in json.loads(discovered.stdout)
+                    if isinstance(item, dict) and isinstance(item.get("installationPath"), str)
+                )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            logger.debug("Visual Studio discovery via vswhere failed")
+    known_root = os.environ.get("VSINSTALLDIR")
+    if known_root:
+        installations.insert(0, Path(known_root))
+    # SDK packages also occur in minimal Build Tools installations where the
+    # installer utility is absent. Bound this search to the conventional roots.
+    for variable, fallback in (
+        ("ProgramFiles", "C:/Program Files"),
+        ("ProgramFiles(x86)", "C:/Program Files (x86)"),
+    ):
+        root = Path(os.environ.get(variable, fallback)) / "Microsoft Visual Studio"
+        if root.is_dir():
+            installations.extend(sorted(root.glob("*/*"), reverse=True))
+    target = (
+        "arm64"
+        if platform.machine().lower() in {"arm64", "aarch64"}
+        else ("x64" if struct.calcsize("P") == 8 else "x86")
+    )
+    host = "arm64" if target == "arm64" else ("x64" if struct.calcsize("P") == 8 else "x86")
+    environments: list[tuple[Path, tuple[tuple[str, str], ...]]] = []
+    seen: set[Path] = set()
+    for installation in installations:
+        if installation in seen:
+            continue
+        seen.add(installation)
+        script = installation / "Common7" / "Tools" / "VsDevCmd.bat"
+        if not script.is_file():
+            continue
+        try:
+            configured = subprocess.run(
+                [
+                    os.environ.get("COMSPEC", "cmd.exe"),
+                    "/d",
+                    "/s",
+                    "/c",
+                    f'call "{script}" -no_logo -arch={target} -host_arch={host} && set',
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+                text=True,
+                errors="replace",
+            )
+            if configured.returncode != 0:
+                diagnostic = (
+                    configured.stderr
+                    or configured.stdout
+                    or "developer environment was not configured"
+                ).strip()
+                _PROBE_FAILURES[str(script)] = "Visual Studio SDK setup failed: " + diagnostic[:500]
+                continue
+            relevant = {
+                "PATH",
+                "INCLUDE",
+                "LIB",
+                "LIBPATH",
+                "VCTOOLSINSTALLDIR",
+                "WINDOWSSDKDIR",
+                "WINDOWSSDKVERSION",
+                "UNIVERSALCRTSDKDIR",
+                "UCRTVERSION",
+            }
+            environment = {}
+            for line in configured.stdout.splitlines():
+                key, sep, value = line.partition("=")
+                if sep and key.upper() in relevant:
+                    environment["PATH" if key.upper() == "PATH" else key.upper()] = value
+            if environment.get("PATH"):
+                environments.append((installation, tuple(sorted(environment.items()))))
+        except (OSError, subprocess.SubprocessError) as exc:
+            _PROBE_FAILURES[str(script)] = f"Visual Studio SDK setup invocation failed: {exc}"
+            logger.debug("Visual Studio developer environment setup failed: %s", script)
+    return environments
+
+
 def detect_toolchain() -> CompilerToolchain | None:
     """Locate a usable host C++ compiler.
 
@@ -226,7 +422,9 @@ def detect_toolchain() -> CompilerToolchain | None:
         A found executable is verified by actually compiling a trivial program,
         since a name on ``PATH`` does not guarantee a working install.
     """
+    _PROBE_FAILURES.clear()
     for name, flags in _CANDIDATES:
+        flags = _process_codegen_flags(flags)
         executable = _find_executable(name)
         if executable is None:
             continue
@@ -245,14 +443,46 @@ def detect_toolchain() -> CompilerToolchain | None:
             return fallback
 
     if os.name == "nt":
-        executable = _find_executable("cl")
-        if executable is not None:
-            msvc = CompilerToolchain(name="msvc", executable=executable, is_msvc=True)
-            if _verify_toolchain(msvc):
-                logger.debug("Using MSVC toolchain")
-                return msvc
+        environments = [(None, ())] + _visual_studio_environments()
+        for installation, environment in environments:
+            search_path = dict(environment).get("PATH")
+            for name in ("cl", "clang-cl"):
+                executable = (
+                    shutil.which(name, path=search_path) if search_path else _find_executable(name)
+                )
+                if not executable and installation is not None and name == "clang-cl":
+                    for relative in (
+                        "VC/Tools/Llvm/x64/bin/clang-cl.exe",
+                        "VC/Tools/Llvm/bin/clang-cl.exe",
+                    ):
+                        candidate = installation / relative
+                        if candidate.is_file():
+                            executable = str(candidate)
+                            break
+                if executable is None:
+                    continue
+                for openmp in (True, False):
+                    flags = ("/std:c++17", "/EHsc", "/fp:precise") + (
+                        ("/openmp",) if openmp else ()
+                    )
+                    msvc = CompilerToolchain(
+                        name="msvc" if name == "cl" else "clang-cl",
+                        executable=executable,
+                        base_flags=flags,
+                        is_msvc=True,
+                        environment=environment,
+                    )
+                    if _verify_toolchain(msvc):
+                        logger.debug("Using %s toolchain: %s", msvc.name, executable)
+                        return msvc
 
-    logger.info("No host C++ compiler found; native CPU kernels will use numpy references")
+    if _PROBE_FAILURES:
+        logger.warning(
+            "Installed C++ compilers failed build/load checks; using NumPy references: %s",
+            _PROBE_FAILURES,
+        )
+    else:
+        logger.info("No host C++ compiler found; native CPU kernels will use numpy references")
     return None
 
 
@@ -273,8 +503,9 @@ def _verify_toolchain(toolchain: CompilerToolchain) -> bool:
     """
     uses_openmp = any("openmp" in flag or flag == "/openmp" for flag in toolchain.base_flags)
     loop = "    for (int i = 0; i < 4; ++i) total += i;\n"
-    body = ("    #pragma omp parallel for\n" + loop) if uses_openmp else loop
+    body = ("    #pragma omp parallel for reduction(+:total)\n" + loop) if uses_openmp else loop
     probe = (
+        "#include <cmath>\n#include <algorithm>\n"
         'extern "C" {export} int aether_probe(void) {{\n'
         "    int total = 0;\n{body}"
         "    return total + 36;\n"
@@ -294,10 +525,18 @@ def _verify_toolchain(toolchain: CompilerToolchain) -> bool:
                 timeout=60,
                 cwd=tmp,
                 check=False,
+                env=toolchain.subprocess_environment(),
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            _PROBE_FAILURES[toolchain.executable] = f"probe invocation failed: {exc}"
             return False
         if result.returncode != 0 or not output.exists():
+            diagnostic = result.stderr or result.stdout or b"compiler produced no library"
+            if isinstance(diagnostic, bytes):
+                diagnostic = diagnostic.decode(errors="replace")
+            _PROBE_FAILURES[toolchain.executable] = (
+                f"probe build failed: {diagnostic.strip()[:500]}"
+            )
             return False
         library: Any = None
         try:
@@ -305,18 +544,96 @@ def _verify_toolchain(toolchain: CompilerToolchain) -> bool:
             probe_symbol = library.aether_probe
             probe_symbol.restype = ctypes.c_int
             if probe_symbol() != 42:
+                _PROBE_FAILURES[toolchain.executable] = (
+                    "compiled probe returned an incorrect result"
+                )
                 return False
         except (OSError, AttributeError) as exc:
             logger.debug(
                 "toolchain %s compiles but its output does not load (%s)",
-                toolchain.executable, exc,
+                toolchain.executable,
+                exc,
             )
+            _PROBE_FAILURES[toolchain.executable] = f"compiled probe could not load/run: {exc}"
             return False
         finally:
             # Windows keeps a compiled probe mapped until its handle is released,
             # and the TemporaryDirectory teardown would then fail to remove it.
             _release_library(library)
+        _PROBE_FAILURES.pop(toolchain.executable, None)
         return True
+
+
+def _normalized_machine() -> str:
+    machine = platform.machine().lower()
+    return {
+        "amd64": "x86_64",
+        "x64": "x86_64",
+        "aarch64": "arm64",
+        "i686": "x86",
+        "i386": "x86",
+    }.get(machine, machine)
+
+
+def _host_cpu_signature(features: dict[str, bool]) -> str | None:
+    """Conservative identity for host-specialized compiler output."""
+    processor = platform.processor()
+    identifier = os.environ.get("PROCESSOR_IDENTIFIER", "")
+    # Python commonly returns an empty or generic processor on Unix. A feature
+    # table alone cannot identify compiler extensions it does not expose. Keep
+    # host specialization only when a concrete x86 vendor/family/model is known;
+    # every other host uses explicitly declared portable ISA requirements.
+    concrete = any(
+        re.search(r"\bfamily\s+\d+\s+model\s+\d+\b", value, re.IGNORECASE)
+        and re.search(r"intel|amd", value, re.IGNORECASE)
+        for value in (processor, identifier)
+    )
+    if _normalized_machine() not in {"x86", "x86_64"} or not concrete:
+        return None
+    identity = {
+        "machine": _normalized_machine(),
+        "processor": processor,
+        "identifier": identifier,
+        "features": sorted(name for name, enabled in features.items() if enabled),
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def library_compatibility_error(identity: dict[str, Any] | None) -> str | None:
+    """Explain why a native library cannot safely execute on this process.
+
+    Operating-system loaders check file format and architecture, not the
+    instructions inside a library. Legacy libraries lacking a build contract
+    therefore fall back to local compilation or reference execution.
+    """
+    if not isinstance(identity, dict) or identity.get("schema_version") != 1:
+        return "native library has no supported platform/ISA build identity"
+    if identity.get("platform") != platform.system().lower():
+        return "native library was built for a different operating system"
+    if (
+        identity.get("machine") != _normalized_machine()
+        or identity.get("pointer_bits") != struct.calcsize("P") * 8
+    ):
+        return "native library was built for a different process architecture"
+    from aether.backends.capabilities import cpu_runtime_features
+
+    features = cpu_runtime_features()
+    required = identity.get("required_cpu_features")
+    if not isinstance(required, list) or any(not isinstance(name, str) for name in required):
+        return "native library has no valid CPU instruction requirements"
+    missing = sorted(name for name in required if not features.get(name, False))
+    if missing:
+        return "native library requires unavailable OS-usable CPU features: " + ", ".join(missing)
+    policy = identity.get("isa_policy")
+    if policy == "host_native":
+        signature = _host_cpu_signature(features)
+        if signature is None:
+            return "host-specialized native library cannot be verified without a concrete CPU identity"
+        if identity.get("host_cpu_signature") != signature:
+            return "host-specialized native library was built for a different CPU identity"
+    elif policy != "architecture_baseline":
+        return "native library has an unknown ISA policy"
+    return None
 
 
 def _release_library(library: Any) -> None:
@@ -907,8 +1224,17 @@ _SIGNATURES: dict[str, tuple[type | object, list[type | object]]] = {
     # FlashAttention-2 online softmax (Dao 2023): no O(seq^2) buffer.
     "aether_flash_attn": (
         None,
-        [_F32, _F32, _F32, _F32,
-         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float],
+        [
+            _F32,
+            _F32,
+            _F32,
+            _F32,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_float,
+        ],
     ),
     "aether_rope": (
         None,
@@ -931,14 +1257,14 @@ _SIGNATURES: dict[str, tuple[type | object, list[type | object]]] = {
     "aether_int4_gemv": (
         None,
         [
-            _U8,                   # codes: packed int4, shape (rows*cols/2,)
-            _F32,                  # scales: float32 per block
+            _U8,  # codes: packed int4, shape (rows*cols/2,)
+            _F32,  # scales: float32 per block
             np.ctypeslib.ndpointer(dtype=np.int8, flags="C_CONTIGUOUS"),  # zero_points
-            _F32,                  # x: input vector
-            _F32,                  # y: output vector
-            ctypes.c_int,          # rows
-            ctypes.c_int,          # cols
-            ctypes.c_int,          # block_size
+            _F32,  # x: input vector
+            _F32,  # y: output vector
+            ctypes.c_int,  # rows
+            ctypes.c_int,  # cols
+            ctypes.c_int,  # block_size
         ],
     ),
     # GeGLU activation for Gemma/Gemma-2 FFN (Hendrycks 2016, Google Gemma 2024).
@@ -947,8 +1273,7 @@ _SIGNATURES: dict[str, tuple[type | object, list[type | object]]] = {
     # Research: Shazeer 2020 (GLU Variants), ClusterFusion NeurIPS 2025.
     "aether_rmsnorm_swiglu_linear": (
         None,
-        [_F32, _F32, _F32, _F32, _F32,
-         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float],
+        [_F32, _F32, _F32, _F32, _F32, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float],
     ),
     "aether_argmax": (ctypes.c_int64, [_F32, ctypes.c_int64]),
 }
@@ -960,6 +1285,52 @@ def _cache_dir() -> Path:
     base = Path(override) if override else Path(tempfile.gettempdir()) / "aether_kernels"
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+_PACKAGED_CACHE_LOCK = threading.Lock()
+
+
+def _cache_packaged_library(payload: bytes, suffix: str, identity: dict[str, Any]) -> Path:
+    """Keep a verified Windows DLL alive in cache without locking its AEG.
+
+    Writes use a sibling temporary file and atomic replacement. Concurrent
+    processes may publish the same bytes; an already loaded, verified winner
+    is reused rather than replaced. The source artifact remains removable.
+    """
+    payload_digest = hashlib.sha256(payload).hexdigest()
+    key = hashlib.sha256(
+        (payload_digest + json.dumps(identity, sort_keys=True)).encode()
+    ).hexdigest()
+    with _PACKAGED_CACHE_LOCK:
+        directory = _cache_dir()
+        destination = directory / f"aether_packaged_{key}{suffix}"
+        if destination.is_file():
+            if hashlib.sha256(destination.read_bytes()).hexdigest() != payload_digest:
+                raise NativeKernelError(
+                    f"cached packaged native library hash mismatch: {destination}"
+                )
+            return destination.resolve()
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="aether_packaged_", suffix=".tmp", dir=directory, delete=False
+            ) as staged:
+                temporary = Path(staged.name)
+                staged.write(payload)
+                staged.flush()
+                os.fsync(staged.fileno())
+            try:
+                os.replace(temporary, destination)
+            except OSError:
+                if (
+                    not destination.is_file()
+                    or hashlib.sha256(destination.read_bytes()).hexdigest() != payload_digest
+                ):
+                    raise
+            return destination.resolve()
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 @dataclass
@@ -976,10 +1347,26 @@ class NativeCPUKernels:
     library_path: Path | None = None
     _lib: ctypes.CDLL | None = field(default=None, repr=False)
     _build_error: str | None = field(default=None, repr=False)
+    _library_build_identity: dict[str, Any] | None = field(default=None, repr=False)
+    _discovery_failures: dict[str, str] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         if self.toolchain is None:
             self.toolchain = detect_toolchain()
+            self._discovery_failures = compiler_probe_failures()
+        elif not self.toolchain.is_msvc:
+            # Explicitly supplied toolchains must obey the same ISA contract as
+            # discovered toolchains, including on anonymous Unix CPU hosts.
+            self.toolchain = replace(
+                self.toolchain, base_flags=_process_codegen_flags(self.toolchain.base_flags)
+            )
+
+    @classmethod
+    def reference(cls) -> "NativeCPUKernels":
+        """Create an independent NumPy provider without probing a compiler."""
+        kernels = cls(toolchain=CompilerToolchain("disabled", ""))
+        kernels.toolchain = None
+        return kernels
 
     # ── Build ────────────────────────────────────────────────────────────────
 
@@ -993,6 +1380,66 @@ class NativeCPUKernels:
         """Why compilation failed, when it did."""
         return self._build_error
 
+    def build_identity(self) -> dict[str, Any]:
+        """Platform, ISA and compiler contract of the loaded or proposed library.
+
+        SDK environment contents are represented by a digest, not published in
+        artifacts. Host-specialized output is deliberately reused only on the
+        same CPU identity; a portable AEG can still recompile or use NumPy.
+        """
+        if self._library_build_identity is not None:
+            return dict(self._library_build_identity)
+        from aether.backends.capabilities import cpu_runtime_features
+
+        features = cpu_runtime_features()
+        flags = self.toolchain.base_flags if self.toolchain else ()
+        compiler_env = self.toolchain.subprocess_environment() if self.toolchain else None
+        environment = compiler_env or os.environ
+        relevant = {
+            name: environment.get(name, "")
+            for name in ("PATH", "INCLUDE", "LIB", "LIBPATH", "CL", "_CL_", "CXXFLAGS", "LDFLAGS")
+        }
+        native = any(flag in {"-march=native", "-mcpu=native"} for flag in flags) or bool(
+            self.toolchain and self.toolchain.is_msvc and (relevant["CL"] or relevant["_CL_"])
+        )
+        required = sorted(name for name, enabled in features.items() if enabled) if native else []
+        for feature, option, dependencies in _EXPLICIT_X86_ISA:
+            if option in flags:
+                required.extend((feature, *dependencies))
+        for flag in flags:
+            if flag.lower() == "/arch:avx2":
+                required.append("avx2")
+            elif flag.lower() == "/arch:avx512":
+                required.append("avx512f")
+        compiler: dict[str, Any] = {}
+        if self.toolchain is not None:
+            executable = Path(self.toolchain.executable)
+            compiler = {
+                "name": self.toolchain.name,
+                "executable": str(executable.resolve()),
+                "flags": list(flags),
+                "is_msvc": self.toolchain.is_msvc,
+            }
+            try:
+                info = executable.stat()
+                compiler.update(size_bytes=info.st_size, modified_ns=info.st_mtime_ns)
+            except OSError:
+                compiler["file_identity"] = "unavailable"
+        return {
+            "schema_version": 1,
+            "platform": platform.system().lower(),
+            "machine": _normalized_machine(),
+            "pointer_bits": struct.calcsize("P") * 8,
+            "isa_policy": "host_native" if native else "architecture_baseline",
+            "host_cpu_signature": _host_cpu_signature(features) if native else None,
+            "required_cpu_features": sorted(set(required)),
+            "source_sha256": hashlib.sha256(CPU_KERNEL_SOURCE.encode()).hexdigest(),
+            "compiler": compiler,
+            "environment_sha256": hashlib.sha256(
+                json.dumps(relevant, sort_keys=True).encode()
+            ).hexdigest(),
+        }
+
     def ensure_compiled(self) -> bool:
         """Compile and load the kernel library, reusing a cached build if present.
 
@@ -1003,45 +1450,77 @@ class NativeCPUKernels:
         if self._lib is not None:
             return True
         if self.toolchain is None:
-            self._build_error = "no host C++ compiler found"
+            self._build_error = (
+                "installed host C++ compilers failed build/load checks: "
+                + "; ".join(
+                    f"{name}: {reason}" for name, reason in self._discovery_failures.items()
+                )
+                if self._discovery_failures
+                else "no host C++ compiler found"
+            )
             return False
 
-        digest = hashlib.sha256(
-            (CPU_KERNEL_SOURCE + self.toolchain.name + " ".join(self.toolchain.base_flags)).encode()
-        ).hexdigest()[:16]
+        identity = self.build_identity()
+        incompatibility = library_compatibility_error(identity)
+        if incompatibility:
+            self._build_error = incompatibility
+            logger.warning("Native CPU build is not safe for this process: %s", incompatibility)
+            return False
+        digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
         library = _cache_dir() / f"aether_cpu_{digest}{self.toolchain.library_suffix}"
 
         if not library.exists() and not self._compile(library):
             return False
 
         try:
-            self._lib = _open_shared_library(library, self.toolchain)
-        except OSError as exc:
+            loaded = _open_shared_library(library, self.toolchain)
+            self._lib = loaded
+            self._bind_signatures()
+        except (OSError, NativeKernelError) as exc:
+            self._lib = None
+            _release_library(locals().get("loaded"))
             self._build_error = f"could not load {library}: {exc}"
             logger.warning("Failed to load native kernels: %s", exc)
             return False
 
-        self._bind_signatures()
         self.library_path = library
+        self._library_build_identity = identity
+        self._build_error = None
         logger.info("Native CPU kernels loaded from %s", library.name)
         return True
 
-    def load_library(self, library_path: str | Path, expected_sha256: str | None = None) -> bool:
+    def load_library(
+        self,
+        library_path: str | Path,
+        expected_sha256: str | None = None,
+        build_identity: dict[str, Any] | None = None,
+    ) -> bool:
         """Load a verified native library carried by an AEG artifact.
 
         The AEG loader performs manifest validation before calling this method;
         the optional digest check is retained here as a second boundary for
-        callers that use the kernel provider directly.  The library is bound
+        callers that use the kernel provider directly. A supported build identity
+        is required before loading, including for direct callers. The library is bound
         through the same signatures as the compiler cache path, so packaged
         kernels are actually executed by the CPU engine rather than merely
         listed in metadata.
         """
         path = Path(library_path).resolve()
+        incompatibility = library_compatibility_error(build_identity)
+        if incompatibility:
+            self._build_error = incompatibility
+            return False
+        assert isinstance(build_identity, dict)
         if not path.is_file():
             self._build_error = f"native kernel library does not exist: {path}"
             return False
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            self._build_error = f"could not read packaged native kernels from {path}: {exc}"
+            return False
         if expected_sha256:
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            digest = hashlib.sha256(payload).hexdigest()
             expected = expected_sha256.removeprefix("sha256:")
             if digest.lower() != expected.lower():
                 self._build_error = f"native kernel library hash mismatch for {path}"
@@ -1050,7 +1529,12 @@ class NativeCPUKernels:
             # A packaged library is loaded through the same dependency-resolving
             # path as a locally compiled one: an AEG built on a MinGW host carries
             # the same OpenMP import.
-            library = _open_shared_library(path, self.toolchain)
+            loaded_path = (
+                _cache_packaged_library(payload, path.suffix, build_identity)
+                if os.name == "nt"
+                else path
+            )
+            library = _open_shared_library(loaded_path, self.toolchain)
             previous = self._lib
             self._lib = library
             try:
@@ -1059,9 +1543,12 @@ class NativeCPUKernels:
                 self._lib = previous
                 raise
         except (OSError, NativeKernelError) as exc:
+            if "library" in locals():
+                _release_library(library)
             self._build_error = f"could not load packaged native kernels from {path}: {exc}"
             return False
-        self.library_path = path
+        self.library_path = loaded_path
+        self._library_build_identity = dict(build_identity) if build_identity is not None else None
         self._build_error = None
         logger.info("Loaded packaged native CPU kernels from %s", path.name)
         return True
@@ -1076,7 +1563,13 @@ class NativeCPUKernels:
             command = self.toolchain.build_command(source, staged)
             try:
                 result = subprocess.run(  # noqa: S603  # nosec B603 - argv from detected toolchain
-                    command, capture_output=True, timeout=180, cwd=tmp, check=False, text=True
+                    command,
+                    capture_output=True,
+                    timeout=180,
+                    cwd=tmp,
+                    check=False,
+                    text=True,
+                    env=self.toolchain.subprocess_environment(),
                 )
             except (OSError, subprocess.SubprocessError) as exc:
                 self._build_error = f"compiler invocation failed: {exc}"
@@ -1084,7 +1577,9 @@ class NativeCPUKernels:
                 return False
 
             if result.returncode != 0 or not staged.exists():
-                self._build_error = (result.stderr or result.stdout or "unknown error").strip()[:500]
+                self._build_error = (result.stderr or result.stdout or "unknown error").strip()[
+                    :500
+                ]
                 logger.warning("Kernel compilation failed: %s", self._build_error)
                 return False
 
@@ -1181,8 +1676,16 @@ class NativeCPUKernels:
         Returns:
             The product as a float32 array of shape ``(M, N)``.
         """
-        lhs = a if isinstance(a, np.ndarray) and a.dtype == np.float32 else np.asarray(a, dtype=np.float32)
-        rhs = b if isinstance(b, np.ndarray) and b.dtype == np.float32 else np.asarray(b, dtype=np.float32)
+        lhs = (
+            a
+            if isinstance(a, np.ndarray) and a.dtype == np.float32
+            else np.asarray(a, dtype=np.float32)
+        )
+        rhs = (
+            b
+            if isinstance(b, np.ndarray) and b.dtype == np.float32
+            else np.asarray(b, dtype=np.float32)
+        )
         if lhs.ndim != 2 or rhs.ndim != 2:
             msg = f"sgemm requires 2-D inputs, got {lhs.ndim}-D and {rhs.ndim}-D"
             raise ValueError(msg)
@@ -1271,8 +1774,14 @@ class NativeCPUKernels:
             return (normed @ pw.T).astype(np.float32)
         out = np.empty((rows, out_dim), dtype=np.float32)
         self._lib.aether_rmsnorm_linear(  # type: ignore[union-attr]
-            arr.reshape(-1), nw, pw.reshape(-1), out.reshape(-1),
-            rows, in_dim, out_dim, eps,
+            arr.reshape(-1),
+            nw,
+            pw.reshape(-1),
+            out.reshape(-1),
+            rows,
+            in_dim,
+            out_dim,
+            eps,
         )
         return out
 
@@ -1301,6 +1810,7 @@ class NativeCPUKernels:
             Output tensor of shape ``(num_q_heads, head_dim)``.
         """
         import math
+
         q_c = np.ascontiguousarray(q, dtype=np.float32)
         k_c = np.ascontiguousarray(k, dtype=np.float32)
         v_c = np.ascontiguousarray(v, dtype=np.float32)
@@ -1331,8 +1841,15 @@ class NativeCPUKernels:
             return np.einsum("hs,hsd->hd", weights, v_exp).astype(np.float32)
         out = np.empty_like(q_c)
         self._lib.aether_flash_attn(  # type: ignore[union-attr]
-            q_c.reshape(-1), k_c.reshape(-1), v_c.reshape(-1), out.reshape(-1),
-            num_q_heads, num_kv_heads, seq_len, head_dim, _scale,
+            q_c.reshape(-1),
+            k_c.reshape(-1),
+            v_c.reshape(-1),
+            out.reshape(-1),
+            num_q_heads,
+            num_kv_heads,
+            seq_len,
+            head_dim,
+            _scale,
         )
         return out
 
@@ -1365,8 +1882,13 @@ class NativeCPUKernels:
             return out
         out = arr.copy()
         self._lib.aether_rope(  # type: ignore[union-attr]
-            out.reshape(-1), cos.reshape(-1), sin.reshape(-1),
-            seq_len, num_heads, head_dim, position_offset,
+            out.reshape(-1),
+            cos.reshape(-1),
+            sin.reshape(-1),
+            seq_len,
+            num_heads,
+            head_dim,
+            position_offset,
         )
         return out
 
@@ -1490,6 +2012,7 @@ class NativeCPUKernels:
             raise ValueError(f"geglu: gate shape {g.shape} != up shape {u.shape}")
         if not self.ensure_compiled():
             import math
+
             gelu_u = 0.5 * u * (1.0 + np.vectorize(math.erf)(u.astype(np.float64) / math.sqrt(2)))
             return (g * gelu_u.astype(np.float32)).astype(np.float32)
         out = np.empty_like(g)
@@ -1543,11 +2066,20 @@ class NativeCPUKernels:
             normed = (arr / np.sqrt(var + eps) * nw).astype(np.float32)
             gate_out = (normed @ wg.T).astype(np.float32)
             up_out = (normed @ wu.T).astype(np.float32)
-            return (gate_out / (1.0 + np.exp(-gate_out.astype(np.float64))).astype(np.float32) * up_out)
+            return (
+                gate_out / (1.0 + np.exp(-gate_out.astype(np.float64))).astype(np.float32) * up_out
+            )
         out = np.empty((rows, ffn_dim), dtype=np.float32)
         self._lib.aether_rmsnorm_swiglu_linear(  # type: ignore[union-attr]
-            arr.reshape(-1), nw, wg.reshape(-1), wu.reshape(-1), out.reshape(-1),
-            rows, in_dim, ffn_dim, eps,
+            arr.reshape(-1),
+            nw,
+            wg.reshape(-1),
+            wu.reshape(-1),
+            out.reshape(-1),
+            rows,
+            in_dim,
+            ffn_dim,
+            eps,
         )
         return out
 

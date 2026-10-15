@@ -769,8 +769,7 @@ def test_release_preserves_everything_execution_reads() -> None:
     previous = os.environ.get("AETHER_TORCH_DTYPE")
     os.environ["AETHER_TORCH_DTYPE"] = "fp16"
     try:
-        before = TorchAEGEngine(_reference_engine(), "cpu")
-        after = TorchAEGEngine(_reference_engine(), "cpu")
+        engine = TorchAEGEngine(_reference_engine(), "cpu")
     finally:
         if previous is None:
             os.environ.pop("AETHER_TORCH_DTYPE", None)
@@ -778,25 +777,29 @@ def test_release_preserves_everything_execution_reads() -> None:
             os.environ["AETHER_TORCH_DTYPE"] = previous
 
     prompt = np.asarray([1, 3, 5, 2], dtype=np.int64)
-    expected_single = before.generate(prompt, max_tokens=6, temperature=0.0)
-    expected_batch = before.generate_batch(
+    # Compare the same live executor so release is the only change: independent
+    # engines may calibrate different valid kernels with different FP16 rounding.
+    expected_single = engine.generate(prompt, max_tokens=6, temperature=0.0)
+    expected_batch = engine.generate_batch(
         [prompt, np.asarray([4, 5], dtype=np.int64)], max_tokens=6, temperature=0.0
     )
-    expected_logits = before.forward(prompt)[0]
+    expected_logits = engine.forward(prompt)[0]
+    expected_rope_theta = engine.weights.rope_theta
+    expected_num_layers = engine.num_layers
 
-    assert after.release_host_weights() > 0
-    assert after.generate(prompt, max_tokens=6, temperature=0.0) == expected_single
-    assert after.generate_batch(
+    assert engine.release_host_weights() > 0
+    assert engine.generate(prompt, max_tokens=6, temperature=0.0) == expected_single
+    assert engine.generate_batch(
         [prompt, np.asarray([4, 5], dtype=np.int64)], max_tokens=6, temperature=0.0
     ) == expected_batch
-    np.testing.assert_array_equal(after.forward(prompt)[0], expected_logits)
+    np.testing.assert_array_equal(engine.forward(prompt)[0], expected_logits)
 
     # The execution-numerics contract and the small arrays must survive: several
     # code paths read them after load, and they are metadata-scale anyway.
-    assert after.weights.final_norm is not None
-    assert all(layer.attention_norm is not None for layer in after.weights.layers)
-    assert after.weights.rope_theta == before.weights.rope_theta
-    assert after.num_layers == before.num_layers
+    assert engine.weights.final_norm is not None
+    assert all(layer.attention_norm is not None for layer in engine.weights.layers)
+    assert engine.weights.rope_theta == expected_rope_theta
+    assert engine.num_layers == expected_num_layers
 
 
 def test_release_can_be_declined_by_the_operator() -> None:

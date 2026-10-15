@@ -7,7 +7,7 @@ contain features supported by the target.  The hardware validation manifest
 uses it to record evidence for each target.
 
 Key principle (PRD §4, §57):
-  - ``implemented=True`` means backend code exists.
+  - ``implemented=True`` means an inference adapter exists for the reported scope.
   - ``available=True`` means the hardware/runtime is present on this host.
   - ``execution_tested=True`` means real inference ran on this hardware.
   - ``production_validated=True`` means multi-model, multi-workload testing
@@ -38,6 +38,10 @@ class ValidationResult:
     warnings: list[str] = field(default_factory=list)
     details: dict[str, Any] = field(default_factory=dict)
     validated_at: float = field(default_factory=time.time)
+    backend_available: bool | None = None
+    execution_tested: bool = False
+    execution_scope: str | None = None
+    production_validated: bool = False
 
     @property
     def all_passed(self) -> bool:
@@ -53,6 +57,10 @@ class ValidationResult:
             "warnings": self.warnings,
             "details": self.details,
             "validated_at": self.validated_at,
+            "backend_available": self.backend_available,
+            "execution_tested": self.execution_tested,
+            "execution_scope": self.execution_scope,
+            "production_validated": self.production_validated,
         }
 
 
@@ -163,7 +171,7 @@ class HardwareCapabilities:
     memory_bytes: int = 0
 
     # Precision support
-    supports_fp32: bool = True
+    supports_fp32: bool = False
     supports_fp16: bool = False
     supports_bf16: bool = False
     supports_fp8: bool = False
@@ -177,7 +185,7 @@ class HardwareCapabilities:
     supports_nvlink: bool = False
     supports_peer_access: bool = False
     supports_unified_memory: bool = False
-    warp_or_wavefront_size: int = 1  # CPU=1, CUDA=32, ROCm=64
+    warp_or_wavefront_size: int = 0  # 0=unconfirmed; CPU=1, queried GPU width
 
     # Validation level (PRD §11)
     implemented: bool = False
@@ -185,6 +193,15 @@ class HardwareCapabilities:
     compile_tested: bool = False
     execution_tested: bool = False
     production_validated: bool = False
+
+    # Detection evidence is separate from Aether backend readiness. None means
+    # the detector could not confirm that stage; it is never a successful probe.
+    hardware_present: bool | None = None
+    runtime_available: bool | None = None
+    backend_dependencies: dict[str, bool] = field(default_factory=dict)
+    backend_available: bool | None = None
+    memory_kind: str | None = None
+    memory_source: str | None = None
 
     # Reason when unavailable
     unavailable_reason: str | None = None
@@ -200,10 +217,11 @@ class HardwareCapabilities:
     # -------------------------------------------------------------------
 
     def validate_precision(self, precision: str) -> bool:
-        """Return True if this target supports the requested precision.
+        """Return whether native device arithmetic has been confirmed.
 
-        The compiler calls this before emitting a precision annotation to
-        prevent creating artifacts that cannot run on the target.
+        False also covers unconfirmed formats. Storage conversion and reference
+        execution are separate compiler/backend contracts; this method does
+        not reject an FP16/BF16/INT4 artifact executed with FP32 accumulation.
         """
         prec = precision.upper()
         mapping = {
@@ -240,6 +258,12 @@ class HardwareCapabilities:
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
+        d["memory_bytes_known"] = bool(self.extra.get("memory_known", self.memory_bytes > 0))
+        d["precision_semantics"] = (
+            "queried vendor runtime formats; native arithmetic and Aether execution require separate validation"
+            if self.extra.get("precision_scope") == "runtime_formats"
+            else "confirmed device arithmetic; Aether execution modes are separate"
+        )
         d["precision_summary"] = {
             "fp32": self.supports_fp32,
             "fp16": self.supports_fp16,
@@ -300,36 +324,20 @@ class HardwareCapabilities:
         else:
             cpu_vendor = "unknown"
         cpu_count = os.cpu_count() or 1
-        # Detect the actual instruction set on every supported host.  The old
-        # implementation only inspected Linux /proc/cpuinfo, which made
-        # Windows report a generic CPU even when NumPy exposed the real CPU
-        # feature table (and made AVX-512 claims depend on the target string).
-        has_avx512 = False
+        features = cpu_runtime_features()
+        # NumPy's runtime table checks OSXSAVE/XGETBV, not merely CPUID or a
+        # model name. A hardware flag without OS register-state support is not
+        # usable by the process. Unknown flags never enable an optimized ISA.
+        has_avx512 = bool(features.get("avx512f"))
+        has_avx2 = bool(features.get("avx2"))
+        has_neon = bool(features.get("neon") or features.get("asimd"))
+        fp16 = bool((has_avx512 and features.get("avx512fp16")) or (has_neon and features.get("asimdhp")))
+        bf16 = bool((has_avx512 and features.get("avx512bf16")) or (has_neon and features.get("bf16")))
         try:
-            from numpy.core import _multiarray_umath
-
-            features = getattr(_multiarray_umath, "__cpu_features__", {})
-            has_avx512 = any(
-                bool(features.get(name))
-                for name in ("AVX512F", "AVX512BW", "AVX512VL")
-            )
-        except (ImportError, AttributeError):
-            pass
-        features: dict[str, bool] = {}
-        try:
-            from numpy.core import _multiarray_umath
-            features = {
-                str(name).lower(): bool(value)
-                for name, value in getattr(_multiarray_umath, "__cpu_features__", {}).items()
-            }
-        except (ImportError, AttributeError):
-            pass
-        if not has_avx512 and platform.system() == "Linux":
-            try:
-                with open("/proc/cpuinfo") as f:
-                    has_avx512 = "avx512" in f.read().lower()
-            except OSError:
-                pass
+            import numpy
+            numpy_available = bool(getattr(numpy, "__version__", None))
+        except (ImportError, OSError):
+            numpy_available = False
         return cls(
             vendor="CPU",
             device=proc,
@@ -337,22 +345,29 @@ class HardwareCapabilities:
             target_id=(
                 "cpu_avx512"
                 if has_avx512
-                else ("cpu_neon" if arch.lower() in {"arm64", "aarch64"} else "cpu_avx2")
+                else ("cpu_avx2" if has_avx2 else ("cpu_neon" if has_neon else "cpu_generic"))
             ),
             driver_version="n/a",
             runtime_version=platform.python_version(),
             memory_bytes=_host_memory_bytes(),
             supports_fp32=True,
-            supports_fp16=True,  # PyTorch emulates on x86
-            supports_bf16=True,  # PyTorch emulates on x86
+            supports_fp16=fp16,
+            supports_bf16=bf16,
             supports_int8=True,
-            supports_int4=True,
+            supports_int4=False,  # Packed INT4 weights are decoded, not an ISA.
             warp_or_wavefront_size=1,
             implemented=True,
-            available=True,
-            compile_tested=True,
-            execution_tested=True,  # CPU inference proven
-            production_validated=False,  # not yet multi-model validated
+            available=numpy_available,
+            compile_tested=False,
+            execution_tested=False,
+            production_validated=False,
+            hardware_present=True,
+            runtime_available=numpy_available,
+            backend_dependencies={"numpy": numpy_available},
+            backend_available=numpy_available,
+            unavailable_reason=None if numpy_available else "CPU hardware present but the NumPy execution dependency could not be imported",
+            memory_kind="host_physical",
+            memory_source="host_memory_query",
             extra={
                 "cpu_count": cpu_count,
                 "cpu_vendor": cpu_vendor,
@@ -360,6 +375,19 @@ class HardwareCapabilities:
                 "machine": arch,
                 "has_avx512": has_avx512,
                 "cpu_features": features,
+                "cpu_features_source": "numpy_os_usable_runtime" if features else "unconfirmed",
+                "precision_evidence": {
+                    "fp16": {"native_arithmetic": fp16, "extension_confirmed": bool(features.get("avx512fp16") or features.get("asimdhp"))},
+                    "bf16": {"native_arithmetic": bf16, "extension_confirmed": bool(features.get("avx512bf16") or features.get("bf16"))},
+                    "f16c_conversion": bool(features.get("f16c")),
+                },
+                "precision_execution": {
+                    "fp32": "native_cpu_or_numpy_reference",
+                    "fp16": "storage_converted_to_fp32",
+                    "bf16": "storage_converted_to_fp32",
+                    "int8": "quantized_weights_with_fp32_accumulation",
+                    "int4": "packed_weights_decoded_for_fp32_accumulation",
+                },
             },
         )
 
@@ -367,6 +395,24 @@ class HardwareCapabilities:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def cpu_runtime_features() -> dict[str, bool]:
+    """Return process-usable CPU flags, conservatively empty if unconfirmed.
+
+    NumPy gates x86 SIMD on OS register-state support. Reading /proc/cpuinfo
+    alone cannot establish that execution is safe. Prefer the NumPy 2 module
+    name and retain compatibility with NumPy 1 without deprecation warnings.
+    """
+    import importlib
+
+    for name in ("numpy._core._multiarray_umath", "numpy.core._multiarray_umath"):
+        try:
+            module = importlib.import_module(name)
+            return {str(key).lower(): bool(value) for key, value in getattr(module, "__cpu_features__", {}).items()}
+        except (ImportError, AttributeError):
+            continue
+    return {}
+
 
 def _host_memory_bytes() -> int:
     """Return total physical memory in bytes (best-effort)."""

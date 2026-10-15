@@ -16,9 +16,10 @@
 
 <p align="center">
   Aether is an open-source AI model compiler and high-performance inference runtime.<br>
-  It ingests any open-source model (HuggingFace, GGUF, SafeTensors, ONNX) and produces a portable<br>
-  <strong>Aether Execution Graph (AEG)</strong> artifact that runs on any detected hardware — CPU, GPU, NPU, FPGA —<br>
-  with zero framework dependency and zero re-compilation.
+  It ingests supported model graphs from HuggingFace, GGUF, SafeTensors, and ONNX and produces a portable<br>
+  <strong>Aether Execution Graph (AEG)</strong> containing the graph, weights, and execution contracts.<br>
+  CPU AEG execution is framework-free; accelerator execution requires a compatible installed backend.<br>
+  Hardware profiles describe compilation targets, with executable, portable, and planning-only status recorded separately.
 </p>
 
 <p align="center">
@@ -41,6 +42,12 @@
 ---
 
 ## Multi-Engine Benchmark Results — Aether vs Competitor Engines
+
+For a MacBook with approximately 16 GB RAM, see the
+[Aether vs ONNX Runtime / Qwen3-8B benchmark runbook](docs/benchmark-macbook.md).
+It includes batch/token sweeps, reports and graphs, plus the current Aether CPU
+memory and batching limits: the 8B native path cannot fit a 16 GB Mac.
+The T4 results below describe a different run.
 
 > **Hardware Testbed:** **2× NVIDIA Tesla T4 (14.6 GiB VRAM each)** · Intel Xeon @ 2.00 GHz · **FP16 Native Tensor-Core Execution** · Linux 6.12 · Kaggle Environment  
 > **Software Stack:** Aether Runtime v1.3.0 vs HuggingFace Transformers v5.0.0 (PyTorch 2.10.0 eager) vs PyTorch Native Decode Loop  
@@ -187,12 +194,18 @@ The charts below illustrate empirical measurements extracted directly from the c
 
 ---
 
-### Why Aether Outperforms: Architectural & Compilation Advantage
+### Interpreting the recorded benchmark
 
-1. **AOT Ahead-of-Time Graph Compilation**: Eliminates Python interpreter overhead and PyTorch dynamic dispatch loops during token generation.
-2. **Fused Custom Kernels**: Native C++ kernels executing fused RMSNorm + SwiGLU / GeGLU and FlashAttention-2 paths optimize memory bandwidth and reduce device kernel launches.
-3. **Optimized KV-Cache Layout**: Zero-copy continuous memory buffers prevent cache fragmentation and preserve memory bandwidth under scaling.
-4. **Compilation Amortization**: On SmolLM2-135M, Aether's 7.0s AOT compilation saves **1.96 seconds on every subsequent generation request** — breaking even and pulling permanently ahead after **just 4 inference requests**.
+These results describe the recorded T4 workload and backend configuration.
+Compilation prepares graph and weight layouts, but does not universally remove
+Python or framework dispatch. Native C++ CPU kernels are optional; Torch paths
+still execute through the installed framework. Cache layouts and operator fusion
+depend on the selected execution engine.
+
+For the recorded SmolLM2-135M request, a 7.0-second compilation and 1.96-second
+generation-time difference imply amortization after about four identical
+requests. This calculation does not establish a speedup for other prompts,
+models, precision policies or hardware.
 
 > 💡 **View the complete suite run, raw measurements, and all 31 charts in [`benchmark/results/benchmark_results.ipynb`](benchmark/results/benchmark_results.ipynb) and [`benchmark/results/BENCHMARK_RESULTS.md`](benchmark/results/BENCHMARK_RESULTS.md).**
 
@@ -202,10 +215,10 @@ The charts below illustrate empirical measurements extracted directly from the c
 
 | Principle | Implementation |
 |-----------|---------------|
-| **Compile once, run anywhere** | AEG artifacts are hardware-portable; they contain multi-target sharding plans and run without re-compilation |
+| **Compile once, run anywhere** | Portable graphs and weights execute through declared compatible executable/portable contracts and installed adapters; `plan_only` is compilation metadata, not an execution engine |
 | **PyTorch-free core** | The runtime, compiler, and CPU engine require only NumPy + tokenizers. PyTorch is optional (`pip install "aether-runtime[pytorch]"`) |
-| **Universal hardware detection** | Detects NVIDIA (CUDA), AMD (ROCm), Apple (Metal/MPS), Intel (OpenVINO), Qualcomm (QNN), RISC-V, FPGA, and pure CPU — no driver installation required |
-| **Multi-GPU with VRAM-weighted distribution** | Automatically shards model weights across all available GPUs proportional to each GPU's VRAM capacity |
+| **Hardware capability evidence** | Separates detected devices, available vendor runtimes, implemented backends, and physical execution validation |
+| **Multi-GPU placement** | Plans compatible selected meshes using memory capacity and workload cost; physical multi-GPU execution needs a supporting backend and validation |
 | **Framework-free native kernels** | C++ kernels compiled at runtime: INT4-GEMV, FlashAttention-2, fused RMSNorm+SwiGLU+Linear, GeGLU, RoPE, OpenMP parallel SGEMM |
 
 ---
@@ -219,7 +232,7 @@ Model (HuggingFace / GGUF / SafeTensors / ONNX)
 ┌─────────────────────────────────────────────────────────────────┐
 │ Stage 1: Ingestion & Architecture Detection                     │
 │  • Reads config.json / GGUF header / SafeTensors metadata       │
-│  • Detects 60+ model families without relying on model names    │
+│  • Detects registered architecture families and aliases       │
 │  • Outputs: AEG-IR computation graph + ModelArchitecture        │
 └─────────────────────────────────────────────────────────────────┘
         │
@@ -227,7 +240,7 @@ Model (HuggingFace / GGUF / SafeTensors / ONNX)
 ┌─────────────────────────────────────────────────────────────────┐
 │ Stage 2: Optimizer (22 Passes)                                  │
 │  Pass 1: Operator Fusion (RMSNorm→QKV→RoPE, SwiGLU fusion)     │
-│  Pass 2: Sensitivity Analysis (per-layer perplexity gradient)   │
+│  Pass 2: Sensitivity scoring (method recorded)                │
 │  Pass 3: Precision Assignment (mixed-precision per sensitivity) │
 │  Pass 4: KV Cache Structuring (paged blocks, radix-tree hints)  │
 │  Pass 5: MoE Expert Routing (hot/warm/cold tier classification) │
@@ -238,7 +251,7 @@ Model (HuggingFace / GGUF / SafeTensors / ONNX)
         ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ Stage 3: Quantization                                           │
-│  • Q4_K_M (INT4 block-scaled) — default for ≤70B models        │
+│  • Q4_K_M (explicit INT4 block-scaled format)                  │
 │  • Q8_0 (INT8 symmetric)                                        │
 │  • BF16 / FP16 / FP8 (E4M3 / E5M2)                            │
 │  • MXFP4 / MXFP6 (microscaling, PRD v4.0+)                     │
@@ -263,8 +276,14 @@ Model (HuggingFace / GGUF / SafeTensors / ONNX)
 └─────────────────────────────────────────────────────────────────┘
         │
         ▼
-  AEG artifact (.aeg/) — runs anywhere, forever
+  AEG artifact (.aeg/) — executes through compatible declared contracts
 ```
+
+Sensitivity reports identify weight reconstruction error or a labeled text
+entropy proxy; the proxy is not measured model perplexity. Automatic precision
+assignment currently uses BF16 storage, which can round higher-precision source
+weights and still requires workload evaluation. Explicit formats are opt-in;
+storage format does not establish the selected engine's arithmetic precision.
 
 ---
 
@@ -273,50 +292,74 @@ Model (HuggingFace / GGUF / SafeTensors / ONNX)
 ```bash
 pip install aether-runtime
 
-# Compile a model to AEG
-aether compile meta-llama/Llama-3.1-8B --target cuda_sm90 --precision q4_k_m
+# Compile a public model to a self-contained CPU AEG (also usable on GPU hosts)
+aether compile HuggingFaceTB/SmolLM2-135M-Instruct --target cpu_avx2 --output smollm2.aeg
 
 # Inspect the compiled artifact
-aether inspect llama-3.1-8b.aeg/
+aether inspect smollm2.aeg
 
-# Run inference (no GPU required for CPU target)
-aether serve llama-3.1-8b.aeg/ --port 8080
+# Run inference
+aether run smollm2.aeg --prompt "Explain quantum entanglement." --max-tokens 128
 
 # Benchmark performance
-aether bench llama-3.1-8b.aeg/
+aether bench smollm2.aeg --max-tokens 128 --output results.json
 
-# Run evaluation gate
-aether eval llama-3.1-8b.aeg/ --suite reasoning --max-regression 0.02
+# Optional API server
+pip install "aether-runtime[server]"
+aether serve smollm2.aeg --port 8080
 ```
+
+Use `cpu_neon` on ARM. To request quantization explicitly, add
+`--precision q4_k_m` or `--precision q8_0`; otherwise compilation preserves
+automatic precision assignment. Explicit lossy precision requires your own
+model-quality evaluation. For accelerator execution, install the backend your
+artifact needs (portable CUDA/ROCm/MPS AEGs use `aether-runtime[pytorch]`) and
+compile with the target reported by `aether hardware detect`.
+
+Automatic dispatch uses a ready accelerator only when the model/artifact permits
+that execution path, and otherwise uses compatible CPU execution. Hardware
+inventory remains visible when optional GPU SDKs are missing. Detection,
+dependency readiness, actual execution tests and production validation are
+reported independently. See the [completion audit](docs/cli-hardware-completion-audit.md)
+and [CLI validation matrix](docs/cli-command-validation.md) for measured results
+and feature prerequisites.
 
 ### Python API
 
 ```python
-from aether.compiler import AetherCompiler
-from aether.compiler.config import CompilerConfig
+from aether import Compiler, CompilerConfig, Runtime
 
 # Compile — no PyTorch required
-compiler = AetherCompiler()
-config = CompilerConfig(
-    target="cuda_sm90",
-    precision="q4_k_m",
-    max_context_length=131072,
+compiler = Compiler(CompilerConfig(targets=["cpu_avx2"]))
+artifact = compiler.compile(
+    "HuggingFaceTB/SmolLM2-135M-Instruct", output_path="smollm2.aeg"
 )
-artifact = compiler.compile("meta-llama/Llama-3.1-8B", config)
-print(artifact.summary())   # model_id, target, precision, size_gb, tok/s estimate
+print(artifact.root)
+
+with Runtime() as runtime:
+    response = runtime.generate(
+        str(artifact.root), "Explain quantum entanglement.",
+        max_tokens=128, apply_chat_template=True,
+    )
+    print(response.text)
+    print(response.metrics.to_dict())
 
 # Run compiled AEG
-from aether.backends import get_backend
+from aether.backends import GenerationRequest, get_backend
 
-backend = get_backend("aether_cpu")   # or "vllm", "mlx", "onnxruntime"
-backend.load_model("llama-3.1-8b", aeg_path="llama-3.1-8b.aeg/")
-result = backend.generate(GenerationRequest(
-    model_id="llama-3.1-8b",
-    prompt="What is quantum entanglement?",
-    max_tokens=512,
-))
-print(result.text)
-print(f"Throughput: {result.metrics['throughput_tps']:.1f} tok/s")
+backend = get_backend("aether_cpu")
+backend.load_model("smollm2", aeg_path=str(artifact.root))
+try:
+    result = backend.generate(GenerationRequest(
+        model_id="smollm2",
+        prompt="What is quantum entanglement?",
+        max_tokens=128,
+        extra={"apply_chat_template": True},
+    ))
+    print(result.text)
+    print(result.metrics)
+finally:
+    backend.unload_model("smollm2")
 ```
 
 ---
@@ -497,30 +540,26 @@ Shoeybi et al., arXiv:1909.08053 §3.3 (why this all-reduce dominates TP cost).
 ## Hardware Detection
 
 ```python
-from aether.backends.hardware_detector import detect_hardware
+from aether.runtime.hardware import HardwareDetector
 
-profile = detect_hardware()
-print(profile.summary())
-# ┌─────────────────────────────────────────────────────┐
-# │ Aether Hardware Profile                             │
-# │  GPUs:  2x NVIDIA RTX 4090 (24 GB each) → cuda_sm89│
-# │  CPU:   AMD Ryzen 9 7950X  (AVX-512)   → cpu_avx512│
-# │  RAM:   128 GB                                      │
-# │  Best target: cuda_sm89                             │
-# └─────────────────────────────────────────────────────┘
+print(HardwareDetector().detect().to_dict())
 ```
 
-Detected targets span: NVIDIA CUDA (sm70–sm130), AMD ROCm (RDNA3, CDNA3/4/5), Apple Metal (M1–M5), Intel OpenVINO (NPU/GPU), Qualcomm QNN, RISC-V NPUs (SiFive X160, XuanTie C930, MIPS S8200), Xilinx FPGA, and CPU (AVX-512, AVX2, NEON, ternary).
+The target catalog includes the following profiles; detection reports queried device evidence, with execution readiness and validation stated separately: NVIDIA CUDA (sm70–sm130), AMD ROCm (RDNA3, CDNA3/4/5), Apple Metal (M1–M5), Intel OpenVINO (NPU/GPU), Qualcomm QNN, RISC-V NPUs (SiFive X160, XuanTie C930, MIPS S8200), Xilinx FPGA, and CPU (AVX-512, AVX2, NEON, ternary).
 
 ---
 
 ## Native CPU Kernel Stack
 
-The Aether CPU engine compiles a C++ shared library at first run (cached thereafter) providing the following kernels — all OpenMP-parallel and auto-vectorized to AVX-512/NEON:
+The Aether CPU engine can compile a cached C++ shared library when a supported
+compiler is available. ISA and OpenMP availability determine the native build;
+unsupported instructions are not enabled from a target label alone. The
+following kernels also have reference paths. Performance depends on the model,
+precision, toolchain and host:
 
 | Kernel | Description | Research Basis |
 |--------|-------------|----------------|
-| `aether_int4_gemv` | **INT4-packed GEMV** — 2x bandwidth vs INT8, ~2x tok/s | GGML Q4_0 (2023), GPTQ (2022) |
+| `aether_int4_gemv` | Packed INT4 GEMV; smaller weight payload than INT8, with format overhead | GGML Q4_0 (2023), GPTQ (2022) |
 | `aether_qgemv_affine` | INT8 affine-quantized GEMV | Frantar et al. 2022 |
 | `aether_flash_attn` | FlashAttention-2 online softmax (O(seq·d) memory) | Dao, NeurIPS 2023 |
 | `aether_rmsnorm_linear` | Fused RMSNorm + QKV projection (1 buffer) | ClusterFusion NeurIPS 2025 |
@@ -528,13 +567,15 @@ The Aether CPU engine compiles a C++ shared library at first run (cached thereaf
 | `aether_geglu` | GeGLU for Gemma/Gemma-2 FFN | Hendrycks 2016, Google Gemma 2024 |
 | `aether_swiglu` | SwiGLU activation (Llama/Qwen/Mistral) | Shazeer 2020 |
 | `aether_rope` | Rotary position embedding in-place | Su et al. 2021 |
-| `aether_sgemv` | FP32 GEMV (M=1 decode fast path, ~3x vs SGEMM) | BLIS (Van Zee 2015) |
+| `aether_sgemv` | FP32 GEMV specialized for single-token decode | BLIS (Van Zee 2015) |
 | `aether_sgemm` | Cache-blocked FP32 SGEMM (prefill) | BLIS tile layout |
 | `aether_softmax` | Numerically stable row-wise softmax | Standard |
 | `aether_rmsnorm` | Double-accumulation RMSNorm | Zhang & Sennrich 2019 |
 | `aether_argmax` | Greedy token selection (OpenMP reduction) | Standard |
 
-No compiler toolchain? Every kernel has a NumPy fallback — the module always imports and runs.
+A compiler is optional for supported CPU AEG execution. Failed compilation is
+reported visibly and the NumPy reference path remains available; neither path
+establishes support for an otherwise unsupported model operator.
 
 ---
 
@@ -603,22 +644,44 @@ distinguishing numerics Aether derives from each checkpoint.
 
 ## Supported Hardware Targets
 
+The registry includes executable, portable, and planning-only targets. A target
+name does not establish that an executable vendor kernel is installed. Inspect
+an AEG's `kernels.variant_status` and use `aether hardware detect` to check the
+current host. See [runtime selection](docs/runtime.md) for the execution contract.
+
+Detection reports hardware and runtime evidence; it does not certify execution.
+Run `aether hardware validate cpu_generic --execute --json` for an offline CPU
+AEG test, or replace the target with your detected GPU target and select its
+installed backend. Execution and production validation are separate statuses.
+See [hardware reporting and validation](docs/hardware-feedback-validation.md).
+
+CUDA/ROCm/Metal AEG execution currently requires a matching PyTorch runtime.
+An explicitly authorized dense-decoder AEG can also execute through semantic
+ONNX export, including DirectML; generation, streaming and cached decode were
+tested on an Intel Windows GPU. Vendor provider/operator support remains a
+separate load-time check. Native CUDA, QNN/ANE, RISC-V NPU, FPGA and TensorRT-LLM
+adapters retain incomplete integration and report unavailable.
+See [runtime execution, precision and cache integration](docs/runtime-feature-integration.md)
+for real phase workers, persistent sessions, explicit drafts and tested limits.
+
 | Target ID | Hardware |
 |-----------|----------|
 | `cuda_sm89` | NVIDIA RTX 4090 (Ada Lovelace) |
 | `cuda_sm90` | NVIDIA H100 (Hopper) |
 | `cuda_sm100` | NVIDIA B200 (Blackwell) |
-| `cuda_sm130` | NVIDIA Rubin Ultra (sm_130) |
+| `cuda_sm130` | CUDA compute capability 13.0 planning profile |
 | `rocm_cdna3` | AMD MI300X |
 | `rocm_cdna5_mi455x` | AMD MI455X (CDNA5) |
 | `metal_m3` | Apple M3/M4/M5 |
-| `openvino_npu` | Intel Arc NPU |
+| `openvino_npu` | Intel NPU via OpenVINO provider (operator/device support requires validation) |
 | `qualcomm_qnn` | Qualcomm Snapdragon NPU |
 | `cpu_avx512` | x86-64 with AVX-512 |
+| `cpu_avx2` | x86-64 with process-usable AVX2 |
+| `cpu_generic` | CPU baseline when optimized SIMD is unconfirmed |
 | `cpu_neon` | ARM NEON (mobile, Raspberry Pi) |
 | `cpu_avx512_ternary` | BitNet b1.58 ternary on x86 |
 | `riscv_sifive_x160` | SiFive Intelligence X160 |
-| `fpga_xilinx_vu9p` | Xilinx VU9P (decode-only) |
+| `fpga_xilinx_vu9p` | Xilinx VU9P planning profile |
 
 Full list: 30+ targets in [`src/aether/core/constants.py`](src/aether/core/constants.py).
 
@@ -735,17 +798,21 @@ RustSDKGenerator().write('./sdk/rust/src/')           # aether_client.rs
 |---------|-------------|
 | `aether compile <model>` | Compile model to AEG package |
 | `aether inspect <path.aeg>` | Show AEG package summary |
-| `aether bench <path.aeg>` | Run benchmark suite |
+| `aether bench <path.aeg>` | Measure one greedy generation |
+| `aether benchmark <path.aeg>` | Measure repeated generation runs |
 | `aether serve <path.aeg>` | Start inference server |
 | `aether eval <path.aeg>` | Run eval gate CI check |
 | `aether hardware` | Show hardware profile |
 | `aether models` | Show the graded model-family support matrix |
 | `aether plan <path.aeg>` | Show the hardware-aware placement decision and its derivation |
-| `aether hub push <path.aeg>` | Push to Aether Hub CDN |
-| `aether hub pull <model-id>` | Pull from Aether Hub CDN |
-| `aether sdk generate` | Generate TypeScript/Go/Rust SDKs |
+| `aether hub push NAMESPACE/NAME path.aeg` | Upload to the configured Hub server |
+| `aether hub pull NAMESPACE/NAME output.aeg` | Download from the configured Hub server |
 | `aether sign <path.aeg>` | Sign with C2PA Content Credentials (CBOR claim + COSE_Sign1 + JUMBF) |
 | `aether verify <path.aeg>` | Verify the claim signature, assertion hashes, and per-file binding |
+
+Generate SDK clients through the Python APIs shown above. The
+[complete CLI matrix](docs/cli-command-validation.md) records each command's
+tested behavior and prerequisites.
 
 ---
 
@@ -761,7 +828,7 @@ pip install "aether-runtime[pytorch]"
 # With HuggingFace Transformers for AutoTokenizer, AutoConfig
 pip install "aether-runtime[transformers-frontend]"
 
-# Full install (all optional backends)
+# Development/test/server tools and PyTorch frontend
 pip install "aether-runtime[full]"
 ```
 
@@ -770,6 +837,7 @@ pip install "aether-runtime[full]"
 ## Testing
 
 ```bash
+pip install -e ".[test]"
 python -m pytest tests/ -v                                     # All tests
 python -m pytest tests/unit/test_native_cpu_kernels.py -v     # CPU kernels
 python -m pytest tests/unit/test_phase5_observability.py -v   # Observability
@@ -779,7 +847,8 @@ python -m pytest tests/unit/test_v31_elite_extensions.py -v   # v3.1 extensions
 
 > **Run the suite serially.** `test_e2e_compile_run_cpu.py` and `test_v31_features.py` share the `~/.aether` cache; parallel pytest workers race on it.
 >
-> Tests requiring HuggingFace weights skip cleanly when offline.
+> Tests requiring optional frameworks or live hardware skip when those dependencies
+> are absent. Network tests are disabled unless `AETHER_RUN_NETWORK_TESTS=1` is set.
 
 ---
 

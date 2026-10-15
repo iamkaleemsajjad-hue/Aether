@@ -9,9 +9,10 @@ wasting N× GPU memory and N× compute.
 R2 implements a *KV Coordination Registry* that:
   1. Maintains a session registry keyed by prefix hash.
   2. When a new agent session starts with a shared prefix, the registry
-     serves cached KV pointers (zero-copy via CUDA IPC / RDMA memory mapping).
-  3. Implements copy-on-write (CoW) for private KV divergence after the
-     shared prefix — each agent gets a private KV tail appended to the shared head.
+     serves an in-process reference to compatible cached state. Execution
+     adapters clone it before private divergence; no CUDA IPC/RDMA is implied.
+  3. Keeps private KV state separate from the shared prefix. The actual copy
+     and execution geometry belong to the selected inference adapter.
   4. Supports cross-agent KV eviction via reference counting: shared KV blocks
      are evicted only when all referencing agents have completed.
 
@@ -24,13 +25,14 @@ KV sharing strategies:
 Research basis:
   - SGLang (2024): RadixAttention for cross-request KV reuse.
   - vLLM prefix caching (2024): hash-based KV block sharing.
-  - Multi-agent KV coordination (2025): CoW for agent divergence.
-  - MemServe (2025): disaggregated memory pool for multi-agent KV.
+  These papers inform prefix reuse and isolation; this local registry does
+  not establish their distributed transport or throughput results.
 """
 
 from __future__ import annotations
 
 import hashlib
+from collections import OrderedDict
 import threading
 import time
 from dataclasses import dataclass, field
@@ -59,6 +61,8 @@ class SharedKVBlock:
     seq_len: int = 0
     last_access_ts: float = field(default_factory=time.time)
     is_pinned: bool = False  # True = cannot be evicted
+    execution_variants: dict[str, SharedKVBlock] = field(default_factory=dict)
+    """Validated execution-specific caches; never aliases unknown legacy state."""
 
 
 @dataclass
@@ -83,8 +87,8 @@ class AgentKVSession:
 class MultiAgentKVCoordinator:
     """Runtime R2: Multi-Agent KV Coordination Layer.
 
-    Manages shared KV blocks across agent sessions and implements
-    copy-on-write for private divergence.
+    Tracks local shared references and separate per-agent private values.
+    Execution adapters implement their own cache cloning and inference.
     """
 
     def __init__(
@@ -98,6 +102,7 @@ class MultiAgentKVCoordinator:
         self.eviction_policy = eviction_policy
 
         self._shared_blocks: dict[str, SharedKVBlock] = {}
+        self._variant_lru: OrderedDict[tuple[str, str], SharedKVBlock] = OrderedDict()
         self._sessions: dict[str, AgentKVSession] = {}
         self._lock = threading.RLock()
         self._stats = _CoordStats()
@@ -171,9 +176,9 @@ class MultiAgentKVCoordinator:
     ) -> None:
         """Append private (post-divergence) KV tokens to a session.
 
-        Implements copy-on-write: shared block remains unchanged, only the
-        private tail grows.  This enables O(1) divergence with zero copying
-        of the shared prefix.
+        The shared block remains unchanged while a Python private accumulator
+        grows. This bookkeeping does not implement device copy-on-write or
+        guarantee constant-time tensor divergence.
 
         Args:
             session_id: Session to update.
@@ -239,26 +244,84 @@ class MultiAgentKVCoordinator:
         kv_data: Any,
         *,
         seq_len: int | None = None,
+        execution_contract: dict[str, Any] | None = None,
     ) -> None:
-        """Publish computed prefix KV into an existing shared block."""
+        """Publish computed state under its prefix and optional weight contract.
+
+        Bound variants are retained independently of unknown legacy state and
+        share the configured variant capacity. If every retained variant is
+        pinned, a new one remains request-local rather than exceeding the limit.
+        """
+        if seq_len is not None and (type(seq_len) is not int or seq_len < 0):
+            raise ValueError("shared KV sequence length must be a non-negative integer")
+        variant_key = self._execution_key(execution_contract)
         with self._lock:
             if block_id in self._shared_blocks:
-                block = self._shared_blocks[block_id]
+                parent = self._shared_blocks[block_id]
+                block = parent
+                if variant_key is not None:
+                    block = parent.execution_variants.get(variant_key)
+                    if block is None:
+                        if self.max_shared_blocks <= 0:
+                            return
+                        if len(self._variant_lru) >= self.max_shared_blocks and not self._evict_variant_one():
+                            return
+                        block = SharedKVBlock(block_id=block_id)
+                        parent.execution_variants[variant_key] = block
+                        self._variant_lru[block_id, variant_key] = block
+                        self._stats.blocks_created += 1
+                    self._variant_lru.move_to_end((block_id, variant_key))
                 block.kv_data = kv_data
                 if seq_len is not None:
-                    if seq_len < 0:
-                        raise ValueError("shared KV sequence length must be non-negative")
-                    block.seq_len = int(seq_len)
+                    block.seq_len = seq_len
                 block.last_access_ts = time.time()
+                parent.last_access_ts = block.last_access_ts
 
-    def get_shared_kv(self, block_id: str) -> tuple[Any, int]:
-        """Return a shared prefix cache and its token length without copying it."""
+    def get_shared_kv(
+        self, block_id: str, *, execution_contract: dict[str, Any] | None = None,
+    ) -> tuple[Any, int]:
+        """Return only the state bound to the selected execution contract.
+
+        The reference is local; inference adapters own any required cloning or
+        device transfer. A contract-bound lookup never consumes unbound state.
+        """
+        variant_key = self._execution_key(execution_contract)
         with self._lock:
-            block = self._shared_blocks.get(block_id)
-            if block is None:
+            parent = self._shared_blocks.get(block_id)
+            if parent is None:
                 return None, 0
+            block = parent
+            if variant_key is not None:
+                block = block.execution_variants.get(variant_key)
+                if block is None:
+                    return None, 0
+                self._variant_lru.move_to_end((block_id, variant_key))
             block.last_access_ts = time.time()
+            parent.last_access_ts = block.last_access_ts
             return block.kv_data, block.seq_len
+
+    @staticmethod
+    def _execution_key(contract: dict[str, Any] | None) -> str | None:
+        if contract is None:
+            return None
+        if not isinstance(contract, dict) or not contract:
+            raise ValueError("shared KV execution contract must be a nonempty object")
+        from aether.runtime.session_contract import contract_key
+
+        return contract_key(contract)
+
+    def _evict_variant_one(self) -> bool:
+        """Drop the oldest unpinned local variant; held references stay valid."""
+        for key in self._variant_lru:
+            parent = self._shared_blocks.get(key[0])
+            if parent is not None and parent.is_pinned:
+                continue
+            if parent is not None:
+                parent.execution_variants.pop(key[1], None)
+            self._variant_lru.pop(key)
+            self._stats.blocks_evicted += 1
+            return True
+        return False
 
     def hash_prefix(self, prefix_text: str) -> str:
         """Compute a stable hash for a text prefix string.
@@ -370,6 +433,8 @@ class MultiAgentKVCoordinator:
             if candidates:
                 candidates.sort()
                 _, evict_id = candidates[0]
+                for variant_key in self._shared_blocks[evict_id].execution_variants:
+                    self._variant_lru.pop((evict_id, variant_key), None)
                 del self._shared_blocks[evict_id]
                 self._stats.blocks_evicted += 1
                 logger.debug("R2: Evicted LRU block %s.", evict_id[:8])
@@ -384,12 +449,15 @@ class MultiAgentKVCoordinator:
         with self._lock:
             return {
                 "shared_blocks": len(self._shared_blocks),
+                "execution_variants": len(self._variant_lru),
+                "execution_variant_capacity": self.max_shared_blocks,
+                "storage_scope": "in_process_reference",
                 "active_sessions": len(self._sessions),
                 "cache_hit_rate": (
                     self._stats.cache_hits / max(1, self._stats.sessions_created)
                 ),
                 "blocks_evicted": self._stats.blocks_evicted,
-                "research_basis": "SGLang RadixAttention 2024 + MemServe 2025",
+                "research_basis": "SGLang RadixAttention + vLLM execution-bound prefix caching",
             }
 
 
@@ -416,8 +484,7 @@ def _hash_token_sequence(tokens: list[int]) -> str:
 
 def _make_kv_buffer(kv: Any, capacity: int) -> Any:
     """Create a new KV buffer with the given initial KV data."""
-    # In production: allocate a contiguous CUDA tensor buffer.
-    # For planning / testing: use a list as a simple accumulator.
+    # This local accumulator stores Python values, not CUDA/RDMA allocations.
     if isinstance(kv, list):
         return list(kv)
     elif hasattr(kv, "tolist"):

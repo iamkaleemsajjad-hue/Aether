@@ -422,6 +422,12 @@ class CXLRackScaleKVPool:
         enable_defrag_daemon: bool = True,
         defrag_interval_s: float = 300.0,
     ) -> None:
+        if enable_defrag_daemon and (
+            type(defrag_interval_s) not in (int, float)
+            or not math.isfinite(defrag_interval_s)
+            or defrag_interval_s <= 0
+        ):
+            raise ValueError("defrag_interval_s must be finite and positive")
         self.pool_size_gb = pool_size_gb
         self.cxl_bandwidth_gbs = cxl_bandwidth_gbs
 
@@ -450,6 +456,8 @@ class CXLRackScaleKVPool:
             total_capacity_bytes=int(pool_size_gb * 1024 ** 3)
         )
         self._lock = threading.RLock()
+        self._closed = False
+        self._defrag_stop = threading.Event()
 
         # Background defragmentation daemon
         self._defrag_thread: threading.Thread | None = None
@@ -486,6 +494,7 @@ class CXLRackScaleKVPool:
             CXLKVBlock descriptor, or None if pool is full.
         """
         with self._lock:
+            self._ensure_open()
             block_id = self._make_block_id(session_id, layer_indices, kv_data[:64])
             offset = self._allocate(len(kv_data))
             if offset is None:
@@ -545,6 +554,7 @@ class CXLRackScaleKVPool:
             Raw KV bytes, or None if not found or checksum failed.
         """
         with self._lock:
+            self._ensure_open()
             block_ids = self._session_blocks.get(session_id, [])
             for block_id in block_ids:
                 block = self._blocks.get(block_id)
@@ -592,6 +602,7 @@ class CXLRackScaleKVPool:
             Migration report with decision, timing, and TTFT reduction estimate.
         """
         with self._lock:
+            self._ensure_open()
             block_ids = self._session_blocks.get(session_id, [])
             if not block_ids:
                 return {
@@ -652,6 +663,7 @@ class CXLRackScaleKVPool:
     def release_session(self, session_id: str) -> int:
         """Release all KV blocks for a session. Returns number of blocks freed."""
         with self._lock:
+            self._ensure_open()
             block_ids = self._session_blocks.pop(session_id, [])
             freed = 0
             for block_id in block_ids:
@@ -673,6 +685,7 @@ class CXLRackScaleKVPool:
         In real CXL hardware, this is done by the BlueField-4 DPU.
         """
         with self._lock:
+            self._ensure_open()
             start = time.perf_counter()
             moved = 0
             # Sort blocks by offset and compact
@@ -711,6 +724,7 @@ class CXLRackScaleKVPool:
         with self._lock:
             d = self._stats.to_dict()
             d["backend_mode"] = self._backend.mode
+            d["closed"] = self._closed
             d["pool_size_gb"] = self.pool_size_gb
             d["tract_policy"] = {
                 "cxl_bandwidth_gbs": self.tract.cxl_bandwidth_gbs,
@@ -777,11 +791,13 @@ class CXLRackScaleKVPool:
     def _start_defrag_daemon(self, interval_s: float) -> None:
         """Start background defragmentation thread."""
         def _daemon():
-            while True:
-                time.sleep(interval_s)
+            while not self._defrag_stop.wait(interval_s):
                 try:
-                    if self._stats.utilization > 0.80:
-                        self.defragment()
+                    with self._lock:
+                        if self._closed:
+                            return
+                        if self._stats.utilization > 0.80:
+                            self.defragment()
                 except Exception as e:
                     logger.debug(f"R12: Defrag daemon error: {e}")
 
@@ -793,5 +809,21 @@ class CXLRackScaleKVPool:
 
     def close(self) -> None:
         """Shut down the CXL pool and release resources."""
-        self._backend.close()
+        self._defrag_stop.set()
+        worker = self._defrag_thread
+        # A worker may be in defragment() waiting for the pool lock. Joining
+        # while holding that lock would deadlock shutdown. Complete its I/O
+        # before closing the mmap underneath it.
+        if worker is not None and worker is not threading.current_thread():
+            worker.join()
+        with self._lock:
+            if self._closed:
+                return
+            self._backend.close()
+            self._closed = True
         logger.info("R12: CXL pool closed")
+
+    def _ensure_open(self) -> None:
+        """Reject I/O and registry changes after the owned backend is closed."""
+        if self._closed:
+            raise RuntimeError("CXL pool is closed")

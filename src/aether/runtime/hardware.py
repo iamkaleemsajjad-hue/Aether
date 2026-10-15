@@ -36,8 +36,8 @@ class HardwareFingerprint:
     cpu_count: int
     """Number of CPU cores."""
 
-    total_ram_gb: float
-    """Total system RAM in GB."""
+    total_ram_gb: float | None
+    """Measured total system RAM in GiB, or None when unknown."""
 
     gpu_name: str | None = None
     """GPU name if available."""
@@ -45,8 +45,8 @@ class HardwareFingerprint:
     gpu_count: int = 0
     """Number of GPUs detected."""
 
-    gpu_memory_gb: float = 0.0
-    """Total GPU memory per GPU in GB."""
+    gpu_memory_gb: float | None = None
+    """Measured memory of the first GPU in GiB, or None when unknown."""
 
     driver_version: str | None = None
     """GPU driver or framework version."""
@@ -82,56 +82,80 @@ class HardwareDetector:
     """Detects hardware capabilities and produces a hardware fingerprint."""
 
     def __init__(self) -> None:
-        self.target = HardwareTarget.auto()
-        self.profile = HardwareProfile.from_target_id(self.target.value)
+        # Construction does not probe hardware. The complete detector below
+        # is the single source of device evidence and target selection.
+        self.target: HardwareTarget | None = None
+        self.profile: HardwareProfile | None = None
 
     def detect(self) -> HardwareFingerprint:
         """Detect hardware and produce a fingerprint."""
         from aether.backends.hardware_detector import detect_all_capabilities
 
         capabilities = detect_all_capabilities()
-        available = [item for item in capabilities if item.available]
+        known_targets = {target.value for target in HardwareTarget}
+        available = [
+            item for item in capabilities if item.available and item.target_id in known_targets
+        ]
+        gpu_prefixes = ("cuda_", "rocm_", "amd_mi", "metal", "openvino_gpu")
         primary = next(
             (
-                item for item in available
-                if item.vendor in {"NVIDIA", "AMD", "Apple", "Intel"}
+                item
+                for item in available
+                if item.implemented and item.target_id.startswith(gpu_prefixes)
             ),
-            next((item for item in available if item.vendor == "CPU"), None),
+            next(
+                (
+                    item
+                    for item in available
+                    if item.implemented and item.target_id.startswith("cpu_")
+                ),
+                None,
+            ),
         )
-        if primary is not None:
-            try:
-                self.target = HardwareTarget.from_string(primary.target_id)
-            except ValueError:
-                # Keep the safe enum-selected target until a new vendor target
-                # is added to the canonical target registry.
-                self.target = HardwareTarget.auto()
-            self.profile = HardwareProfile.from_target_id(self.target.value)
+        if primary is None:
+            raise RuntimeError("Hardware detection found no available canonical CPU/GPU target")
+        self.target = HardwareTarget.from_string(primary.target_id)
+        self.profile = HardwareProfile.from_target_id(self.target.value)
         os_name = platform.system()
         cpu_arch = platform.machine()
         cpu_count = os.cpu_count() or 1
-        total_ram_gb = self._get_total_ram_gb()
+        cpu_capability = next((item for item in capabilities if item.vendor == "CPU"), None)
+        total_ram_gb = (
+            cpu_capability.memory_bytes / (1024**3)
+            if cpu_capability is not None and cpu_capability.memory_bytes > 0
+            else self._get_total_ram_gb()
+        )
 
         gpu_name = None
         gpu_count = 0
-        gpu_memory_gb = 0.0
+        gpu_memory_gb = None
         driver_version = None
         compute_capability = None
 
-        accelerator_caps = [
-            item for item in available if item.vendor in {"NVIDIA", "AMD", "Apple"}
+        gpu_caps = [
+            item
+            for item in capabilities
+            if item.target_id.startswith(("cuda", "rocm", "amd_mi", "metal", "openvino_gpu", "gpu_"))
+            and (getattr(item, "hardware_present", None) is True or item.available)
+            and not item.extra.get("catalog_only")
         ]
-        if accelerator_caps:
-            first = accelerator_caps[0]
-            gpu_count = len(accelerator_caps)
+        from aether.backends.hardware_inventory import summarize_gpu_devices
+        gpu_summary = summarize_gpu_devices(capabilities)
+        if gpu_caps:
+            first = primary if primary in gpu_caps else gpu_caps[0]
+            gpu_count = gpu_summary["count"]
             gpu_name = first.device
-            gpu_memory_gb = first.memory_bytes / (1024 ** 3) if first.memory_bytes else 0.0
+            gpu_memory_gb = first.memory_bytes / (1024**3) if first.memory_bytes > 0 else None
             compute_capability = str(first.extra.get("compute_capability", first.architecture))
-            driver_version = first.driver_version
+            driver_version = (
+                first.driver_version
+                if first.driver_version and not first.driver_version.lower().startswith("unknown")
+                else None
+            )
 
-        profile_name = self.profile.name if self.profile else self.target.value
         return HardwareFingerprint(
             target_id=self.target.value,
-            target_name=profile_name,
+            target_name=primary.device,
             os_name=os_name,
             cpu_arch=cpu_arch,
             cpu_count=cpu_count,
@@ -142,23 +166,26 @@ class HardwareDetector:
             driver_version=driver_version,
             compute_capability=compute_capability,
             attributes={
-                "available_targets": [item.target_id for item in available],
-                "available_accelerator_count": len(accelerator_caps),
+                "available_targets": list(dict.fromkeys(item.target_id for item in available)),
+                "available_accelerator_count": sum(item.available for item in gpu_caps),
+                "gpu_count_known": gpu_summary["count_known"],
+                "gpu_count_maximum": gpu_summary["maximum_count"],
+                "gpu_count_scope": "physical device identities; ambiguous cross-provider matches report a lower bound",
+                "hardware_inventory": cpu_capability.extra.get("hardware_inventory") if cpu_capability else None,
+                "compiler_profile_name": self.profile.name if self.profile else None,
+                "gpu_memory_known": gpu_memory_gb is not None,
+                "ram_memory_known": total_ram_gb is not None,
             },
             capabilities=[item.to_dict() for item in capabilities],
         )
 
     @staticmethod
-    def _get_total_ram_gb() -> float:
-        """Get total system RAM in GB."""
-        try:
-            import psutil
-            return psutil.virtual_memory().total / (1024**3)
-        except ImportError:
-            try:
-                return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024**3)
-            except (ValueError, AttributeError):
-                return 16.0
+    def _get_total_ram_gb() -> float | None:
+        """Get measured system memory; never substitute an assumed capacity."""
+        from aether.backends.capabilities import _host_memory_bytes
+
+        memory_bytes = _host_memory_bytes()
+        return memory_bytes / (1024**3) if memory_bytes > 0 else None
 
     def __repr__(self) -> str:
-        return f"HardwareDetector(target={self.target.value})"
+        return f"HardwareDetector(target={self.target.value if self.target else 'not detected'})"

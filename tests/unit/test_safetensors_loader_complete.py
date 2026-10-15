@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 from safetensors.torch import save_file
 
 from aether.compiler.stage1_ingestion.safetensors_loader import SafeTensorsLoader
@@ -320,7 +320,7 @@ class TestSafeTensorsSecurity:
 
 
 class TestSafeTensorsModelFamilies:
-    """Test compatibility with different model families."""
+    """Test family tensor names with small checkpoints, independent of RAM size."""
 
     def test_llama_architecture(self, tmp_path):
         """Test Llama-style model loading."""
@@ -328,17 +328,17 @@ class TestSafeTensorsModelFamilies:
         model_dir.mkdir()
 
         tensors = {
-            "model.embed_tokens.weight": torch.randn(32000, 4096),
-            "model.layers.0.self_attn.q_proj.weight": torch.randn(4096, 4096),
-            "model.norm.weight": torch.randn(4096),
-            "lm_head.weight": torch.randn(32000, 4096),
+            "model.embed_tokens.weight": torch.randn(128, 64),
+            "model.layers.0.self_attn.q_proj.weight": torch.randn(64, 64),
+            "model.norm.weight": torch.randn(64),
+            "lm_head.weight": torch.randn(128, 64),
         }
         save_file(tensors, model_dir / "model.safetensors")
 
         config = {
             "architectures": ["LlamaForCausalLM"],
             "model_type": "llama",
-            "hidden_size": 4096,
+            "hidden_size": 64,
         }
         (model_dir / "config.json").write_text(json.dumps(config))
 
@@ -352,9 +352,9 @@ class TestSafeTensorsModelFamilies:
         model_dir.mkdir()
 
         tensors = {
-            "transformer.wte.weight": torch.randn(152064, 1536),
-            "transformer.h.0.attn.c_attn.weight": torch.randn(4608, 1536),
-            "lm_head.weight": torch.randn(152064, 1536),
+            "transformer.wte.weight": torch.randn(128, 64),
+            "transformer.h.0.attn.c_attn.weight": torch.randn(192, 64),
+            "lm_head.weight": torch.randn(128, 64),
         }
         save_file(tensors, model_dir / "model.safetensors")
 
@@ -374,11 +374,11 @@ class TestSafeTensorsModelFamilies:
         model_dir.mkdir()
 
         tensors = {
-            "model.embed_tokens.weight": torch.randn(32000, 4096),
-            "model.layers.0.block_sparse_moe.gate.weight": torch.randn(8, 4096),
-            "model.layers.0.block_sparse_moe.experts.0.w1.weight": torch.randn(14336, 4096),
-            "model.layers.0.block_sparse_moe.experts.1.w1.weight": torch.randn(14336, 4096),
-            "lm_head.weight": torch.randn(32000, 4096),
+            "model.embed_tokens.weight": torch.randn(128, 64),
+            "model.layers.0.block_sparse_moe.gate.weight": torch.randn(8, 64),
+            "model.layers.0.block_sparse_moe.experts.0.w1.weight": torch.randn(128, 64),
+            "model.layers.0.block_sparse_moe.experts.1.w1.weight": torch.randn(128, 64),
+            "lm_head.weight": torch.randn(128, 64),
         }
         save_file(tensors, model_dir / "model.safetensors")
 

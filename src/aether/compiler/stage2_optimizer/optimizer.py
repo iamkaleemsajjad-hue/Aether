@@ -204,13 +204,12 @@ class OperatorFusionPass(BasePass):
 class SensitivityAnalysisPass(BasePass):
     """Pass 2: Sensitivity Analysis.
 
-    Computes a per-layer sensitivity score: the change in model perplexity
-    per saved bit when a layer is quantized. This is the mathematical
-    foundation for Aether's mixed-precision quantization.
+    Reports weight reconstruction sensitivity or a labeled text entropy proxy.
+    These scores do not measure model perplexity or establish a quality budget.
     """
 
     name = "sensitivity_analysis"
-    description = "Compute d(perplexity)/d(precision) per layer."
+    description = "Report per-layer sensitivity with its measured or proxy method."
 
     def run(self, graph: Any, architecture: Any, config: CompilerConfig) -> tuple[Any, PassReport]:
         start = time.perf_counter()
@@ -360,8 +359,8 @@ class SensitivityAnalysisPass(BasePass):
 class PrecisionAssignmentPass(BasePass):
     """Pass 3: Precision Assignment.
 
-    Using the sensitivity map from Pass 2, assigns an optimal precision
-    format to each layer subject to the quality budget constraint.
+    Applies explicit manual/uniform formats or a conservative BF16 baseline.
+    Pass 2 reconstruction scores do not establish a model-quality budget.
     """
 
     name = "precision_assignment"
@@ -375,7 +374,7 @@ class PrecisionAssignmentPass(BasePass):
                 precision_map.update(config.manual_precision_map)
             elif config.precision_assignment_mode == "uniform":
                 for i in range(architecture.layers):
-                    precision_map[f"layer_{i}"] = "Q4_K_M"
+                    precision_map[f"layer_{i}"] = config.precision or "Q4_K_M"
             else:
                 sensitivity_map: dict[str, float] = {}
                 if hasattr(graph, "metadata"):
@@ -396,7 +395,7 @@ class PrecisionAssignmentPass(BasePass):
                     for i in range(architecture.layers):
                         # Weight-reconstruction sensitivity is not a model
                         # quality evaluation.  Until a perplexity/task gate has
-                        # actually run, keep the source precision rather than
+                        # actually run, keep the BF16 baseline rather than
                         # silently accumulating lossy Q4/Q3 error across all
                         # transformer layers.
                         precision_map[f"layer_{i}"] = "BF16"

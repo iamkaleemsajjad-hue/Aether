@@ -52,7 +52,7 @@ class HardwareProfile:
     """Whether this target supports native FP4 (NVFP4/MXFP4/MXFP6).
     Requires Blackwell sm_100 or newer. Enables Pass 3 NVFP4 precision path."""
 
-    supports_bf16: bool = True
+    supports_bf16: bool = False
     """Whether this target supports native BF16."""
 
     supports_ternary: bool = False
@@ -192,11 +192,11 @@ class HardwareProfile:
         # never the development-only pytorch backend.
         import os
         return HardwareProfile(
-            target_id="cpu_avx512",
+            target_id="cpu_generic",
             name=os.uname().machine if hasattr(os, "uname") else "x86_64",
             compute_capability="cpu",
-            memory_gb=16.0,
-            memory_bandwidth_gb_s=50.0,
+            memory_gb=0.0,
+            memory_bandwidth_gb_s=0.0,
             tensor_core_flops=0.0,
             supports_fp8=False,
             supports_bf16=False,
@@ -243,7 +243,7 @@ class HardwareProfile:
             flops_fp4=data.get("flops_fp4", 0.0),
             supports_fp8=data.get("supports_fp8", False),
             supports_fp4=data.get("supports_fp4", False),
-            supports_bf16=data.get("supports_bf16", True),
+            supports_bf16=data.get("supports_bf16", False),
             supports_ternary=data.get("supports_ternary", False),
             supports_mxfp6=data.get("supports_mxfp6", False),
             supports_tee=data.get("supports_tee", False),
@@ -534,6 +534,16 @@ _TARGET_PROFILES: dict[str, dict[str, Any]] = {
 
     # ── v3.1 Apple ────────────────────────────────────────────────────────────
 
+    "metal": {
+        "name": "Metal GPU (portable contract)",
+        "compute_capability": "metal",
+        "memory_gb": 0.0,
+        "memory_bandwidth_gb_s": 0.0,
+        "tensor_core_flops": 0.0,
+        "supports_fp8": False,
+        "supports_bf16": False,
+        "supports_flash_attention": False,
+    },
     "metal_m1": {
         "name": "Apple M1/M2",
         "compute_capability": "m1",
@@ -660,6 +670,22 @@ _TARGET_PROFILES: dict[str, dict[str, Any]] = {
         "sm_count": 12,
         "tdp_watts": 15.0,
     },
+    "cpu_generic": {
+        "name": "CPU (portable baseline)",
+        "compute_capability": "cpu_generic",
+        "memory_gb": 0.0,
+        "memory_bandwidth_gb_s": 0.0,
+        "tensor_core_flops": 0.0,
+        "supports_fp8": False,
+        "supports_fp4": False,
+        "supports_bf16": False,
+        "supports_flash_attention": False,
+        "recommended_flash_attention": "cpu_attention",
+        "max_shm_size_bytes": 0,
+        "warp_size": 1,
+        "sm_count": 0,
+        "tdp_watts": 0.0,
+    },
     "cpu_avx512": {
         "name": "x86_64 (AVX-512)",
         "compute_capability": "cpu",
@@ -669,7 +695,7 @@ _TARGET_PROFILES: dict[str, dict[str, Any]] = {
         "flops_fp4": 0.0,
         "supports_fp8": False,
         "supports_fp4": False,
-        "supports_bf16": True,
+        "supports_bf16": False,  # AVX512F does not imply AVX512_BF16.
         "supports_flash_attention": False,
         "recommended_flash_attention": "paged_attention",
         "max_shm_size_bytes": 32768,
@@ -703,7 +729,7 @@ _TARGET_PROFILES: dict[str, dict[str, Any]] = {
         "flops_fp4": 0.0,
         "supports_fp8": False,
         "supports_fp4": False,
-        "supports_bf16": True,
+        "supports_bf16": False,  # Baseline NEON does not imply a BF16 extension.
         "supports_flash_attention": False,
         "recommended_flash_attention": "paged_attention",
         "max_shm_size_bytes": 16384,

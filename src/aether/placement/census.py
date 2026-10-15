@@ -29,8 +29,10 @@ References:
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import platform
+import statistics
 from dataclasses import dataclass
 from typing import Any
 
@@ -57,17 +59,23 @@ _BANDWIDTH_PROBE_BYTES = 64 << 20
 _DISPATCH_PROBE_OPS = 400
 """Operations timed per dispatch-probe pass.
 
-Large enough that the perf_counter resolution is negligible against the total, small
-enough that the whole probe costs well under 100 ms on any host."""
+Initial block size; the pilot adjusts subsequent blocks to amortize timer overhead.
+No fixed runtime bound is inferred for an arbitrary device implementation."""
 
-_DISPATCH_PROBE_PASSES = 12
-"""Upper bound on probe passes. Convergence normally stops it after three or four."""
+_DISPATCH_PROBE_PASSES = 40
+"""Bounded repeated measurements; noisy probes return no new measurement."""
+
+_DISPATCH_PROBE_MIN_SECONDS = 0.1
+"""Minimum timed work before a stable dispatch estimate can be accepted."""
+
+_DISPATCH_PROBE_BLOCK_SECONDS = 0.005
+"""Target timed block duration, amortizing host clock overhead."""
 
 _DISPATCH_PROBE_SETTLED = 1.25
 """Pass-to-pass agreement that counts as converged.
 
-Comfortably inside the staleness ratio, so a converged probe cannot trip the staleness
-check against the value a converged probe stored a moment earlier."""
+Maximum spread of the middle half of a recent five-sample window, excluding
+isolated scheduling outliers. Changing system load can still move later measurements."""
 
 # Conservative sustained-throughput priors, used only until a measurement exists.
 # CPUs are deliberately pessimistic: a CPU that turns out to be faster than this
@@ -468,19 +476,19 @@ def measure_dispatch_seconds(
     bandwidth-bound models.  One synchronise happens after the timed region, purely so
     the probe does not leave work queued behind it.
 
-    The measurement is taken to *convergence* rather than for a fixed number of passes.
-    That matters more than it looks: a cold process pays dispatcher and autograd
-    initialisation on its first few hundred calls, so a fixed-count probe reports a
-    number the same machine will not reproduce a second later — and a value that does
-    not reproduce would trip the staleness check on the next load and thrash the stored
-    calibration.  Passes therefore continue until two consecutive ones agree, and the
-    minimum is kept because the fastest pass is the one least polluted by the OS
-    scheduler.
+    Warmup precedes adaptive timed blocks. A median of recent measurements is
+    accepted only after enough timed work and agreement across several complete
+    windows. A cold or unusually fast individual sample cannot become the answer.
+    If the bounded probe does not settle, it returns no new measurement rather
+    than replacing a ledger entry with an unqualified minimum. This estimates
+    the current issue cost, not invariant performance under changing system load.
 
     Returns:
         Seconds per operation, or ``0.0`` when the probe cannot run — in which case the
         caller keeps its prior and says so, rather than trusting a failed measurement.
     """
+    if type(operations) is not int or operations <= 0:
+        raise ValueError("dispatch probe operations must be a positive integer")
     try:
         import time as _time
 
@@ -491,31 +499,49 @@ def measure_dispatch_seconds(
         # One lookup for every asynchronous backend; ``None`` on a CPU, where the work
         # is already complete when the call returns.
         synchronize = _device_barrier(torch, device)
+        if device.type != "cpu" and synchronize is None:
+            return 0.0
 
-        def one_pass() -> float:
+        def one_pass(count: int) -> float:
             start = _time.perf_counter()
-            for _ in range(operations):
+            for _ in range(count):
                 tensor.add_(1.0)
             elapsed = _time.perf_counter() - start
             if synchronize is not None:
                 synchronize()
-            return elapsed / operations if elapsed > 0 else 0.0
+            return elapsed
 
-        best = 0.0
-        previous = 0.0
+        # Warm the dispatcher and drain outstanding accelerator work outside
+        # the timed samples. This does not alter the caller's thread settings.
+        for _ in range(3):
+            one_pass(operations)
+        pilot = one_pass(operations)
+        if not math.isfinite(pilot) or pilot <= 0:
+            return 0.0
+        count = max(1, min(65536, round(operations * _DISPATCH_PROBE_BLOCK_SECONDS / pilot)))
+        samples: list[float] = []
+        timed_seconds = 0.0
         settled = 0
         for _ in range(_DISPATCH_PROBE_PASSES):
-            per_op = one_pass()
-            if per_op <= 0:
-                continue
-            best = per_op if best == 0.0 else min(best, per_op)
-            if previous > 0:
-                spread = max(per_op / previous, previous / per_op)
+            elapsed = one_pass(count)
+            if not math.isfinite(elapsed) or elapsed <= 0:
+                return 0.0
+            timed_seconds += elapsed
+            samples.append(elapsed / count)
+            # A pilot can itself be delayed by the scheduler. Re-size later
+            # blocks when their actual duration misses the timing budget.
+            # Per-operation samples remain comparable after changing count.
+            if elapsed < _DISPATCH_PROBE_BLOCK_SECONDS / 2 or elapsed > _DISPATCH_PROBE_BLOCK_SECONDS * 2:
+                count = max(1, min(65536, round(count * _DISPATCH_PROBE_BLOCK_SECONDS / elapsed)))
+            recent = samples[-5:]
+            if len(recent) == 5:
+                ordered = sorted(recent)
+                spread = ordered[3] / ordered[1]
                 settled = settled + 1 if spread <= _DISPATCH_PROBE_SETTLED else 0
-                if settled >= 2:
-                    break
-            previous = per_op
-        return best
+                if settled >= 3 and timed_seconds >= _DISPATCH_PROBE_MIN_SECONDS:
+                    return float(statistics.median(recent))
+        logger.debug("dispatch probe on %s did not settle; retaining its prior", device_id)
+        return 0.0
     except Exception as exc:  # noqa: BLE001 - probing must never block planning
         logger.debug("dispatch probe on %s failed: %s", device_id, exc)
         return 0.0
@@ -615,7 +641,7 @@ def take_census(
             roughly 20 ms per device and replaces a registry prior with a fact.
         probe_dispatch: Time a stream of trivial operations to get the host cost per
             graph op, and reconcile it against whatever the ledger holds for this
-            backend build. Costs a few tens of milliseconds per device and is the
+            backend build. Uses at least 100 ms of timed work when settled and is the
             check that catches a mis-keyed or stale dispatch cost — the failure mode
             that silently stops the planner sharding models it should.
 

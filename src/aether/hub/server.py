@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import tempfile
 import time
@@ -287,7 +288,14 @@ class HubStorageBackend:
             "role": user.role,
             "namespaces": user.namespaces,
         }
-        user_path.write_text(json.dumps(user_data, indent=2))
+        # API keys belong only in the administrator-controlled storage tree.
+        # POSIX creates this file with owner access; Windows access control is
+        # inherited from that tree and must be configured by its administrator.
+        descriptor = os.open(user_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(user_data, stream, indent=2)
+        if os.name != "nt":
+            user_path.chmod(0o600)
         self._index.setdefault("users", {})[user.user_id] = {
             "username": user.username,
             "api_key_prefix": user.api_key[:8],
@@ -338,13 +346,22 @@ class AetherHubServer:
         self._initialize_default_admin()
 
     def _initialize_default_admin(self) -> None:
-        """Create a default admin user if no users exist."""
+        """Bootstrap a locally stored administrator only for new storage.
+
+        An explicit AETHER_HUB_ADMIN_TOKEN can provision the secret. Otherwise
+        a random key is persisted in metadata/user_admin_001.json for local
+        administrator retrieval. Existing accounts are never replaced and the
+        credential is never logged or included in public HTTP responses.
+        """
         if not self.storage._index.get("users"):
+            configured_token = os.environ.get("AETHER_HUB_ADMIN_TOKEN")
+            if configured_token is not None and not configured_token.strip():
+                raise ValueError("AETHER_HUB_ADMIN_TOKEN must not be empty")
             admin = HubUser(
                 user_id="admin_001",
                 username="admin",
                 email="admin@aether.local",
-                api_key="aether_admin_" + hashlib.sha256(b"default_admin").hexdigest()[:32],
+                api_key=configured_token or "aether_admin_" + secrets.token_urlsafe(32),
                 created_at=time.time(),
                 role="admin",
                 namespaces=["public", "admin"],
@@ -404,8 +421,13 @@ class AetherHubServer:
                     manifest_data = json.loads(zf.read("manifest.json").decode())
                     arch = manifest_data.get("architecture", {}).get("family", "")
                     fmt_version = manifest_data.get("format_version", "")
-                    hw_targets = list(manifest_data.get("kernels", {}).keys())
-                    meta.update({"manifest_keys": list(manifest_data.keys())})
+                    kernel_data = manifest_data.get("kernels", {})
+                    hw_targets = list(kernel_data.get("targets", [])) if isinstance(kernel_data.get("targets"), list) else list(kernel_data.keys())
+                    meta.update({
+                        "manifest_keys": list(manifest_data.keys()),
+                        "manifest_architecture": manifest_data.get("architecture", {}),
+                        "aether_version": manifest_data.get("aether_version", "unknown"),
+                    })
         except Exception:  # noqa: BLE001
             pass
 
@@ -572,123 +594,306 @@ class AetherHubServer:
 # FastAPI integration (optional — only if fastapi is installed)
 # ---------------------------------------------------------------------------
 
-def create_hub_app(hub: AetherHubServer | None = None) -> Any:
-    """
-    Create a FastAPI application exposing the Hub HTTP API.
+def create_hub_app(
+    hub: AetherHubServer | None = None,
+    *,
+    max_upload_bytes: int = 2 * 1024**3,
+    max_kv_storage_bytes: int = 200 * 1024**3,
+) -> Any:
+    """Expose the Hub storage API and compatible HubClient HTTP routes.
 
-    Endpoints:
-      POST /v1/hub/models/{namespace}/{name}/push  — push artifact
-      GET  /v1/hub/models/{namespace}/{name}/pull  — pull artifact
-      GET  /v1/hub/models/{namespace}/{name}       — get model info
-      GET  /v1/hub/models                          — search models
-      DELETE /v1/hub/models/{namespace}/{name}     — delete model
-      GET  /v1/hub/stats                           — server statistics
-      POST /v1/hub/users                           — create user
+    Uploads contain binary ZIP AEG artifacts, with bounded body and expanded
+    size, verified package hashes, and namespace access checks. Older
+    ``/v1/hub`` endpoints remain available. This factory creates no external
+    connections and makes no claim of production or hardware validation.
     """
     try:
-        from fastapi import FastAPI, HTTPException, Depends, Header
-        from fastapi.responses import Response, JSONResponse
-        import uvicorn
+        from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
+        from fastapi.responses import Response
     except ImportError as exc:
-        msg = "fastapi and uvicorn are required for Hub server mode"
-        raise ImportError(msg) from exc
-
-    if hub is None:
-        hub = AetherHubServer()
-
-    app = FastAPI(
-        title="Aether Hub",
-        description="Aether Model Registry — content-addressed AEG artifact storage",
-        version=AETHER_VERSION,
-    )
+        raise ImportError("fastapi is required for Hub server mode") from exc
+    if max_upload_bytes <= 0:
+        raise ValueError("max_upload_bytes must be positive")
+    hub = hub or AetherHubServer()
+    app = FastAPI(title="Aether Hub", version=AETHER_VERSION)
+    app.state.aether_hub = hub
+    app.state.max_upload_bytes = max_upload_bytes
+    from aether.runtime.kv_storage import KVPayloadStore, CacheQuotaError
+    kv_store = KVPayloadStore(hub.storage.storage_root / "kv_cache", max_bytes=max_kv_storage_bytes,
+                              max_entry_bytes=max_upload_bytes)
+    app.state.kv_store = kv_store
 
     def _auth(authorization: str | None = Header(default=None)) -> HubUser:
         if authorization is None:
-            raise HTTPException(status_code=401, detail="Authorization header required")
+            raise HTTPException(401, "Authorization header required")
         scheme, _, token = authorization.partition(" ")
-        if scheme.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Bearer authentication required")
+        if scheme.lower() != "bearer" or not token:
+            raise HTTPException(401, "Bearer authentication required")
         user = hub.authenticate(token)
         if user is None:
-            raise HTTPException(status_code=403, detail="Invalid API key")
+            raise HTTPException(403, "Invalid API key")
         return user
 
-    @app.post("/v1/hub/models/{namespace}/{name}/push")
-    async def push_model(
-        namespace: str,
-        name: str,
-        tag: str = "latest",
-        description: str = "",
+    def _parts(model_id: str) -> tuple[str, str]:
+        import re
+        parts = model_id.split("/")
+        if len(parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", part) for part in parts):
+            raise HTTPException(400, "model ID must be NAMESPACE/NAME using letters, digits, dots, underscores or hyphens")
+        return parts[0], parts[1]
+
+    def _can_read(user: HubUser, model: HubModel) -> bool:
+        return (
+            user.role == "admin" or model.visibility == "public"
+            or model.created_by == user.user_id or model.namespace in user.namespaces
+        )
+
+    def _write_access(user: HubUser, namespace: str) -> None:
+        if user.role != "admin" and (user.role != "user" or namespace not in user.namespaces):
+            raise HTTPException(403, "write access to this namespace is required")
+
+    def _read_model(model_id: str, user: HubUser) -> HubModel:
+        namespace, name = _parts(model_id)
+        model = hub.storage.find_model_by_name(namespace, name)
+        if model is None or not _can_read(user, model):
+            raise HTTPException(404, "model not found")
+        return model
+
+    def _manifest(model: HubModel, version: HubModelVersion | None = None) -> dict[str, Any]:
+        version = version or model.latest_version
+        return {
+            "model_id": model.full_name,
+            "aether_version": version.metadata.get("aether_version", "unknown") if version else "unknown",
+            "aeg_version": version.format_version if version else "unknown",
+            "targets": version.hardware_targets if version else [],
+            "architecture": version.metadata.get("manifest_architecture", {}) if version else {},
+            "file_size_bytes": version.size_bytes if version else 0,
+            "content_hash": version.content_hash if version else "",
+            "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(version.created_at)) if version else "",
+            "downloads": model.download_count,
+            "source": "server", "persistence": "remote_service",
+        }
+
+    async def _body(request: Any, limit: int) -> bytes:
+        length = request.headers.get("content-length")
+        if length is not None:
+            try:
+                size = int(length)
+            except ValueError as exc:
+                raise HTTPException(400, "invalid Content-Length") from exc
+            if size < 0:
+                raise HTTPException(400, "invalid Content-Length")
+            if size > limit:
+                raise HTTPException(413, "request exceeds configured body limit")
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > limit:
+                raise HTTPException(413, "request exceeds configured body limit")
+            body.extend(chunk)
+        return bytes(body)
+
+    def _kv_access(namespace: str, key: str, user: HubUser, *, write: bool = False) -> str:
+        _parts(f"{namespace}/{key}")
+        if write:
+            _write_access(user, namespace)
+        elif user.role != "admin" and namespace not in user.namespaces:
+            # Cache tensors may contain private prompt state; never public-by-default.
+            raise HTTPException(404, "cache snapshot not found")
+        return f"{namespace}/{key}"
+
+    async def put_kv(request: Any, namespace: str, key: str, user: HubUser = Depends(_auth)) -> dict[str, Any]:
+        cache_key = _kv_access(namespace, key, user, write=True)
+        data = await _body(request, min(max_upload_bytes, kv_store.max_entry_bytes))
+        claimed = request.headers.get("x-content-hash")
+        if claimed is None or claimed != hashlib.sha256(data).hexdigest():
+            raise HTTPException(400, "cache upload requires its matching X-Content-Hash")
+        try:
+            entry = kv_store.put_bytes(cache_key, data, metadata={"namespace": namespace, "key": key,
+                                                                "uploaded_by": user.user_id})
+        except CacheQuotaError as exc:
+            raise HTTPException(413, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {**entry, "namespace": namespace, "key": key, "source": "server", "persistence": "remote_service"}
+
+    @app.get("/v1/kv/{namespace}/{key}")
+    async def get_kv(namespace: str, key: str, user: HubUser = Depends(_auth)) -> Any:
+        cache_key = _kv_access(namespace, key, user)
+        try:
+            data = kv_store.get_bytes(cache_key)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(500, f"cache snapshot integrity/read failure: {exc}") from exc
+        if data is None:
+            raise HTTPException(404, "cache snapshot not found")
+        return Response(content=data, media_type="application/vnd.aether.cache",
+                        headers={"X-Content-Hash": hashlib.sha256(data).hexdigest(),
+                                 "Cache-Control": "private, no-store"})
+
+    @app.delete("/v1/kv/{namespace}/{key}")
+    async def delete_kv(namespace: str, key: str, user: HubUser = Depends(_auth)) -> dict[str, Any]:
+        cache_key = _kv_access(namespace, key, user, write=True)
+        return {"deleted": kv_store.delete(cache_key), "namespace": namespace, "key": key,
+                "source": "server", "persistence": "remote_service"}
+
+    @app.get("/v1/kv/{namespace}")
+    async def list_kv(namespace: str, user: HubUser = Depends(_auth)) -> dict[str, Any]:
+        _kv_access(namespace, "listing", user)
+        return {"entries": [entry for entry in kv_store.entries() if entry["metadata"].get("namespace") == namespace],
+                "namespace": namespace, "source": "server", "persistence": "remote_service"}
+
+    def _validate_artifact(data: bytes) -> None:
+        import io
+        import zipfile
+        from aether.core.aeg_format import load_aeg_package
+        from aether.hub.client import _safe_extract_zip
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                entries = archive.infolist()
+                if len(entries) > 100000 or sum(item.file_size for item in entries) > max_upload_bytes * 4:
+                    raise ValueError("archive exceeds expanded artifact limit")
+                names = [item.filename.replace("\\", "/") for item in entries]
+                if len(set(names)) != len(names):
+                    raise ValueError("archive contains duplicate member names")
+                if "manifest.json" not in names:
+                    raise ValueError("AEG archive requires manifest.json at its root")
+                with tempfile.TemporaryDirectory(prefix="aether-hub-verify-") as staging:
+                    _safe_extract_zip(archive, Path(staging))
+                    package = load_aeg_package(staging)
+                    package.verify_integrity()
+        except Exception as exc:
+            raise HTTPException(400, f"invalid AEG archive: {exc}") from exc
+
+    async def _store_upload(
+        request: Any, model_id: str, user: HubUser,
+        tag: str, description: str, visibility: str | None,
+    ) -> dict[str, Any]:
+        namespace, name = _parts(model_id)
+        _write_access(user, namespace)
+        if visibility is not None and visibility not in {"public", "private", "team"}:
+            raise HTTPException(400, "visibility must be public, private or team")
+        header_id = request.headers.get("x-model-id")
+        if header_id is not None and header_id != model_id:
+            raise HTTPException(400, "X-Model-Id does not match requested model")
+        data = await _body(request, max_upload_bytes)
+        expected_hash = request.headers.get("x-content-hash")
+        digest = hashlib.sha256(data).hexdigest()
+        if expected_hash is not None and expected_hash != digest:
+            raise HTTPException(400, "artifact content hash mismatch")
+        _validate_artifact(data)
+        version = hub.push_model(namespace, name, tag, data, user.user_id, description=description)
+        model = hub.storage.find_model_by_name(namespace, name)
+        if model is None:
+            raise HTTPException(500, "stored model metadata is unavailable")
+        if visibility is not None:
+            model.visibility = visibility
+            hub.storage.store_model(model)
+        return {"status": "ok", "manifest": _manifest(model, version)}
+
+    # Request is imported lazily to keep the Hub data models importable without
+    # FastAPI. Bind its concrete annotation before registering these handlers;
+    # postponed annotations otherwise resolve against module globals.
+    def _request_route(path: str, handler: Any, method: str) -> None:
+        handler.__annotations__["request"] = Request
+        app.add_api_route(path, handler, methods=[method])
+
+    @app.get("/health")
+    async def health() -> dict[str, Any]:
+        return {"status": "ok", "service": "aether_hub", "version": AETHER_VERSION}
+
+    async def login(request: Any, user: HubUser = Depends(_auth)) -> dict[str, Any]:
+        try:
+            data = json.loads(await _body(request, 65536))
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise HTTPException(400, "invalid authentication JSON") from exc
+        if not isinstance(data, dict) or data.get("token") != user.api_key:
+            raise HTTPException(401, "token does not match authenticated request")
+        return {"status": "ok", "authentication_validated": True, "user": user.to_dict()}
+    _request_route("/auth/validate", login, "POST")
+    _request_route("/v1/kv/{namespace}/{key}", put_kv, "PUT")
+
+    def _visible_models(user: HubUser, query: str | None, namespace: str | None, limit: int) -> list[HubModel]:
+        models = hub.storage.search_models(query=query, namespace=namespace, limit=len(hub.storage._index.get("models", {})))
+        return [model for model in models if _can_read(user, model)][:limit]
+
+    @app.get("/v1/models/search")
+    @app.get("/v1/models")
+    async def search(
+        q: str | None = None, limit: int = Query(default=20, ge=1, le=1000),
         user: HubUser = Depends(_auth),
     ) -> dict[str, Any]:
-        """Push an AEG artifact to the Hub."""
-        from fastapi import Request
-        raise HTTPException(status_code=501, detail="Use multipart upload endpoint")
+        rows = [_manifest(model) for model in _visible_models(user, q, None, limit)]
+        return {"models": rows, "count": len(rows)}
+
+    async def upload(
+        request: Any, model_id: str, tag: str = "latest", description: str = "",
+        visibility: str | None = None, user: HubUser = Depends(_auth),
+    ) -> dict[str, Any]:
+        return await _store_upload(request, model_id, user, tag, description, visibility)
+    _request_route("/v1/models/{model_id:path}/upload", upload, "POST")
+
+    def _download(model_id: str, user: HubUser, tag: str) -> Any:
+        model = _read_model(model_id, user)
+        try:
+            data = hub.pull_model(model.namespace, model.name, tag)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        return Response(content=data, media_type="application/zip", headers={"X-Content-Hash": hashlib.sha256(data).hexdigest()})
+
+    @app.get("/v1/models/{model_id:path}/download")
+    async def download(model_id: str, tag: str = "latest", user: HubUser = Depends(_auth)) -> Any:
+        return _download(model_id, user, tag)
+
+    @app.get("/v1/models/{model_id:path}")
+    async def metadata(model_id: str, user: HubUser = Depends(_auth)) -> dict[str, Any]:
+        return _manifest(_read_model(model_id, user))
+
+    def _delete(model_id: str, user: HubUser, tag: str | None) -> dict[str, Any]:
+        namespace, name = _parts(model_id)
+        _write_access(user, namespace)
+        if not hub.delete_model(namespace, name, tag):
+            raise HTTPException(404, "model not found")
+        return {"status": "ok", "model": model_id}
+
+    @app.delete("/v1/models/{model_id:path}")
+    async def delete(model_id: str, tag: str | None = None, user: HubUser = Depends(_auth)) -> dict[str, Any]:
+        return _delete(model_id, user, tag)
+
+    async def legacy_push(
+        request: Any, namespace: str, name: str, tag: str = "latest", description: str = "",
+        visibility: str | None = None, user: HubUser = Depends(_auth),
+    ) -> dict[str, Any]:
+        return await _store_upload(request, f"{namespace}/{name}", user, tag, description, visibility)
+    _request_route("/v1/hub/models/{namespace}/{name}/push", legacy_push, "POST")
 
     @app.get("/v1/hub/models/{namespace}/{name}/pull")
-    async def pull_model(
-        namespace: str,
-        name: str,
-        tag: str = "latest",
-        user: HubUser = Depends(_auth),
-    ) -> Response:
-        """Pull an AEG artifact from the Hub."""
-        try:
-            data = hub.pull_model(namespace, name, tag)
-            return Response(
-                content=data,
-                media_type="application/octet-stream",
-                headers={"Content-Disposition": f'attachment; filename="{name}_{tag}.aeg.zip"'},
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    async def legacy_pull(namespace: str, name: str, tag: str = "latest", user: HubUser = Depends(_auth)) -> Any:
+        return _download(f"{namespace}/{name}", user, tag)
 
     @app.get("/v1/hub/models/{namespace}/{name}")
-    async def get_model(
-        namespace: str,
-        name: str,
-        user: HubUser = Depends(_auth),
-    ) -> dict[str, Any]:
-        """Get model metadata."""
-        info = hub.get_model_info(namespace, name)
-        if info is None:
-            raise HTTPException(status_code=404, detail=f"Model {namespace}/{name} not found")
-        return info
+    async def legacy_metadata(namespace: str, name: str, user: HubUser = Depends(_auth)) -> dict[str, Any]:
+        return _read_model(f"{namespace}/{name}", user).to_dict()
+
+    @app.delete("/v1/hub/models/{namespace}/{name}")
+    async def legacy_delete(namespace: str, name: str, tag: str | None = None, user: HubUser = Depends(_auth)) -> dict[str, Any]:
+        return _delete(f"{namespace}/{name}", user, tag)
 
     @app.get("/v1/hub/models")
-    async def search_models(
-        query: str | None = None,
-        namespace: str | None = None,
-        limit: int = 50,
-        user: HubUser = Depends(_auth),
-    ) -> dict[str, Any]:
-        """Search for models in the Hub."""
-        results = hub.search(query=query, namespace=namespace, limit=limit)
-        return {"models": results, "count": len(results)}
+    async def legacy_search(query: str | None = None, namespace: str | None = None, limit: int = Query(default=50, ge=1, le=1000), user: HubUser = Depends(_auth)) -> dict[str, Any]:
+        rows = [model.to_dict() for model in _visible_models(user, query, namespace, limit)]
+        return {"models": rows, "count": len(rows)}
 
     @app.get("/v1/hub/stats")
-    async def get_stats(user: HubUser = Depends(_auth)) -> dict[str, Any]:
-        """Get Hub server statistics."""
-        if user.role not in ("admin",):
-            raise HTTPException(status_code=403, detail="Admin access required")
+    async def stats(user: HubUser = Depends(_auth)) -> dict[str, Any]:
+        if user.role != "admin":
+            raise HTTPException(403, "Admin access required")
         return hub.get_stats()
 
     @app.post("/v1/hub/users")
-    async def create_user(
-        username: str,
-        email: str,
-        role: str = "user",
-        user: HubUser = Depends(_auth),
-    ) -> dict[str, Any]:
-        """Create a new Hub user. Admin only."""
+    async def create_user(username: str, email: str, role: str = "user", user: HubUser = Depends(_auth)) -> dict[str, Any]:
         if user.role != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
+            raise HTTPException(403, "Admin access required")
+        if role not in {"admin", "user", "viewer"}:
+            raise HTTPException(400, "invalid user role")
         new_user = hub.create_user(username=username, email=email, role=role)
-        return {
-            "user_id": new_user.user_id,
-            "username": new_user.username,
-            "api_key": new_user.api_key,
-            "role": new_user.role,
-        }
+        return {"user_id": new_user.user_id, "username": new_user.username, "api_key": new_user.api_key, "role": new_user.role}
 
     return app

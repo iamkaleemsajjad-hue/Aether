@@ -12,6 +12,7 @@ works without any extra dependencies.
 
 from __future__ import annotations
 
+import json
 import struct
 from pathlib import Path
 from typing import Any
@@ -794,10 +795,9 @@ def export_gguf_tokenizer_metadata(
         from tokenizers.decoders import Metaspace as MetaspaceDecoder
         from tokenizers.models import Unigram
         from tokenizers.pre_tokenizers import Metaspace
-        from transformers import PreTrainedTokenizerFast
     except ImportError as exc:
         raise IngestionError(
-            "GGUF tokenizer export requires tokenizers and transformers"
+            "GGUF tokenizer export requires tokenizers"
         ) from exc
 
     tokenizer = Tokenizer(Unigram(vocab=vocab, unk_id=unk_id))
@@ -813,16 +813,23 @@ def export_gguf_tokenizer_metadata(
             raise IngestionError(f"GGUF tokenizer special token id is outside vocabulary: {key}")
         return tokens[token_id]
 
-    fast = PreTrainedTokenizerFast(
-        tokenizer_object=tokenizer,
-        unk_token=tokens[unk_id],
-        bos_token=special_token("tokenizer.ggml.bos_token_id"),
-        eos_token=special_token("tokenizer.ggml.eos_token_id"),
-        pad_token=special_token("tokenizer.ggml.padding_token_id"),
-    )
+    special_tokens = {
+        "unk_token": tokens[unk_id],
+        "bos_token": special_token("tokenizer.ggml.bos_token_id"),
+        "eos_token": special_token("tokenizer.ggml.eos_token_id"),
+        "pad_token": special_token("tokenizer.ggml.padding_token_id"),
+    }
+    special_tokens = {key: value for key, value in special_tokens.items() if value is not None}
+    tokenizer.add_special_tokens(list(dict.fromkeys(special_tokens.values())))
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
-    fast.save_pretrained(destination)
+    tokenizer.save(str(destination / "tokenizer.json"))
+    config = {"tokenizer_class": "PreTrainedTokenizerFast", **special_tokens}
+    chat_template = metadata.get("tokenizer.chat_template")
+    if isinstance(chat_template, str) and chat_template:
+        config["chat_template"] = chat_template
+    (destination / "tokenizer_config.json").write_text(json.dumps(config), encoding="utf-8")
+    (destination / "special_tokens_map.json").write_text(json.dumps(special_tokens), encoding="utf-8")
     return {
         "token_count": len(tokens),
         "tokenizer_type": "gguf_embedded_unigram",
