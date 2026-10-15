@@ -53,7 +53,21 @@ def test_compiled_package_contains_v31_artifacts(tmp_path) -> None:
 
     compiler = Compiler(CompilerConfig(targets=["cpu_avx512"], overwrite=True, calibration_tokens=128))
     package = compiler.compile("Qwen/Qwen3-0.6B", output_path=tmp_path / "qwen.aeg")
+    _assert_v31_package_artifacts(package)
+
+
+def test_local_compiled_package_contains_v31_artifacts(tmp_path, tiny_local_safetensors_model) -> None:
+    """Core CI compiles real local weights instead of skipping the network contract."""
+    from aether import Compiler
+
+    compiler = Compiler(CompilerConfig(targets=["cpu_generic"], overwrite=True, calibration_tokens=128))
+    package = compiler.compile(str(tiny_local_safetensors_model), output_path=tmp_path / "local.aeg")
+    _assert_v31_package_artifacts(package)
+
+
+def _assert_v31_package_artifacts(package: AEGPackage) -> None:
     loaded = AEGPackage(package.root).load()
+    loaded.verify_integrity()
     assert (loaded.root / "graph" / "reasoning_graph.aeg-ir").exists()
     assert (loaded.root / "graph" / "attention_head_patterns.json").exists()
     assert (loaded.root / "safety" / "prompt_guard.json").exists()

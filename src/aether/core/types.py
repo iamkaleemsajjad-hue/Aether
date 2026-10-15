@@ -439,6 +439,7 @@ class HardwareTarget(enum.Enum):
             HardwareTarget.CUDA_SM130: "NVIDIA",
             HardwareTarget.CUDA_SM100_TEE: "NVIDIA",
             HardwareTarget.CUDA_SM100_GB300: "NVIDIA",
+            HardwareTarget.METAL: "Metal",
             HardwareTarget.METAL_M1: "Apple",
             HardwareTarget.METAL_M3: "Apple",
             HardwareTarget.ROCM_RDNA3: "AMD",
@@ -466,79 +467,17 @@ class HardwareTarget(enum.Enum):
 
     @property
     def display_name(self) -> str:
-        """Return a human-readable display name for this target."""
-        _names: dict[HardwareTarget, str] = {
-            HardwareTarget.CUDA_SM70: "NVIDIA V100 (Volta)",
-            HardwareTarget.CUDA_SM80: "NVIDIA A100 (Ampere)",
-            HardwareTarget.CUDA_SM89: "NVIDIA RTX 4090 (Ada)",
-            HardwareTarget.CUDA_SM90: "NVIDIA H100 (Hopper)",
-            HardwareTarget.CUDA_SM100: "NVIDIA B200 (Blackwell)",
-            HardwareTarget.CUDA_SM120: "NVIDIA Rubin R100 (sm_120)",
-            HardwareTarget.CUDA_SM130: "NVIDIA Rubin Ultra (sm_130)",
-            HardwareTarget.CUDA_SM100_TEE: "NVIDIA B200 Confidential Computing",
-            HardwareTarget.CUDA_SM100_GB300: "NVIDIA GB300 Blackwell Ultra",
-            HardwareTarget.METAL_M1: "Apple M1/M2",
-            HardwareTarget.METAL_M3: "Apple M3/M4/M5",
-            HardwareTarget.ROCM_RDNA3: "AMD RX 7000 Series (RDNA3)",
-            HardwareTarget.ROCM_CDNA3: "AMD MI300X (CDNA3)",
-            HardwareTarget.AMD_MI350X: "AMD MI350X (CDNA4)",
-            HardwareTarget.ROCM_CDNA5_MI455X: "AMD MI455X (CDNA5, 432 GB HBM4)",
-            HardwareTarget.OPENVINO_NPU: "Intel Arc NPU (OpenVINO)",
-            HardwareTarget.OPENVINO_GPU: "Intel GPU (OpenVINO)",
-            HardwareTarget.QUALCOMM_QNN: "Qualcomm Snapdragon NPU (QNN)",
-            HardwareTarget.QUALCOMM_CLOUD_AI100: "Qualcomm Cloud AI 100 Ultra",
-            HardwareTarget.CPU_AVX512: "x86_64 (AVX-512)",
-            HardwareTarget.CPU_GENERIC: "CPU (portable baseline)",
-            HardwareTarget.CPU_AVX2: "x86_64 (AVX2)",
-            HardwareTarget.CPU_NEON: "ARM (NEON SIMD)",
-            HardwareTarget.CPU_AVX512_TERNARY: "x86_64 AVX2 Ternary (BitNet b1.58)",
-            HardwareTarget.CPU_NEON_TERNARY: "ARM NEON Ternary (BitNet b1.58)",
-            HardwareTarget.RISCV_MIPS_S8200: "MIPS S8200 NPU (RISC-V, sub-10W)",
-            HardwareTarget.RISCV_SIFIVE_X160: "SiFive Intelligence X160",
-            HardwareTarget.RISCV_XUANTIE_C930: "Alibaba XuanTie C930 RISC-V NPU",
-            HardwareTarget.RISCV_CERVELL: "Semidynamics Cervell RISC-V NPU",
-            HardwareTarget.FPGA_XILINX_VU9P: "Xilinx VU9P FPGA (decode-only)",
-            HardwareTarget.FPGA_TERNARY: "FPGA BTC-LLM Ternary (sub-2-bit)",
-        }
-        return _names[self]
+        """Return the canonical target description, not a detected device name."""
+        from aether.core.constants import SUPPORTED_TARGETS
+
+        return SUPPORTED_TARGETS[self.value]
 
     @property
     def backend_candidates(self) -> list[str]:
-        """Return priority-ordered candidate backend names for this target."""
-        _candidates: dict[HardwareTarget, list[str]] = {
-            HardwareTarget.CUDA_SM70: ["pytorch", "tensorrt-llm"],
-            HardwareTarget.CUDA_SM80: ["vllm", "pytorch", "tensorrt-llm"],
-            HardwareTarget.CUDA_SM89: ["vllm", "pytorch", "tensorrt-llm"],
-            HardwareTarget.CUDA_SM90: ["vllm", "pytorch", "tensorrt-llm"],
-            HardwareTarget.CUDA_SM100: ["vllm", "pytorch", "tensorrt-llm"],
-            HardwareTarget.CUDA_SM120: ["vllm", "pytorch", "tensorrt-llm"],
-            HardwareTarget.CUDA_SM130: ["vllm", "pytorch", "tensorrt-llm"],
-            HardwareTarget.CUDA_SM100_TEE: ["pytorch"],  # TEE requires bespoke backend
-            HardwareTarget.CUDA_SM100_GB300: ["vllm", "pytorch", "tensorrt-llm"],
-            HardwareTarget.METAL_M1: ["mlx", "llama.cpp", "pytorch"],
-            HardwareTarget.METAL_M3: ["mlx", "llama.cpp", "pytorch"],
-            HardwareTarget.ROCM_RDNA3: ["pytorch", "llama.cpp"],
-            HardwareTarget.ROCM_CDNA3: ["vllm", "pytorch"],
-            HardwareTarget.AMD_MI350X: ["vllm", "pytorch"],
-            HardwareTarget.ROCM_CDNA5_MI455X: ["vllm", "pytorch"],
-            HardwareTarget.OPENVINO_NPU: ["onnxruntime", "pytorch"],
-            HardwareTarget.OPENVINO_GPU: ["onnxruntime", "pytorch"],
-            HardwareTarget.QUALCOMM_QNN: ["onnxruntime", "pytorch"],
-            HardwareTarget.QUALCOMM_CLOUD_AI100: ["onnxruntime", "pytorch"],
-            HardwareTarget.CPU_AVX512: ["llama.cpp", "onnxruntime", "aether_cpu"],
-            HardwareTarget.CPU_GENERIC: ["aether_cpu", "onnxruntime", "pytorch"],
-            HardwareTarget.CPU_AVX2: ["llama.cpp", "onnxruntime", "aether_cpu"],
-            HardwareTarget.CPU_NEON: ["llama.cpp", "onnxruntime", "aether_cpu"],
-            HardwareTarget.CPU_AVX512_TERNARY: ["bitnet.cpp", "llama.cpp", "aether_cpu"],
-            HardwareTarget.CPU_NEON_TERNARY: ["bitnet.cpp", "llama.cpp", "aether_cpu"],
-            HardwareTarget.RISCV_MIPS_S8200: ["onnxruntime"],
-            HardwareTarget.RISCV_SIFIVE_X160: ["onnxruntime"],
-            HardwareTarget.RISCV_XUANTIE_C930: ["onnxruntime", "pytorch"],
-            HardwareTarget.RISCV_CERVELL: ["onnxruntime"],
-            HardwareTarget.FPGA_XILINX_VU9P: ["onnxruntime"],
-            HardwareTarget.FPGA_TERNARY: ["bitnet.cpp"],
-        }
-        return _candidates[self]
+        """Return a fresh copy of the canonical backend candidate order."""
+        from aether.core.constants import BACKEND_BY_TARGET
+
+        return list(BACKEND_BY_TARGET.get(self.value, []))
 
     @property
     def supports_ternary(self) -> bool:
@@ -591,6 +530,23 @@ class HardwareTarget(enum.Enum):
         raise ValueError(msg)
 
     @staticmethod
+    def _select_detected(capabilities: Sequence[Any]) -> tuple[HardwareTarget, Any] | None:
+        """Select canonical evidence without probing again or guessing a GPU model."""
+        candidates = []
+        for capability in capabilities:
+            if not (capability.available and capability.implemented):
+                continue
+            try:
+                target = HardwareTarget.from_string(capability.target_id)
+            except ValueError:
+                continue
+            candidates.append((target, capability))
+        return next(
+            (item for item in candidates if not item[0].value.startswith("cpu_")),
+            next((item for item in candidates if item[0].value.startswith("cpu_")), None),
+        )
+
+    @staticmethod
     def auto() -> HardwareTarget:
         """Select an implemented, available target from canonical host evidence.
 
@@ -600,20 +556,8 @@ class HardwareTarget(enum.Enum):
         """
         from aether.backends.hardware_detector import detect_all_capabilities
 
-        detected = detect_all_capabilities()
-        candidates = []
-        for capability in detected:
-            if not (capability.available and capability.implemented):
-                continue
-            try:
-                target = HardwareTarget.from_string(capability.target_id)
-            except ValueError:
-                continue
-            candidates.append(target)
-        return next(
-            (target for target in candidates if target.vendor != "CPU"),
-            next((target for target in candidates if target.vendor == "CPU"), HardwareTarget.CPU_GENERIC),
-        )
+        selected = HardwareTarget._select_detected(detect_all_capabilities())
+        return selected[0] if selected is not None else HardwareTarget.CPU_GENERIC
 
 
 @dataclass(frozen=True)

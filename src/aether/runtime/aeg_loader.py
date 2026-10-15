@@ -1054,7 +1054,9 @@ def _runtime_cross_layer_kv_plan(metadata: Any, num_layers: int) -> dict[str, An
 
 
 def _prepare_native_kernels(package: Any) -> NativeCPUKernels:
-    kernels = get_native_kernels()
+    # Artifact-local loading must not replace the compiler/emitter singleton's
+    # library path or build identity with a removable package's executable.
+    kernels = get_native_kernels().independent()
     _load_packaged_native_kernels(package, kernels)
     return kernels
 

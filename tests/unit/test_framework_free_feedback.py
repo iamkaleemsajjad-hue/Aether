@@ -6,6 +6,7 @@ import json
 import struct
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -87,10 +88,17 @@ def test_directml_os_dlls_are_not_evidence_of_an_executable_device(monkeypatch):
 
     from aether.backends.hardware_detector import detect_directml
 
+    # DLL presence is the only evidence this fixture supplies. The independent
+    # OS probe may otherwise return a real device cached by an earlier test.
+    inventory = Mock(return_value={"devices": [], "complete": False})
+    monkeypatch.setattr("aether.backends.hardware_inventory.probe_gpu_inventory", inventory)
     monkeypatch.setattr("platform.system", lambda: "Windows")
-    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: object(), raising=False)
+    load_dll = Mock(return_value=object())
+    monkeypatch.setattr(ctypes, "WinDLL", load_dll, raising=False)
     monkeypatch.setitem(sys.modules, "onnxruntime", None)
     capabilities = detect_directml()
+    inventory.assert_called_once_with()
+    assert [call.args[0] for call in load_dll.call_args_list] == ["d3d12", "dxgi"]
     assert capabilities.available is False
     assert capabilities.implemented is True  # ONNX adapter code is independent of installed runtime
     assert capabilities.backend_available is False
@@ -98,6 +106,48 @@ def test_directml_os_dlls_are_not_evidence_of_an_executable_device(monkeypatch):
     assert capabilities.execution_tested is False
     assert capabilities.supports_fp16 is False
     assert capabilities.extra["detection_method"] == "d3d12_dxgi_dll_probe"
+
+
+@pytest.mark.parametrize("providers", [None, ["CPUExecutionProvider"], ["DmlExecutionProvider", "CPUExecutionProvider"]],
+                         ids=["runtime-missing", "cpu-provider-only", "dml-registered"])
+@pytest.mark.parametrize("presence", ["unknown", "absent", "present"])
+def test_directml_dependency_and_inventory_evidence_remain_independent(monkeypatch, providers, presence):
+    """Controlled vendor inputs verify reporting; they never execute a GPU."""
+    import ctypes
+
+    from aether.backends.hardware_detector import detect_directml
+
+    devices = [{"device": "controlled graphics adapter", "device_id": "test:gpu"}] if presence == "present" else []
+    inventory = Mock(return_value={"devices": devices, "complete": presence != "unknown"})
+    load_dll = Mock(return_value=object())
+    monkeypatch.setattr("aether.backends.hardware_inventory.probe_gpu_inventory", inventory)
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+    monkeypatch.setattr(ctypes, "WinDLL", load_dll, raising=False)
+    runtime = None if providers is None else SimpleNamespace(
+        __version__="controlled-test-runtime", get_available_providers=Mock(return_value=providers),
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", runtime)
+
+    cap = detect_directml()
+
+    inventory.assert_called_once_with()
+    assert cap.hardware_present is {"unknown": None, "absent": False, "present": True}[presence]
+    assert cap.extra["physical_adapters"] == devices
+    registered = providers is not None and "DmlExecutionProvider" in providers
+    assert cap.backend_dependencies == {"onnxruntime": providers is not None, "DmlExecutionProvider": registered}
+    assert cap.runtime_available is (None if registered else False)
+    assert cap.backend_available is (None if registered else False)
+    assert cap.implemented and not cap.available
+    assert not cap.execution_tested and not cap.compile_tested and not cap.production_validated
+    assert not any(cap.to_dict()["precision_summary"].values())
+    assert cap.memory_bytes == 0 and not cap.to_dict()["memory_bytes_known"]
+    if runtime is None:
+        assert [call.args[0] for call in load_dll.call_args_list] == ["d3d12", "dxgi"]
+        assert cap.extra["os_dlls_present"]
+    else:
+        runtime.get_available_providers.assert_called_once_with()
+        load_dll.assert_not_called()
+        assert cap.extra["ort_providers"] == providers
 
 
 def test_torch_availability_is_independent_of_the_previous_models_mesh(monkeypatch):

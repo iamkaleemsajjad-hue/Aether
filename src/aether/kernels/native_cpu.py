@@ -1291,11 +1291,12 @@ _PACKAGED_CACHE_LOCK = threading.Lock()
 
 
 def _cache_packaged_library(payload: bytes, suffix: str, identity: dict[str, Any]) -> Path:
-    """Keep a verified Windows DLL alive in cache without locking its AEG.
+    """Keep verified executable bytes in host cache independently of their AEG.
 
     Writes use a sibling temporary file and atomic replacement. Concurrent
     processes may publish the same bytes; an already loaded, verified winner
-    is reused rather than replaced. The source artifact remains removable.
+    is reused rather than replaced. The source artifact remains removable, and
+    later emission does not depend on a POSIX library's unlinked source path.
     """
     payload_digest = hashlib.sha256(payload).hexdigest()
     key = hashlib.sha256(
@@ -1366,6 +1367,25 @@ class NativeCPUKernels:
         """Create an independent NumPy provider without probing a compiler."""
         kernels = cls(toolchain=CompilerToolchain("disabled", ""))
         kernels.toolchain = None
+        return kernels
+
+    def independent(self) -> "NativeCPUKernels":
+        """Own provider state without changing the process-wide host provider.
+
+        Immutable toolchain settings and an already loaded host library can be
+        shared. Loading an artifact then replaces only this provider's handle,
+        path and build identity. No compiler is reprobed or tensor copied.
+        """
+        kernels = type(self).reference()
+        kernels.toolchain = self.toolchain
+        kernels.library_path = self.library_path
+        kernels._lib = self._lib
+        kernels._build_error = self._build_error
+        kernels._library_build_identity = (
+            dict(self._library_build_identity)
+            if self._library_build_identity is not None else None
+        )
+        kernels._discovery_failures = dict(self._discovery_failures)
         return kernels
 
     # ── Build ────────────────────────────────────────────────────────────────
@@ -1529,11 +1549,10 @@ class NativeCPUKernels:
             # A packaged library is loaded through the same dependency-resolving
             # path as a locally compiled one: an AEG built on a MinGW host carries
             # the same OpenMP import.
-            loaded_path = (
-                _cache_packaged_library(payload, path.suffix, build_identity)
-                if os.name == "nt"
-                else path
-            )
+            # POSIX can unlink a loaded library while its code remains mapped;
+            # emitters still need live executable bytes for later compilation.
+            # Windows additionally requires this copy to leave the AEG removable.
+            loaded_path = _cache_packaged_library(payload, path.suffix, build_identity)
             library = _open_shared_library(loaded_path, self.toolchain)
             previous = self._lib
             self._lib = library
