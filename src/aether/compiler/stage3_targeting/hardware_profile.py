@@ -15,7 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from aether.core.constants import BACKEND_BY_TARGET, SUPPORTED_TARGET_IDS
+from aether.core.constants import BACKEND_BY_TARGET, SUPPORTED_TARGET_IDS, SUPPORTED_TARGETS
+from aether.core.types import HardwareTarget
 
 
 @dataclass
@@ -120,7 +121,7 @@ class HardwareProfile:
     """Additional hardware-specific attributes."""
 
     @staticmethod
-    def from_target_id(target_id: str) -> HardwareProfile | None:
+    def from_target_id(target_id: str | HardwareTarget) -> HardwareProfile | None:
         """Create a profile from a target ID.
 
         Args:
@@ -129,17 +130,24 @@ class HardwareProfile:
         Returns:
             A HardwareProfile, or None if the target ID is unknown.
         """
+        if isinstance(target_id, HardwareTarget):
+            target_id = target_id.value
+        elif isinstance(target_id, str):
+            target_id = target_id.strip().lower()
+        else:
+            return None
         if target_id not in SUPPORTED_TARGET_IDS:
             return None
-        backends = BACKEND_BY_TARGET.get(target_id, ["aether_cpu"])
+        backends = BACKEND_BY_TARGET.get(target_id, [])
         profile_data = _TARGET_PROFILES.get(target_id)
         if profile_data is None:
-            name = target_id.replace("_", " ").title()
+            name = SUPPORTED_TARGETS[target_id]
             profile = HardwareProfile(
                 target_id=target_id,
                 name=name,
-                recommended_backend=backends[0],
+                recommended_backend=backends[0] if backends else None,
                 backend_candidates=list(backends),
+                warp_size=0,
             )
             return profile
         profile = HardwareProfile(
@@ -158,7 +166,7 @@ class HardwareProfile:
             supports_tee=profile_data.get("supports_tee", False),
             supports_flash_attention=profile_data.get("supports_flash_attention", False),
             recommended_flash_attention=profile_data.get("recommended_flash_attention", "flash_attention_3"),
-            recommended_backend=backends[0],
+            recommended_backend=backends[0] if backends else None,
             backend_candidates=list(backends),
             max_shm_size_bytes=profile_data.get("max_shm_size_bytes", 0),
             warp_size=profile_data.get("warp_size", 32),
@@ -168,9 +176,29 @@ class HardwareProfile:
             tee_backend=profile_data.get("tee_backend"),
             is_riscv_npu=profile_data.get("is_riscv_npu", False),
             abstract_ir_family=profile_data.get("abstract_ir_family"),
-            attributes=profile_data.get("attributes", {}),
+            attributes=dict(profile_data.get("attributes", {})),
         )
         return profile
+
+    @staticmethod
+    def _from_detected(target: HardwareTarget, capability: Any) -> HardwareProfile:
+        """Preserve queried device evidence without copying catalog estimates."""
+        backends = target.backend_candidates
+        return HardwareProfile(
+            target_id=target.value,
+            name=capability.device,
+            compute_capability=str(capability.extra.get("compute_capability") or capability.architecture),
+            memory_gb=max(0, capability.memory_bytes) / (1024**3),
+            supports_fp8=capability.supports_fp8,
+            supports_fp4=capability.supports_fp4,
+            supports_bf16=capability.supports_bf16,
+            supports_tee=capability.supports_tee,
+            recommended_backend=backends[0] if backends else None,
+            backend_candidates=backends,
+            recommended_flash_attention="unvalidated",
+            warp_size=capability.warp_or_wavefront_size,
+            attributes={"profile_scope": "detected_device", "capabilities": capability.to_dict()},
+        )
 
     @staticmethod
     def auto() -> HardwareProfile:
@@ -180,20 +208,19 @@ class HardwareProfile:
         Falls back to a CPU profile if no accelerator is found.
         """
         try:
-            from aether.core.types import HardwareTarget as HTarget
-            target = HTarget.auto()
-            profile = HardwareProfile.from_target_id(target.value)
-            if profile:
-                return profile
+            from aether.backends.hardware_detector import detect_all_capabilities
+
+            selected = HardwareTarget._select_detected(detect_all_capabilities())
+            if selected is not None:
+                return HardwareProfile._from_detected(*selected)
         except ImportError:
             pass
         # CPU fallback.  The backend contract (``plan.recommend_backend``)
         # requires CPU targets to execute on the native Aether CPU engine —
         # never the development-only pytorch backend.
-        import os
         return HardwareProfile(
             target_id="cpu_generic",
-            name=os.uname().machine if hasattr(os, "uname") else "x86_64",
+            name=SUPPORTED_TARGETS["cpu_generic"],
             compute_capability="cpu",
             memory_gb=0.0,
             memory_bandwidth_gb_s=0.0,
@@ -201,6 +228,8 @@ class HardwareProfile:
             supports_fp8=False,
             supports_bf16=False,
             recommended_backend="aether_cpu",
+            backend_candidates=list(BACKEND_BY_TARGET["cpu_generic"]),
+            warp_size=0,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -221,6 +250,7 @@ class HardwareProfile:
             "supports_flash_attention": self.supports_flash_attention,
             "recommended_flash_attention": self.recommended_flash_attention,
             "recommended_backend": self.recommended_backend,
+            "backend_candidates": list(self.backend_candidates),
             "max_shm_size_bytes": self.max_shm_size_bytes,
             "warp_size": self.warp_size,
             "sm_count": self.sm_count,
@@ -229,6 +259,7 @@ class HardwareProfile:
             "tee_backend": self.tee_backend,
             "is_riscv_npu": self.is_riscv_npu,
             "abstract_ir_family": self.abstract_ir_family,
+            "attributes": dict(self.attributes),
         }
 
     @staticmethod
@@ -250,6 +281,7 @@ class HardwareProfile:
             supports_flash_attention=data.get("supports_flash_attention", False),
             recommended_flash_attention=data.get("recommended_flash_attention", "flash_attention_3"),
             recommended_backend=data.get("recommended_backend"),
+            backend_candidates=list(data.get("backend_candidates", [])),
             max_shm_size_bytes=data.get("max_shm_size_bytes", 0),
             warp_size=data.get("warp_size", 32),
             sm_count=data.get("sm_count", 0),
@@ -258,6 +290,7 @@ class HardwareProfile:
             tee_backend=data.get("tee_backend"),
             is_riscv_npu=data.get("is_riscv_npu", False),
             abstract_ir_family=data.get("abstract_ir_family"),
+            attributes=dict(data.get("attributes", {})),
         )
 
     def __repr__(self) -> str:
@@ -543,6 +576,7 @@ _TARGET_PROFILES: dict[str, dict[str, Any]] = {
         "supports_fp8": False,
         "supports_bf16": False,
         "supports_flash_attention": False,
+        "warp_size": 0,
     },
     "metal_m1": {
         "name": "Apple M1/M2",

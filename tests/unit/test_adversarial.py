@@ -430,19 +430,50 @@ class TestBackendSelection:
         assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr[-2000:]}"
         assert "OK" in proc.stdout
 
-    def test_cpu_fallback_is_aether_native(self) -> None:
-        """recommend_backend never falls back to pytorch, and the CPU target's
-        terminal candidate is the Aether-native engine."""
+    @pytest.mark.parametrize(
+        "target_id",
+        ["cpu_generic", "cpu_avx512", "cpu_neon", "cpu_avx512_ternary", "cpu_neon_ternary"],
+    )
+    def test_cpu_fallback_is_aether_native(self, monkeypatch, target_id: str) -> None:
+        """Native-first CPU planning selects Aether without probing optional frameworks."""
+        import builtins
+
         from aether.compiler.plan import recommend_backend
         from aether.core.types import HardwareTarget
 
-        recommended = recommend_backend("cpu_avx512")
-        # An installed external CPU backend (e.g. onnxruntime) may be
-        # preferred, but pytorch must never be the fallback and the native
-        # engine must remain the terminal candidate.
-        assert recommended != "pytorch"
-        assert recommended is not None
-        assert HardwareTarget.CPU_AVX512.backend_candidates[-1] == "aether_cpu"
+        original_import = builtins.__import__
+
+        def reject_optional_frameworks(name, *args, **kwargs):
+            if name.split(".")[0] in {"torch", "llama_cpp", "onnxruntime", "vllm", "mlx"}:
+                raise AssertionError(f"Native-first CPU planning tried importing {name}")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_optional_frameworks)
+        assert HardwareTarget.from_string(target_id).backend_candidates[0] == "aether_cpu"
+        assert recommend_backend(target_id) == "aether_cpu"
+
+    def test_cpu_portable_fallback_does_not_import_torch(self, monkeypatch) -> None:
+        """Unavailable AVX2 frontends leave a framework-free native fallback."""
+        import builtins
+
+        from aether.compiler.plan import recommend_backend
+        from aether.core.types import HardwareTarget
+
+        original_import = builtins.__import__
+        attempted = []
+
+        def block_optional_frontends(name, *args, **kwargs):
+            if name.split(".")[0] == "torch":
+                raise AssertionError("CPU fallback tried importing torch")
+            if name in {"llama_cpp", "onnxruntime"}:
+                attempted.append(name)
+                raise ImportError(f"{name} is blocked for this test")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", block_optional_frontends)
+        assert HardwareTarget.CPU_AVX2.backend_candidates[-1] == "aether_cpu"
+        assert recommend_backend("cpu_avx2") == "aether_cpu"
+        assert attempted == ["llama_cpp", "onnxruntime"]
 
     def test_no_torch_in_sys_modules_after_full_pipeline(self, valid_package: AEGPackage) -> None:
         """End-to-end: load + forward + generate with torch importable in the

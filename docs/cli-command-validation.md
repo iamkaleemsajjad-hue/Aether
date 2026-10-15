@@ -19,6 +19,20 @@ stdout; check the exit status even when a failure report is parseable. Runtime
 backend/device/offline environment controls are described in the
 [API reference](api-reference.md).
 
+For a model or cached artifact name that starts with `-`, place command options
+before the standard `--` separator and the literal model name after it. For
+example:
+
+```console
+aether --cache-dir ./cache info -- --local-model.aeg
+aether --cache-dir ./cache inspect --json -- --local-model.aeg
+aether --cache-dir ./cache run --prompt "hello" --max-tokens 2 --non-interactive -- --local-model.aeg
+```
+
+This applies to names encoded from absolute POSIX source paths as well as
+manually named artifacts. The cache layout remains compatible with existing
+artifacts; misspelled options still fail.
+
 ## Evidence and limits
 
 **CPU workflow** means a real local safetensors fixture was compiled to an AEG,

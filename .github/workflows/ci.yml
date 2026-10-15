@@ -16,6 +16,7 @@ jobs:
   lint:
     name: Lint and typecheck
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,19 +26,58 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[lint,test]"
-      - name: Run ruff linter
-        run: ruff check src tests examples benchmarks scripts || true
-      - name: Run ruff format check
-        run: ruff format --check src tests examples benchmarks scripts || true
-      - name: Run mypy typecheck
-        run: mypy src/aether || true
+      - name: Check Python syntax and undefined names
+        run: ruff check src tests examples benchmark benchmarks scripts --select E9,F63,F7,F82
+      # The repository-wide style/type backlog is advisory, not a passed check.
+      # Keep its diagnostics visible while correctness and API checks block CI.
+      - name: Run full ruff linter (advisory)
+        id: ruff
+        continue-on-error: true
+        run: ruff check src tests examples benchmark benchmarks scripts --output-format concise --output-file ruff-check.txt
+      - name: Run ruff format check (advisory)
+        id: format
+        continue-on-error: true
+        run: ruff format --check src tests examples benchmark benchmarks scripts > ruff-format.txt 2>&1
+      - name: Run mypy typecheck (advisory)
+        id: mypy
+        continue-on-error: true
+        run: mypy src/aether > mypy.txt 2>&1
       - name: Verify public API stub exports
         run: python scripts/generate_stubs.py --check
+      - name: Summarize advisory checks
+        if: always()
+        env:
+          RUFF_OUTCOME: ${{ steps.ruff.outcome }}
+          FORMAT_OUTCOME: ${{ steps.format.outcome }}
+          MYPY_OUTCOME: ${{ steps.mypy.outcome }}
+        run: |
+          {
+            echo '### Advisory style and type checks'
+            echo "Ruff: $RUFF_OUTCOME; formatting: $FORMAT_OUTCOME; mypy: $MYPY_OUTCOME."
+            echo 'These outcomes describe the existing repository-wide backlog. Diagnostics are attached as lint-reports; syntax, undefined-name, and API checks are blocking.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload advisory diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-reports
+          path: |
+            ruff-check.txt
+            ruff-format.txt
+            mypy.txt
+          if-no-files-found: warn
 
   # ── Unit tests (core) ──────────────────────────────────────────────────────
   unit-tests:
     name: Unit tests (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -56,8 +96,10 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install --retries 5 -e ".[test]"
       - name: Run unit tests
+        env:
+          AETHER_CACHE_DIR: ${{ runner.temp }}/aether-cache
         run: |
-          pytest tests -q -m "not slow and not network and not gpu and not cuda and not metal and not rocm" --no-cov --junitxml=test-results-core.xml
+          pytest tests -q -m "not slow and not network and not gpu and not cuda and not metal and not rocm" --no-cov --timeout=180 --junitxml=test-results-core.xml
         continue-on-error: false
       - name: Upload test results
         uses: actions/upload-artifact@v4
@@ -81,13 +123,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[docs]"
       - name: Build docs (warnings allowed)
-        run: sphinx-build --keep-going -b html docs docs/_build/html || true
+        run: sphinx-build --keep-going -b html docs docs/_build/html
       - name: Upload docs artifact
         uses: actions/upload-artifact@v4
         with:
           name: docs-html
           path: docs/_build/html
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   # ── AEG v3.1 artifact contract ────────────────────────────────────────────
   v31-artifact-contract:
@@ -102,8 +144,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install --retries 5 -e ".[test]"
-      - name: Verify v3.1 package artifacts
-        run: pytest tests/unit/test_v31_features.py::test_compiled_package_contains_v31_artifacts --no-cov -v || true
+      - name: Verify v3.1 package artifacts with local weights
+        run: pytest tests/unit/test_v31_features.py::test_local_compiled_package_contains_v31_artifacts --no-cov -v
 
   # ── PRD v3.1 Runtime Layer Contracts ─────────────────────────────────────
   v31-runtime-layer-contract:
@@ -119,7 +161,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install --retries 5 -e ".[test]"
       - name: Validate v3.1 runtime layers
-        run: pytest tests/unit/test_v31_runtime_layers.py --no-cov -v || true
+        run: pytest tests/unit/test_v31_runtime_layers.py --no-cov -v
 
   # ── PRD v4.0 + v5.0 CI jobs ───────────────────────────────────────────────
   v40-pass-contract:

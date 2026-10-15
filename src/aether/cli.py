@@ -664,18 +664,19 @@ def _print_hardware_fingerprint() -> None:
 
 @cli.command()
 def kernels() -> None:
-    """List active kernel targets and recommended backends."""
+    """List kernel target profiles and the detected host target."""
     target = HardwareProfile.auto()
     registry = TargetRegistry()
-    table = Table(title="Kernel Targets")
+    table = Table(title="Kernel Target Profiles")
     table.add_column("Target ID", style="cyan")
     table.add_column("Name", style="magenta")
-    table.add_column("Recommended Backend", style="green")
+    table.add_column("Candidate Backend", style="green")
     for tid in registry.supported_targets:
         profile = registry.get_profile(tid)
-        table.add_row(tid, profile.name, profile.recommended_backend or "pytorch")
+        table.add_row(tid, profile.name, profile.recommended_backend or "unconfirmed")
     console.print(table)
-    console.print(f"[dim]Current target: {target.target_id}[/dim]")
+    console.print(f"Current target: {target.target_id} ({target.name})", style="dim", markup=False)
+    console.print("[dim]Profiles do not establish installed backend readiness or successful execution.[/dim]")
 
 
 @cli.command()

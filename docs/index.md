@@ -16,6 +16,7 @@ runtime
 api-reference
 research
 roadmap
+ci-failure-verification
 ```
 
 - [Quick start guide](getting-started.md)
@@ -26,6 +27,7 @@ roadmap
 - [API reference](api-reference.md)
 - [Research foundation](research.md)
 - [Roadmap](roadmap.md)
+- [CI failure investigation and verification](ci-failure-verification.md)
 
 ## What is Aether?
 

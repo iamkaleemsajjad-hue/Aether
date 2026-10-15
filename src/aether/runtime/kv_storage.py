@@ -108,6 +108,23 @@ class KVPayloadStore:
         _safe_path(path)
         return path
 
+    def _read_blob(self, path: Path, size: int) -> bytes:
+        """Bound allocation to committed bytes, checking size before and after IO."""
+        if type(size) is not int or size <= 0:
+            raise ValueError("Invalid committed cache payload size")
+        if size > self.max_entry_bytes:
+            raise CacheQuotaError("Stored cache entry exceeds the configured read bound")
+        with path.open("rb") as stream:
+            if os.fstat(stream.fileno()).st_size != size:
+                raise ValueError("Stored cache payload checksum mismatch (size changed)")
+            # Reading against the global quota can reserve gigabytes for a tiny
+            # snapshot. One extra byte detects growth after fstat without an
+            # unbounded read or a quota-sized allocation.
+            data = stream.read(size + 1)
+        if len(data) != size:
+            raise ValueError("Stored cache payload checksum mismatch (size changed)")
+        return data
+
     @staticmethod
     def _row(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
@@ -160,7 +177,7 @@ class KVPayloadStore:
                 if sum(retained.values()) > self.max_bytes:
                     raise CacheQuotaError("Cache storage quota would be exceeded")
                 if destination.exists():
-                    existing = destination.read_bytes()
+                    existing = self._read_blob(destination, size)
                     if len(existing) != size or hashlib.sha256(existing).hexdigest() != content_hash:
                         raise ValueError("Existing cache blob checksum mismatch")
                 else:
@@ -194,14 +211,16 @@ class KVPayloadStore:
             row = connection.execute("SELECT * FROM entries WHERE cache_key=?", (key,)).fetchone()
             if row is None:
                 return None
-            if row["size_bytes"] > self.max_entry_bytes:
+            size = row["size_bytes"]
+            if type(size) is not int or size <= 0:
+                raise ValueError("Invalid committed cache payload size")
+            if size > self.max_entry_bytes:
                 raise CacheQuotaError("Stored cache entry exceeds the configured read bound")
             path = self._blob(row["content_hash"])
             if not path.exists():
                 raise ValueError("Committed cache payload is missing from disk")
-            with path.open("rb") as stream:
-                data = stream.read(self.max_entry_bytes + 1)
-            if len(data) != row["size_bytes"] or hashlib.sha256(data).hexdigest() != row["content_hash"]:
+            data = self._read_blob(path, size)
+            if hashlib.sha256(data).hexdigest() != row["content_hash"]:
                 raise ValueError("Stored cache payload checksum mismatch")
             payload = CachePayload.deserialize(data, expected_model_fingerprint=row["model_fingerprint"],
                                                expected_cache_kind=row["cache_kind"], max_bytes=self.max_entry_bytes)
