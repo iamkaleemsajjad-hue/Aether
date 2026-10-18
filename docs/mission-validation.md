@@ -36,6 +36,7 @@ clean environment was installed before the authoritative run.
 | Four multiprocessing checks previously denied by the sandbox | 4 passed outside sandbox, exit 0 | `build/mission/ipc-corrected.log`, `.xml`, `.exit` |
 | Audit helper contracts, first revision | 26 passed; 1 optional integration skip | `build/mission/tool-tests-initial.log` |
 | Audit helper contracts, expanded revision | 31 passed; 1 optional integration skip | `build/mission/tool-tests-expanded.log` |
+| Audit helper contracts, worker-identity sampler revision | 33 passed; 1 optional integration skip | `build/mission/harness-validation/sampler-pytest.log` |
 | Audit helper mypy (third-party imports skipped) | Passed, 2 source files | `build/mission/tools-mypy-final.log` |
 
 The complete suite ran with Torch and Transformers installed, offline model
@@ -98,8 +99,13 @@ These findings remain unfixed at this checkpoint.
 The first harness version followed the Windows venv launcher for sampled
 main-process RSS, while its phase boundaries came from the actual Python child.
 Its peak-RSS results are therefore not accepted as validated measurements.
-The sampler needs an owned-worker PID check and an allocation regression before
-memory results can support claims. Numerical/token comparisons are unaffected.
+The corrected sampler now checks owned worker PID and creation time, measures
+that worker separately from its process tree, and rejects stale/unowned markers.
+A real allocation regression touches and frees 64 MiB in the Python child before
+exit; the sampled peak exceeds final RSS by at least 48 MiB. The 33 helper tests
+passed, including that regression. The original peak values remain invalid;
+numerical/token comparisons are unaffected. Sampling can miss brief peaks, and
+summed tree RSS can count shared pages more than once.
 
 The legacy speculation regression file separately reproduced 35 failures and
 5 passes against unchanged production source. Evidence:
@@ -145,3 +151,41 @@ CPU execution and real-process collectives have current physical-host evidence.
 CUDA, ROCm, Metal, native vendor/NPU/FPGA paths, and hardware attestation require
 their own execution evidence. None is promoted by CPU tests, mocks, package
 installation, or target-profile presence.
+
+## Correction: legacy speculation fails closed
+
+Read scope included the complete legacy module, its public exports and runtime
+caller, the executable speculative decoders and sampling/cache contracts, related
+unit/integration tests, and runtime feature documentation. The runtime imports
+the legacy class but does not call its builder in the serving path.
+
+The unsupported builder now raises an explanatory error. Manual greedy
+verification requires valid target logits, validates candidate IDs and
+probabilities, and updates counters only after successful verification. Existing
+imports and method signatures remain available. The real draft/target decoder
+was preserved. See [migration and scope](legacy-speculation.md).
+
+| Check | Before | After |
+|---|---|---|
+| New legacy regression file | 35 failed, 5 passed | All 40 passed in the focused selection |
+| Focused runtime/speculation/Torch/persistence selection | Not run as one baseline selection | 131 passed, 0 failed |
+| Complete suite with coverage | 4,923 passed, 41 skipped | 4,996 passed, 42 skipped, 0 failed; exit 0 |
+| Line coverage | 78.19% | 78.22% |
+| Branch coverage | 61.96% | 62.02% |
+| Original AEG replay, maximum absolute logit error | Reference capture | 0 |
+| Original AEG replay, greedy token IDs | 16 reference IDs | 16/16 identical; public `Runtime.generate` passed |
+| Engine speed / memory benefit | Not measured | No benefit claimed; engine execution was unchanged |
+
+Evidence: `build/mission/legacy-before.*`, `legacy-after.*`, `legacy-full.*`,
+`legacy-full-coverage.xml`, `coverage-comparison.json`, and
+`legacy-artifact-replay/report.json`. The complete after-suite took 646.78 seconds.
+Suite wall times include new tests and uncontrolled host memory pressure; they
+are not a decode throughput benchmark. The extra skip is the explicitly optional
+heavy pass-audit integration test. All new helper and legacy regressions ran in
+the complete suite.
+
+Full Ruff passed for the corrected production module and new regression file;
+the existing runtime test file retains exactly its prior 32 findings. Targeted
+mypy passed for the corrected module with imported modules excluded. This does
+not clear the 1,796-error full-package baseline. Native AEG reproducibility and
+the remaining pass/correctness/performance work remain open.

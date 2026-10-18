@@ -573,7 +573,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - N/A
 
 ### Fixed
-- N/A
+
+- Removed fabricated candidate generation from the legacy public tree-speculation
+  API. Unsupported drafting now fails clearly; manual verification requires valid
+  target evidence and commits acceptance counters only after successful validation.
+  Existing imports and constructor signatures remain available. See
+  `docs/legacy-speculation.md` for migration and validation scope.
 
 ### Security
 - N/A
