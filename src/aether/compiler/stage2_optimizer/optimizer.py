@@ -2,12 +2,13 @@
 OptimizerPipeline — pass manager for Stage 2 optimizer passes.
 
 The OptimizerPipeline orchestrates all 22 compiler passes in the PRD-defined
-order.  It also handles pass registration, dependency checking, and report
+order.  It also handles pass registration, selection, and report
 generation.
 """
 
 from __future__ import annotations
 
+import copy
 import time
 from typing import Any
 
@@ -42,8 +43,8 @@ class OperatorFusionPass(BasePass):
     """Pass 1: Operator Fusion.
 
     Identifies fuseable operation sequences (e.g., RMSNorm + QKV + RoPE) and
-    merges them into single megakernel operations. This reduces the number of
-    GPU kernel launches and eliminates intermediate DRAM round-trips.
+    merges their IR representation. The CPU/Torch engines own their execution
+    schedules; this experimental rewrite does not establish saved launches.
     """
 
     name = "operator_fusion"
@@ -175,7 +176,7 @@ class OperatorFusionPass(BasePass):
                 graph.set_metadata("fusion_accounting", {
                     "fused_groups": fused_count,
                     "merged_ops_total": merged_ops_total,
-                    "launches_saved": max(0, merged_ops_total - fused_count),
+                    "launches_saved": 0,
                     "patterns": dict(patterns),
                 })
             report = PassReport(
@@ -1162,6 +1163,31 @@ class OptimizerPipeline:
       21 AdvancedPEFTCompilationPass    22 RLVRVerifierHeadInjectionPass
     """
 
+    _CONFIG_FLAGS: tuple[tuple[str, str], ...] = (
+        ("operator_fusion", "enable_fusion"),
+        ("sensitivity_analysis", "enable_sensitivity"),
+        ("precision_assignment", "enable_precision_assignment"),
+        ("kv_cache_structuring", "enable_kv_cache_structuring"),
+        ("moe_routing", "enable_moe_routing"),
+        ("parallelism_discovery", "enable_parallelism_discovery"),
+        ("reasoning_graph", "enable_reasoning_graph"),
+        ("sparse_attention", "enable_sparse_attention"),
+        ("pruning_sparsity", "enable_pruning"),
+        ("mtp_head_compilation", "enable_mtp_head"),
+        ("grammar_constraint_compilation", "enable_grammar_constraint"),
+        ("model_merging", "enable_model_merging"),
+        ("ttt_fast_weight_injection", "enable_ttt"),
+        ("semantic_kv_compression", "enable_semantic_kv"),
+        ("cross_layer_kv_sharing", "enable_cross_layer_kv"),
+        ("green_energy_compilation", "enable_green_energy"),
+        ("tee_kernel_wrapping", "enable_tee"),
+        ("mdlm_drafter_compilation", "enable_mdlm_drafter"),
+        ("sub2bit_quantization", "enable_sub2bit"),
+        ("video_token_compression", "enable_video_compression"),
+        ("advanced_peft_compilation", "enable_advanced_peft"),
+        ("rlvr_verifier_head_injection", "enable_rlvr_verifier"),
+    )
+
     def __init__(self, config: CompilerConfig | None = None) -> None:
         self.config = config or CompilerConfig()
         self._passes: list[BasePass] = [
@@ -1191,37 +1217,9 @@ class OptimizerPipeline:
             AdvancedPEFTCompilationPass(),
             RLVRVerifierHeadInjectionPass(),
         ]
-        self._pass_enabled: dict[str, bool] = {
-            # PRD v3.1 — all on by default
-            "operator_fusion": True,
-            "sensitivity_analysis": True,
-            "precision_assignment": True,
-            "kv_cache_structuring": True,
-            "moe_routing": True,
-            "parallelism_discovery": True,
-            "reasoning_graph": True,
-            "sparse_attention": True,
-            "pruning_sparsity": True,
-            # PRD v4.0 — opt-in passes; ``_sync_enabled_from_config`` applies
-            # the CompilerConfig flags before every run, and constants.py
-            # keeps every v4/v5 pass disabled by default.  The values here
-            # mirror those defaults so a directly-constructed pipeline (used
-            # by tests) cannot silently run v4/v5 passes unconfigured.
-            "mtp_head_compilation": False,          # opt-in (enable_mtp_head)
-            "grammar_constraint_compilation": False,   # opt-in
-            "model_merging": False,                    # opt-in
-            "ttt_fast_weight_injection": False,        # opt-in
-            "semantic_kv_compression": False,       # opt-in (enable_semantic_kv)
-            "cross_layer_kv_sharing": False,        # opt-in (enable_cross_layer_kv)
-            "green_energy_compilation": False,         # opt-in
-            "tee_kernel_wrapping": False,              # opt-in
-            # PRD v5.0
-            "mdlm_drafter_compilation": False,         # opt-in
-            "sub2bit_quantization": False,             # opt-in
-            "video_token_compression": False,      # opt-in (enable_video_compression)
-            "advanced_peft_compilation": False,    # opt-in (enable_advanced_peft)
-            "rlvr_verifier_head_injection": False,     # opt-in
-        }
+        self._pass_enabled: dict[str, bool] = {}
+        self._pass_overrides: dict[str, bool] = {}
+        self._sync_enabled_from_config()
 
     @property
     def pass_count(self) -> int:
@@ -1233,13 +1231,15 @@ class OptimizerPipeline:
         self._pass_enabled[pass_instance.name] = True
 
     def enable_pass(self, name: str) -> None:
-        """Enable a pass by name."""
+        """Explicitly enable a registered pass across subsequent runs."""
         if name in self._pass_enabled:
+            self._pass_overrides[name] = True
             self._pass_enabled[name] = True
 
     def disable_pass(self, name: str) -> None:
-        """Disable a pass by name."""
+        """Explicitly disable a registered pass across subsequent runs."""
         if name in self._pass_enabled:
+            self._pass_overrides[name] = False
             self._pass_enabled[name] = False
 
     def run(
@@ -1259,6 +1259,15 @@ class OptimizerPipeline:
         self._sync_enabled_from_config()
         pass_reports: list[PassReport] = []
         current_graph = graph
+        effective_config = self.config
+        if self._pass_overrides:
+            # Some passes also guard themselves with their canonical config
+            # flag. Give them the same selection as the scheduler without
+            # changing the caller's config or reapplying conflicting aliases.
+            effective_config = copy.copy(self.config)
+            for name, flag in self._CONFIG_FLAGS:
+                if name in self._pass_overrides:
+                    setattr(effective_config, flag, self._pass_overrides[name])
 
         for pass_instance in self._passes:
             if not self._pass_enabled.get(pass_instance.name, True):
@@ -1279,46 +1288,23 @@ class OptimizerPipeline:
                     PassReport(
                         pass_name=pass_instance.name,
                         status="skipped",
-                        details={"reason": "Disabled in configuration"},
+                        details={"reason": "Disabled in pipeline selection"},
                     )
                 )
                 logger.debug(f"Pass '{pass_instance.name}' skipped (disabled)")
                 continue
 
             logger.info(f"Running pass: {pass_instance.name}")
-            current_graph, report = pass_instance.run(current_graph, architecture, self.config)
+            current_graph, report = pass_instance.run(current_graph, architecture, effective_config)
             pass_reports.append(report)
 
         return current_graph, pass_reports
 
     def _sync_enabled_from_config(self) -> None:
         """Sync pass-enabled flags from CompilerConfig."""
-        c = self.config
-        # PRD v3.1
-        self._pass_enabled["operator_fusion"] = c.enable_fusion
-        self._pass_enabled["sensitivity_analysis"] = c.enable_sensitivity
-        self._pass_enabled["precision_assignment"] = c.enable_precision_assignment
-        self._pass_enabled["kv_cache_structuring"] = c.enable_kv_cache_structuring
-        self._pass_enabled["moe_routing"] = c.enable_moe_routing
-        self._pass_enabled["parallelism_discovery"] = c.enable_parallelism_discovery
-        self._pass_enabled["reasoning_graph"] = c.enable_reasoning_graph
-        self._pass_enabled["sparse_attention"] = c.enable_sparse_attention
-        self._pass_enabled["pruning_sparsity"] = c.enable_pruning
-        # PRD v4.0
-        self._pass_enabled["mtp_head_compilation"] = c.enable_mtp_head
-        self._pass_enabled["grammar_constraint_compilation"] = c.enable_grammar_constraint
-        self._pass_enabled["model_merging"] = c.enable_model_merging
-        self._pass_enabled["ttt_fast_weight_injection"] = c.enable_ttt
-        self._pass_enabled["semantic_kv_compression"] = c.enable_semantic_kv
-        self._pass_enabled["cross_layer_kv_sharing"] = c.enable_cross_layer_kv
-        self._pass_enabled["green_energy_compilation"] = c.enable_green_energy
-        self._pass_enabled["tee_kernel_wrapping"] = c.enable_tee
-        # PRD v5.0
-        self._pass_enabled["mdlm_drafter_compilation"] = c.enable_mdlm_drafter
-        self._pass_enabled["sub2bit_quantization"] = c.enable_sub2bit
-        self._pass_enabled["video_token_compression"] = c.enable_video_compression
-        self._pass_enabled["advanced_peft_compilation"] = c.enable_advanced_peft
-        self._pass_enabled["rlvr_verifier_head_injection"] = c.enable_rlvr_verifier
+        for name, flag in self._CONFIG_FLAGS:
+            self._pass_enabled[name] = bool(getattr(self.config, flag))
+        self._pass_enabled.update(self._pass_overrides)
 
     def __repr__(self) -> str:
         enabled = sum(1 for v in self._pass_enabled.values() if v)

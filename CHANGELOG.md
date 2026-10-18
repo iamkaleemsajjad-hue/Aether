@@ -579,6 +579,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Made unverified default passes P1/P2/P4/P5/P6/P7/P8 experimental opt-ins,
+  retaining default BF16 precision assignment and source MoE/KV execution.
+  Pipeline toggles now survive config synchronization and reach internal pass
+  gates. Packaging requires an applied sharding-plan producer; IR fusion reports
+  actual groups without claiming runtime launch or memory savings. Serial tiny
+  and MoE measurements, exact A/B numerics and mixed TTFT results are recorded
+  in `docs/mission-default-policy.md`; larger-model benefit remains unverified.
 - Rejected reported optimizer failures before targeting or AEG publication,
   preserving their structured reasons, cleaning private staging and retaining an
   existing destination even when overwrite is requested. Diagnostic pipeline

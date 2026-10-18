@@ -1,397 +1,184 @@
 # Aether Optimizer Passes
 
-Aether's Stage 2 optimizer runs **22 graph-level compiler passes** in sequence.
-Each pass is a self-contained transformation that can be enabled or disabled
-independently. All 22 passes fire on every `aether compile` invocation at the
-default optimization level (O2).
-
----
-
-## Pass 1: Operator Fusion
-
-Merges sequences of operations into single fused kernels to reduce kernel
-launches and eliminate intermediate DRAM round-trips.
-
-Typical fusion patterns:
-
-- `RMSNorm → QKV projection → RoPE` → `fused_qkv_rope_norm`
-- `Attention → output projection → residual add` → `fused_attn_out_residual`
-- `FFN gate/up/down projections + residual` → `fused_ffn_residual`
-- `Softmax → Dropout → MatMul` → `fused_softmax_attn`
-
-Research: ClusterFusion (NeurIPS 2025), FlashAttention-3, TensorRT-LLM kernel fusion.
-
----
-
-## Pass 2: Sensitivity Analysis
-
-Computes a per-layer sensitivity score using calibration data:
-
-```
-sensitivity[L] = Δperplexity / bits_saved(L)
-```
-
-Higher sensitivity = layer is more important to preserve precision.
-Calibration runs on WikiText-103 (50-sequence sample) by default.
-
-Research: AutoMixQ (2024), AMQ, GPTQ, AWQ sensitivity analysis.
-
----
-
-## Pass 3: Precision Assignment
-
-Using the sensitivity map, each layer receives an optimal precision:
-
-| Sensitivity | Precision |
-|-------------|-----------|
-| > 0.9 | BF16 |
-| 0.7–0.9 | FP8 or Q6_K |
-| 0.4–0.7 | Q4_K_M |
-| < 0.4 | Q3_K or IQ3_XS |
-
-Modes: `sensitivity` (default), `uniform`, `manual`.
-
----
-
-## Pass 4: KV Cache Structuring
-
-Annotates the AEG-IR with explicit KV cache nodes and policies:
-
-- Paged blocks aligned to hardware page size (64 KB default)
-- RadixTree prefix hints for shared system prompts
-- Memory tier thresholds: GPU HBM → CPU DRAM → NVMe SSD → Aether Hub
-- Cross-session sharing policies
-- Sub-2-bit KV quantization metadata (Q2K_KV)
-
-Research: PagedAttention (vLLM 2023), SGLang RadixAttention, DistServe, Mooncake.
-
----
-
-## Pass 5: MoE Expert Routing
-
-For MoE models (Mixtral, DeepSeek-MoE, etc.):
-
-1. Profiles expert activation on calibration set.
-2. Classifies experts as hot (>5%), warm (0.1–5%), or cold (<0.1%).
-3. Pins hot experts to GPU HBM; stages warm to CPU DRAM; lazy-loads cold from NVMe.
-4. Replaces top-K routing with adaptive threshold-based routing (DynaMoE).
-5. Emits intra-expert sparsity kernels for dead activation channels.
-
-Research: MoE-Infinity, CommitMoE, FinDEP, DynaMoE.
-
----
-
-## Pass 6: Automatic Parallelism Discovery
-
-Searches over the strategy space of TP/PP/EP/CP parallelism.
-Produces separate prefill and decode sharding plans for 1/2/4/8/16 GPU configurations.
-
-Search space:
-- Tensor parallelism: 1, 2, 4, 8
-- Pipeline stages: 1, 2, 4
-- Expert parallelism (MoE only): 1, 2, 4
-- Context parallelism (long context): 1, 2, 4
-
-Research: Alpa, Megatron-LM, Seesaw, Ring Attention.
-
----
-
-## Pass 7: Reasoning Graph Compiler
-
-Emits `graph/reasoning_graph.aeg-ir` with explicit reasoning metadata:
-- Budget/token allocation per reasoning step
-- Early-exit conditions and confidence thresholds
-- Verification step injection points
-- Speculative chain-of-thought (CoT) metadata
-
-Research: DeepSeek-R1, Sky-T1, ARC reasoning (2025).
-
----
-
-## Pass 8: Sparse Attention
-
-For prompts exceeding the long-context threshold, emits sparse attention patterns:
-- MInference vertical-slash pattern
-- Block-sparse (sliding window)
-- A-shape (dense for first tokens)
-
-Output: `graph/attention_head_patterns.json`
-Falls back to dense attention below the threshold.
-
-Research: MInference (Microsoft 2024), Longformer, BigBird.
-
----
-
-## Pass 9: Pruning and Sparsity
-
-Emits weight sparsity masks using Wanda/SparseGPT-inspired importance scoring:
-
-- **2:4 structured sparsity** for NVIDIA tensor cores (sm80+)
-- **Unstructured sparsity** for CPU targets (up to 70% sparsity)
-- Sensitive layers receive lower sparsity ratios
-
-Output: `weights/sparsity_masks.json`
-
-Research: SparseGPT (2023), Wanda (2024), 2:4 Structured Pruning.
-
----
-
-## Pass 10: Speculative Decoding Configuration
-
-Embeds speculative decoding configuration for draft/verify inference:
-
-- Selects optimal draft model (Eagle-2, Medusa-style, or n-gram)
-- Configures speculation depth (default: 5 tokens per draft)
-- Tunes acceptance threshold per model quality
-
-Research: Eagle (2024), Medusa, SpecInfer, BiLD.
-
----
-
-## Pass 11: LoRA/PEFT Adapter Merging
-
-Merges LoRA/QLoRA/DoRA adapter weights into the base model graph:
-
-- Fuses `W + A·B` into a single weight matrix when rank ≤ 64
-- Validates adapter compatibility (matching hidden dim, attention heads)
-- Preserves adapter metadata for multi-LoRA serving
-
-Research: LoRA (Hu et al. 2021), QLoRA (Dettmers 2023), DoRA (2024).
-
----
-
-## Pass 12: Embedding Optimization
-
-Optimizes the embedding and unembedding (LM head) layers:
-
-- Quantizes vocabulary embeddings to INT8 or lower
-- Ties input/output embeddings when weights are shared
-- Applies vocab pruning for domain-specific models
-
----
-
-## Pass 13: Long-Context Adaptation
-
-For models operating above 32K context:
-
-- Applies dynamic NTK RoPE scaling for the configured context length
-- Inserts ring attention boundaries for multi-device long-context
-- Configures chunked prefill block sizes
-
-Research: YaRN (2023), RoPE NTK scaling, Ring Attention.
-
----
-
-## Pass 14: Video KV Management
-
-For vision-language models processing video:
-
-- Extracts per-frame KV cache plans
-- Inserts temporal compression nodes (deduplicate similar frames)
-- Configures cross-frame KV sharing policies
-
-Research: Video LLaVA (2024), Aether AEG/3.0 video payload spec.
-
----
-
-## Pass 15: Multi-Agent KV Coordination
-
-For multi-agent inference workloads:
-
-- Emits shared prefix KV cache policies across agents
-- Configures SwarmKV-style distributed KV sharing
-- Inserts inter-agent token visibility boundaries
-
-Research: SwarmKV (2026), vLLM prefix caching.
-
----
-
-## Pass 16: Grammar-Constrained Decoding
-
-Embeds structured output configuration:
-
-- Compiles JSON schema / regex grammar into a finite-state machine (FSM)
-- Emits grammar FSM as `graph/grammar_fsm.bin`
-- Configures token masking at each decode step for constrained generation
-
-Research: Outlines (2024), LM-Format-Enforcer, Guidance.
-
----
-
-## Pass 17: TEE Wrapping
-
-When the target platform supports Intel TDX, AMD SEV-SNP, or NVIDIA Hopper CC:
-
-- Wraps weight loading in a Trusted Execution Environment enclave
-- Emits remote attestation metadata into `provenance/tee_attestation.json`
-- Ensures weight decryption occurs only inside the enclave
-
-Falls back to plaintext execution with explicit warning when TEE is unavailable.
-
-Research: Intel TDX (2024), AMD SEV-SNP, NVIDIA Hopper Confidential Computing.
-
----
-
-## Pass 18: MDLM Drafter Injection
-
-For models using MDLM-style diffusion speculative decoding:
-
-- Loads drafter weights from a supplied MDLM checkpoint
-- Fuses drafter tokenizer alignment layer
-- Configures diffusion timestep schedule for 5-token draft lookahead
-
-Requires: `--drafter-path /path/to/mdlm_drafter.safetensors`
-
-Research: MDLM (2024), DiffuSeq, PLM-based diffusion language models.
-
----
-
-## Pass 19: SLO-Aware Scheduling Configuration
-
-Embeds per-model Service Level Objective metadata:
-
-- Configures TTFT deadline (default: 2000 ms for streaming, 5000 ms for batch)
-- Binds per-tenant priority weights for EDF (Earliest Deadline First) scheduling
-- Sets preemption thresholds for long-running requests
-
-Research: Orca (2022), S3 (2023), DejaVu SLO-aware scheduling.
-
----
-
-## Pass 20: Green Power Optimization
-
-Embeds power-aware scheduling hints:
-
-- Profiles model thermal design power (TDP) per hardware target
-- Annotates idle periods for CPU/GPU power gating
-- Configures carbon-intensity-aware batch scheduling
-
-Research: Green Scheduling (2024), NVIDIA GPU power state management.
-
----
-
-## Pass 21: MCP Tool Integration
-
-For agentic models using the Model Context Protocol:
-
-- Validates tool schema compatibility (JSON Schema draft-07)
-- Embeds tool call routing tables into `graph/mcp_tool_manifest.json`
-- Configures tool-call output parsing and result injection
-
-Research: Model Context Protocol spec (Anthropic 2024), OpenAI function calling.
-
----
-
-## Pass 22: RLVR Verifier Injection
-
-For GRPO/RLVR-style reinforcement learning from verifiable rewards:
-
-- Injects a verifier head into the model graph for process reward model (PRM) scoring
-- Configures GRPO training loop hyperparameters: group size, KL penalty, clip ratio
-- Emits `graph/rlvr_config.json` for online RL training integration
-
-Research: DeepSeek-R1 GRPO (2025), RLVR (2025), OpenR reasoning (2025).
-
----
-
-## Configuration
-
-All 22 passes are controlled via `CompilerConfig`:
+Stage 2 registers 22 passes in the order below. **Only Pass 3, precision
+assignment, is enabled by default.** Passes 1, 2, 4, 5, 6, 7 and 8 are now
+experimental opt-ins; Passes 9 through 22 remain opt-in. Changing
+`optimization_level` does not select these flags or enable every pass.
+
+The pipeline returns one `PassReport` per registration, including disabled or
+unsupported passes. `applied` describes a compiler transformation, not a runtime
+benefit or a model-quality guarantee. `OptimizerPipeline.run()` retains failed
+reports for inspection; public `Compiler.compile()` rejects a failed report
+before targeting and publication. A benign skip remains distinct from failure.
+CLI feature requests also refuse success when the requested pass was skipped.
+
+## Defaults, consumers and experimental status
+
+The flags below are the canonical `CompilerConfig` fields. All manual opt-ins
+remain available. A runtime consumer means that some emitted data reaches an
+execution path; it does not certify a latency, memory, energy or quality gain.
+
+| # | Pass/report name | Enable flag | Default | Actual consumer and disposition |
+|---|---|---|---|---|
+| 1 | `operator_fusion` | `enable_fusion` | Off | Rewrites AEG graph groups and records actual fusion patterns. The CPU/Torch transformer schedules are not interpreters of these fused IR groups. Experimental IR transformation; no demonstrated reduction in runtime launches or attributed speed benefit. |
+| 2 | `sensitivity_analysis` | `enable_sensitivity` | Off | Annotates nodes and a sensitivity map using weight/calibration statistics. P9 can use the scores. P3 currently selects BF16 in its default mode with or without this map. Experimental diagnostic; scores are not measured perplexity or quality certification. |
+| 3 | `precision_assignment` | `enable_precision_assignment` | **On** | Packaging consumes the precision map, writes encoded tensors, and loaders reconstruct execution weights. Default `sensitivity` mode conservatively assigns BF16; explicit uniform/manual formats can change numerical results. Real storage transformation, without automatic quality certification. |
+| 4 | `kv_cache_structuring` | `enable_kv_cache_structuring` | Off | Adds KV IR nodes and placement/block hints. Ordinary runtime KV caching does not require this pass. Experimental plan; emitted hints do not establish paged allocation, tiered offload or cache savings. |
+| 5 | `moe_routing` | `enable_moe_routing` | Off | Adds a global routing/tier plan. Executable source MoE routing separately uses each layer's authenticated router weights, experts and source top-k. Experimental placement hints; no demonstrated tier migration, adaptive routing or benefit. |
+| 6 | `parallelism_discovery` | `enable_parallelism_discovery` | Off | Adds sharding plans to graph metadata; packaging persists those plans only when this pass applies. Runtime exposes them for inspection, without consuming them for device placement. Experimental discovery; no distributed execution, scaling or memory benefit is established. |
+| 7 | `reasoning_graph` | `enable_reasoning_graph` | Off | Emits reasoning metadata and `graph/reasoning_graph.aeg-ir`. No demonstrated serving consumer executes these nodes to improve reasoning or early exit. Experimental graph artifact. |
+| 8 | `sparse_attention` | `enable_sparse_attention` | Off | Loader validates `attention_head_patterns` and the CPU attention path applies per-head masks. This is executable approximation, not just metadata. Experimental: no validated long-context quality or speed benefit; plan presence can also bypass native decode attention. |
+| 9 | `pruning_sparsity` | `enable_pruning` | Off | Computes masks from available weights; packaging applies them to stored tensors. Execution uses the resulting weights, without proof of a specialized sparse kernel. Experimental lossy transform; measured synthetic regressions preclude a quality-preserved default. |
+| 10 | `mtp_head_compilation` | `enable_mtp_head` | Off | Serializes supplied MTP projection heads under `speculation/`; Runtime can load them for speculative requests. Missing real heads are skipped. Experimental: generic generation is not evidence of head use, correct target verification, acceptance rate or speed. |
+| 11 | `grammar_constraint_compilation` | `enable_grammar_constraint` | Off | Compiles a supplied constraint and tokenizer-aware FSM under `grammar/`; public constrained generation can consume token masks. Experimental feature opt-in: ordinary generation does not prove the requested constraint was enforced, and no decode-overhead claim is certified. |
+| 12 | `model_merging` | `enable_model_merging` | Off | Merges supplied weight sources; persisted tensors are consumed by normal execution. Runtime also exposes AEG merging/task-vector selection. Experimental, intentionally changes the model; graph emission or a successful merge is not task-quality evidence. |
+| 13 | `ttt_fast_weight_injection` | `enable_ttt` | Off | Emits fast-weight configuration loaded by Runtime's TTT engine; the CPU request path can request adaptation. Experimental: loading slots or reporting adaptation loss does not prove useful transformer adaptation or improved model quality. |
+| 14 | `semantic_kv_compression` | `enable_semantic_kv` | Off | Persists a compression plan consumed by the CPU KV cache, changing retention during generation. Experimental lossy cache policy; teacher-forced prefix logits alone miss generation/cache regressions. No general semantic-preservation or speed guarantee. |
+| 15 | `cross_layer_kv_sharing` | `enable_cross_layer_kv` | Off | Persists sharing groups consumed by CPU cache aliasing. Experimental approximation: shared pointers are real, but the synthetic audit observed numerical/generation regressions. No quality-preserved memory-saving default. |
+| 16 | `green_energy_compilation` | `enable_green_energy` | Off | Writes a profile loaded by Runtime's green power manager for request accounting. TDP-duration energy estimates are labeled estimates. Experimental metadata/accounting; no demonstrated device power control or measured energy reduction. |
+| 17 | `tee_kernel_wrapping` | `enable_tee` | Off | Requires a concrete backend-emitted TEE kernel bundle. The current tree has no such executable backend, so ordinary requests skip and CLI requests are refused. Unsupported execution; hashes/configuration are not enclave isolation or attestation. |
+| 18 | `mdlm_drafter_compilation` | `enable_mdlm_drafter` | Off | Requires a supplied, validated MDLM head bundle; Runtime can reload it into the diffusion drafter. Missing weights skip. Experimental trained-head integration; synthetic head execution does not prove draft acceptance, target correctness or throughput benefit. |
+| 19 | `sub2bit_quantization` | `enable_sub2bit` | Off | Public packaging supports BitNet/ternary storage and the CPU reference path dequantizes for dense execution. Other accepted method names are refused at packaging when no runtime codec exists. Experimental lossy storage; reconstruction error is not PPL, nor proof of addition-only kernels or speed. |
+| 20 | `video_token_compression` | `enable_video_compression` | Off | Gated on a vision-language architecture; text checkpoints skip. Public video generation requires a backend advertising executable vision support; the CPU AEG backend refuses it. Experimental/unvalidated end-to-end; emitted plans establish no token-reduction, streaming-memory or quality benefit. |
+| 21 | `advanced_peft_compilation` | `enable_advanced_peft` | Off | Requires real adapter tensors. Packaging persists supported LoRA A/B data; CPU execution can select a compiled adapter via public `adapter_id`. Experimental: selection and changed logits alone do not validate source scaling, every PEFT variant or fused dispatch. |
+| 22 | `rlvr_verifier_head_injection` | `enable_rlvr_verifier` | Off | Emits verifier/GRPO configuration consumed by the separate Runtime training interface, which requires caller-supplied policy/optimizer callbacks for real updates. Ordinary generation does not validate training; unconfigured human feedback skips. Experimental training integration, without demonstrated reward, convergence or model-quality benefit. |
+
+## Precision and source-model semantics
+
+The default P3 implementation assigns BF16 to transformer layers, embeddings
+and the output head. Enabling P2 alongside it currently leaves that default
+BF16 choice unchanged. Uniform mode uses the requested `precision` (or Q4_K_M
+when uniform mode is selected without one); manual mode reads
+`manual_precision_map`. These are explicit numerical changes, not an optimal
+sensitivity-to-bit allocation or an automatically enforced perplexity budget.
+
+An all-passes-off AEG can still use packaging's BF16 fallback. It is therefore
+not an original FP32 oracle. Audit comparisons against unoptimized AEG and
+against actual original-precision HF execution must be labeled separately.
+`quality_budget` without a supplied evaluation callback does not certify
+quality; deployment evaluation uses `Compiler.compile()`'s explicit evaluator
+and benchmark/baseline inputs.
+
+Disabling P5 removes that pass's global planning annotations, **not source MoE
+routing**. Ingestion still binds real per-layer router/expert tensors and the
+execution engines retain source top-k behavior. Specialized ingestion can add
+its own tier annotations independently; turning off P5 does not erase every
+MoE annotation. Similarly, P4 off does not disable runtime KV caches. P6 off
+omits sharding-plan files from newly compiled artifacts; existing artifacts
+can still load their stored plans for inspection.
+
+P8's default context threshold is 32768. A declared long context selects plan
+compilation; actual masks depend on the request length and configured windows.
+The audit's forced threshold of 16 with a 64-token prompt is a diagnostic,
+not validation of long-context accuracy or sparse-kernel speed. Even below
+mask activation, attaching a plan can change native attention dispatch.
+
+## Explicit SDK configuration
+
+Use `CompilerConfig` to request compiler features. These flags are independent
+of optimization level and do not silently enable prerequisite passes.
 
 ```python
-from aether import CompilerConfig
+from aether import Compiler, CompilerConfig
 
-config = CompilerConfig(
-    # Core passes (O1+)
+# Current default: P3 enabled; the other 21 canonical pass flags are false.
+compiler = Compiler(CompilerConfig(targets=["cpu_avx2"]))
+
+# Explicit graph/annotation inspection; no implied serving speed benefit.
+inspection = CompilerConfig(
+    targets=["cpu_avx2"],
     enable_fusion=True,
     enable_sensitivity=True,
-    enable_precision_assignment=True,
     enable_kv_cache_structuring=True,
-    enable_moe_routing=True,            # Auto-detected for MoE models
+    enable_moe_routing=True,
     enable_parallelism_discovery=True,
-
-    # Reasoning passes (O2+)
     enable_reasoning_graph=True,
     enable_sparse_attention=True,
-    enable_pruning=True,
+)
 
-    # Advanced passes (O2+)
-    enable_speculative_decoding=True,
-    enable_lora_merging=True,           # Auto-detected if adapters present
-    enable_long_context=True,           # Auto-detected above 32K ctx
+# Explicit lossy precision selection; requires independent quality evaluation.
+quantized = CompilerConfig(precision="Q4_K_M")
 
-    # Specialized passes (explicit opt-in)
-    enable_tee_wrapping=False,          # Requires TEE hardware
-    enable_mdlm_drafter=False,          # Requires drafter weights
-    enable_rlvr=False,                  # Requires training mode
+# Sensitivity-aware pruning needs both opt-ins; it does not enable P2 itself.
+pruning = CompilerConfig(enable_sensitivity=True, enable_pruning=True)
 
-    # Quality
-    calibration_samples=50,
-    quality_threshold=0.99,             # Perplexity ratio vs BF16
+# A grammar request also needs the actual constraint.
+structured = CompilerConfig(
+    enable_grammar_constraint=True,
+    grammar_schema='root ::= "hello"',
+)
+
+# Supported adapter files are required; select the adapter at runtime.
+adapted = CompilerConfig(
+    enable_advanced_peft=True,
+    peft_adapter_paths=["path/to/adapter"],
 )
 ```
 
-Or via CLI:
+Direct pass invocation explicitly exercises that pass. Pipeline-local
+`enable_pass()` / `disable_pass()` selection is distinct from configuring a
+public `Compiler.compile()` invocation, which creates its optimization
+pipeline from its compile configuration. Pass the required flags to
+`CompilerConfig` for public compilation.
+
+## CLI examples
+
+These are actual `aether compile` options. Use a local checkpoint directory
+containing its configuration and weights; paths below must exist.
 
 ```bash
-# Default (O2 — all 22 passes)
-aether compile model.safetensors --target cpu_avx512
+# Current defaults, including conservative BF16 assignment.
+aether compile path/to/checkpoint --target cpu_avx2 --output build/default.aeg
 
-# Minimal (O1 — core passes only)
-aether compile model.safetensors --target cpu_avx512 --opt-level 1
+# Explicit lossy layer precision; embeddings/head remain BF16.
+aether compile path/to/checkpoint --target cpu_avx2 --precision Q4_K_M \
+    --output build/q4.aeg
 
-# With TEE wrapping (requires compatible hardware)
-aether compile model.safetensors --target cuda_sm100_tee --enable-tee
+# Experimental grammar feature; supply a real supported constraint file.
+aether compile path/to/checkpoint --target cpu_avx2 \
+    --grammar-schema path/to/constraint.ebnf --output build/grammar.aeg
 
-# With MDLM drafter
-aether compile model.safetensors --target cuda_sm90 \
-    --drafter path/to/drafter.safetensors
+# Experimental MTP: checkpoint must contain usable prediction-head weights.
+aether compile path/to/mtp-checkpoint --target cpu_avx2 --mtp \
+    --output build/mtp.aeg
+
+# Experimental MDLM: requires a real head bundle in Aether's supported format.
+aether compile path/to/checkpoint --target cpu_avx2 --mdlm-drafter \
+    --mdlm-weights path/to/head.npz --mdlm-K 8 --mdlm-T 6 \
+    --output build/mdlm.aeg
+
+# Experimental BitNet storage, executed by dense dequantization on CPU.
+aether compile path/to/checkpoint --target cpu_avx2 --sub2bit ternary \
+    --output build/ternary.aeg
 ```
 
----
+The CLI has no general switch for each of P1/P2/P4/P5/P6/P7/P8; use the SDK
+flags in the table for those opt-ins. There is no `--opt-level` pass-selection
+option. Other explicit CLI features include `--ttt`, `--green`, `--tee` and
+`--video-compression`; an accepted option still requires a supported source,
+consumer and successful pass report. In particular, `--tee` does not turn
+missing enclave execution into successful compilation.
 
-## Pass Ordering and Dependencies
+## Ordering, evidence and compatibility
 
-```
-Pass 1  (Fusion)
-  └── Pass 2  (Sensitivity)
-        └── Pass 3  (Precision)
-              ├── Pass 4  (KV Cache)
-              ├── Pass 9  (Pruning)
-              └── Pass 11 (LoRA merge)
-Pass 5  (MoE) — depends on Pass 3
-Pass 6  (Parallelism) — depends on Pass 3, 4, 5
-Pass 7  (Reasoning) — independent
-Pass 8  (Sparse Attention) — depends on Pass 4
-Pass 10 (Speculative) — independent
-Pass 12–16 — independent (model family specific)
-Pass 17 (TEE) — depends on all weight passes
-Pass 18 (MDLM) — depends on Pass 10
-Pass 19–21 — independent
-Pass 22 (RLVR) — independent
-```
+The table is the canonical pipeline order: 1 through 22. Disabled passes still
+occupy their report position. P2 precedes P3 and P9, but no automatic dependency
+activation occurs: P3 works without P2; P9 uses sensitivity only when supplied.
+Grammar is P11, model merging P12, MDLM P18, sub-2-bit P19 and adapters P21.
+Scheduling, MCP tool integration and long-context adaptation are not alternate
+names for those passes.
 
----
+Changes to default selection alter IR, optional artifact inventories and
+hashes. AEG merging requires compatible graph semantics, so artifacts built
+with older fusion defaults may require rebuilding with matching explicit flags.
+Existing package loading is separate from the default compile policy.
 
-## Research Foundation
-
-| Pass | Key Research |
-|------|-------------|
-| 1 | ClusterFusion NeurIPS 2025, FlashAttention-3 |
-| 2 | GPTQ, AWQ, AutoMixQ 2024 |
-| 3 | Mixed-precision inference, FP8 LLM survey 2024 |
-| 4 | PagedAttention, RadixAttention, Mooncake |
-| 5 | MoE-Infinity, DynaMoE, CommitMoE |
-| 6 | Alpa, Megatron-LM, Ring Attention |
-| 7 | DeepSeek-R1, Sky-T1 2025 |
-| 8 | MInference Microsoft 2024 |
-| 9 | SparseGPT, Wanda, 2:4 Pruning |
-| 10 | Eagle 2024, Medusa, SpecInfer |
-| 11 | LoRA, QLoRA, DoRA 2024 |
-| 13 | YaRN, RoPE NTK, Ring Attention |
-| 16 | Outlines, LM-Format-Enforcer |
-| 17 | Intel TDX, AMD SEV-SNP 2024 |
-| 18 | MDLM 2024, DiffuSeq |
-| 22 | DeepSeek-R1 GRPO, RLVR 2025 |
-
-See [research.md](research.md) for the full paper mapping.
+The [executed pass audit](mission-pass-audit.md) records a historical CPU
+checkpoint and its unresolved gaps; its uniform-Q4 P3 row does not describe
+the conservative BF16 default. The [default-policy comparison](mission-default-policy.md)
+retains before/after raw observations, repeated-build diffs and dispatch profiles.
+Synthetic exact-logit/token agreement is numerical evidence on those fixtures,
+not natural-language quality. Mid-model compilation/reference work blocked by
+memory admission remains blocked, not successful coverage. No individual pass
+receives a speed or energy claim from an IR rewrite, metadata emission,
+modeled estimate or unrelated timing difference.

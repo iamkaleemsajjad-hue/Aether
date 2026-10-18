@@ -1049,6 +1049,7 @@ def test_local_aeg_consumes_persisted_sparse_attention_plan(tmp_path: Path) -> N
             overwrite=True,
             calibration_tokens=8,
             cache_dir=str(tmp_path / "compiler-cache"),
+            enable_sparse_attention=True,
         )
     ).compile(str(source), output_path=artifact)
     package = load_aeg_package(artifact)

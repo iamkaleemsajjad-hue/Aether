@@ -122,7 +122,7 @@ class TestArchitectureDetector:
 
     def test_approximate_quality_sensitive_passes_are_opt_in(self) -> None:
         config = CompilerConfig()
-        assert config.enable_sparse_attention is True
+        assert config.enable_sparse_attention is False
         assert config.enable_pruning is False
 
     @pytest.mark.parametrize(
@@ -203,7 +203,7 @@ class TestCompilerPlan:
     """Tests for the compiler dry-run plan."""
 
     def test_plan_returns_opportunities(self) -> None:
-        compiler = Compiler()
+        compiler = Compiler(CompilerConfig(enable_fusion=True))
         plan = compiler.plan("Qwen/Qwen3-8B")
         assert plan.model_id == "Qwen/Qwen3-8B"
         assert plan.total_opportunities > 0

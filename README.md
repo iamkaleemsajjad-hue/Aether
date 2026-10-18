@@ -33,7 +33,7 @@
 <p align="center">
   <a href="#multi-engine-benchmark-results--aether-vs-competitor-engines">📊 <b>Benchmark Results</b></a> &bull;
   <a href="#quick-start">⚡ <b>Quick Start</b></a> &bull;
-  <a href="#5-stage-compiler-pipeline">⚙️ <b>Architecture</b></a> &bull;
+  <a href="#4-stage-compiler-pipeline">⚙️ <b>Architecture</b></a> &bull;
   <a href="#supported-hardware-targets">🖥️ <b>Hardware Targets</b></a> &bull;
   <a href="#installation">📦 <b>Installation</b></a> &bull;
   <a href="docs/">📚 <b>Documentation</b></a>
@@ -45,7 +45,7 @@
 
 Supported CPU models compile to an integrity-verified AEG, reload and generate
 through the framework-free CPU engine. On an Intel Core i5-1334U running Windows,
-the complete collection with Torch and Transformers installed passed **5,059 tests**
+an earlier complete collection with Torch and Transformers installed passed **5,059 tests**
 with 41 explicit skips in two serial processes on 2026-10-18. A before/after
 replay preserved all 16 greedy tokens and produced zero logit difference. See the [environment, coverage and
 limits](docs/mission-validation.md), [architecture](docs/mission-architecture-note.md)
@@ -58,6 +58,15 @@ table](#supported-hardware-targets) includes historical Intel UHD DirectML evide
 Help us validate additional devices with `aether hardware validate TARGET --execute --json`.
 Functional tests and recorded benchmarks have separate scopes; neither is a
 production-readiness certification.
+
+Default compilation now selects BF16 precision assignment; the other 21 passes
+require explicit opt-in. The [measured default-policy correction](docs/mission-default-policy.md)
+records exact synthetic A/B numerics, restored native CPU decode dispatch,
+artifact reductions and mixed TTFT results. Larger trained-model speed and
+component-memory improvements remain to be established.
+The latest policy collection returned 5,069 passed, 41 skipped and two existing
+localhost HTTP failures, reproduced on unchanged source; its full-suite and
+coverage requirements remain open in the [validation record](docs/mission-validation.md#default-pass-correction-measured-execution-validation-still-incomplete).
 
 ## Multi-Engine Benchmark Results — Aether vs Competitor Engines
 
@@ -241,7 +250,7 @@ models, precision policies or hardware.
 
 ---
 
-## 5-Stage Compiler Pipeline
+## 4-Stage Compiler Pipeline
 
 ```
 Model (HuggingFace / GGUF / SafeTensors / ONNX)
@@ -256,41 +265,27 @@ Model (HuggingFace / GGUF / SafeTensors / ONNX)
         │
         ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ Stage 2: Optimizer (22 Passes)                                  │
-│  Pass 1: Operator Fusion (RMSNorm→QKV→RoPE, SwiGLU fusion)     │
-│  Pass 2: Sensitivity scoring (method recorded)                │
-│  Pass 3: Precision Assignment (mixed-precision per sensitivity) │
-│  Pass 4: KV Cache Structuring (paged blocks, radix-tree hints)  │
-│  Pass 5: MoE Expert Routing (hot/warm/cold tier classification) │
-│  Pass 6: Parallelism Discovery (TP/PP/EP/CP strategy search)   │
-│  Pass 7–22: Graph lowering, sparse attention, pruning, etc.     │
+│ Stage 2: Optimizer (22 registered passes)                       │
+│  • Pass flags select execution independently                  │
+│  • Default: P3 precision assignment (BF16)                     │
+│  • Other passes: explicit experimental/functional requests     │
+│  • Failed reports reject public compilation                   │
 └─────────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ Stage 3: Quantization                                           │
-│  • Q4_K_M (explicit INT4 block-scaled format)                  │
-│  • Q8_0 (INT8 symmetric)                                        │
-│  • BF16 / FP16 / FP8 (E4M3 / E5M2)                            │
-│  • MXFP4 / MXFP6 (microscaling, PRD v4.0+)                     │
+│ Stage 3: Hardware Targeting                                    │
+│  • Select backend contracts and available kernel variants      │
+│  • Distinguish executable, portable and planning-only targets  │
+│  • Target labels alone do not establish hardware validation   │
 └─────────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ Stage 4: AEG Packaging                                          │
-│  • Self-contained .aeg/ directory with manifest, weights,       │
-│    tokenizer, precision map, sharding plans                     │
-│  • Integrity-verified (SHA-256 per artifact)                    │
-│  • Version-stamped (AEG/1.1 – AEG/3.0)                        │
-└─────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Stage 5: Target Code Generation                                 │
-│  • CUDA (sm70–sm130), ROCm (RDNA3, CDNA3/4/5)                 │
-│  • Apple Metal (M1–M5), OpenVINO (NPU/GPU)                     │
-│  • Qualcomm QNN, RISC-V NPU, FPGA                              │
-│  • Native CPU (AVX-512, AVX2, NEON, ternary BitNet)            │
+│  • Encode tensors in their selected storage formats            │
+│  • Package graph, weights, tokenizer and actual payloads       │
+│  • Preserve versioning and graph/manifest integrity chain      │
 └─────────────────────────────────────────────────────────────────┘
         │
         ▼
@@ -302,6 +297,8 @@ entropy proxy; the proxy is not measured model perplexity. Automatic precision
 assignment currently uses BF16 storage, which can round higher-precision source
 weights and still requires workload evaluation. Explicit formats are opt-in;
 storage format does not establish the selected engine's arithmetic precision.
+The CPU/Torch engines own their forward schedules. Experimental IR fusion does
+not establish fused engine execution; see [pass flags and consumers](docs/optimizer-passes.md).
 
 ---
 
@@ -513,7 +510,9 @@ print(decision.selected.tokens_max)         # capacity, not a boolean
 print(decision.plan.device_ids)             # which devices, and why
 ```
 
-The compiler embeds sharding plans for 1–8 GPUs in every AEG artifact (Pass 6: Parallelism Discovery). At runtime the distributed engine reads the matching plan and reduces with Aether's own collectives.
+Explicit experimental Pass 6 can emit sharding plans for inspection; ordinary
+compilation omits those files. Runtime device placement uses its separate
+execution planner. The presence of a P6 plan does not prove distributed execution.
 
 **Which collective runs where — precisely.** "No NCCL" is true of two of the three paths, and the difference matters:
 

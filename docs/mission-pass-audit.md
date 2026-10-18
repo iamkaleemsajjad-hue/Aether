@@ -2,6 +2,10 @@
 
 Run date: 2026-10-18. This is an incomplete mission checkpoint, not a benefit certification.
 
+The subsequent [default-policy correction](mission-default-policy.md) makes
+P1/P2/P4/P5/P6/P7/P8 explicit experimental opt-ins and measures actual native
+decode dispatch. This table retains its original source/configuration scope.
+
 The tiny fixture has 26,784 real untrained parameters, two layers, width 32 and
 vocabulary 128. All 22 flags were explicitly disabled for the baseline, then
 each was enabled alone; seven combinations also ran. Native CPU execution on

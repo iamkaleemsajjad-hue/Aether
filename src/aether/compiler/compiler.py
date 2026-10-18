@@ -2,14 +2,13 @@
 Aether Compiler API.
 
 The `Compiler` class is the main entry point for compiling AI models into the
-Aether Execution Graph (AEG) format. It orchestrates the five stages of the
+Aether Execution Graph (AEG) format. It orchestrates the four stages of the
 compiler pipeline:
 
 1. Model ingestion and graph extraction
-2. Aether optimizer (six graph-level passes)
+2. Aether optimizer (22 registered passes with explicit selection)
 3. Hardware targeting and backend selection
 4. AEG artifact packaging
-5. Quality report generation
 
 It also exposes the dry-run `plan()` method that previews the compilation
 without doing the expensive work.
@@ -47,7 +46,7 @@ from aether.core.aeg_format import AEGManifest, AEGPackage, KernelSetMetadata, M
 from aether.core.constants import AEG_FORMAT_VERSION, AETHER_VERSION, DEFAULT_HUB_URL, SUPPORTED_TARGET_IDS
 from aether.core.exceptions import CompilationError, CompilerConfigError, CompilerPassError
 from aether.core.hash_utils import compute_aeg_cache_key, compute_graph_hash
-from aether.core.types import HardwareTarget, ModelArchitecture, Precision
+from aether.core.types import HardwareTarget, ModelArchitecture, Precision, ShardingPlan
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -529,21 +528,21 @@ class Compiler:
             plan.add_fusion_opportunity(
                 OptimizationOpportunity(
                     pass_name="operator_fusion",
-                    description="Fuse RMSNorm + QKV + RoPE into a single megakernel",
+                    description="Inspect experimental RMSNorm/QKV/RoPE IR fusion",
                     nodes=[f"layer_{i}_norm" for i in range(min(architecture.layers, 4))],
-                    estimated_memory_saved_mb=architecture.params_billion * 50.0,
-                    estimated_latency_reduction_ms=0.5 * architecture.layers,
-                    confidence=0.9,
+                    estimated_memory_saved_mb=0.0,
+                    estimated_latency_reduction_ms=0.0,
+                    confidence=0.0,
                 )
             )
             plan.add_fusion_opportunity(
                 OptimizationOpportunity(
                     pass_name="operator_fusion",
-                    description="Fuse attention output projection + residual add",
+                    description="Inspect experimental attention/residual IR fusion",
                     nodes=["attn_out", "residual_add"],
-                    estimated_memory_saved_mb=architecture.params_billion * 20.0,
-                    estimated_latency_reduction_ms=0.2 * architecture.layers,
-                    confidence=0.85,
+                    estimated_memory_saved_mb=0.0,
+                    estimated_latency_reduction_ms=0.0,
+                    confidence=0.0,
                 )
             )
 
@@ -552,21 +551,21 @@ class Compiler:
             plan.add_sensitivity_opportunity(
                 OptimizationOpportunity(
                     pass_name="sensitivity_analysis",
-                    description="Compute d(perplexity)/d(precision) per layer",
+                    description="Inspect weight reconstruction sensitivity; no perplexity gate",
                     nodes=[f"layer_{i}" for i in range(architecture.layers)],
                     estimated_memory_saved_mb=0.0,
                     estimated_latency_reduction_ms=0.0,
-                    confidence=0.95,
+                    confidence=0.0,
                 )
             )
             plan.add_precision_opportunity(
                 OptimizationOpportunity(
                     pass_name="precision_assignment",
-                    description="Assign mixed precision (BF16/FP8/Q4) based on sensitivity",
+                    description="Keep the BF16 sensitivity baseline; explicit formats are separate",
                     nodes=[f"layer_{i}" for i in range(architecture.layers)],
-                    estimated_memory_saved_mb=architecture.params_billion * 500.0,
+                    estimated_memory_saved_mb=0.0,
                     estimated_latency_reduction_ms=0.0,
-                    confidence=0.8,
+                    confidence=0.0,
                 )
             )
 
@@ -575,11 +574,11 @@ class Compiler:
             plan.add_kv_cache_opportunity(
                 OptimizationOpportunity(
                     pass_name="kv_cache_structuring",
-                    description="Paged KV cache with RadixTree prefix hints",
+                    description="Inspect experimental KV graph annotations",
                     nodes=["kv_cache"],
-                    estimated_memory_saved_mb=architecture.context_length * 0.1,
-                    estimated_latency_reduction_ms=0.3,
-                    confidence=0.9,
+                    estimated_memory_saved_mb=0.0,
+                    estimated_latency_reduction_ms=0.0,
+                    confidence=0.0,
                 )
             )
 
@@ -588,11 +587,13 @@ class Compiler:
             plan.add_moe_opportunity(
                 OptimizationOpportunity(
                     pass_name="moe_routing",
-                    description="Hot/warm/cold expert tiering and threshold-based routing",
+                    description=(
+                        "Inspect experimental expert-tier hints; source routing is separate"
+                    ),
                     nodes=["moe_router"],
-                    estimated_memory_saved_mb=architecture.params_billion * 1000.0,
-                    estimated_latency_reduction_ms=1.0,
-                    confidence=0.75,
+                    estimated_memory_saved_mb=0.0,
+                    estimated_latency_reduction_ms=0.0,
+                    confidence=0.0,
                 )
             )
 
@@ -603,11 +604,11 @@ class Compiler:
                     plan.add_parallelism_opportunity(
                         OptimizationOpportunity(
                             pass_name="parallelism_discovery",
-                            description=f"Compute {num_gpus}-GPU tensor/pipeline parallelism plan",
+                            description=f"Inspect experimental {num_gpus}-GPU sharding hints",
                             nodes=[],
                             estimated_memory_saved_mb=0.0,
                             estimated_latency_reduction_ms=0.0,
-                            confidence=0.7,
+                            confidence=0.0,
                         )
                     )
 
@@ -917,10 +918,7 @@ class Compiler:
                     aeg.metadata.get("fusion_accounting", {}).get("merged_ops_total",
                     aeg.manifest.optimization.fused_ops_count),
                 ),
-                memory_round_trips_saved=int(
-                    aeg.metadata.get("fusion_accounting", {}).get("launches_saved",
-                    aeg.manifest.optimization.fused_ops_count),
-                ),
+                memory_round_trips_saved=0,
                 fusion_patterns=dict(
                     aeg.metadata.get("fusion_accounting", {}).get(
                         "patterns",
@@ -1209,12 +1207,16 @@ class Compiler:
         # but only when the logical tensors it stands for are all serialized.
         _verify_weight_accounting(graph, architecture, package, model_id)
 
-        # Sharding plans
-        from aether.core.aeg_format import create_default_sharding_plans
-
-        sharding_plans = create_default_sharding_plans(architecture)
-        for num_gpus, plan in sharding_plans.items():
-            package.set_sharding_plan(num_gpus, plan)
+        # Persist only plans actually emitted by the explicitly selected
+        # inspection pass. Ordinary compilation does not manufacture GPU plans;
+        # runtime device placement is independent of these experimental hints.
+        if any(
+            report.pass_name == "parallelism_discovery" and report.status == "applied"
+            for report in pass_reports
+        ):
+            for payload in getattr(graph, "metadata", {}).get("sharding_plans", {}).values():
+                plan = ShardingPlan.from_dict(payload)
+                package.set_sharding_plan(plan.num_gpus, plan)
 
         # Backend plans per target.  A target profile is a compilation request,
         # not evidence that an executable vendor binary was produced.  Mark
@@ -1332,10 +1334,17 @@ class Compiler:
             package.metadata["kernel_artifacts"] = packaged_kernel_artifacts
 
         # Optimization metadata
+        fusion_reports = [
+            report for report in pass_reports
+            if report.pass_name == "operator_fusion" and report.status == "applied"
+        ]
         fused_ops_count = sum(
-            1 for r in pass_reports if r.pass_name == "operator_fusion" and r.status == "applied"
+            int(report.details.get("fused_count", 0)) for report in fusion_reports
         )
-        fusion_passes = [r.details.get("fusion_pattern", "unknown") for r in pass_reports if r.pass_name == "operator_fusion"]
+        fusion_passes = sorted({
+            pattern for report in fusion_reports
+            for pattern, count in report.details.get("fusion_patterns", {}).items() if count > 0
+        })
         applied_passes = [r.pass_name for r in pass_reports if r.status in {"applied", "ok"}]
         package.metadata["optimizer_passes"] = applied_passes
         v4_passes = {
@@ -1361,7 +1370,7 @@ class Compiler:
             package.manifest.format_version = "AEG/2.0"
         package.metadata["aeg_format_version"] = package.manifest.format_version
         optimization = OptimizationMetadata(
-            fusion_passes_applied=fusion_passes or applied_passes,
+            fusion_passes_applied=fusion_passes,
             fused_ops_count=fused_ops_count,
             sensitivity_calibration_dataset=config.calibration_dataset,
             quality_budget_ppl_increase=config.quality_budget,

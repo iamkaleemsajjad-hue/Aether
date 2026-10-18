@@ -337,6 +337,32 @@ def test_default_sensitivity_combo_uses_real_config_default(tmp_path: Path) -> N
     assert config.enable_sensitivity and config.enable_precision_assignment
 
 
+def test_explicit_compile_config_cannot_publish_under_a_different_pass_label(
+    tmp_path: Path,
+) -> None:
+    """A mislabeled real checkpoint job fails before emitting an artifact."""
+    from tools.pass_audit import _worker
+
+    from aether import CompilerConfig
+
+    pytest.importorskip("safetensors.numpy")
+    pytest.importorskip("tokenizers")
+    fixture = create_fixture(tmp_path / "source", "tiny")
+    options = CompilerConfig(targets=["cpu_generic"], skip_download=True).to_dict()
+    assert options["enable_precision_assignment"]
+    with pytest.raises(ValueError, match="Declared pass selection differs"):
+        _worker(
+            {
+                "action": "compile",
+                "work": str(tmp_path),
+                "fixture": fixture,
+                "passes": [],
+                "compiler_config": options,
+            }
+        )
+    assert not (tmp_path / "model.aeg").exists()
+
+
 def test_idempotency_snapshot_hashes_full_tensor_not_truncated_repr() -> None:
     """A mutation in an array's undisplayed middle still changes the snapshot."""
     from tools.pass_audit import canonical_graph_value

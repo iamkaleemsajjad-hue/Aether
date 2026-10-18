@@ -158,3 +158,32 @@ The real smoke uses an explicit 128 MiB diagnostic reserve and keeps admission
 checks active. It tests compilation, loading, public generation and raw repeated
 artifact equality without timing. A memory-blocked smoke fails with its report;
 it is not treated as a passing execution check.
+
+## Default-policy comparison
+
+`audit_default_passes.py` compares actual production defaults against explicit
+P1/P2/P4/P5/P6/P7/P8 removal. After that policy is adopted, those profiles are
+intentionally identical. Add `--historical-baseline` to instead compare the
+former seven-on flags with current production defaults. Both controller and
+workers use this checkout's source; recorded pass labels must match the actual
+config or compilation is refused. It does not change production defaults.
+
+```powershell
+# Serial only; leave the default 512 MiB free headroom on a suitable host.
+& $python -B tools/audit_default_passes.py --historical-baseline --fixtures tiny moe --hf-reference --output build/pass-audit/default-policy
+```
+
+This comparison uses native CPU execution, three fresh cold-cache builds,
+two warmups and seven repeats, eight generated IDs per prompt. It records
+compile/integrity time, actual config, source hashes, phase RSS, every-file
+diffs and numerical/token comparisons. Context 32768 is declared in the source;
+the prompts remain 4/64 IDs, not a long-context performance test. The tiny HF
+oracle is original FP32; MoE HF is explicitly unsupported. Mid can be selected,
+but blocked jobs remain unsuccessful rather than inferred from tiny results.
+
+Small HF workers now use a 512 MiB overhead estimate based on retained actual
+small-oracle process-tree RSS below 300 MiB; mid retains 1 GiB. Independent
+live free-memory checks and the configurable headroom remain active. These
+estimates are admission policy, not measured component memory or guarantees.
+See the [executed policy report](../docs/mission-default-policy.md), including
+mixed TTFT observations and the limits of the small synthetic speed results.

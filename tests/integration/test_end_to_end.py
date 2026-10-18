@@ -76,7 +76,7 @@ def test_chat_completion(tmp_path: Path) -> None:
 @pytest.mark.network
 def test_compile_plan_dry_run() -> None:
     """Test that compilation planning works for a known model."""
-    compiler = Compiler()
+    compiler = Compiler(CompilerConfig(enable_fusion=True))
     plan = compiler.plan("Qwen/Qwen3-0.6B")
     assert plan.is_feasible
     assert len(plan.fusion_opportunities) > 0

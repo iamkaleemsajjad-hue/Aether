@@ -497,7 +497,10 @@ def reserve_bytes(fixture_name: str, action: str, passes: Sequence[int] = ()) ->
         if action == "fixture"
         else 4
     )
-    overhead = 1024 * MIB if action == "hf" else 384 * MIB
+    # The fixed small HF fixtures peaked below 300 MiB aggregate tree RSS in
+    # recorded CPU runs. Keep a 512 MiB estimate plus the independent live
+    # headroom guard; the unmeasured 27M oracle retains its 1 GiB estimate.
+    overhead = (1024 if fixture_name == "mid" else 512) * MIB if action == "hf" else 384 * MIB
     return int(overhead + raw * multiplier)
 
 
@@ -858,16 +861,27 @@ def _worker(job: JsonObject) -> JsonObject:
     if action == "compile":
         from aether import Compiler, CompilerConfig
 
-        options = compiler_options(
-            job["passes"],
-            job["fixture"],
-            work / "compiler_cache",
-            precision_mode=job.get("precision_mode", "uniform"),
-        )
+        if "compiler_config" in job:
+            options = dict(job["compiler_config"])
+            options["cache_dir"] = str(work / "compiler_cache")
+        else:
+            options = compiler_options(
+                job["passes"],
+                job["fixture"],
+                work / "compiler_cache",
+                precision_mode=job.get("precision_mode", "uniform"),
+            )
         config = CompilerConfig(**options)
+        enabled = [p.number for p in PASSES if getattr(config, p.flag)]
+        if enabled != sorted(job["passes"]):
+            raise ValueError(
+                "Declared pass selection differs from the actual compiler configuration"
+            )
         mark_phase(work, "compile")
+        started = time.perf_counter()
         package = Compiler(config).compile(job["fixture"]["model"], output_path=work / "model.aeg")
         package.verify_integrity()
+        compile_and_verify_seconds = time.perf_counter() - started
         transformations = package.metadata.get("provenance", {}).get("transformations", [])
         statuses = {
             entry["pass"]: entry.get("parameters", {}).get("status", "unknown")
@@ -882,6 +896,7 @@ def _worker(job: JsonObject) -> JsonObject:
         return {
             "status": "ok",
             "artifact": str(package.root),
+            "compile_and_verify_seconds": compile_and_verify_seconds,
             "passes": statuses,
             "config": config.to_dict(),
             "evaluation_status": package.metadata.get("evaluation_status", "unavailable"),

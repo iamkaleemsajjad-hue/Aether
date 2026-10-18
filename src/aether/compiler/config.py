@@ -2,8 +2,8 @@
 Compiler configuration for Aether.
 
 Defines the `CompilerConfig` class and all configuration options that control the
-five compiler stages: ingestion, optimization (six passes), hardware targeting, and
-quality reporting.
+four compiler stages: ingestion, optimization (22 registered passes), hardware
+targeting, and packaging. Pass flags select transformations independently.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ class CompilerConfig:
     """
 
     quality_budget: float = DEFAULT_QUALITY_BUDGET
-    """Maximum allowed perplexity increase relative to BF16 baseline (0.02 = 2%)."""
+    """Requested quality budget; without evaluation evidence this certifies no PPL bound."""
 
     calibration_dataset: str = DEFAULT_CALIBRATION_DATASET
     """Dataset name used for sensitivity analysis and calibration."""
@@ -86,51 +86,49 @@ class CompilerConfig:
     """
 
     optimization_level: int = DEFAULT_OPTIMIZATION_LEVEL
-    """Optimization level: 0=none, 1=basic, 2=full, 3=aggressive."""
+    """Planning label (0–3); pass flags independently select the executed passes."""
 
     enable_fusion: bool = DEFAULT_FUSION_PASS
-    """Enable operator fusion pass (Pass 1)."""
+    """Experimental IR fusion (P1); engines do not execute these fused graph groups."""
 
     enable_sensitivity: bool = DEFAULT_SENSITIVITY_PASS
-    """Enable sensitivity analysis pass (Pass 2)."""
+    """Experimental weight-reconstruction sensitivity (P2), not measured model PPL."""
 
     enable_precision_assignment: bool = DEFAULT_PRECISION_PASS
-    """Enable precision assignment pass (Pass 3)."""
+    """Select stored tensor precision (P3); default sensitivity mode assigns BF16."""
 
     enable_kv_cache_structuring: bool = DEFAULT_KV_CACHE_PASS
-    """Enable KV cache structuring pass (Pass 4)."""
+    """Experimental KV graph annotations (P4); runtime caches are independent."""
 
     enable_moe_routing: bool = DEFAULT_MOE_ROUTING_PASS
-    """Enable MoE routing pass (Pass 5)."""
+    """Experimental expert-tier hints (P5); source per-layer routing is independent."""
 
     enable_parallelism_discovery: bool = DEFAULT_PARALLELISM_PASS
-    """Enable automatic parallelism discovery pass (Pass 6)."""
+    """Experimental sharding-plan inspection (P6), without distributed execution."""
 
     enable_reasoning_graph: bool = DEFAULT_REASONING_GRAPH_PASS
-    """Enable reasoning graph compilation pass (Pass 7)."""
+    """Experimental reasoning annotations (P7), without demonstrated serving benefit."""
 
     enable_sparse_attention: bool = DEFAULT_SPARSE_ATTENTION_PASS
-    """Enable sparse attention pattern compilation pass (Pass 8)."""
+    """Experimental dense-score masking (P8); can bypass native decode attention."""
 
     enable_pruning: bool = DEFAULT_PRUNING_PASS
-    """Enable pruning and sparsity planning pass (Pass 9)."""
+    """Experimental lossy weight masking (P9); no sparse-kernel speedup is certified."""
 
     # ── PRD v4.0 compiler passes (10–17) ──────────────────────────────────────
 
     enable_mtp_head: bool = DEFAULT_MTP_HEAD_PASS
     """Pass 10: Compile native Multi-Token Prediction heads from the model graph.
 
-    Detects DeepSeek-V3/FastMTP/L-MTP style MTP heads and compiles them into
-    AEG speculation/mtp_heads.bin.  Enables 1.8–2.5× throughput with no
-    external draft model required.
+    Experimental: packages supplied head weights under speculation/. Missing
+    heads skip; loading heads does not prove verified speculation or speedup.
     """
 
     enable_grammar_constraint: bool = DEFAULT_GRAMMAR_CONSTRAINT_PASS
     """Pass 11: Pre-compile grammar/JSON Schema/regex constraints into FSM token masks.
 
-    Requires `grammar_schema` to be set.  Produces .aeg/grammar/fsm.bin with
-    pre-built per-state token bitmasks.  Enables <50µs structured output at
-    decode time via the grammar FSM runtime engine (R3).
+    Requires `grammar_schema` and a supported tokenizer. Produces grammar/fsm.bin
+    for constrained generation. No decode-overhead guarantee is established.
     """
 
     grammar_schema: str | None = None
@@ -142,9 +140,8 @@ class CompilerConfig:
     enable_model_merging: bool = DEFAULT_MODEL_MERGING_PASS
     """Pass 12: Merge task vectors from multiple fine-tunes into a single AEG.
 
-    Supports Task Arithmetic, DARE, TIES-Merging, and FREE-Merging (evolutionary
-    optimization of merge coefficients).  Enables multi-task inference at
-    single-model cost.
+    Experimental weight transformation using supplied sources and coefficients.
+    A successful merge does not establish task quality or multi-task capability.
     """
 
     model_merging_sources: list[str] = field(default_factory=list)
@@ -159,9 +156,8 @@ class CompilerConfig:
     enable_ttt: bool = DEFAULT_TTT_PASS
     """Pass 13: Inject TTT fast-weight slots for test-time training.
 
-    Injects µ/σ fast-weight LayerNorm slots into every transformer layer.
-    Enables domain adaptation during inference without full recompilation.
-    Based on In-Place TTT (arXiv 2026) and VDS-TTT (NeurIPS 2026).
+    Experimental configuration and slot emission for Runtime's TTT interface.
+    Useful transformer adaptation and model-quality gains remain unverified.
     """
 
     ttt_rank: int = 16
@@ -173,9 +169,8 @@ class CompilerConfig:
     enable_semantic_kv: bool = DEFAULT_SEMANTIC_KV_PASS
     """Pass 14: Compress KV cache by semantic similarity clustering.
 
-    ChunkKV: cosine-distance clustering of KV blocks.
-    SentenceKV: sentence-boundary aware retention.
-    Achieves 40–70% KV reduction while preserving semantic meaning.
+    Experimental lossy retention policy consumed by the CPU KV cache. The
+    requested retention ratio is not a quality or peak-memory guarantee.
     """
 
     semantic_kv_compression_ratio: float = 0.5
@@ -187,10 +182,8 @@ class CompilerConfig:
     enable_cross_layer_kv: bool = DEFAULT_CROSS_LAYER_KV_PASS
     """Pass 15: Share KV pointers across layers to reduce per-layer KV memory.
 
-    xKV: SVD-based cross-layer KV sharing.
-    CommonKV: layers sharing >threshold KV redundancy share a pointer.
-    Middle-outward assignment (Wu/Tu 2025): layers share from center outward.
-    Achieves 30–50% per-layer KV memory reduction.
+    Experimental CPU cache aliasing. Synthetic generation regressions were
+    observed; pointer sharing does not establish quality-preserved savings.
     """
 
     cross_layer_kv_share_threshold: float = 0.85
@@ -199,10 +192,8 @@ class CompilerConfig:
     enable_green_energy: bool = DEFAULT_GREEN_ENERGY_PASS
     """Pass 16: Embed green energy profile and DVFS hints into AEG metadata.
 
-    MELODI: energy-aware operator scheduling.
-    DVFS: Dynamic Voltage and Frequency Scaling breakpoint embedding.
-    CodeCarbon: carbon intensity metadata per target region.
-    Achieves up to 48% energy reduction on idle-burst workloads.
+    Experimental request accounting using modeled energy estimates. Emitted
+    hints do not establish device power control or measured energy reduction.
     """
 
     green_carbon_region: str = "us-west"
@@ -214,10 +205,8 @@ class CompilerConfig:
     enable_tee: bool = DEFAULT_TEE_PASS
     """Pass 17: Wrap emitted kernels with TEE (Trusted Execution Environment) guards.
 
-    Intel TDX: Trust Domain Extension enclave enter/exit per kernel.
-    AMD SEV-SNP: Secure Encrypted Virtualization wrapping.
-    NVIDIA H100/B200 CC mode: encrypted weight loading + activation encryption.
-    Overhead < 10% on H100/B200 Confidential Computing mode.
+    Requires a concrete backend-emitted TEE kernel bundle. No executable TEE
+    backend is supplied; ordinary inputs skip and explicit CLI requests refuse.
     """
 
     tee_backend: str = "nvidia_cc"
@@ -231,9 +220,8 @@ class CompilerConfig:
     enable_mdlm_drafter: bool = DEFAULT_MDLM_DRAFTER_PASS
     """Pass 18: Compile a lightweight MDLM diffusion drafter alongside the model.
 
-    Masked Diffusion LM: cosine denoising schedule, T=6 default steps, K=8
-    parallel draft tokens per step.  DiffuSpec / SpecDiff ACL 2026: 2.8–4.1×
-    over autoregressive on long-context tasks.
+    Experimental integration requiring a validated trained head bundle. Missing
+    weights skip; head execution does not establish acceptance or throughput.
     """
 
     mdlm_drafter_steps: int = 6
@@ -254,26 +242,22 @@ class CompilerConfig:
     enable_sub2bit: bool = DEFAULT_SUB2BIT_PASS
     """Pass 19: Quantize model weights to sub-2-bit ternary or binary format.
 
-    BitNet b1.58: ternary {-1,0,+1} packed as 2 bits, addition-only inference.
-    BTC-LLM: binary codebook (0.8–1.11 bits), gather-based inference.
-    NanoQuant: trellis codebook (sub-1-bit), highest compression.
-    10× memory reduction and up to 5× throughput on ternary-native hardware.
+    Experimental lossy storage; CPU execution dequantizes for dense arithmetic.
+    Post-hoc ternary conversion is not trained BitNet b1.58. The reconstruction
+    proxy is not measured PPL and does not certify the requested quality gate.
     """
 
     sub2bit_method: str = "bitnet"
     """Sub-2-bit method: bitnet | btc_llm | nanoquant."""
 
     sub2bit_quality_gate_ppl: float = 0.1
-    """Max perplexity increase allowed by Pass 19 quality gate (10%)."""
+    """Requested P19 proxy threshold; not an enforced model-perplexity guarantee."""
 
     enable_video_compression: bool = DEFAULT_VIDEO_COMPRESSION_PASS
     """Pass 20: Compress video tokens for Vision-Language Models (VLMs).
 
-    STC (CVPR 2026): plug-and-play, 98% visual token reduction.
-    STORM: Mamba temporal projector for streaming video.
-    StreamingTOM: bounded KV for infinite video, 15.7× KV compression.
-    InfoTok: ELBO information-theoretic token budget allocation.
-    Only activates when model architecture includes a vision encoder.
+    Experimental vision-architecture plan. Text inputs skip; current CPU AEG
+    execution refuses public video generation. No end-to-end benefit is proven.
     """
 
     video_compression_ratio: float = 0.75
@@ -285,10 +269,9 @@ class CompilerConfig:
     enable_advanced_peft: bool = DEFAULT_ADVANCED_PEFT_PASS
     """Pass 21: Compile advanced PEFT adapter weights into AEG.
 
-    LoRA+: asymmetric learning rate (λ=16) baked into AEG adapter scaling.
-    LoRAMoE: fuse LoRA experts into Pass 5 MoE dispatch graph.
-    MoLF: gradient-guided LoRA / FullFT navigation schedule.
-    LoRAFusion: single-kernel dispatch for multi-adapter batches.
+    Experimental supplied-adapter integration. Supported A/B tensors can be
+    selected by the CPU engine; source scaling, every advertised PEFT variant
+    and fused dispatch require separate validation. MoLF is explicitly refused.
     """
 
     peft_adapter_paths: list[str] = field(default_factory=list)
@@ -300,11 +283,9 @@ class CompilerConfig:
     enable_rlvr_verifier: bool = DEFAULT_RLVR_VERIFIER_PASS
     """Pass 22: Inject RLVR verifier head for reinforcement learning from verification.
 
-    GRPO: group relative policy optimization (K=8 solutions/prompt).
-    RLVR: deterministic binary verifier (sympy for math, pytest for code).
-    K2V: sub-task decomposition DAG for dense reward shaping.
-    RLSVR: multi-agent self-play for open-ended RLHF.
-    Stores verifier weights in .aeg/training/.
+    Experimental verifier/GRPO configuration for the separate training API.
+    Real updates require caller-supplied policy and optimizer callbacks; ordinary
+    generation does not establish training or reward/quality improvements.
     """
 
     rlvr_verifier_type: str = "sympy"

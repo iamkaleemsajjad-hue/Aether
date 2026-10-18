@@ -401,3 +401,55 @@ CPU execution has current physical-host evidence. No accelerator validation tier
 changes in this area. The [22-row measured pass audit](mission-pass-audit.md),
 mandatory numerical quality gating, default-pass corrections, remaining model
 families, engine performance/memory and hardware/robustness/CI work remain open.
+
+## Default-pass correction: measured execution, validation still incomplete
+
+The [policy report](mission-default-policy.md) records read scope, confirmed
+issues, all 22 dispositions, before/after timing spread, actual dispatch profiles,
+artifact size, sampled RSS and numerical evidence. Only P3 remains default-on;
+P1/P2/P4/P5/P6/P7/P8 are experimental opt-ins. Pipeline toggles reach internal
+pass gates, sharding files require an applied producer, and fusion metadata no
+longer claims engine launch/memory savings. No numerical algorithm was rewritten.
+
+| Check | Before | Current evidence |
+|---|---|---|
+| Initial policy/toggle regression selection | 5 failed, 1 passed | All pass in focused and complete collection |
+| Packaging/preview regressions | 2 failed, 1 passed | All pass |
+| Internal grammar gate pair | 1 failed, 1 passed | Both pass; actual FSM emitted only when selected |
+| Final focused compiler/optimizer/audit checks | No single combined before run | 200 passed, 2 skipped |
+| Complete serial collection | Last green checkpoint: 5059 passed, 41 skipped | 5069 passed, 41 skipped, **2 failed**; product exit 1 |
+| Collection continuity | 5100 cases | All retained plus 12 regressions: 5112 cases |
+| Combined line coverage | 44049/56287 = 78.26% | **43993/56280 = 78.17%**, lower |
+| Combined branch coverage | 10457/16864 = 62.01% | **10438/16874 = 61.86%**, lower |
+| Existing touched-file Ruff / scoped source mypy | 280 / 17 | 266 / 17; no new diagnostic messages |
+| New/helper files full Ruff; critical Ruff across CI paths and tools | Existing backlog remains | Passed |
+| Tiny/MoE cold builds, load, numerics and public Runtime | Before run completed small fixtures; mid blocked | All requested small jobs succeeded; every file matched across three builds per profile |
+| Current original-FP32 HF oracle | Tiny only | Executed; maximum KL 5.449e-8, minimum cosine 0.99999538, 100% greedy agreement, maximum fixed-label PPL +0.01509% |
+
+The complete run separated 43 passing tool tests (63.86 seconds) from the product
+collection (5026 passed, 41 skipped, two failed in 438.21 seconds). The failures
+are both existing localhost HTTP MCP handshake cases. They also fail in isolated
+runs, outside the sandbox, and against an unchanged HEAD source snapshot. A
+byte trace records the server writing a complete `Content-Length` response while
+the client receives `transfer-encoding: chunked` with an empty/truncated body.
+This supports a host/intermediary framing problem rather than a pass-policy
+regression, but its origin is unresolved. A plain loopback JSON/HTTP probe works;
+the evidence does not establish a general absence of network access. A separate
+HTTP/1.1 diagnostic also fails. Production transport and existing tests were not
+changed to accept the truncated responses, skipped or reclassified as passing.
+
+The full-suite-green and coverage-not-reduced requirements are **not met** at
+this checkpoint. The lower coverage includes unexecuted HTTP/MCP success paths;
+it is not explained away or certified as harmless. Both requirements remain
+open. Evidence: `build/mission/default-policy-tools.*`, `default-policy-product.*`,
+`default-policy-full-coverage.xml`, `default-policy-full-verification.json`,
+`default-policy-http-isolated.*`, `default-policy-http-unrestricted.*`,
+`default-policy-http-head-verified.*`, `default-policy-http-probe.json`,
+`default-policy-http-trace.log` and `default-policy-http11-trace.log`.
+
+Static comparison retains the existing global backlog; no package-wide type/style
+pass is claimed. Evidence: `default-policy-static-comparison.json`, identical
+before/after import-skipping options and `default-policy-critical-ruff-final.txt`.
+The report's mixed TTFT observations and small RSS deltas establish neither a
+universal latency improvement nor component-memory savings. Physical CPU evidence
+is current; hardware tiers for other backends remain unchanged.
