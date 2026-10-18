@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aether-runtime"
 version = "1.3.0"
-description = "Aether Runtime — the compiler for AI models. Compile any model into a portable Aether Execution Graph (AEG) and run it on any hardware."
+description = "Compile supported AI models into portable Aether Execution Graph (AEG) artifacts and execute them through compatible runtime backends."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
@@ -26,7 +26,7 @@ keywords = [
     "speculative-decoding",
 ]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
