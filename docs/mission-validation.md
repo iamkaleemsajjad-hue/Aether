@@ -335,3 +335,69 @@ no production source changed in this harness area. Repository-wide mypy/style,
 compiler quality gating, pass/default corrections, hardware execution and the
 remaining performance/memory work are still open. The harness encoding policy
 does not fix unconfigured logging in other library applications.
+
+## Correction: reject reported optimizer failures before publication
+
+Read scope covered the complete compiler, pass/report and exception contracts,
+the optimizer pipeline, source-merging implementation and publication tests,
+shared real-checkpoint fixtures, and the CLI/Runtime/hardware/script callers.
+The direct pipeline intentionally returns reports for inspection. The genuine
+bug was that `Compiler.compile` accepted those reports without checking failure,
+then targeted and packaged the graph. A failed source merge could return a
+runnable unmerged artifact, or replace an existing artifact with overwrite set.
+
+The compiler now rejects exactly `status="failed"` at the Stage 2 boundary,
+before targeting or destination mutation. Its existing cleanup path removes
+private pass staging. The outer `CompilationError` retains Stage 2 attribution,
+the original `CompilerPassError` cause and every failed report in
+`details.failed_passes`. Direct pipeline inspection and benign `skipped` reports
+retain their API. This is a publication-correctness gate, not automatic numerical
+quality certification.
+
+| Check | Before | After |
+|---|---|---|
+| Final real-checkpoint regression selection | 3 failed, 1 passed on an unmodified `6d24bfb` snapshot | All four pass in the complete suite |
+| Failed requested merge, new destination | Compilation returned a runnable artifact despite its failed pass | Stage 2 error, original pass reason, no output, targeting not called |
+| Failed requested merge, overwrite enabled | Compilation could replace the existing destination | Every existing file hash preserved; identical logits and generated IDs |
+| Benign empty-source skip | Accepted | Still accepted; integrity, all weights and generation checked |
+| Related compiler/merge/publication/evaluation checks | No single combined before selection | 72 passed; 0 failed |
+| Complete collection, serial coverage processes | 5,055 passed; 41 skipped | 5,059 passed; 41 skipped; 0 failed/errors; both exits 0 |
+| Collection continuity | 5,096 cases | All previous cases plus exactly four regressions; 5,100 cases |
+| Line coverage | 44,030 / 56,283 = 78.23% | 44,049 / 56,287 = 78.26% |
+| Branch coverage | 10,449 / 16,862 = 61.97% | 10,457 / 16,864 = 62.01% |
+| Existing compiler Ruff findings / scoped mypy errors | 27 / 5 | 27 / 5; no new diagnostic messages |
+| Engine speed, TTFT or resident-memory benefit | Not benchmarked for this control-flow correction | No benefit claimed; no engine, codec or numerical algorithm changed |
+
+The before run used the final functional regressions against a separately
+extracted, unchanged Git snapshot. The earlier initial three-case file separately
+returned two failures and one pass. The first CLI-test draft expected a raw SDK
+exception, while the CLI correctly wraps domain errors as Click exits; that test
+expectation was corrected before the final before/after comparison. No production
+behavior was relaxed. Evidence: `build/mission/failed-pass-before.*`,
+`failed-pass-final-before.*`, `failed-pass-pristine/`, `failed-pass-cli-after.*`
+and `failed-pass-after.*`.
+
+The successful complete run separated the unchanged harness checks (42 passed
+in 34.28 seconds) from the remaining collection (5,017 passed, 41 skipped in
+252.02 seconds), with accumulated coverage. Evidence:
+`build/mission/failed-pass-tools.*`, `failed-pass-product.*`,
+`failed-pass-full-coverage.xml` and `failed-pass-full-verification.json`.
+Critical Ruff passed across the CI paths and tools. The new regression file
+passes full Ruff and scoped mypy with imported modules checked silently;
+production diagnostics were compared with identical import-skipping options.
+Evidence: `failed-pass-static-comparison.json`, `failed-pass-tests-mypy-final.*`
+and `failed-pass-critical-ruff-final.txt`. Full-package static cleanup remains open.
+
+A supplemental inspection of the actual positive-control AEGs verified all 12
+decoded tensors and the **6,752-byte weight blobs** match exactly. Both artifacts
+total **128,981 bytes**; maximum absolute logit difference is **0**, and all three
+generated IDs match (`[30, 7, 30]`). This compares all-off AEG with a benign
+skipped-merge AEG on the one-layer test fixture; it is not an HF/source-quality
+or performance certification. Evidence: `failed-pass-control-parity.json` and
+`failed-pass-control-parity-verified.*` (exit 0). Two earlier inspector attempts
+stopped before engine execution on temporary-path selection; their logs remain.
+
+CPU execution has current physical-host evidence. No accelerator validation tier
+changes in this area. The [22-row measured pass audit](mission-pass-audit.md),
+mandatory numerical quality gating, default-pass corrections, remaining model
+families, engine performance/memory and hardware/robustness/CI work remain open.

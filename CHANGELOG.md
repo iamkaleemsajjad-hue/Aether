@@ -579,6 +579,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Rejected reported optimizer failures before targeting or AEG publication,
+  preserving their structured reasons, cleaning private staging and retaining an
+  existing destination even when overwrite is requested. Diagnostic pipeline
+  reports and benign skips remain available. Real SDK/CLI regressions cover it.
 - Removed fabricated candidate generation from the legacy public tree-speculation
   API. Unsupported drafting now fails clearly; manual verification requires valid
   target evidence and commits acceptance counters only after successful validation.

@@ -45,7 +45,7 @@ from aether.compiler.stage2_optimizer.optimizer import OptimizerPipeline
 from aether.compiler.stage3_targeting.hardware_profile import HardwareProfile
 from aether.core.aeg_format import AEGManifest, AEGPackage, KernelSetMetadata, MemoryRequirements, OptimizationMetadata
 from aether.core.constants import AEG_FORMAT_VERSION, AETHER_VERSION, DEFAULT_HUB_URL, SUPPORTED_TARGET_IDS
-from aether.core.exceptions import CompilationError, CompilerConfigError
+from aether.core.exceptions import CompilationError, CompilerConfigError, CompilerPassError
 from aether.core.hash_utils import compute_aeg_cache_key, compute_graph_hash
 from aether.core.types import HardwareTarget, ModelArchitecture, Precision
 from aether.utils.logging import get_logger
@@ -761,10 +761,27 @@ class Compiler:
         # Stage 2: Optimize
         try:
             optimized_graph, pass_reports = self._stage2_optimize(graph, architecture, config)
+            # Passes return failure reports instead of raising. Inspection can
+            # retain every report, but a failed transformation cannot authorize
+            # targeting or publication, including replacement of an older AEG.
+            failed_passes = [report for report in pass_reports if report.status == "failed"]
+            if failed_passes:
+                names = ", ".join(report.pass_name for report in failed_passes)
+                raise CompilerPassError(
+                    f"Optimizer passes failed: {names}",
+                    model_id=model_id,
+                    pass_name=failed_passes[0].pass_name,
+                    details={"failed_passes": [report.to_dict() for report in failed_passes]},
+                )
         except Exception as exc:
             shutil.rmtree(pass_artifact_dir, ignore_errors=True)
             msg = f"Optimization failed for {model}: {exc}"
-            raise CompilationError(msg, model_id=model_id, stage="stage2_optimizer") from exc
+            raise CompilationError(
+                msg,
+                model_id=model_id,
+                stage="stage2_optimizer",
+                details=exc.details if isinstance(exc, CompilationError) else None,
+            ) from exc
 
         # Stage 3: Target and backend selection
         try:

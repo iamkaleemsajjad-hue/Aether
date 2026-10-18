@@ -81,3 +81,11 @@ numerical worker and executed changed logits. This does not prove source-adapter
 scaling correctness or public adapter request behavior. Full functional grammar/MTP/adapter
 probes, the complete mid/conditional matrix, ordering checks, hardware execution
 and clean-host/pretrained quality/performance comparisons remain required.
+
+The subsequent compiler-admission correction rejects any reported optimizer
+failure before targeting or publication, preserving the original failure details
+and an existing destination. Direct pipeline idempotency diagnostics still retain
+their reports. The measured table above remains the original checkpoint; this
+correction establishes no new per-pass speed, memory or quality benefit. An
+`applied` report still does not establish numerical quality certification. See
+[the executed regression and complete-suite results](mission-validation.md#correction-reject-reported-optimizer-failures-before-publication).
