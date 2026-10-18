@@ -70,9 +70,9 @@ def _assert_v31_package_artifacts(package: AEGPackage) -> None:
     loaded.verify_integrity()
     assert (loaded.root / "graph" / "reasoning_graph.aeg-ir").exists()
     assert (loaded.root / "graph" / "attention_head_patterns.json").exists()
-    assert (loaded.root / "safety" / "prompt_guard.json").exists()
+    assert not (loaded.root / "safety" / "prompt_guard.json").exists()
     assert (loaded.root / "provenance" / "manifest.json").exists()
-    assert (loaded.root / "watermark" / "config.json").exists()
+    assert not (loaded.root / "watermark" / "config.json").exists()
     assert loaded.manifest is not None
     assert "graph/reasoning_graph.aeg-ir" in loaded.manifest.artifacts
 
@@ -97,8 +97,8 @@ def test_provenance_manifest_and_watermark() -> None:
         eval_results={"hellaswag": 0.8},
     )
     payload = manifest.to_dict()
-    assert payload["model_hash"].startswith("sha256:")
-    assert payload["eu_ai_act"]["transparency_obligations_met"] is True
+    assert payload["model_hash"] == ""
+    assert payload["eu_ai_act"]["transparency_obligations_met"] is False
     watermark = AetherOutputWatermark(vocab_size=16, green_fraction=0.25, delta=2.0, z_threshold=1.0)
     logits = watermark.apply_watermark([0.0] * 16, [1, 2, 3])
     assert max(logits) == 2.0

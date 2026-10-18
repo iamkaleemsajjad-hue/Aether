@@ -107,7 +107,9 @@ def test_multimodal_unified_graph_plan() -> None:
     assert graph["optimizations"]["mm_sparse_attention"] is True
 
 
-def test_compiled_package_emits_remaining_v31_artifact_contracts(tmp_path, tiny_local_safetensors_model) -> None:
+def test_compiled_package_omits_unrequested_v31_templates(
+    tmp_path, tiny_local_safetensors_model,
+) -> None:
     from aether import Compiler
 
     compiler = Compiler(CompilerConfig(targets=["cpu_avx512"], overwrite=True, calibration_tokens=128))
@@ -129,6 +131,7 @@ def test_compiled_package_emits_remaining_v31_artifact_contracts(tmp_path, tiny_
     ]
     assert loaded.manifest is not None
     for artifact in expected:
-        assert (loaded.root / artifact).exists(), artifact
-        assert artifact in loaded.manifest.artifacts
-    assert loaded.metadata["agentic_workflow"]["meta_tools"]
+        assert not (loaded.root / artifact).exists(), artifact
+        assert artifact not in loaded.manifest.artifacts
+    assert "agentic_workflow" not in loaded.metadata
+    loaded.verify_integrity()

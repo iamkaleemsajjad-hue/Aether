@@ -4,6 +4,10 @@ The architecture decision is recorded in [the pre-change note](mission-architect
 The mission remains in progress. This record separates executed checks from
 inspection and work that has not run.
 
+The latest [22-row executed CPU pass audit](mission-pass-audit.md) includes raw
+timing spread, sampled RSS, artifact size and original-FP32 HF comparisons. It
+also records the conditional fixtures, failures and remaining functional gaps.
+
 ## Initial source and environment
 
 The initial runtime/compiler source was `7bed38c6722630fdfc7c16ddfe517a52b4369221`.
@@ -94,7 +98,8 @@ The audit exited 1 because fresh native DLL builds differed despite the fixed
 reproducible-build epoch. Only the DLL bytes and their dependent metadata and
 manifest hashes differed; no fields were stripped. Applying fusion twice to
 one graph also reset its accounting metadata, so it was not graph-idempotent.
-These findings remain unfixed at this checkpoint.
+Native build reproducibility is corrected in the executed follow-up below.
+Fusion's accounting idempotency remains open.
 
 The first harness version followed the Windows venv launcher for sampled
 main-process RSS, while its phase boundaries came from the actual Python child.
@@ -189,3 +194,98 @@ the existing runtime test file retains exactly its prior 32 findings. Targeted
 mypy passed for the corrected module with imported modules excluded. This does
 not clear the 1,796-error full-package baseline. Native AEG reproducibility and
 the remaining pass/correctness/performance work remain open.
+
+## Correction: GNU PE native build reproducibility
+
+The native source, compiler discovery/build/cache path, loader/emitter callers,
+portability and library-lifetime tests were read before the correction. The four
+original DLLs had timestamp 1700000000 and identical `.text` sections. Preferred
+image bases differed; the baseline pair had 95 changed bytes in the base,
+dependent addresses and checksum. GNU ld derives automatic PE image bases from
+the output filename, including our random staging directory. This is distinct
+from timestamps; see [GNU ld's PE options](https://sourceware.org/binutils/docs/ld/Options.html).
+
+After identifying the actual selected linker, GNU PE builds use a fixed default
+preferred base and zero timestamp. ASLR and base relocations remain enabled.
+The linker policy and recipe revision participate in the cache key, so an old
+cached DLL cannot hide the correction. MSVC, LLD and non-Windows linker commands
+retain their existing policy; their reproducibility is not newly certified.
+
+| Check | Before | After |
+|---|---|---|
+| Two cold DLL builds in different directories | Different raw bytes in the initial audit | Identical raw bytes; both execute correct GEMM/GEMV |
+| Fresh native AEGs, all passes off | Raw file differences and dependent hashes | Every artifact file identical across two fresh builds |
+| Fresh native AEGs, fusion only | Raw file differences and dependent hashes | Every artifact file identical across two fresh builds |
+| Loader, numerical and public generation workers | Executed successfully | Executed successfully for both cases |
+| Native/portability/lifetime focused selection | Initial suite baseline | 112 passed, 0 failed; exit 0 |
+| Decode throughput / memory benefit | Not benchmarked | No speed or memory benefit claimed |
+
+Evidence: `build/mission/native-after.*`, `native-repro-audit/report.json`,
+`native-repro-audit.log`, and `.exit` (0). The follow-up did not request another
+HF oracle or timings. Same-graph fusion idempotency is a separate failing
+diagnostic and is not made green by reproducible binary builds.
+
+## Correction: optional payloads and factual provenance
+
+The package writer, compiler staging/packaging, provenance implementation,
+producer/consumer searches and related tests showed that a normal compile
+emitted demonstration payloads without actual serving consumers. It also
+advertised enabled watermarking, legal compliance, certified hardware and
+FlashAttention-3 without the corresponding evidence. A graph digest was labeled
+as a source-weight digest, and the standalone provenance class synthesized a
+source-weight digest from names when none was supplied.
+
+The correction emits optional metadata payloads only when a producer supplies
+them, preserves standalone writer output and legacy package files, retains real
+runtime contracts and evaluation reports, and leaves unknown source/compliance
+evidence unknown. Explicit CPU contracts identify `aether_cpu`. The raw
+graph/manifest/payload integrity chain is retained.
+
+The final regression file was run against an isolated Git snapshot of the
+unchanged source: **9 failed, 32 passed**. The first draft's 37 failures included
+test setup errors and are not accepted as a genuine defect count. Evidence:
+`build/mission/requested-corrected-before.*` and the unchanged snapshot under
+`build/mission/truth-pristine/`. Focused correction tests passed except an old
+legal-risk expectation, which was corrected to unknown and passed separately.
+The complete post-change suite passed **5,052 tests, 42 skipped, 0 failures** in
+351.13 seconds, exit 0. Line coverage is 44,032 / 56,283 = 78.23%; branch coverage
+is 10,452 / 16,862 = 61.99%. Both exceed the initial source baseline; branch
+coverage is slightly below the legacy-only checkpoint's 62.02%. Evidence:
+`build/mission/truth-final.*`, `truth-final-coverage.xml`, and
+`truth-coverage-comparison.json`.
+
+The first complete attempt had one test failure: it tampered with the first
+manifest item, which became `FORMAT_VERSION` after template removal. Loading
+correctly rejected it before the test's later integrity assertion. The test now
+creates and tampers with an explicit auxiliary payload. It and the 41 new package
+regressions passed together (42 passed, exit 0), then the complete suite was rerun.
+The original failed run remains in `build/mission/truth-full.*`.
+
+Scoped mypy has 89 to 87 existing errors, with no new diagnostic messages.
+Ruff across the touched existing files has 391 to 378 findings, with no new
+messages; the new regression/helper files pass full Ruff. Critical Ruff across
+all CI paths plus tools passed. Repository-wide types and style remain failing.
+Evidence: `build/mission/truth-check-comparison.json` and `truth-critical-ruff.txt`.
+
+The separately requested opt-in pass-audit smoke did not start its fixture:
+678 MiB available was below a 384 MiB worker estimate plus 512 MiB headroom.
+Its selection returned 39 passed and one failed admission assertion, not a
+successful compiler/runtime smoke. Evidence: `build/mission/harness-opt-in.*` and
+the report path retained in that log. A new full tiny-pass audit uses the explicit
+128 MiB diagnostic reserve; its timings cannot certify clean-host performance.
+
+The diagnostic tiny matrix subsequently completed all 22 single passes and seven
+combinations. Template removal reduced the all-off artifact from **47 to 24
+files** and **210,955 to 192,640 bytes**, with zero before/after logit error and
+all 16 greedy IDs unchanged. The same fixture and native recipe were used on
+both sides. This is an artifact-size and truthfulness correction, not an engine
+speed or resident-memory improvement. Evidence:
+`build/mission/template-removal-numerics.json` and the two report inventories.
+
+The 27,271,680-parameter checkpoint was successfully created twice and all files
+matched; its compilation was blocked by the conservative memory estimate. MoE,
+MTP and adapter checkpoints were also created and executed in conditional audits.
+The initial adapter and merging attempts revealed a Windows cp1252 logging
+failure. Explicit UTF-8 reruns completed (exit 0), including a strict FP32 HF
+oracle and actual selected-adapter execution. The general logging failure, cache
+quality losses, KV idempotency failure and full functional probes remain open.

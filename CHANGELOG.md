@@ -582,6 +582,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Made GNU PE native CPU builds reproducible across fresh staging directories,
   retaining ASLR and relocations and invalidating caches from the older recipe.
   Two cold native DLLs and complete repeated AEG builds were verified byte for byte.
+- Stopped emitting unrequested package templates and unsupported default feature,
+  watermark, kernel and certification claims. Explicit payloads and old packages
+  retain integrity checks. Unknown source-weight hashes and compliance remain
+  unknown. See `docs/mission-validation.md` and `docs/mission-pass-audit.md`.
 
 ### Security
 - N/A

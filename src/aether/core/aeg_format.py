@@ -191,7 +191,7 @@ class KernelSetMetadata:
     targets: list[str] = field(default_factory=list)
     """Hardware targets covered by this kernel set."""
 
-    flash_attention_variant: str = "flash_attention_3"
+    flash_attention_variant: str = ""
     """FlashAttention variant used for attention kernels."""
 
     backend_plans: dict[str, str] = field(default_factory=dict)
@@ -222,7 +222,7 @@ class KernelSetMetadata:
     def from_dict(data: dict[str, Any]) -> KernelSetMetadata:
         return KernelSetMetadata(
             targets=list(data.get("targets", [])),
-            flash_attention_variant=data.get("flash_attention_variant", "flash_attention_3"),
+            flash_attention_variant=data.get("flash_attention_variant", ""),
             backend_plans=dict(data.get("backend_plans", {})),
             portable_backends=list(data.get("portable_backends", [])),
             variant_status=dict(data.get("variant_status", {})),
@@ -688,7 +688,9 @@ class AEGPackage:
             plan_path.write_text(json.dumps(plan.to_dict(), indent=2), encoding="utf-8")
         # Write kernel metadata
         kernel_meta_path = self.root / "kernels" / "kernel_sets.json"
-        kernel_meta_path.write_text(json.dumps(self.manifest.kernels.to_dict(), indent=2), encoding="utf-8")
+        kernel_metadata = self.manifest.kernels.to_dict()
+        if any(kernel_metadata.values()):
+            kernel_meta_path.write_text(json.dumps(kernel_metadata, indent=2), encoding="utf-8")
         self._write_extended_artifacts()
         # Compute and set manifest hash
         self.manifest.compute_and_set_manifest_hash()
@@ -1102,175 +1104,63 @@ class AEGPackage:
             return
         artifacts: dict[str, str] = {}
         graph_metadata = dict(self.metadata)
-        defaults: dict[str, Any] = {
-            "graph/reasoning_graph.aeg-ir": graph_metadata.get("reasoning_graph", {
-                "version": "reasoning_graph/1.0",
-                "entrypoint": "disabled",
-                "nodes": [],
-                "edges": [],
-            }),
-            "graph/rag_pipeline.aeg-ir": graph_metadata.get("rag_pipeline", {
-                "version": "rag_pipeline/1.0",
-                "stages": ["query_encode", "retrieve", "rerank", "context_pack", "generate"],
-                "enabled": False,
-            }),
-            "graph/attention_head_patterns.json": graph_metadata.get("attention_head_patterns", {
-                "version": "sparse_attention/1.0",
-                "enabled": False,
-                "patterns": [],
-            }),
-            "parallelism/prefill_decode_split.json": graph_metadata.get("prefill_decode_split", {
-                "prefill_pool": {"role": "compute_bound", "chunk_size": 2048},
-                "decode_pool": {"role": "memory_bound", "batching": "continuous"},
-                "kv_transfer": "shared_memory_or_rdma",
-            }),
-            "inference/compute_profiles.json": graph_metadata.get("compute_profiles", {
-                "greedy": {"relative_cost": 1.0, "quality_bias": 0.0},
-                "beam": {"relative_cost": 2.5, "quality_bias": 0.04},
-                "best_of_n": {"relative_cost": 4.0, "quality_bias": 0.07},
-                "mcts": {"relative_cost": 8.0, "quality_bias": 0.12},
-            }),
-            "safety/prompt_guard.json": graph_metadata.get("prompt_guard", {
-                "enabled": True,
-                "threshold": 0.65,
-                "signals": ["ignore_previous", "reveal_system", "tool_exfiltration"],
-            }),
-            "safety/output_filter.json": graph_metadata.get("output_filter", {
-                "enabled": True,
-                "policies": ["safety", "privacy", "copyright"],
-                "action": "block_or_redact",
-            }),
-            "safety/audit_log.json": graph_metadata.get("audit_log", {"events": [], "hash_algorithm": "sha256"}),
-            "provenance/manifest.json": graph_metadata.get("provenance", {
-                "compiler_version": self.manifest.aether_version,
-                "source_model": {"id": self.manifest.model_id, "license": "unknown"},
-                "transformations": self.manifest.optimization.fusion_passes_applied,
-                "eu_ai_act": {"risk_category": "unknown", "transparency_obligations_met": False},
-            }),
-            "provenance/fingerprint.json": graph_metadata.get("fingerprint", {
-                "enabled": False,
-                "trigger_count": 0,
-                "ownership_threshold": 0.85,
-            }),
-            "watermark/config.json": graph_metadata.get("watermark", {
-                "enabled": True,
-                "algorithm": "greenlist_statistical",
-                "context_width": 16,
-                "delta": 1.0,
-                "z_threshold": 4.0,
-            }),
-            "adapters/manifest.json": graph_metadata.get("adapters", {
-                "mode": "none",
-                "slots": 0,
-                "adapters": [],
-            }),
-            "cuda_graphs/capture_manifest.json": graph_metadata.get("cuda_graphs", {
-                "version": "cuda_graph_capture/1.0",
-                "enabled": False,
-                "piecewise": True,
-                "decode_batch_sizes": [1, 2, 4, 8, 16, 32],
-                "prefill_chunk_sizes": [512, 1024, 2048],
-                "persistent_kernels": ["decode_attention", "rmsnorm", "moe_router"],
-            }),
-            "observability/eval_gates.json": graph_metadata.get("eval_gates", {
-                "enabled": True,
-                "max_relative_regression": 0.02,
-                "required_benchmarks": ["hellaswag", "mmlu", "gsm8k", "math-500", "humaneval"],
-                "action": "block_rollout_on_failure",
-            }),
-            "observability/drift_monitor.json": graph_metadata.get("drift_monitor", {
-                "enabled": True,
-                "baseline_win_rate": 0.5,
-                "alert_drop": 0.05,
-                "signals": ["win_rate", "ttft_ms", "tokens_per_second", "spec_accept_rate"],
-            }),
-            "observability/metrics_schema.json": graph_metadata.get("metrics_schema", {
-                "version": "otel_metrics/1.0",
-                "metrics": [
-                    "tokens_per_second",
-                    "ttft_ms",
-                    "eagle3_accept_rate",
-                    "kv_hit_rate",
-                    "mla_compression_ratio",
-                    "reasoning_budget_used",
-                    "gpu_vram_utilization",
-                ],
-            }),
-            "rollout/ab_config.json": graph_metadata.get("ab_rollout", {
-                "enabled": True,
-                "candidate_percent": 0.01,
-                "assignment": "sha256_stable_bucket",
-                "rollback_on": ["eval_gate_failure", "quality_drift_alert", "safety_alert"],
-            }),
-            "fleet/deployment_plan.json": graph_metadata.get("fleet_deployment", {
-                "version": "fleet/1.0",
-                "strategy": "heterogeneous_target_aware",
-                "targets": self.manifest.kernels.targets,
-                "hot_reload": True,
-            }),
-            "fleet/hot_reload.json": graph_metadata.get("hot_reload", {
-                "enabled": True,
-                "routing": "stable_hash",
-                "rollback": "instant_switch_to_active",
-            }),
-            "distillation/plan.json": graph_metadata.get("distillation", {
-                "version": "distillation/1.0",
-                "modes": ["logit", "feature", "reasoning", "self"],
-                "quality_gates": ["perplexity", "task_eval", "safety_regression"],
-                "target_quality_retention": 0.95,
-            }),
-            "agentic/workflow_cache.json": graph_metadata.get("agentic_workflow", {
-                "version": "agentic_workflow/1.0",
-                "meta_tools": [],
-                "routes": ["fast", "balanced", "deep"],
-                "context_cache": {"enabled": True, "scope": "session_and_org_prefix"},
-            }),
-            "mla/plan.json": graph_metadata.get("mla_plan", {
-                "version": "mla_compression/1.0",
-                "enabled": self.manifest.architecture.attention_type.upper() == "MLA",
-                "weight_absorption": self.manifest.architecture.attention_type.upper() == "MLA",
-                "kernel": "aeg.mla_portable",
-            }),
-            "speculation/eagle3.json": graph_metadata.get("eagle3", {
-                "version": "eagle3/1.0",
-                "fusion_layers": list(range(min(self.manifest.architecture.layers, 8))),
-                "tree_depth": 5 if self.manifest.architecture.context_length >= 65536 else 4,
-                "branching_factor": 4,
-                "attention_drift_correction": self.manifest.architecture.context_length >= 65536,
-                "flattened_tree": True,
-                "acceptance_floor": 0.75,
-            }),
-            "multimodal/graph.json": graph_metadata.get("multimodal_graph", {
-                "version": "multimodal_graph/1.0",
-                "enabled": False,
-                "stages": ["modality_encode", "project", "llm_generate"],
-                "optimizations": {"vit_data_parallel": True, "llm_tensor_parallel": True},
-            }),
+        # An optional payload needs an actual producer. Never synthesize enabled
+        # features or numerical/performance claims from the package format alone.
+        optional_artifacts = {
+            "graph/reasoning_graph.aeg-ir": "reasoning_graph",
+            "graph/rag_pipeline.aeg-ir": "rag_pipeline",
+            "graph/attention_head_patterns.json": "attention_head_patterns",
+            "parallelism/prefill_decode_split.json": "prefill_decode_split",
+            "inference/compute_profiles.json": "compute_profiles",
+            "safety/prompt_guard.json": "prompt_guard",
+            "safety/output_filter.json": "output_filter",
+            "safety/audit_log.json": "audit_log",
+            "provenance/manifest.json": "provenance",
+            "provenance/fingerprint.json": "fingerprint",
+            "watermark/config.json": "watermark",
+            "adapters/manifest.json": "adapters",
+            "cuda_graphs/capture_manifest.json": "cuda_graphs",
+            "observability/eval_gates.json": "eval_gates",
+            "observability/drift_monitor.json": "drift_monitor",
+            "observability/metrics_schema.json": "metrics_schema",
+            "rollout/ab_config.json": "ab_rollout",
+            "fleet/deployment_plan.json": "fleet_deployment",
+            "fleet/hot_reload.json": "hot_reload",
+            "distillation/plan.json": "distillation",
+            "agentic/workflow_cache.json": "agentic_workflow",
+            "mla/plan.json": "mla_plan",
+            "speculation/eagle3.json": "eagle3",
+            "multimodal/graph.json": "multimodal_graph",
+            "observability/eval_report.json": "eval_report",
+            "weights/sparsity_masks.json": "sparsity_plan",
         }
-        if "eval_report" in graph_metadata:
-            defaults["observability/eval_report.json"] = graph_metadata["eval_report"]
-        sparsity_plan = graph_metadata.get("sparsity_plan")
-        if sparsity_plan is not None:
-            defaults["weights/sparsity_masks.json"] = sparsity_plan
-        if self.manifest.architecture.attention_type.upper() == "MLA":
-            mla_dir = self.root / "weights" / "mla_compressed"
-            mla_dir.mkdir(parents=True, exist_ok=True)
-            latent_path = mla_dir / "latent_kv.manifest.json"
-            latent_payload = {
-                "enabled": True,
-                "compression": "latent_kv",
-                "estimated_kv_reduction": 0.90,
-                "weight_absorption": True,
-            }
-            latent_path.write_text(json.dumps(latent_payload, indent=2), encoding="utf-8")
-            artifacts["weights/mla_compressed/latent_kv.manifest.json"] = compute_file_hash(latent_path)
-        for relative_path, payload in defaults.items():
+        payloads = {
+            path: graph_metadata[key]
+            for path, key in optional_artifacts.items()
+            if key in graph_metadata and graph_metadata[key] is not None
+        }
+        for relative_path, payload in payloads.items():
             target = self.root / relative_path
             target.parent.mkdir(parents=True, exist_ok=True)
-            if isinstance(payload, str):
-                target.write_text(payload, encoding="utf-8")
-            else:
-                target.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+            serialized = (
+                payload if isinstance(payload, str)
+                else json.dumps(payload, indent=2, sort_keys=True, default=str)
+            )
+            unchanged = False
+            if target.is_file():
+                existing = target.read_text(encoding="utf-8")
+                unchanged = existing == serialized
+                if not unchanged and not isinstance(payload, str):
+                    try:
+                        decoded = json.loads(existing)
+                    except json.JSONDecodeError:
+                        # An explicit valid payload replaces invalid prior JSON.
+                        decoded = None
+                    unchanged = json.dumps(
+                        decoded, indent=2, sort_keys=True, default=str
+                    ) == serialized
+            if not unchanged:
+                target.write_text(serialized, encoding="utf-8")
             artifacts[relative_path] = compute_file_hash(target)
 
         # Include all package payloads in the manifest, excluding the manifest

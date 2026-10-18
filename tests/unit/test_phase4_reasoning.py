@@ -841,7 +841,7 @@ class TestProvenanceManifest:
         d = pm.to_dict()
         assert "eu_ai_act" in d
         assert "hardware_certification" in d
-        assert d["eu_ai_act"]["risk_category"] == "limited_risk"
+        assert d["eu_ai_act"]["risk_category"] == "unknown"
 
 
 class TestProvenanceBuilder:

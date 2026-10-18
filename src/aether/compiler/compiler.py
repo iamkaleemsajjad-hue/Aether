@@ -1050,114 +1050,18 @@ class Compiler:
                 cross_layer_kv_plan.read_text(encoding="utf-8")
             )
         primary_target = target_profiles[0].target_id if target_profiles else "cpu_avx512"
-        from aether.agentic import AgentWorkflowOptimizer, ToolCall
-        from aether.attention import MLAPlanner
-        from aether.cuda import CUDAGraphCapturePlan
-        from aether.distillation import DistillationPipeline
-        from aether.fleet import AetherFleetManager, FleetConfig, FleetNode, HotReloadRouter
-        from aether.inference.multimodal import default_multimodal_plan
-        from aether.observability import ABRolloutController, DriftMonitor, EvalGate
-        from aether.runtime.eagle import EAGLE3Planner
-
-        agentic_trace = [
-            ToolCall("retrieve", {"query": "string"}, average_latency_ms=18.0),
-            ToolCall("rerank", {"documents": "array"}, average_latency_ms=24.0),
-            ToolCall("generate", {"context": "string"}, average_latency_ms=90.0, writes_context=True),
-        ]
-        fleet_nodes = [
-            FleetNode("local-0", primary_target, gpu_count=1 if primary_target.startswith(("cuda", "rocm", "metal")) else 0, memory_gb=80.0),
-            FleetNode("portable-0", "cpu_avx512", memory_gb=max(16.0, architecture.params_billion * 2)),
-        ]
-
-        # Capabilities are derived from what actually ran and what the source
-        # architecture is — never a fixed advertisement.  Infrastructure
-        # plans that every AEG package physically embeds (safety configs,
-        # provenance, observability manifests, rollout/fleet/distillation
-        # plan templates) legitimately count as packaged capabilities;
-        # architecture-specific traits (MLA, SSM) and optimizer features are
-        # gated on their real triggers.
-        applied_passes = {
-            report.pass_name for report in pass_reports if getattr(report, "status", "") == "applied"
-        }
-        family = (architecture.family or "").lower()
-        attention = (architecture.attention_type or "").lower()
-        capabilities = [
-            "safety_guardrails",
-            "provenance",
-            "watermark",
-            "lora_adapters",
-            "rag_pipeline",
-            "agentic_workflow",
-            "multimodal_graph",
-            "quantization_aware_compilation",
-            "observability",
-            "eval_gates",
-            "ab_rollout",
-            "fleet_management",
-            "hot_reload",
-            "distillation",
-            "cuda_graph_capture",
-            "eagle3_speculation",
-        ]
-        if "reasoning_graph" in applied_passes:
-            capabilities.append("reasoning_graph")
-        if "sparse_attention" in applied_passes:
-            capabilities.append("sparse_attention")
-        if "pruning_sparsity" in applied_passes:
-            capabilities.append("pruning_sparsity")
-        if "mla" in attention or "deepseek" in family or "kimi" in family or "glm" in family:
-            capabilities.append("mla_native")
-        if any(marker in family for marker in ("mamba", "rwkv", "jamba", "zamba", "ssm")):
-            capabilities.append("hybrid_ssm")
-
         package.metadata.update({
             "model_id": model_id,
             "architecture": architecture.to_dict(),
-            "capabilities": capabilities,
-            "agentic_workflow": AgentWorkflowOptimizer(min_sequence_frequency=1).compile([agentic_trace]),
-            "eval_gates": EvalGate().manifest(),
-            "drift_monitor": DriftMonitor(baseline_win_rate=0.5).manifest(),
-            "ab_rollout": ABRolloutController("compile_default", candidate_percent=0.01).manifest(),
-            "fleet_deployment": AetherFleetManager(fleet_nodes).plan_manifest(
-                model_id,
-                FleetConfig(replicas=1, preferred_targets=tuple(profile.target_id for profile in target_profiles) or ("cpu_avx512",)),
-            ),
-            "hot_reload": HotReloadRouter(active_aeg=model_id).manifest(),
-            "distillation": DistillationPipeline().compile_manifest(
-                DistillationPipeline().plan(model_id, f"{model_id}-student", task_type="general"),
-            ),
-            "cuda_graphs": CUDAGraphCapturePlan(primary_target, max_context_length=architecture.context_length).to_dict(),
-            "mla_plan": MLAPlanner().plan(architecture, target=primary_target).to_dict(),
-            "eagle3": EAGLE3Planner().plan(architecture).to_dict(),
-            "multimodal_graph": default_multimodal_plan(model_id).to_graph(),
-            "metrics_schema": {
-                "version": "otel_metrics/1.0",
-                "metrics": [
-                    "tokens_per_second",
-                    "ttft_ms",
-                    "eagle3_accept_rate",
-                    "kv_hit_rate",
-                    "mla_compression_ratio",
-                    "reasoning_budget_used",
-                    "gpu_vram_utilization",
-                ],
-            },
-            "quantization_aware_compilation": {
-                "enabled": True,
-                "calibration_dataset": config.calibration_dataset,
-                "quality_budget_ppl_increase": config.quality_budget,
-                "precision_formats": ["BF16", "FP8", "FP4", "Q4_K_M", "Q3_K"],
-            },
         })
 
         # Compute graph hash
         graph_hash = compute_graph_hash(ir)
 
         # ── Provenance (PRD §35) ────────────────────────────────────────────
-        # Built from the real ProvenanceManifest rather than an inline dict so
-        # the artifact carries a verifiable model hash and the actual
-        # transformation chain. EU AI Act Art. 50 requires a deployer be able
-        # to audit what was done to the model they are running.
+        # Record actual transformations. The IR digest is recorded separately:
+        # it is not a source-weight hash, hardware certification, watermark,
+        # measured quality result, or legal compliance assessment.
         from aether.provenance.manifest import (
             EUAIActRecord,
             HardwareCertification,
@@ -1166,8 +1070,8 @@ class Compiler:
         )
 
         provenance = ProvenanceManifest(
-            model_hash=graph_hash.replace("sha256:", ""),
             source_model_id=model_id,
+            source_license="",
             model_architecture=architecture.family,
             compiler_version=f"aether/{AETHER_VERSION}",
             compile_timestamp=start_time.timestamp(),
@@ -1180,18 +1084,18 @@ class Compiler:
                 for report in pass_reports
             ],
             eu_ai_act=EUAIActRecord(
-                risk_category="limited_risk",
-                transparency_obligations_met=True,
+                risk_category="unknown",
+                transparency_obligations_met=False,
                 intended_purpose="general_text_generation",
             ),
             hardware_certification=HardwareCertification(
-                certified_targets=[p.target_id for p in target_profiles] or ["cpu_avx512"],
+                certified_targets=[],
                 primary_target=primary_target,
             ),
-            watermark_enabled=True,
-            watermark_algorithm="greenlist_statistical",
+            watermark_enabled=False,
         )
         package.metadata["provenance"] = provenance.to_dict()
+        package.metadata["provenance"]["graph_hash"] = graph_hash
 
         # Build precision map from pass reports
         precision_map: dict[str, str] = {}
@@ -1301,7 +1205,10 @@ class Compiler:
         # portable PyTorch contract when this is a standard decoder graph.
         kernels = KernelSetMetadata(targets=[p.target_id for p in target_profiles])
         for profile in target_profiles:
-            backend_name = profile.recommended_backend or "pytorch"
+            backend_name = (
+                "aether_cpu" if profile.target_id.startswith("cpu_")
+                else profile.recommended_backend or "pytorch"
+            )
             package.set_backend_plan(profile.target_id, backend_name)
         kernels.backend_plans = {t: package.get_backend_plan(t) for t in kernels.targets if package.get_backend_plan(t)}
         kernels.variant_status = {

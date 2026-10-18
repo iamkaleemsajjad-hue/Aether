@@ -85,8 +85,8 @@ class TransformationRecord:
 @dataclass
 class EUAIActRecord:
     """EU AI Act compliance fields (Article 52 + Annex III)."""
-    risk_category: str = "limited_risk"          # "minimal" | "limited" | "high" | "unacceptable"
-    transparency_obligations_met: bool = True
+    risk_category: str = "unknown"
+    transparency_obligations_met: bool = False
     human_oversight_required: bool = False
     prohibited_use_cases: list[str] = field(default_factory=list)
     intended_purpose: str = "general_text_generation"
@@ -136,7 +136,7 @@ class ProvenanceManifest:
     # Source model
     model_hash: str = ""              # SHA-256 of source weights
     source_model_id: str = ""
-    source_license: str = "Apache-2.0"
+    source_license: str = ""
     model_architecture: str = ""
 
     # Compiler
@@ -181,20 +181,8 @@ class ProvenanceManifest:
     def __post_init__(self) -> None:
         if self.compile_timestamp is None:
             self.compile_timestamp = time.time()
-        if not self.model_hash:
-            # An unset hash would serialize as a bare "sha256:" prefix. Derive a
-            # stable identity hash from the source model id and transformation
-            # chain so every manifest carries a verifiable content binding.
-            seed = json.dumps(
-                {
-                    "source_model_id": self.source_model_id,
-                    "compiler_version": self.compiler_version,
-                    "architecture": self.model_architecture,
-                    "transformations": [t.pass_name for t in self.transformations],
-                },
-                sort_keys=True,
-            ).encode()
-            self.model_hash = hashlib.sha256(seed).hexdigest()
+        # A model identifier and pass names are not a hash of source weights.
+        # Leave unknown content evidence empty until a producer supplies it.
 
     def add_transformation(self, record: TransformationRecord) -> None:
         self.transformations.append(record)
@@ -231,7 +219,7 @@ class ProvenanceManifest:
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
-            "model_hash": f"sha256:{self.model_hash}",
+            "model_hash": f"sha256:{self.model_hash}" if self.model_hash else "",
             "compiler_version": self.compiler_version,
             "compile_timestamp": self.compile_timestamp,
             "compile_date": time.strftime(
@@ -312,8 +300,8 @@ class ProvenanceManifest:
             ))
         eu = d.get("eu_ai_act", {})
         pm.eu_ai_act = EUAIActRecord(
-            risk_category=eu.get("risk_category", "limited_risk"),
-            transparency_obligations_met=eu.get("transparency_obligations_met", True),
+            risk_category=eu.get("risk_category", "unknown"),
+            transparency_obligations_met=eu.get("transparency_obligations_met", False),
             human_oversight_required=eu.get("human_oversight_required", False),
         )
         hw = d.get("hardware_certification", {})
@@ -335,7 +323,7 @@ class ProvenanceManifest:
         model_id: str,
         model_weights_hash: str,
         compiler_version: str = "aether/3.1.0",
-        license_spdx: str = "Apache-2.0",
+        license_spdx: str = "",
         architecture: str = "",
         certified_targets: list[str] | None = None,
         eval_results: dict[str, float] | None = None,
