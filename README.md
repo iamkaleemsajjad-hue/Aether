@@ -45,9 +45,9 @@
 
 Supported CPU models compile to an integrity-verified AEG, reload and generate
 through the framework-free CPU engine. On an Intel Core i5-1334U running Windows,
-the clean suite with Torch and Transformers installed passed **5,052 tests** with
-42 explicit skips on 2026-10-18. A before/after replay preserved all 16 greedy
-tokens and produced zero logit difference. See the [environment, coverage and
+the complete collection with Torch and Transformers installed passed **5,055 tests**
+with 41 explicit skips in two serial processes on 2026-10-18. A before/after
+replay preserved all 16 greedy tokens and produced zero logit difference. See the [environment, coverage and
 limits](docs/mission-validation.md), [architecture](docs/mission-architecture-note.md)
 and [current implementation status](IMPLEMENTATION_STATUS.md).
 

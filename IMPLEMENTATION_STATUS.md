@@ -5,7 +5,8 @@ Reviewed 2026-10-18. The runtime/compiler mission is in progress.
 Supported CPU AEG compilation, integrity verification, reload and generation have
 executed on an Intel Core i5-1334U running Windows. The clean baseline passed
 4,923 tests with 41 skips; after the speculation and package corrections, the
-complete suite passed 5,052 tests with 42 skips. Torch and Transformers were installed.
+complete collection passed 5,055 tests with 41 skips in two serial processes.
+Torch and Transformers were installed.
 Line coverage was 78.23%. These are functional checks, not production or
 throughput certification. Exact environment, evidence, known failures and the
 22-pass matrix are in [the validation record](docs/mission-validation.md).

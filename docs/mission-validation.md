@@ -289,3 +289,49 @@ The initial adapter and merging attempts revealed a Windows cp1252 logging
 failure. Explicit UTF-8 reruns completed (exit 0), including a strict FP32 HF
 oracle and actual selected-adapter execution. The general logging failure, cache
 quality losses, KV idempotency failure and full functional probes remain open.
+
+## Audit harness: reproducible execution and complete serial validation
+
+The complete harness, fixture generators, tests, report and their importers were
+read before the final correction. Its worker log files were opened as UTF-8,
+but child Python processes inherited the parent's pipe encoding. A real merge
+compile with Greek/CJK source paths and an ASCII parent failed during ingestion.
+The harness also mislabeled pruning's executed zeroed dense weights as having no
+consumer. Both new regressions failed before the correction; they now pass.
+
+Workers explicitly use UTF-8 for Python files and pipes. Pruning's dense weight
+consumer is recorded without inferring sparse execution or benefit. This changes
+audit reliability and reporting, not model numerics or engine performance. The
+real Unicode-path regression compiles a merge, verifies the AEG and runs loaded
+logits/generation. The optional public API smoke retains all artifact equality,
+loader and generation assertions, using the documented 128 MiB diagnostic
+reserve. No admission check is bypassed.
+
+| Check | Result | Evidence |
+|---|---|---|
+| New encoding/consumer regressions before correction | 2 failed | `build/mission/harness-encoding-before.*` |
+| Harness selection, optional smoke disabled | 35 passed; 1 explicit skip | `build/mission/harness-encoding-after.*` |
+| Harness plus README generator, optional smoke enabled | 42 passed; 0 skipped | `build/mission/harness-complete.*` |
+| Complete collection, two serial coverage processes | 5,055 passed; 41 skipped; 0 failed/errors; both exits 0 | `build/mission/harness-shard-tools.*`, `harness-shard-product.*` |
+| Collection identity comparison | Exactly the same 5,096 cases, including parameterized names and multiplicities | `build/mission/harness-shard-verification.json` |
+| Combined line coverage | 44,030 / 56,283 = 78.23% | `build/mission/harness-sharded-coverage.xml` |
+| Combined branch coverage | 10,449 / 16,862 = 61.97% | Same coverage XML |
+| Critical Ruff across all CI paths and tools | Passed | `build/mission/harness-critical-ruff.txt` |
+| Full Ruff on tools and their tests; scoped mypy on all three helper source files | Passed | Executed before the complete suite |
+| Engine speed, resident memory and quality benefit from the helper correction | Not claimed; production source unchanged | Earlier numerical and pass audit evidence retains its scope |
+
+The first complete attempt returned **5,053 passed, 41 skipped and two failed**.
+Both failures were honest admission refusals: about 477 MiB was available in the
+fully collected parent, below the worker estimate plus the 128 MiB reserve. Raw
+logs and coverage are retained as `build/mission/harness-final.*`. The successful
+rerun separated `tests/tools` (42 passed in 32.55 seconds) from the remaining
+collection (5,013 passed, 41 skipped in 252.56 seconds), in serial fresh processes.
+Coverage was accumulated across those two processes. No case was dropped or
+assertion weakened. These times are test-suite durations, not runtime benchmarks.
+
+Both combined coverage rates exceed the initial source baseline. They are below
+the prior truthfulness-only run by two covered lines and three covered branches;
+no production source changed in this harness area. Repository-wide mypy/style,
+compiler quality gating, pass/default corrections, hardware execution and the
+remaining performance/memory work are still open. The harness encoding policy
+does not fix unconfigured logging in other library applications.
