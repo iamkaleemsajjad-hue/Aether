@@ -579,6 +579,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target evidence and commits acceptance counters only after successful validation.
   Existing imports and constructor signatures remain available. See
   `docs/legacy-speculation.md` for migration and validation scope.
+- Made GNU PE native CPU builds reproducible across fresh staging directories,
+  retaining ASLR and relocations and invalidating caches from the older recipe.
+  Two cold native DLLs and complete repeated AEG builds were verified byte for byte.
 
 ### Security
 - N/A
