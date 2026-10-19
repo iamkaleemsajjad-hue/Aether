@@ -1570,7 +1570,7 @@ def test_compiler_rejects_and_runtime_blocks_failed_eval_artifact(
             "latency_ms": 1.0,
         }
 
-    with pytest.raises(CompilationError, match="Evaluation gate failed"):
+    with pytest.raises(CompilationError, match="Evaluation gate failed") as rejected:
         Compiler(
             CompilerConfig(
                 targets=["cpu_avx512"],
@@ -1586,13 +1586,21 @@ def test_compiler_rejects_and_runtime_blocks_failed_eval_artifact(
             eval_baselines={"mmlu": 1.0},
         )
 
-    report_path = artifact / "observability" / "eval_report.json"
-    assert report_path.is_file()
-    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert not artifact.exists()
+    report = rejected.value.details
     assert report["gate"]["passed"] is False
+    # Admission must still reject an independently persisted failed policy.
+    # Failed compilation itself must no longer publish that artifact.
+    control = Compiler(CompilerConfig(
+        targets=["cpu_avx512"], cache_dir=str(tmp_path / "control-cache"),
+    )).compile(str(tiny_local_safetensors_model), output_path=tmp_path / "policy-control.aeg")
+    control.metadata["evaluation_status"] = "rejected"
+    control.metadata["eval_report"] = report
+    control.save()
+    control.verify_integrity()
     with pytest.raises(BackendError, match="rejected by its persisted evaluation gate"):
         Runtime(RuntimeConfig(hf_offline=True, enable_semantic_cache=False)).generate(
-            str(artifact), "hello", max_tokens=1, temperature=0.0
+            str(control.root), "hello", max_tokens=1, temperature=0.0
         )
 
 

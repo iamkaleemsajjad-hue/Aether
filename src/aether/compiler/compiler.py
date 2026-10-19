@@ -658,10 +658,12 @@ class Compiler:
             quality_budget: Optional quality budget override.
             calibration_dataset: Optional calibration dataset override.
             output_path: Optional path to save the AEG package. If None, uses
-                the Aether cache directory.
+                the Aether cache directory. Candidates are packaged and checked
+                privately; rejected compilation preserves any existing output.
             evaluation_evaluator: Optional measured benchmark callback. When
                 supplied, the callback is executed through the CI evaluation
-                gate before the artifact is accepted.
+                gate before publication. Its spec contains ``aeg_path`` for the
+                private candidate and ``publication_path`` for the destination.
             eval_benchmarks: Benchmark names required by the evaluator.
             eval_baselines: Measured baseline scores keyed by benchmark.
             eval_max_regression: Maximum relative score regression. Defaults
@@ -674,6 +676,11 @@ class Compiler:
             CompilationError: If compilation fails.
         """
         config = self.config.clone()
+        if evaluation_evaluator is not None and not callable(evaluation_evaluator):
+            raise CompilationError(
+                "evaluation_evaluator must be callable",
+                model_id=self._normalize_model_id(model), stage="evaluation",
+            )
         if config.reproducible_builds:
             raw_epoch = os.environ.get("SOURCE_DATE_EPOCH")
             if raw_epoch is None:
@@ -792,26 +799,74 @@ class Compiler:
             msg = f"Hardware targeting failed for {model}: {exc}"
             raise CompilationError(msg, model_id=model_id, stage="stage3_targeting") from exc
 
-        # Stage 4: Package
+        # Package and evaluate a private candidate before any public mutation.
         try:
-            package = self._stage4_package(
-                model_id,
-                architecture,
-                optimized_graph,
-                target_profiles,
-                pass_reports,
-                config,
-                output_path,
-                start_time,
-                source_model_id=model,
+            from aether.compiler.publication import compilation_publication
+            from aether.utils.file_io import aeg_cache_path
+
+            destination = Path(output_path) if output_path is not None else aeg_cache_path(
+                model, config.cache_dir
             )
+            with compilation_publication(
+                destination, overwrite=config.overwrite,
+                source_path=getattr(graph, "metadata", {}).get("source_model_path", model),
+            ) as publication:
+                try:
+                    package = self._stage4_package(
+                        model_id, architecture, optimized_graph, target_profiles,
+                        pass_reports, config, publication.candidate, start_time,
+                        source_model_id=model,
+                    )
+                except Exception as exc:
+                    raise CompilationError(
+                        f"AEG packaging failed for {model}: {exc}",
+                        model_id=model_id, stage="stage4_packaging",
+                    ) from exc
+                self._evaluate_candidate(
+                    package, publication.destination, config, evaluation_evaluator,
+                    eval_benchmarks, eval_baselines, eval_max_regression,
+                )
+                # Verification and all gates precede promotion. No writes or
+                # model computations are needed after the accepted directory moves.
+                package.verify_integrity()
+                publication.publish()
+                package.root = publication.destination
+                # Any lazy index consulted during eligibility checks referred
+                # to the private path; the next reader must bind the public blob.
+                package._weight_store = None
+        except CompilationError as exc:
+            if exc.model_id is None:
+                exc.model_id = model_id
+            raise
         except Exception as exc:
+            raise CompilationError(
+                f"AEG publication failed for {model}: {exc}",
+                model_id=model_id, stage="publication",
+            ) from exc
+        finally:
             shutil.rmtree(pass_artifact_dir, ignore_errors=True)
-            msg = f"AEG packaging failed for {model}: {exc}"
-            raise CompilationError(msg, model_id=model_id, stage="stage4_packaging") from exc
 
-        shutil.rmtree(pass_artifact_dir, ignore_errors=True)
+        logger.info("Compilation complete", model_id=model_id, package_path=str(package.root))
+        return package
 
+    def _evaluate_candidate(
+        self,
+        package: AEGPackage,
+        publication_path: Path,
+        config: CompilerConfig,
+        evaluation_evaluator: Any | None,
+        eval_benchmarks: list[str] | None,
+        eval_baselines: dict[str, float] | None,
+        eval_max_regression: float | None,
+    ) -> None:
+        """Finalize optional benchmark evidence on unpublished candidate bytes.
+
+        Evaluators receive ``spec['aeg_path']`` for actual candidate execution
+        and ``spec['publication_path']`` for its intended destination. They must
+        use the candidate rather than a captured old output path. This callback
+        remains supplementary; it is not the mandatory HF numerical admission.
+        """
+        model_id = package.manifest.model_id if package.manifest else None
         # A missing evaluator is not a passing quality gate. Preserve a
         # truthful uncertified state in the artifact until measured benchmark
         # evidence is supplied below.
@@ -825,12 +880,6 @@ class Compiler:
         package.verify_integrity()
 
         if evaluation_evaluator is not None:
-            if not callable(evaluation_evaluator):
-                raise CompilationError(
-                    "evaluation_evaluator must be callable",
-                    model_id=model_id,
-                    stage="evaluation",
-                )
             try:
                 from aether.observability.ci_pipeline import CIEvalPipeline
 
@@ -846,8 +895,16 @@ class Compiler:
                     aeg_path=package.root,
                     max_regression=max_regression,
                     required_benchmarks=benchmarks,
-                    evaluator=evaluation_evaluator,
+                    evaluator=lambda benchmark, spec: evaluation_evaluator(
+                        benchmark,
+                        {
+                            **spec,
+                            "aeg_path": str(package.root),
+                            "publication_path": str(publication_path),
+                        },
+                    ),
                 ).run(list(benchmarks), baselines=eval_baselines)
+                quality_report.aeg_path = str(publication_path)
                 package.metadata["eval_report"] = quality_report.to_dict()
                 package.metadata["evaluation_status"] = (
                     "certified" if quality_report.gate_decision.passed else "rejected"
@@ -885,9 +942,6 @@ class Compiler:
                     model_id=model_id,
                     stage="evaluation",
                 ) from exc
-
-        logger.info("Compilation complete", model_id=model_id, package_path=str(package.root))
-        return package
 
     def quality_report(self, aeg: AEGPackage) -> QualityReport:
         """Generate a quality report from a compiled AEG artifact.
@@ -997,13 +1051,13 @@ class Compiler:
         start_time: datetime.datetime,
         source_model_id: str | None = None,
     ) -> AEGPackage:
-        """Run Stage 4: create and save the AEG package.
+        """Run Stage 4: create a fresh, unpublished AEG candidate.
 
         ``source_model_id`` is the reference the caller actually passed — a Hugging
-        Face ID or a local directory. The cache path is derived from it through the
-        shared naming contract so that the runtime, which resolves from the same
-        function, looks exactly where this writes. ``model_id`` is the normalized
-        form recorded inside the manifest and is deliberately not used for the path.
+        Face ID or a local directory. ``compile`` supplies a transaction-owned
+        candidate path. Direct internal callers can omit the path and use the
+        canonical cache name, but must still supply a previously absent directory.
+        ``model_id`` is the normalized manifest identity, not the cache-path input.
         """
         from aether.core.aeg_ir import AEGIRModule
 
@@ -1018,11 +1072,11 @@ class Compiler:
         else:
             output_path = Path(output_path)
 
-        if output_path.exists() and not config.overwrite:
-            msg = f"AEG output path already exists: {output_path}. Use overwrite=True to replace."
+        # This stage only builds a fresh candidate. Overwrite policy and old
+        # artifact retention belong to compile()'s publication transaction.
+        if os.path.lexists(output_path):
+            msg = f"AEG candidate output path already exists: {output_path}"
             raise CompilationError(msg, model_id=model_id)
-        if output_path.exists():
-            shutil.rmtree(output_path)
 
         package = AEGPackage.create(output_path, model_id=model_id, aether_version=AETHER_VERSION)
 

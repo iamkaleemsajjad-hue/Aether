@@ -208,3 +208,25 @@ below 64 MiB; the independent configurable headroom remains active. The default
 headroom is 512 MiB. The executed constrained-host diagnostic used 128 MiB and
 is labeled accordingly. See [quality validation](../docs/mission-quality-validation.md)
 for the measured improvements, timing regressions and remaining production gate.
+
+## Compiler publication comparison
+
+Compare an explicit pre-transaction compiler with the current implementation:
+
+```powershell
+& $python -B tools/audit_compiler_publication.py --baseline-revision dea65036a42f0d11d0a95471049de42facb64461 --output build/pass-audit/compiler-publication
+```
+
+This loads the exact recorded `compiler.py` from Git for the baseline; all other
+modules use the current checkout. It isolates candidate publication rather than
+comparing whole releases. It records source hashes, three alternating cold-cache
+builds per variant, integrity checks, every-file differences, native CPU forwards,
+public Runtime, load RSS, timing spread and fixed-label AEG-to-AEG parity. Two
+warmups and seven timed repeats use eight generated IDs on the same 4/64-ID
+prompts. No evaluation callback or HF oracle is invented. The artifacts remain
+uncertified, and synthetic parity does not establish language quality.
+
+Use the default 512 MiB free headroom on a suitable host. Explicitly selecting
+128 MiB retains admission/live guards and labels timings as a constrained-host
+diagnostic. Blocked/failed workers and byte or numerical differences produce a
+nonzero result. Output directories must be new; evidence is never overwritten.

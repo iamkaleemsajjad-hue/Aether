@@ -528,3 +528,73 @@ tests and real NumPy/Torch forwards; no other hardware verification tier changes
 Mandatory pre-publication quality admission, model-family math, remaining pass
 corrections, engine speed/memory work, hardware expansion, robustness and blocking
 CI remain active work. This checkpoint does not complete the mission.
+
+## Compiler publication safety, 2026-10-19
+
+The [publication report](mission-compiler-publication.md) records the reproduced
+data-loss boundary and correction: packaging and optional evaluation now operate
+on a private candidate while prior public bytes remain usable. Native writer
+exclusion, integrity checking and rollback guard promotion. Evaluation callbacks
+execute the candidate path; returned lazy weights rebind to the public path.
+Cancellation recovery checks actual backup bytes, including interruption just
+after the first OS rename. Mandatory original-source-FP32 HF numerical admission
+remains unfinished; this is its publication prerequisite, not its completion.
+
+The final serial collection is **5214 passed, 41 skipped, zero failed; 5255 cases**.
+All 5229 prior cases remain, plus **26 new cases, all passing**. Product tests
+passed 5171 cases with 41 skips in 508.66 seconds; tools passed all 43 cases in
+71.94 seconds. The new cases cover real rejected/malformed checkpoint builds,
+accepted candidate execution, cache discovery, rollback, cancellation, physical
+Windows sharing denial, competing processes, descriptor failures, abrupt process
+exit and a fresh-process import-allocation budget.
+
+Combined coverage improved from **44361/56444 = 78.59294%** to
+**44497/56579 = 78.64579%** lines, and from **10546/16942 = 62.24767%** to
+**10586/16976 = 62.35862%** branches. Publication-module coverage is 89.17% lines
+and 73.53% branches. Critical Ruff, new-file full Ruff and API stub checks pass.
+Compiler/integration full Ruff retain their existing 26/53 diagnostics with no
+new messages. Scoped compiler mypy retains three existing return-Any errors,
+down from five; new source/harness and both new test modules add no errors.
+The native module also passes Linux/macOS platform type checks; those are not
+execution or native filesystem validation on those operating systems.
+
+A measured 1,363,968-byte import RSS increase in the general-lock prototype
+prompted an allocation profile before further changes. Standard-library native
+locking reduced fresh import observations to **8192 RSS bytes / 28399 traced
+Python bytes**, from **1363968 / 1303710**. The direct locking-library dependency
+was removed. Package metadata was rebuilt offline in an isolated build
+environment, and pip check passes without changing installed build tools.
+
+The final guarded three-block audit succeeds. All 16 files match byte for byte
+across six builds, with 190976 bytes per artifact. Actual CPU logits match exactly;
+KL is zero, minimum cosine is 0.9999999999999998, greedy agreement is 16/16 and
+fixed-label PPL change is zero. This is AEG-to-AEG parity on a tiny untrained
+checkpoint, not re-executed HF or trained-model quality certification. Compiler
+RSS returned to the prior range. Timing medians were slower with overlapping
+ranges on the shared host; the report publishes those losses and makes no
+inference speedup or clean-host guarantee.
+
+Earlier attempts remain preserved. The initial complete run had 5205 passes,
+41 skips and four failures: the two existing HTTP MCP cases plus two audit cases
+refused by RAM admission. Both HTTP cases passed in the subsequent complete
+runs without transport-code changes; the origin of the earlier framing problem
+is still unresolved. RAM guards and assertions were not weakened, and those
+failed runs are not relabeled successful. Two early audits were RAM-blocked;
+another reached numerical execution but exposed a missing harness pass-selection
+field, corrected from the actual compiler configuration. The successful
+general-lock prototype audit exposed its import memory cost; the final native
+audit includes the measured correction.
+
+Final evidence is under build/mission/publication-native-* and
+publication-audit-native/report.json. The JUnit multiset verifier confirms every
+prior case and all 26 additions, hashes XML evidence and records the actual green
+verdict. Older publication-area-*, publication-final-*, publication-audit-attempt-*,
+publication-audit-final and publication-audit-complete records remain separate.
+The [report](mission-compiler-publication.md) contains exact measurements, source
+scope, primary OS references and crash/reader limits.
+
+The [22-pass dispositions](mission-default-policy.md) and
+[hardware tiers](../hardware_validation_matrix.json) are unchanged. Current
+execution evidence is physical Windows CPU/native locking. Numerical admission,
+model math, remaining pass corrections, engine speed/memory, broader hardware,
+robustness and blocking CI remain active mission work.

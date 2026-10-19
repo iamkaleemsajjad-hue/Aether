@@ -5,6 +5,17 @@ All notable changes to Aether Runtime will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Preserve existing AEG output when packaging or optional evaluation fails. Build
+  and verify private candidates, serialize cooperating writers with native locks,
+  and restore previous output on promotion failure. Evaluators receive the actual
+  candidate path. Crash/reader limits, regression evidence and incomplete
+  performance validation are documented in
+  [compiler publication safety](docs/mission-compiler-publication.md).
+
 ## [1.3.0] - 2026-09-15 -- Visual Benchmark Telemetry & Documentation Release
 
 ### Added
