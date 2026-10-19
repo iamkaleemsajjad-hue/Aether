@@ -187,3 +187,24 @@ live free-memory checks and the configurable headroom remain active. These
 estimates are admission policy, not measured component memory or guarantees.
 See the [executed policy report](../docs/mission-default-policy.md), including
 mixed TTFT observations and the limits of the small synthetic speed results.
+
+## Quality-validator comparison
+
+After an executed default-policy report contains original-FP32 HF and candidate
+evidence, compare an explicit Git revision of the validator with current source:
+
+```powershell
+& $python -B tools/audit_quality_validator.py --report build/pass-audit/default-policy/report.json --baseline-revision 3ebcb26 --output build/pass-audit/quality-validator
+```
+
+This reuses hashed archived HF outputs, executes the actual NumPy AEG for cache
+history checks, and records fixed-label metrics, fresh-prefix greedy-oracle
+agreement, actual cache-array bytes, serial timing spread and worker/tree RSS.
+It does not rerun HF or certify compiler quality. Baseline/current order
+alternates across three blocks. Missing/changed evidence and blocked workers
+remain unsuccessful. Existing outputs are not overwritten. The fixed tiny
+quality action uses a 256 MiB overhead estimate, based on recorded tree RSS
+below 64 MiB; the independent configurable headroom remains active. The default
+headroom is 512 MiB. The executed constrained-host diagnostic used 128 MiB and
+is labeled accordingly. See [quality validation](../docs/mission-quality-validation.md)
+for the measured improvements, timing regressions and remaining production gate.

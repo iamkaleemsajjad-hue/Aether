@@ -543,6 +543,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comparisons, raw timing spread and worker-identified sampled RSS. Windows
   workers pin UTF-8; admission refusals and unsupported paths remain explicit.
   See `tools/README-pass-audit.md` and `docs/mission-pass-audit.md`.
+- Added a serial quality-validator comparison using hashed original-FP32 HF
+  evidence, actual AEG cache execution and verified-worker memory samples.
+  The report includes timing regressions and does not certify compiler quality.
 - Initial project structure and foundational packages.
 - `aether.core` package: AEG format, AEG-IR, computation graph, tensor types, and content-addressed hashing.
 - `aether.compiler` skeleton: `Compiler` and `CompilerConfig`, dry-run planning, quality reports, and optimizer pass manager.
@@ -579,6 +582,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Made evaluation quality checks reject absent, mismatched and nonfinite
+  evidence, measure uncapped KL/PPL correctly, count greedy suffix mismatches,
+  and validate append-only engine histories against fixed labels. Mutable empty
+  reports cannot assert success. Mandatory compiler/admission integration remains
+  open; measured benefits and costs are in `docs/mission-quality-validation.md`.
 - Returned a one-dimensional FP32 vocabulary vector from Torch's public
   last-position `forward_step`, preserving all-position output and append-only
   caches. Real CPU/Torch prefill/decode regressions cover both cache modes.

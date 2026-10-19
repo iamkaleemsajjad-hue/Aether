@@ -501,6 +501,11 @@ def reserve_bytes(fixture_name: str, action: str, passes: Sequence[int] = ()) ->
     # recorded CPU runs. Keep a 512 MiB estimate plus the independent live
     # headroom guard; the unmeasured 27M oracle retains its 1 GiB estimate.
     overhead = (1024 if fixture_name == "mid" else 512) * MIB if action == "hf" else 384 * MIB
+    # The fixed tiny NumPy quality audit measured below 64 MiB tree RSS in
+    # archived runs. Reserve 256 MiB plus tensor estimates and the independent
+    # live headroom guard. Other fixtures/actions keep their existing reserves.
+    if fixture_name == "tiny" and action == "quality_validation":
+        overhead = 256 * MIB
     return int(overhead + raw * multiplier)
 
 
@@ -657,7 +662,13 @@ class WorkerMemorySampler:
         }
 
 
-def run_worker(job: JsonObject, directory: Path, args: argparse.Namespace) -> JsonObject:
+def run_worker(
+    job: JsonObject,
+    directory: Path,
+    args: argparse.Namespace,
+    *,
+    worker_script: Path | None = None,
+) -> JsonObject:
     """Run one admitted subprocess and sample only its own phase memory."""
     import psutil
 
@@ -704,7 +715,7 @@ def run_worker(job: JsonObject, directory: Path, args: argparse.Namespace) -> Js
             [
                 sys.executable,
                 "-B",
-                str(Path(__file__).resolve()),
+                str((worker_script or Path(__file__)).resolve()),
                 "--worker",
                 str(directory / "job.json"),
             ],
