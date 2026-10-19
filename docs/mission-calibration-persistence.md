@@ -3,7 +3,8 @@
 The optional calibration ledger can now retain measurements in memory when
 temporary-file creation is denied, without retrying that denial as a filename
 collision. This corrects a first-forward stall observed on the physical Windows
-CPU host on 2026-10-19. It does not change model weights or calibration equations.
+CPU host on 2026-10-18 and corrected on 2026-10-19. It does not change model
+weights or calibration equations.
 
 Read scope covered the complete ledger and strategy calibrator, placement exports,
 planner and census call paths, bootstrap, Torch construction/forward contracts,

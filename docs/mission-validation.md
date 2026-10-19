@@ -453,3 +453,78 @@ before/after import-skipping options and `default-policy-critical-ruff-final.txt
 The report's mixed TTFT observations and small RSS deltas establish neither a
 universal latency improvement nor component-memory savings. Physical CPU evidence
 is current; hardware tiers for other backends remain unchanged.
+
+## Evaluation correctness and two runtime prerequisites, 2026-10-19
+
+Three separate changes correct the
+[calibration-ledger stall](mission-calibration-persistence.md),
+[Torch last-position forward-step shape](mission-forward-step-contract.md), and
+[quality measurements and append-only histories](mission-quality-validation.md).
+Those reports record read scope, code-path proof, before-failing regressions,
+primary mathematical/reference sources and measurement limits. No model/kernel
+algorithm or numerical weights were changed. Mandatory compiler quality gating
+is still unfinished; the corrected evaluation API is not claimed as its wiring.
+
+| Check | Before this area | Final executed result |
+|---|---|---|
+| Complete serial collection | 5069 passed, 41 skipped, 2 HTTP MCP failures | **5186 passed, 41 skipped, the same 2 HTTP MCP failures** |
+| Collection continuity | 5112 cases | All retained; exactly 117 added cases, all passing; 5229 total |
+| Tool collection | Prior 43 passed | 43 passed in 87.01 seconds; exit 0 |
+| Product collection | Prior 5026 passed, 41 skipped, 2 failed | 5143 passed, 41 skipped, 2 failed in 610.84 seconds; exit 1 |
+| Line coverage | 43993/56280 = 78.17% | **44361/56444 = 78.59%** |
+| Branch coverage | 10438/16874 = 61.86% | **10546/16942 = 62.25%** |
+| Evaluation validator line / branch coverage | 0% / 0% | 91.87% / 90.00% |
+| New validator, ledger tests and harness full Ruff | Not a prior combined selection | Passed |
+| Critical Ruff across source/tests/benchmarks/examples/tools | Existing check green | Passed |
+| Ledger full Ruff / scoped source mypy errors | 28 / 0 | 28 / 0; no new messages |
+| Torch/portable-test full Ruff; scoped Torch source mypy errors | 116 / 46 | 116 / 46; no new messages |
+| New validator/test scoped mypy; helper/ledger scoped mypy | Existing global backlog remains | Passed for the new scopes |
+| Existing portable-test scoped mypy | 3 pre-existing errors in unchanged lines | Same 3; no new test errors |
+| Dependency consistency | Isolated baseline clean | `pip check` passed; final freeze records added `py-spy==0.4.1` |
+
+The complete collection was run again after correcting a new regression test's
+logging assumption. The first attempt had 42 passing tool tests and one
+RAM-blocked real audit smoke; its product run had 5142 passes, 41 skips and three
+failures. The extra failure asserted that a warning appeared on stdout, while
+earlier tests had configured standard logging. The captured log proves the
+warning was emitted and all persistence/counter assertions had passed. The
+regression now observes the actual logger call and its `PermissionError`, while
+preserving its real logging behavior and restoring the original logger after
+the test. The final whole collection exercises that correction under its normal
+global logging configuration. Production persistence was not changed for it.
+
+The failed audit smoke recorded about 356 MiB available against an approximately
+512 MiB admission requirement. Several workers correctly refused to start.
+After the first product process released memory, the next full tool collection
+passed with the same smoke/admission assertions. That failed attempt is retained,
+not reclassified as successful. Both complete runs still reproduce the two
+unchanged HTTP MCP framing failures documented above. Their origin remains
+unresolved, and the **full-suite-green requirement is not met**.
+
+Final evidence: `build/mission/quality-area-final-tools.*`,
+`quality-area-final-product.*`, `quality-area-final-full-coverage.xml` and
+`quality-area-final-verification.json`. The verifier compares JUnit identity
+multisets, confirms every prior case and all 117 added cases, preserves failure
+verdicts, and hashes the final XML evidence. Earlier failed attempts remain under
+`quality-area-tools.*` and `quality-area-product.*`. Static evidence is in the
+`quality-area-final-*-ruff.*`, `quality-area-final-*-mypy.*`,
+`ledger-static-comparison-final.json` and `forward-step-static-comparison.json`
+records. The portable-test before comparison uses the unchanged `3ebcb26` file.
+
+The serial three-block quality diagnostic succeeded before the suites ran.
+It measured actual final KV arrays at 313344 -> 17408 bytes and cache length
+624 -> 35, repairing greedy agreement with an independent fresh-prefix oracle.
+Full comparison median was 125.7457 -> 83.8309 ms, with a slightly slower first
+block. Stricter metric-check median regressed 0.8784 -> 1.0140 ms. These are
+memory-constrained diagnostic timings, not serving TTFT or tokens/s claims.
+Original-FP32 HF outputs are archived executed evidence, not re-executed by this
+diagnostic. Raw timing spreads, worker identities, RSS and actual numerical
+values are in the [quality report](mission-quality-validation.md).
+
+The [22-pass dispositions](mission-default-policy.md) and
+[executed pass matrix](mission-pass-audit.md) are unchanged by these evaluation
+and I/O fixes. CPU has current physical-host evidence, with controlled denied-I/O
+tests and real NumPy/Torch forwards; no other hardware verification tier changes.
+Mandatory pre-publication quality admission, model-family math, remaining pass
+corrections, engine speed/memory work, hardware expansion, robustness and blocking
+CI remain active work. This checkpoint does not complete the mission.
