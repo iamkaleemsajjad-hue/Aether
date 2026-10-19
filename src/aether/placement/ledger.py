@@ -42,7 +42,7 @@ from __future__ import annotations
 import json
 import math
 import os
-import tempfile
+import secrets
 import threading
 import time
 from dataclasses import dataclass, field
@@ -394,7 +394,15 @@ class CalibrationLedger:
         logger.debug("placement ledger loaded: %d entries", len(self._entries))
 
     def save(self) -> None:
-        """Persist atomically, so a crash mid-write cannot corrupt the ledger."""
+        """Replace the ledger only after writing a complete temporary file.
+
+        Retry name collisions at most eight times; permission and other I/O errors
+        retain the dirty in-memory measurements and return with a warning. Avoid
+        CPython 3.10's ``tempfile._mkstemp_inner`` Windows permission retry, which
+        can spin through ``TMP_MAX`` attempts when an ACL probe says writable but
+        the actual creation is denied. This bounds creation attempts, not the
+        latency of an individual filesystem call or crash durability.
+        """
         with self._lock:
             if not self._dirty:
                 return
@@ -404,20 +412,41 @@ class CalibrationLedger:
                 "bandwidth": self._bandwidth,
                 "entries": {key: entry.to_dict() for key, entry in self._entries.items()},
             }
+            temporary_path: Path | None = None
+            descriptor: int | None = None
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                # Not a context manager on the outer call by design: the file must
-                # outlive the `with` below so os.replace can move it into place.
-                handle = tempfile.NamedTemporaryFile(  # noqa: SIM115
-                    "w", encoding="utf-8", dir=str(self.path.parent),
-                    prefix=".calibration-", suffix=".tmp", delete=False,
-                )
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+                for _ in range(8):
+                    candidate = self.path.parent / f".calibration-{secrets.token_hex(16)}.tmp"
+                    try:
+                        descriptor = os.open(candidate, flags, 0o600)
+                    except FileExistsError:
+                        continue
+                    temporary_path = candidate
+                    break
+                else:
+                    raise FileExistsError(
+                        "could not create calibration file after eight collisions"
+                    )
+                handle = os.fdopen(descriptor, "w", encoding="utf-8")
+                descriptor = None  # The text handle now owns the descriptor.
                 with handle:
                     json.dump(payload, handle, indent=2)
-                os.replace(handle.name, self.path)
+                os.replace(temporary_path, self.path)
                 self._dirty = False
             except OSError as exc:
                 logger.warning("could not persist placement ledger: %s", exc)
+            finally:
+                try:
+                    if descriptor is not None:
+                        os.close(descriptor)
+                finally:
+                    if temporary_path is not None:
+                        try:
+                            temporary_path.unlink(missing_ok=True)
+                        except OSError as exc:
+                            logger.warning("could not remove calibration temporary file: %s", exc)
 
     # ── reads ─────────────────────────────────────────────────────────────────
 

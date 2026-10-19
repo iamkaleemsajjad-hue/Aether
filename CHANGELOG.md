@@ -579,6 +579,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bounded calibration-ledger temporary creation and stopped retrying denied
+  writes as filename collisions. Failed writes preserve previous evidence and
+  clean owned temporary files/descriptors; real Torch CPU forwards keep working
+  with a denied advisory cache. See `docs/mission-calibration-persistence.md`.
 - Made unverified default passes P1/P2/P4/P5/P6/P7/P8 experimental opt-ins,
   retaining default BF16 precision assignment and source MoE/KV execution.
   Pipeline toggles now survive config synchronization and reach internal pass
