@@ -579,6 +579,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Returned a one-dimensional FP32 vocabulary vector from Torch's public
+  last-position `forward_step`, preserving all-position output and append-only
+  caches. Real CPU/Torch prefill/decode regressions cover both cache modes.
+  See `docs/mission-forward-step-contract.md`.
 - Bounded calibration-ledger temporary creation and stopped retrying denied
   writes as filename collisions. Failed writes preserve previous evidence and
   clean owned temporary files/descriptors; real Torch CPU forwards keep working

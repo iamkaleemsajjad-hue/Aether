@@ -2823,6 +2823,8 @@ class TorchAEGEngine:
         else:
             logits_np = np.asarray(device_logits, dtype=np.float32)
 
+        if not return_all_logits:
+            logits_np = logits_np[-1]
         return logits_np, new_cache
 
     def _new_batched_cache(
