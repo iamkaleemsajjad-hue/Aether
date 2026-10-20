@@ -93,7 +93,8 @@ class MambaExecutionEngine:
         result = np.sum(kernel[None, :, :] * window, axis=2)
         if layer.conv_bias is not None:
             result = result + layer.conv_bias
-        return self._silu(result), window[:, :, -max(kernel.shape[1] - 1, 0):]
+        # The window contains k columns; keep k-1, including an empty k=1 history.
+        return self._silu(result), window[:, :, 1:]
 
     def _step(self, hidden: np.ndarray, index: int, cache: MambaCache) -> np.ndarray:
         layer = self.weights.layers[index]

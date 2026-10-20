@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep causal-convolution histories bounded for width-1 kernels in CPU and
+  Torch Mamba/Mamba-2 execution. Independent convolution-oracle and real cache
+  handoff tests reproduce the former wrong outputs and growing history.
+  See [memory, numerical and mixed timing observations](docs/mission-mamba-convolution.md);
+  whole-model HF parity and controlled speed validation remain open.
 - Make the resident-memory sampler probe use an explicitly closed anonymous
   mapping and wait for a real parent RSS observation before releasing it.
   Preserve its peak-size assertion across platforms without relying on malloc

@@ -25,11 +25,12 @@ def _write_tokenizer(path: Path, vocab_size: int) -> None:
 
 
 @pytest.mark.integration
-def test_mamba2_ssd_compiles_serializes_and_generates(tmp_path: Path) -> None:
+@pytest.mark.parametrize("conv", [1, 3])
+def test_mamba2_ssd_compiles_serializes_and_generates(tmp_path: Path, conv: int) -> None:
     safetensors = pytest.importorskip("safetensors.numpy")
     source = tmp_path / "mamba2"
     source.mkdir()
-    vocab, hidden, state, conv, groups, heads, head_dim = 16, 8, 2, 3, 2, 4, 4
+    vocab, hidden, state, groups, heads, head_dim = 16, 8, 2, 2, 4, 4
     inner = heads * head_dim
     channels = inner + 2 * groups * state
     rng = np.random.default_rng(31)
@@ -93,9 +94,11 @@ def test_mamba2_ssd_compiles_serializes_and_generates(tmp_path: Path) -> None:
     from aether.runtime.torch_state_engine import TorchMamba2AEGEngine
 
     cpu_engine = load_engine_from_path(artifact, allow_uncertified=True)
-    cpu_logits, _ = cpu_engine.forward(np.asarray([1, 2, 3], dtype=np.int64))
+    cpu_logits, cpu_cache = cpu_engine.forward(np.asarray([1, 2, 3], dtype=np.int64))
+    assert all(history.shape[-1] == conv - 1 for history in cpu_cache.conv_history)
     portable = TorchMamba2AEGEngine(cpu_engine, "cpu")
-    portable_logits, _ = portable.forward(np.asarray([1, 2, 3], dtype=np.int64))
+    portable_logits, portable_cache = portable.forward(np.asarray([1, 2, 3], dtype=np.int64))
+    assert all(history.shape[-1] == conv - 1 for history in portable_cache.conv_history)
     np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
     mesh = TorchMamba2AEGEngine(cpu_engine, "cpu", devices=["cpu:0", "cpu:1"])
     mesh_logits, _ = mesh.forward(np.asarray([1, 2, 3], dtype=np.int64))

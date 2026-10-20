@@ -178,7 +178,8 @@ class TorchMamba2AEGEngine(_TorchStateBase):
         xbc = (window * kernel.reshape(1, xbc.shape[1], -1)).sum(dim=-1)
         if layer["conv_bias"] is not None:
             xbc = xbc + layer["conv_bias"].reshape(1, -1)
-        cache.conv_history[index] = window[..., -max(self.conv_kernel - 1, 0):].detach()
+        # Drop the oldest column, also when k=1 leaves no history.
+        cache.conv_history[index] = window[..., 1:].detach()
         xbc = self._silu(xbc, torch)
         x = xbc[:, :self.inner_size].reshape(-1, self.num_heads, self.head_dim)
         b = xbc[:, self.inner_size:self.inner_size + groups].reshape(-1, self.num_groups, self.state_size)
@@ -261,7 +262,8 @@ class TorchMambaAEGEngine(_TorchStateBase):
         conv = (window * kernel.reshape(1, self.inner_size, -1)).sum(dim=-1)
         if layer["conv_bias"] is not None:
             conv = conv + layer["conv_bias"].reshape(1, -1)
-        cache.conv_history[index] = window[..., -max(self.conv_kernel - 1, 0):].detach()
+        # Drop the oldest column, also when k=1 leaves no history.
+        cache.conv_history[index] = window[..., 1:].detach()
         conv = self._silu(conv, torch)
         selective = self._linear(conv, layer["x_proj"])
         dt_raw = selective[..., :self.dt_rank]
