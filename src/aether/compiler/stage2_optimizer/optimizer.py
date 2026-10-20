@@ -410,9 +410,16 @@ class PrecisionAssignmentPass(BasePass):
                         # requests until a real evaluation gate is available.
                         precision_map[layer_key] = "BF16"
 
-            # Always keep embedding and LM head at BF16
-            precision_map["embedding"] = "BF16"
-            precision_map["lm_head"] = "BF16"
+            # Quantized plans retain conservative global defaults. An explicit
+            # FP32 request must not silently narrow source parameters, and
+            # named manual overrides take precedence over these defaults.
+            global_precision = (
+                "FP32"
+                if config.precision_assignment_mode == "uniform" and config.precision == "FP32"
+                else "BF16"
+            )
+            precision_map.setdefault("embedding", global_precision)
+            precision_map.setdefault("lm_head", global_precision)
 
             # Annotate nodes with precision
             if hasattr(graph, "iter_layers"):

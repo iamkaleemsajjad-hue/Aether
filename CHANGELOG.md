@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve explicitly requested FP32 globals and projection biases through
+  precision assignment and packing. Real original-HF/CPU/Torch CPU probes
+  recovered 16/16 greedy agreement per executor; the tiny fixture's weight blob
+  costs 8,256 additional bytes. See [storage and numerical evidence](docs/mission-fp32-storage.md).
 - Preserve existing AEG output when packaging or optional evaluation fails. Build
   and verify private candidates, serialize cooperating writers with native locks,
   and restore previous output on promotion failure. Evaluators receive the actual

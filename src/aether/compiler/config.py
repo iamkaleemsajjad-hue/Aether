@@ -332,8 +332,9 @@ class CompilerConfig:
     precision: str | None = None
     """Explicit uniform layer precision. None preserves automatic assignment.
 
-    Embeddings and the output head retain BF16. Lossy formats are an explicit
-    request; they do not establish a measured model-quality guarantee.
+    FP32 preserves globals and biases alongside the layer parameters.
+    Compact formats retain BF16 embedding/head defaults. Requested formats
+    require independent model-quality evaluation.
     """
 
     manual_precision_map: dict[str, str] = field(default_factory=dict)

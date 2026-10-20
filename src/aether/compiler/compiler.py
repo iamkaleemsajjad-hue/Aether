@@ -1224,7 +1224,12 @@ class Compiler:
                     graph=graph,
                     package=package,
                     precision_map=precision_map,
-                    default_precision="BF16",
+                    default_precision=(
+                        "FP32"
+                        if config.precision_assignment_mode == "uniform"
+                        and config.precision == "FP32"
+                        else "BF16"
+                    ),
                     block_size=32,
                 )
                 if quant_stats.tensors_written == 0:
