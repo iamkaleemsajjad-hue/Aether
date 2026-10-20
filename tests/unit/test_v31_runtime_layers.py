@@ -112,7 +112,14 @@ def test_compiled_package_omits_unrequested_v31_templates(
 ) -> None:
     from aether import Compiler
 
-    compiler = Compiler(CompilerConfig(targets=["cpu_avx512"], overwrite=True, calibration_tokens=128))
+    compiler = Compiler(
+        CompilerConfig(
+            quality_mode="diagnostic",
+            targets=["cpu_avx512"],
+            overwrite=True,
+            calibration_tokens=128,
+        )
+    )
     package = compiler.compile(str(tiny_local_safetensors_model), output_path=tmp_path / "qwen.aeg")
     loaded = AEGPackage(package.root).load()
     expected = [

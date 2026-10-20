@@ -23,6 +23,7 @@ import numpy as np
 
 from aether.core.aeg_format import AEGPackage, load_aeg_package
 from aether.core.hash_utils import compute_file_hash
+from aether.core.quality_gate import GATE_PATH
 from aether.core.weight_store import WeightStore
 from aether.quantization.formats import QuantizedTensor, dequantize_tensor, quantize_tensor
 from aether.utils.artifact_publication import publish_staged_directory
@@ -59,6 +60,7 @@ def invalidate_weight_dependent_evidence(
     """
     if package.manifest is None:
         raise ValueError("Evidence invalidation requires a loaded AEG manifest")
+    (package.root / GATE_PATH).unlink(missing_ok=True)
     for directory in ("provenance", "observability", "security", "tee", "watermark"):
         for file in (package.root / directory).rglob("*"):
             if file.is_file() and (

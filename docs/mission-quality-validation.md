@@ -3,9 +3,10 @@
 The evaluation validator now rejects missing, mismatched and nonfinite evidence,
 scores fixed next-token labels correctly, and drives append-only engine caches
 without duplicating their prefixes. This is a correction to the evaluation API.
-**Mandatory compiler/publication and runtime-admission quality gating is still
-open**: the compiler's existing `core.QualityReport` is a different type, and no
-new production compiler gate is claimed here.
+This report records the validator correction before mandatory compiler/runtime
+integration. The subsequent [numerical admission report](mission-numerical-admission.md)
+documents that integration, actual original-HF execution, costs and limitations.
+The compiler's older `core.QualityReport` remains a separate summary type.
 
 Read scope covered the complete evaluation validator and exports, its importers,
 compiler quality/report contracts, evaluation tests, actual CPU/Torch forward-step
@@ -110,16 +111,18 @@ the retained edge/DTO/consistency failures, `quality-combined-focused.*`,
 attempts exited one. Raw samples, cache traces, actual outputs, source/evidence
 hashes, profiling records and verified-worker RSS remain in those directories.
 
-## Remaining integration
+## Integration required at the original checkpoint
 
 Production admission must bind original source/config/tokenizer/sample identities
 to the candidate graph, weights, execution profile and actual HF measurements,
 then recompute all required gates before publishing or replacing an artifact.
-The current optional compiler evaluator runs after publication and cannot serve
-as that contract. A source-FP32 oracle must not be substituted with a BF16 AEG or
+At this checkpoint the optional compiler evaluator ran after publication and
+could not serve as that contract. A source-FP32 oracle must not be substituted with a BF16 AEG or
 a low-precision reference merely to fit memory. Unsupported references and
 unavailable memory must remain clear refusals. CLI, SDK and serving admission
-still need this mandatory end-to-end gate.
+needed this mandatory end-to-end gate. The subsequent implementation and its
+remaining ONNX/accelerator/transformed-reference limits are recorded in
+[numerical admission](mission-numerical-admission.md).
 
 The [full collection report](mission-validation.md),
 [ledger correction](mission-calibration-persistence.md),

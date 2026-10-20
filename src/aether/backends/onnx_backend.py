@@ -138,7 +138,11 @@ class ONNXBackend(Backend):
         """
         from aether.backends.model_contract import model_format
 
-        if aeg_path is not None or model_format(model_id) == "aeg":
+        if (
+            isinstance(self._models.get(model_id), ONNXAEGHandle)
+            or aeg_path is not None
+            or model_format(model_id) == "aeg"
+        ):
             return self._load_aeg_model(model_id, aeg_path or model_id, **kwargs)
         if "providers" in kwargs and (
             not isinstance(kwargs["providers"], (list, tuple)) or not kwargs["providers"]
@@ -265,6 +269,12 @@ class ONNXBackend(Backend):
                     "model ID already refers to a raw ONNX session; unload it first",
                     backend_name=self.name,
                 )
+            from aether.backends.artifact_validation import validate_cached_evaluation
+
+            validate_cached_evaluation(
+                self._models[model_id], allow_uncertified=kwargs.get("allow_uncertified", False),
+                backend_name=self.name,
+            )
             engine = self._models[model_id].engine
             requested_mesh = kwargs.get("execution_devices")
             if requested_mesh and list(requested_mesh) not in (
@@ -312,7 +322,10 @@ class ONNXBackend(Backend):
             package = load_aeg_package(path)
             from aether.backends.artifact_validation import validate_aeg_evaluation, verify_aeg_integrity
 
-            validate_aeg_evaluation(package, backend_name=self.name)
+            numerical_quality_admitted = validate_aeg_evaluation(
+                package, backend_name=self.name,
+                allow_uncertified=kwargs.get("allow_uncertified", False),
+            )
             if not package.supports_portable_backend("onnx"):
                 raise BackendError(
                     "AEG export requires a declared portable 'onnx' contract",
@@ -329,7 +342,8 @@ class ONNXBackend(Backend):
             )
             resource = tempfile.TemporaryDirectory(prefix="aether-onnx-")
             bundle = export_aeg_to_onnx(
-                package, Path(resource.name) / "export", max_context=kwargs.get("max_context")
+                package, Path(resource.name) / "export", max_context=kwargs.get("max_context"),
+                allow_uncertified=kwargs.get("allow_uncertified", False),
             )
             options = {
                 key: kwargs[key]
@@ -415,6 +429,7 @@ class ONNXBackend(Backend):
                 precision_map=package.get_precision_map(),
                 engine=engine,
                 tokenizer=tokenizer,
+                numerical_quality_admitted=numerical_quality_admitted,
             )
             self._models[model_id] = handle
             self._tokenizers[model_id] = tokenizer

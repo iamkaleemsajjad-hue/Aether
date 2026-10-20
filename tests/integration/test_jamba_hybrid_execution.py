@@ -85,6 +85,7 @@ def test_jamba_hybrid_compiles_reloads_and_reuses_cache(tmp_path: Path) -> None:
 
     artifact = tmp_path / "jamba.aeg"
     Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
         overwrite=True, calibration_tokens=4,
         cache_dir=str(tmp_path / "cache"),
@@ -106,7 +107,7 @@ def test_jamba_hybrid_compiles_reloads_and_reuses_cache(tmp_path: Path) -> None:
     assert package.supports_runtime_target("metal_m3")
     assert "pytorch" in package.manifest.kernels.portable_backends
 
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
     full_logits, full_cache = engine.forward(np.asarray([1, 2, 3], dtype=np.int64))
     step_logits, step_cache = engine.forward(np.asarray([1, 2], dtype=np.int64))
     step_logits_2, step_cache = engine.forward(np.asarray([3], dtype=np.int64), step_cache)
@@ -124,9 +125,9 @@ def test_jamba_hybrid_compiles_reloads_and_reuses_cache(tmp_path: Path) -> None:
     mesh_logits, _ = mesh.forward(np.asarray([1, 2, 3], dtype=np.int64))
     np.testing.assert_allclose(full_logits, mesh_logits, rtol=2e-5, atol=2e-5)
 
-    result = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
-        str(artifact), prompt="hello", max_tokens=2, temperature=0.0
-    )
+    result = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2)
+    ).generate(str(artifact), prompt="hello", max_tokens=2, temperature=0.0)
     assert result.usage["completion_tokens"] == 2
     assert result.text
 
@@ -146,6 +147,6 @@ def test_jamba_hybrid_rejects_incomplete_schedule(tmp_path: Path) -> None:
     (source / "config.json").write_text(json.dumps(config), encoding="utf-8")
     safetensors.save_file({"model.embed_tokens.weight": np.zeros((8, 8), dtype="float32")}, str(source / "model.safetensors"))
     with pytest.raises(Exception, match="hybrid|schedule|layer"):
-        Compiler(CompilerConfig(targets=["cpu_avx2"], overwrite=True)).compile(
-            str(source), output_path=tmp_path / "invalid.aeg"
-        )
+        Compiler(
+            CompilerConfig(quality_mode="diagnostic", targets=["cpu_avx2"], overwrite=True)
+        ).compile(str(source), output_path=tmp_path / "invalid.aeg")

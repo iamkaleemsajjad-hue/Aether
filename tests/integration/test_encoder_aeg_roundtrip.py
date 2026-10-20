@@ -86,6 +86,7 @@ def test_encoder_compile_reload_and_embedding(tmp_path: Path) -> None:
 
     package = Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             pruning_target_sparsity=0.0,
             targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
         )
@@ -98,14 +99,14 @@ def test_encoder_compile_reload_and_embedding(tmp_path: Path) -> None:
     assert package.manifest.kernels.variant_status["rocm_cdna3"] == "portable"
     assert package.manifest.kernels.variant_status["metal_m3"] == "portable"
     assert "pytorch" in package.manifest.kernels.portable_backends
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
     embedding = np.asarray(engine.embed([[1, 2, 3]]), dtype=np.float32)
     assert embedding.shape == (1, 8)
     assert np.isfinite(embedding).all()
     assert not np.allclose(embedding, 0.0)
 
     backend = TorchBackend()
-    backend.load_model("tiny-bert", str(artifact), offline=True)
+    backend.load_model("tiny-bert", str(artifact), offline=True, allow_uncertified=True)
     api_embedding = np.asarray(backend.embed("tiny-bert", ["tok1 tok2"]), dtype=np.float32)
     assert api_embedding.shape == (1, 8)
     assert np.isfinite(api_embedding).all()

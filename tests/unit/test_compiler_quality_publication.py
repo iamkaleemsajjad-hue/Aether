@@ -18,6 +18,7 @@ from aether.runtime.aeg_loader import load_engine_from_path
 
 def _config(root: Path) -> CompilerConfig:
     return CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         skip_download=True,
         overwrite=True,
@@ -35,7 +36,7 @@ def _inventory(root: Path) -> dict[str, str]:
 
 
 def _capture(root: Path) -> tuple[Any, list[int]]:
-    engine = load_engine_from_path(root, prepare_native_kernels=False)
+    engine = load_engine_from_path(root, prepare_native_kernels=False, allow_uncertified=True)
     ids = np.asarray([1, 2], dtype=np.int64)
     logits, _ = engine.forward(ids)
     tokens = list(engine.generate_iter(ids, max_tokens=3, temperature=0))

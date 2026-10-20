@@ -247,8 +247,13 @@ def test_real_cli_phase_workers_are_joined_before_command_returns(tmp_path, monk
     from aether import Compiler, CompilerConfig
     from aether.backends.hardware_validation import _write_probe_checkpoint
     _write_probe_checkpoint(tmp_path / "checkpoint")
-    config = CompilerConfig(targets=["cpu_generic"], precision="FP32", optimization_level=0,
-                            cache_dir=str(tmp_path / "compiler-cache"))
+    config = CompilerConfig(
+        quality_mode="diagnostic",
+        targets=["cpu_generic"],
+        precision="FP32",
+        optimization_level=0,
+        cache_dir=str(tmp_path / "compiler-cache"),
+    )
     for item in fields(config):
         if item.name.startswith("enable_"):
             setattr(config, item.name, item.name == "enable_precision_assignment")
@@ -270,7 +275,8 @@ def test_real_cli_phase_workers_are_joined_before_command_returns(tmp_path, monk
             raise KeyboardInterrupt()
         return original(message, *args, **kwargs)
     monkeypatch.setattr(click, "echo", observe)
-    args = ["--runtime-config", str(runtime_config), "run", str(artifact), "--prompt", "hello world",
+    args = ["--diagnostic", "--runtime-config", str(runtime_config), "run", str(artifact),
+            "--prompt", "hello world",
             "--max-tokens", "2", "--temperature", "0", "--raw", "--non-interactive"]
     if mode != "completion":
         args.append("--stream")
@@ -526,7 +532,7 @@ def test_real_offline_cpu_command_workflow(tiny_local_safetensors_model, tmp_pat
     monkeypatch.setenv("AETHER_EXECUTION_DEVICES", "cpu")
     monkeypatch.setenv("AETHER_HF_OFFLINE", "1")
     cache = tmp_path / "cache"
-    prefix = ["--cache-dir", str(cache)]
+    prefix = ["--diagnostic", "--cache-dir", str(cache)]
     runner = _runner()
     compiled = runner.invoke(cli, prefix + ["compile", str(tiny_local_safetensors_model), "--target", "cpu_avx2", "--precision", "fp32"])
     assert compiled.exit_code == 0, compiled.output

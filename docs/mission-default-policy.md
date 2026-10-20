@@ -134,7 +134,7 @@ Exact dependency versions remain in `clean-freeze.txt`.
 |---|---|---|
 | 1 fusion | Off; experimental IR | Actual group reporting; no engine schedule consumer |
 | 2 sensitivity | Off; experimental diagnostic | Reconstruction proxy, no default P3 decision change |
-| 3 precision | On | Encoded weights consumed; default BF16; no automatic quality certificate |
+| 3 precision | On | Encoded weights consumed; default BF16; explicit FP32 preservation corrected; publication's independent numerical gate is described below |
 | 4 KV structure | Off; experimental IR | Engine caches independent; duplicate-application defect remains |
 | 5 MoE tiers | Off; experimental hints | Source router/top-k remain executable; placement benefit unproved |
 | 6 parallelism | Off; experimental inspection | Applied producer required for files; no device-placement consumer |
@@ -150,15 +150,22 @@ Exact dependency versions remain in `clean-freeze.txt`.
 | 16 green | Off; experimental accounting | No measured device energy reduction |
 | 17 TEE | Off; unsupported execution | No backend-emitted attested kernels; explicit CLI request refused |
 | 18 MDLM | Off; experimental supplied trained heads | Missing weights refused/skipped; real draft benefit unproved |
-| 19 sub-2-bit | Off; experimental lossy storage | Dense dequantization; numerical gate/kernel still unfinished |
+| 19 sub-2-bit | Off; experimental lossy storage | Dense dequantization; independent compiler numerical gate added; optimized runtime kernel and QAT quality remain unverified |
 | 20 video | Off; unsupported CPU execution | No end-to-end VLM benefit verified |
 | 21 adapter | Off; experimental supplied tensors | Dense adapter consumer; source scaling/parity unresolved |
 | 22 RLVR | Off; experimental training integration | Gradient callbacks required; generation cannot validate training |
 
 The [pass reference](optimizer-passes.md) records flags and consumers; the
 [historical 22-row audit](mission-pass-audit.md) preserves the individual measured
-losses. Full ordering/idempotency, mandatory numerical compiler gating, model-family
+losses. Full ordering/idempotency, model-family
 math, trained-model and larger-model performance, memory attribution/soak,
 hardware execution, archive/download robustness and blocking CI remain open.
 Current CPU evidence is physical execution; historical DirectML evidence is not
 rerun, and no accelerator tier is promoted by this correction.
+
+On 2026-10-20, [independent numerical admission](mission-numerical-admission.md)
+was added before ordinary publication/loading, comparing actual CPU and Torch
+CPU against original FP32 HF. It is separate from P3 and checks every compiled
+base candidate. Diagnostic audits explicitly retain uncertified execution so
+they can measure rejected experimental cases. This does not establish runtime
+benefits for the remaining passes or certify request-time transformations.

@@ -69,6 +69,7 @@ def compile_revision(job: dict[str, Any]) -> dict[str, Any]:
     spec.loader.exec_module(module)
     work = Path(job["work"])
     config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         skip_download=True,
         overwrite=True,
@@ -91,7 +92,7 @@ def compile_revision(job: dict[str, Any]) -> dict[str, Any]:
         "artifact_bytes": sum(row["bytes"] for row in files.values()),
         "enabled_passes": [entry.number for entry in PASSES if getattr(config, entry.flag)],
         "evaluation_status": package.metadata.get("evaluation_status"),
-        "quality_scope": "No evaluator supplied; not compiler quality certification",
+        "quality_scope": "Explicit diagnostic compilation; not compiler quality certification",
         "final_memory_point": memory_point("compile"),
     }
 

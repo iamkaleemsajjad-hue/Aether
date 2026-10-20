@@ -9,8 +9,10 @@ targeting, and packaging. Pass flags select transformations independently.
 from __future__ import annotations
 
 from copy import deepcopy
+import math
 import os
 from dataclasses import dataclass, field, fields
+from numbers import Real
 from typing import Any
 
 from aether.core.constants import (
@@ -66,6 +68,24 @@ class CompilerConfig:
 
     quality_budget: float = DEFAULT_QUALITY_BUDGET
     """Requested quality budget; without evaluation evidence this certifies no PPL bound."""
+
+    quality_mode: str = "require_hf"
+    """Require measured original-HF numerical admission; 'diagnostic' is uncertified."""
+
+    quality_dataset: str | None = None
+    """Optional fixed-probe JSONL (text prefix/continuation or explicit token IDs)."""
+
+    quality_greedy_tokens: int = 32
+    """Fixed greedy continuation count per probe; EOS does not shorten the check."""
+
+    quality_memory_headroom_mib: int = 256
+    """Required free host memory throughout each isolated quality worker."""
+
+    quality_worker_timeout_s: float = 600.0
+    """Per-worker deadline; a timed out or RAM-blocked reference cannot certify an AEG."""
+
+    model_revision: str = "main"
+    """Hub revision resolved once to an immutable commit before normal compilation."""
 
     calibration_dataset: str = DEFAULT_CALIBRATION_DATASET
     """Dataset name used for sensitivity analysis and calibration."""
@@ -332,9 +352,9 @@ class CompilerConfig:
     precision: str | None = None
     """Explicit uniform layer precision. None preserves automatic assignment.
 
-    FP32 preserves globals and biases alongside the layer parameters.
-    Compact formats retain BF16 embedding/head defaults. Requested formats
-    require independent model-quality evaluation.
+    FP32 preserves all source parameter values, including globals and biases.
+    Compact formats retain BF16 embedding/head defaults. A requested format
+    must still pass the independent numerical gate for ordinary publication.
     """
 
     manual_precision_map: dict[str, str] = field(default_factory=dict)
@@ -475,9 +495,39 @@ class CompilerConfig:
 
     def validate(self) -> None:
         """Validate configuration values and raise CompilerConfigError on failure."""
-        if self.quality_budget < 0.0 or self.quality_budget > 1.0:
+        if self.quality_mode not in ("require_hf", "diagnostic"):
+            raise CompilerConfigError("quality_mode must be 'require_hf' or 'diagnostic'")
+        if self.quality_dataset is not None and (
+            not isinstance(self.quality_dataset, str) or not self.quality_dataset
+        ):
+            raise CompilerConfigError("quality_dataset must be a nonempty JSONL path")
+        if (
+            type(self.quality_greedy_tokens) is not int
+            or not 1 <= self.quality_greedy_tokens <= 128
+        ):
+            raise CompilerConfigError("quality_greedy_tokens must be an integer in [1, 128]")
+        if (
+            type(self.quality_memory_headroom_mib) is not int
+            or self.quality_memory_headroom_mib < 128
+        ):
+            raise CompilerConfigError("quality_memory_headroom_mib must be an integer >= 128")
+        if (
+            type(self.quality_worker_timeout_s) not in (int, float)
+            or not math.isfinite(self.quality_worker_timeout_s)
+            or self.quality_worker_timeout_s <= 0
+        ):
+            raise CompilerConfigError("quality_worker_timeout_s must be finite and positive")
+        if not isinstance(self.model_revision, str) or not self.model_revision.strip():
+            raise CompilerConfigError("model_revision must be a nonempty Hub revision")
+        if (
+            isinstance(self.quality_budget, bool)
+            or not isinstance(self.quality_budget, Real)
+            or not 0.0 <= self.quality_budget <= 1.0
+            or not math.isfinite(self.quality_budget)
+        ):
             msg = f"quality_budget must be in [0, 1], got {self.quality_budget}"
             raise CompilerConfigError(msg)
+        self.quality_budget = float(self.quality_budget)
         if self.optimization_level < 0 or self.optimization_level > 3:
             msg = f"optimization_level must be 0-3, got {self.optimization_level}"
             raise CompilerConfigError(msg)

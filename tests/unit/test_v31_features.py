@@ -56,6 +56,7 @@ def test_compiled_package_contains_v31_artifacts(tmp_path) -> None:
 
     compiler = Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=128,
@@ -73,6 +74,7 @@ def test_local_compiled_package_contains_v31_artifacts(tmp_path, tiny_local_safe
 
     compiler = Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_generic"],
             overwrite=True,
             calibration_tokens=128,

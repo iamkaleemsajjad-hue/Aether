@@ -6,6 +6,12 @@ dependencies installed. Workers use this checkout's `src/`, and are always
 serial. Do not run execution alongside another suite or benchmark. `--plan`
 does not launch workers or create fixtures.
 
+Audit compiles explicitly select `quality_mode="diagnostic"`; loader and public
+Runtime probes explicitly permit uncertified execution. This lets the harness
+measure and retain failing experimental cases. It does not bypass production
+admission or turn its optional HF comparisons into a persisted numerical gate.
+Ordinary compilation/execution follows [numerical admission](../docs/mission-numerical-admission.md).
+
 Workers pin Python file and pipe encoding to UTF-8, including on Windows and
 when the parent requests another encoding. This makes the recorded UTF-8 logs
 reliable; it does not fix unconfigured logging in other library applications.

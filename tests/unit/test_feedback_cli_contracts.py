@@ -193,6 +193,7 @@ def test_cli_precision_reaches_serialized_weights(
     result = CliRunner().invoke(
         cli,
         [
+            "--diagnostic",
             "--cache-dir",
             str(tmp_path / "cache"),
             "compile",
@@ -220,11 +221,12 @@ def test_real_cpu_artifact_bench_run_stream_and_metrics_on_a_gpu_host(
 ):
     from dataclasses import replace
 
-    from aether import Compiler, Runtime
+    from aether import Compiler, Runtime, RuntimeConfig
     from aether.runtime.hardware import HardwareDetector
 
     artifact = Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx2"],
             cache_dir=str(tmp_path / "cache"),
         )
@@ -243,19 +245,22 @@ def test_real_cpu_artifact_bench_run_stream_and_metrics_on_a_gpu_host(
         },
     )
     monkeypatch.setattr(HardwareDetector, "detect", lambda _: fingerprint)
-    runtime = Runtime()
+    runtime = Runtime(RuntimeConfig(allow_uncertified=True))
     response = runtime.generate(str(artifact.root), "hello", max_tokens=2, temperature=0.0)
     assert response.usage["completion_tokens"] == 2
     assert response.metrics.kernel_target == cpu_target
     assert response.metrics.backend_name == "aether_cpu"
     runner = CliRunner()
-    bench = runner.invoke(cli, ["bench", str(artifact.root), "--max-tokens", "2", "--json"])
+    bench = runner.invoke(
+        cli, ["--diagnostic", "bench", str(artifact.root), "--max-tokens", "2", "--json"]
+    )
     assert bench.exit_code == 0, bench.output
     assert json.loads(bench.output)["backend"] == "aether_cpu"
     assert json.loads(bench.output)["kernel_target"] == cpu_target
     stream = runner.invoke(
         cli,
         [
+            "--diagnostic",
             "run",
             str(artifact.root),
             "--prompt",
@@ -282,7 +287,9 @@ def test_real_cpu_artifact_serves_openai_http(tiny_local_safetensors_model, tmp_
     from aether import Compiler
 
     artifact = Compiler(
-        CompilerConfig(targets=["cpu_avx2"], cache_dir=str(tmp_path / "cache"))
+        CompilerConfig(
+            quality_mode="diagnostic", targets=["cpu_avx2"], cache_dir=str(tmp_path / "cache")
+        )
     ).compile(str(tiny_local_safetensors_model), output_path=tmp_path / "served.aeg")
     with socket.socket() as port_probe:
         port_probe.bind(("127.0.0.1", 0))
@@ -298,6 +305,7 @@ def test_real_cpu_artifact_serves_openai_http(tiny_local_safetensors_model, tmp_
                 sys.executable,
                 "-m",
                 "aether",
+                "--diagnostic",
                 "--cache-dir",
                 str(tmp_path / "cache"),
                 "serve",

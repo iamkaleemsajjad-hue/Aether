@@ -22,7 +22,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aether.compiler.config import CompilerConfig
 from aether.compiler.plan import (
@@ -46,10 +46,14 @@ from aether.core.aeg_format import AEGManifest, AEGPackage, KernelSetMetadata, M
 from aether.core.constants import AEG_FORMAT_VERSION, AETHER_VERSION, DEFAULT_HUB_URL, SUPPORTED_TARGET_IDS
 from aether.core.exceptions import CompilationError, CompilerConfigError, CompilerPassError
 from aether.core.hash_utils import compute_aeg_cache_key, compute_graph_hash
+from aether.core.quality_gate import NumericalQualityError
 from aether.core.types import HardwareTarget, ModelArchitecture, Precision, ShardingPlan
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from aether.compiler.numerical_admission import NumericalAdmission
 
 
 #: Logical per-layer tensors the CPU forward pass requires for every
@@ -708,9 +712,32 @@ class Compiler:
         if calibration_dataset is not None:
             config.calibration_dataset = calibration_dataset
 
+        from aether.compiler.numerical_admission import numerical_admission
+
+        with numerical_admission(model, config) as admission:
+            return self._compile_candidate(
+                model, config, start_time, output_path, admission,
+                evaluation_evaluator, eval_benchmarks, eval_baselines, eval_max_regression,
+            )
+
+    def _compile_candidate(
+        self,
+        model: str,
+        config: CompilerConfig,
+        start_time: datetime.datetime,
+        output_path: str | Path | None,
+        admission: NumericalAdmission | None,
+        evaluation_evaluator: Any | None,
+        eval_benchmarks: list[str] | None,
+        eval_baselines: dict[str, float] | None,
+        eval_max_regression: float | None,
+    ) -> AEGPackage:
+        """Build while the pre-ingestion reference and its cleanup remain owned."""
+        source = str(admission.source) if admission is not None else model
+
         # Resolve model ID and detect architecture
         try:
-            architecture = self._detect_architecture(model)
+            architecture = self._detect_architecture(source)
         except Exception as exc:
             msg = f"Architecture detection failed for {model}: {exc}"
             raise CompilationError(msg, model_id=model, stage="ingestion") from exc
@@ -725,10 +752,12 @@ class Compiler:
 
         # Stage 1: Ingestion
         try:
-            graph = self._stage1_ingest(model, architecture)
+            graph = self._stage1_ingest(source, architecture)
         except Exception as exc:
             msg = f"Model ingestion failed for {model}: {exc}"
             raise CompilationError(msg, model_id=model_id, stage="stage1_ingestion") from exc
+        if admission is not None:
+            admission.verify_source()
 
         # Stage 1 may materialize a Hub snapshot and replace preliminary
         # name-based metadata with the checkpoint's authoritative config.  The
@@ -826,6 +855,8 @@ class Compiler:
                     package, publication.destination, config, evaluation_evaluator,
                     eval_benchmarks, eval_baselines, eval_max_regression,
                 )
+                if admission is not None:
+                    admission.accept(package)
                 # Verification and all gates precede promotion. No writes or
                 # model computations are needed after the accepted directory moves.
                 package.verify_integrity()
@@ -834,6 +865,11 @@ class Compiler:
                 # Any lazy index consulted during eligibility checks referred
                 # to the private path; the next reader must bind the public blob.
                 package._weight_store = None
+        except NumericalQualityError as exc:
+            raise CompilationError(
+                f"Numerical quality admission failed: {exc}",
+                model_id=model_id, stage="numerical_quality",
+            ) from exc
         except CompilationError as exc:
             if exc.model_id is None:
                 exc.model_id = model_id
@@ -1122,6 +1158,7 @@ class Compiler:
         package.metadata.update({
             "model_id": model_id,
             "architecture": architecture.to_dict(),
+            "numerical_quality_mode": config.quality_mode,
         })
 
         # Compute graph hash

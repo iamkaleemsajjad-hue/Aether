@@ -1,16 +1,17 @@
 # Aether Runtime implementation status
 
-Reviewed 2026-10-18. The runtime/compiler mission is in progress.
+Reviewed 2026-10-20. The runtime/compiler mission is in progress.
 
 Supported CPU AEG compilation, integrity verification, reload and generation have
-executed on an Intel Core i5-1334U running Windows. The clean baseline passed
-4,923 tests with 41 skips; after the speculation and package corrections, the
-complete collection passed 5,059 tests with 41 skips in two serial processes.
-Torch and Transformers were installed.
-That checkpoint's line coverage was 78.26%. The subsequent default-policy
-collection returned 5069 passed, 41 skipped and two existing localhost HTTP
-failures, also reproduced on unchanged source. Current line coverage is 78.17%;
-full-suite-green and coverage-not-reduced remain unresolved. These are
+executed on an Intel Core i5-1334U running Windows. The last complete green
+collection passed 5,214 tests with 41 skips in two serial processes, with Torch
+and Transformers installed; line coverage was 78.6457873%. The numerical-admission
+area's complete verification is recorded in [its report](docs/mission-numerical-admission.md).
+Independent stdlib-only local HTTP POSTs reproduce altered response framing
+affecting two MCP tests. The latest serial product/tools runs returned 5,264
+passed, 41 skipped and four failures (two HTTP framing cases and two RAM-refused
+audit workers), retaining all prior cases and adding 54. Line coverage increased
+to 78.6648254%. Full-suite-green remains open. These are
 functional checks, not production or
 throughput certification. Exact environment, evidence, known failures and the
 22-pass matrix are in [the validation record](docs/mission-validation.md).
@@ -24,7 +25,7 @@ throughput certification. Exact environment, evidence, known failures and the
 | Compiler failure admission | Reported optimizer failures now reject compilation before targeting or destination mutation. Original failure details survive; existing artifacts and diagnostic pipeline reports are preserved. This is separate from mandatory numerical quality gating. |
 | Legacy tree speculation | Fabricated candidates removed; unsupported drafting fails closed. Manual verification requires target evidence. [Migration and tests](docs/legacy-speculation.md). |
 | Executable speculation | Explicit draft/target execution and cache tests pass. Medusa/self-speculation require separate review; no blanket distribution or acceleration guarantee is claimed. |
-| Quality gate | Validator input/protocol defects and missing compiler integration are reproduced. Automatic quality certification is unfinished. |
+| Quality gate | Default compilation measures original FP32 HF against actual CPU and Torch CPU AEG execution before publication. Loader/backend/cache admission requires bound evidence; diagnostics waive absence only. Real tiny public API/CLI execution passed. ONNX/accelerator checks, trained-model/corpus quality, transformed references and runtime adaptation remain unfinished; see [scope and costs](docs/mission-numerical-admission.md). |
 | Model families | [The graded family registry](SUPPORTED_MODELS.md) distinguishes parity checks, execution-only coverage, known divergence and refused families. Mamba/Mamba-2/RWKV-7/Jamba require numerical correction. |
 | KV and batching | Real storage and runtime tests exist. Bounded memory, eviction, copy-on-write and long-running serving require per-path measurement; a pool implementation alone does not prove end-to-end behavior. |
 | Hardware | [The maintained matrix](hardware_validation_matrix.json) separates recorded execution, compilation checks and incomplete integration. Historical Intel UHD DirectML evidence is scoped and dated; other accelerator paths need their own execution records. |

@@ -261,16 +261,26 @@ def _execute_aeg_probe(backend: Any, cap: HardwareCapabilities, device_index: in
         root = Path(directory)
         checkpoint = root / "checkpoint"
         _write_probe_checkpoint(checkpoint)
-        config = CompilerConfig(targets=[cap.target_id], precision="FP32", optimization_level=0,
-                                cache_dir=str(root / "cache"))
+        config = CompilerConfig(
+            quality_mode="diagnostic",
+            targets=[cap.target_id],
+            precision="FP32",
+            optimization_level=0,
+            cache_dir=str(root / "cache"),
+        )
         for item in fields(config):
             if item.name.startswith("enable_"):
                 setattr(config, item.name, item.name == "enable_precision_assignment")
         artifact = root / "probe.aeg"
         Compiler(config).compile(str(checkpoint), output_path=artifact)
-        reference = load_engine_from_path(artifact, prepare_native_kernels=False)
+        reference = load_engine_from_path(
+            artifact, prepare_native_kernels=False, allow_uncertified=True
+        )
         try:
-            handle = backend.load_model(model_id, aeg_path=str(artifact), execution_devices=[device], offline=True)
+            handle = backend.load_model(
+                model_id, aeg_path=str(artifact), execution_devices=[device],
+                offline=True, allow_uncertified=True,
+            )
             engine = handle.engine
             if engine is None:
                 raise RuntimeError("Backend did not load an executable AEG engine")
@@ -325,6 +335,8 @@ def _execute_aeg_probe(backend: Any, cap: HardwareCapabilities, device_index: in
                     "prefill_logits_shape": list(measured.shape), "decode_logits_shape": list(measured_decode.shape),
                     "kv_cache_length": cache.length, "storage_precision": "FP32",
                     "compute_dtype": compute_dtype,
+                    "compilation_quality_mode": "diagnostic",
+                    "original_hf_quality_validated": False,
                     "native_cpu": bool(kernels.is_native) if kernels is not None else None,
                     "tensor_devices": tensor_devices,
                     "reference": "independent NumPy FP32 CPU engine", "max_absolute_errors": errors,

@@ -9,8 +9,9 @@ An AEG artifact is a directory (or compressed archive) containing:
 - A versioned AEG-IR computation graph
 - Mixed-precision quantized weights
 - Per-target backend/kernel plans
-- Pre-computed parallelism plans for 1/2/4/8 GPUs
+- Optional parallelism inspection plans from an explicitly selected producer
 - A top-level manifest with hashes and provenance
+- Bound numerical evidence for ordinarily compiled/executed artifacts
 
 ## Package Layout
 
@@ -36,14 +37,20 @@ my-model.aeg/
     └── 8gpu.json                     # 8-GPU plan
 ```
 
+The layout illustrates optional legacy extensions. Ordinary compilation does
+not emit generic GPU plans or unused platform templates. Current measured builds
+also include `quality/numerical_gate.json`, described below.
+
 ## Versioning
 
 AEG format versions follow semantic compatibility rules:
 
-- **AEG/1.x** — Stable forever. All 1.x `.aeg` files are readable by all future Aether versions.
-- **AEG/2.x** — When introduced, backward compatibility mode will be maintained for 3 years.
+- **AEG/1.x** — Existing reader compatibility is retained; optional extensions
+  do not change required field semantics.
+- **AEG/2.x / AEG/3.x** — Extension layouts have explicit reader handling.
 
-This mirrors LLVM IR's stability guarantee and makes AEG a reliable distribution format.
+Parsing compatibility is separate from the current execution-admission policy.
+Inspecting legacy artifacts does not manufacture missing numerical evidence.
 
 ## Manifest Schema
 
@@ -126,7 +133,11 @@ func @transformer_layer(%x: tensor<*xbf16>, %pos: i64) -> tensor<*xbf16> {
 }
 ```
 
-Allowed formats: `BF16`, `FP16`, `FP8`, `Q8_0`, `Q6_K`, `Q4_K_M`, `Q4_0`, `Q3_K`, `IQ3_XS`, `Q2_K`, `INT4`, `INT8`.
+Formats include `FP32`, `BF16`, `FP16`, `FP8`, `Q8_0`, `Q6_K`, `Q4_K_M`,
+`Q4_0`, `Q3_K`, `IQ3_XS`, `Q2_K`, `INT4`, `INT8`; actual supported requests
+come from the codec/compiler registry. Explicit uniform FP32 preserves global
+tensors and biases. A storage label alone establishes neither arithmetic
+precision nor numerical quality.
 
 ## Content Addressing
 
@@ -149,34 +160,28 @@ Every AEG file is content-addressed using SHA-256. The `graph_hash` is the hash 
 AEG packages may be distributed as directories or compressed tar archives (`.tar.gz`). The `.aeg` extension is reserved for both forms. Future AEG versions may introduce additional compression options.
 
 
-## AEG v3.1 Extension Directories
+## Numerical admission extension
 
-The current package writer emits backward-compatible v3.1 extension directories while keeping the manifest format at AEG/1.x compatibility:
+`quality/numerical_gate.json` uses the independently versioned schema
+`aether-numerical-quality/1`. The existing manifest hashes the report. The report
+binds the manifest header and every declared payload except itself, plus original
+checkpoint/config/tokenizer hashes, fixed token samples and actual CPU/Torch CPU
+measurements against original FP32 HF. Authentication and parsing use the same
+bounded bytes. Unknown/unbound payloads, inconsistent measurements, rejected
+reports and missing declared reports fail admission.
 
-- `graph/reasoning_graph.aeg-ir`: compiled reasoning workflow metadata.
-- `graph/rag_pipeline.aeg-ir`: RAG workflow graph contract.
-- `graph/attention_head_patterns.json`: sparse attention head pattern plan.
-- `weights/precision_map.json`: root precision map mirror for v3.1 readers.
-- `weights/sparsity_masks.json`: pruning and sparse-kernel eligibility plan when available.
-- `parallelism/prefill_decode_split.json`: disaggregated prefill/decode pool contract.
-- `inference/compute_profiles.json`: greedy, beam, best-of-N, and MCTS cost profiles.
-- `safety/`: prompt guard, output filter, and audit-log configuration.
-- `provenance/`: model provenance manifest and fingerprint metadata.
-- `watermark/`: SynthID-style statistical watermark configuration.
-- `adapters/`: LoRA adapter manifest and slot configuration.
-- `cuda_graphs/`: piecewise CUDA graph capture manifest.
+This is an execution policy separate from parsing compatibility. Older packages
+remain inspectable; absent evidence requires an explicit diagnostic execution
+decision. Diagnostics never waive recorded rejection or malformed declared
+evidence. Post-hoc mutations can invalidate the binding and require reevaluation.
+See [the exact thresholds, supported reference and limitations](mission-numerical-admission.md).
 
-Each emitted extension file is hashed into `manifest.artifacts` for integrity tracking.
+## Optional extension payloads
 
-
-## AEG v3.1 Platform Artifacts
-
-Compiled packages now include deterministic manifests for the PRD v3.1 platform surface:
-
-- `agentic/workflow_cache.json` stores meta-tool sequences, cascade routes, and context-cache policy.
-- `observability/eval_gates.json`, `observability/drift_monitor.json`, and `observability/metrics_schema.json` define production gates and telemetry.
-- `rollout/ab_config.json` stores deterministic A/B bucket assignment and rollback triggers.
-- `fleet/deployment_plan.json` and `fleet/hot_reload.json` describe heterogeneous placement and candidate promotion/rollback.
-- `distillation/plan.json` defines teacher/student modes, datasets, loss weights, and eval gates.
-- `cuda_graphs/capture_manifest.json` records decode and prefill graph buckets plus persistent kernels.
-- `mla/plan.json`, `speculation/eagle3.json`, and `multimodal/graph.json` cover MLA, EAGLE-3, and unified VLM/RAG workflows.
+Older AEGs and explicit experimental producers may include grammar, speculation,
+TTT, cache, adapter, merge, safety or provenance payloads. Each emitted payload
+is hashed into `manifest.artifacts`; presence does not certify that a runtime
+consumes it or that it improves performance/quality. New compilation omits
+unrequested fleet, rollout, watermark, CUDA-graph, workflow-cache and other
+platform templates. The [22-pass audit](mission-pass-audit.md) and
+[default policy](mission-default-policy.md) describe actual consumers.

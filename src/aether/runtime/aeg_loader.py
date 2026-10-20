@@ -201,17 +201,23 @@ def package_is_runnable(package: Any) -> bool:
 
 
 def load_engine_from_path(
-    aeg_path: Path | str, *, prepare_native_kernels: bool = True
+    aeg_path: Path | str, *, prepare_native_kernels: bool = True,
+    allow_uncertified: bool = False,
 ) -> CPUExecutionEngine:
     """Open an authenticated AEG; optional accelerator bootstrap skips CPU builds."""
     from aether.core.aeg_format import AEGPackage
 
     package = AEGPackage(Path(aeg_path))
     package.load()
-    return load_engine_from_package(package, prepare_native_kernels=prepare_native_kernels)
+    return load_engine_from_package(
+        package, prepare_native_kernels=prepare_native_kernels,
+        allow_uncertified=allow_uncertified,
+    )
 
 
-def load_engine_from_package(package: Any, *, prepare_native_kernels: bool = True) -> CPUExecutionEngine:
+def load_engine_from_package(
+    package: Any, *, prepare_native_kernels: bool = True, allow_uncertified: bool = False,
+) -> CPUExecutionEngine:
     """Build a :class:`CPUExecutionEngine` from a loaded AEG package.
 
     Args:
@@ -219,6 +225,8 @@ def load_engine_from_package(package: Any, *, prepare_native_kernels: bool = Tru
         prepare_native_kernels: Prepare native CPU execution when true. False
             deserializes the identical authenticated model with an independent
             NumPy provider, for wrapping in an accelerator executor.
+        allow_uncertified: Explicit diagnostic execution of an artifact lacking
+            numerical evidence. Recorded failures and invalid reports still refuse.
 
     Returns:
         An engine ready to run :meth:`~CPUExecutionEngine.generate`.
@@ -231,6 +239,9 @@ def load_engine_from_package(package: Any, *, prepare_native_kernels: bool = Tru
     # before any weight or packaged-kernel data reaches execution. This also
     # protects callers that use the loader directly instead of Runtime.
     package.verify_integrity()
+    from aether.backends.artifact_validation import validate_aeg_evaluation
+
+    validate_aeg_evaluation(package, allow_uncertified=allow_uncertified)
     if not package.has_weights:
         msg = (
             f"AEG package at {package.root} contains no weights; it was compiled "

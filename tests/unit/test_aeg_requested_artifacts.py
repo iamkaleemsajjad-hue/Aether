@@ -277,6 +277,7 @@ def test_cpu_compile_has_execution_contract_without_demo_claims(
     # This test never starts a compiler/toolchain process or requires a native DLL.
     monkeypatch.setattr(NativeCPUKernels, "ensure_compiled", lambda self: False)
     config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         overwrite=True,
         calibration_tokens=8,
@@ -306,7 +307,9 @@ def test_cpu_compile_has_execution_contract_without_demo_claims(
     assert kernels.flash_attention_variant == ""
     assert kernels.backend_plans == {"cpu_generic": "aether_cpu"}
 
-    engine = load_engine_from_package(AEGPackage(package.root).load(), prepare_native_kernels=False)
+    engine = load_engine_from_package(
+        AEGPackage(package.root).load(), prepare_native_kernels=False, allow_uncertified=True
+    )
     prompt = np.asarray([1, 2, 3], dtype=np.int64)
     logits, _ = engine.forward(prompt)
     expected_tokens = engine.generate(prompt, max_tokens=3, temperature=0.0)
@@ -317,7 +320,9 @@ def test_cpu_compile_has_execution_contract_without_demo_claims(
         path.write_text('{"enabled": true, "legacy_template": true}', encoding="utf-8")
     package.save()
     restored = AEGPackage.load_from_archive(package.save_as_archive(tmp_path / "cpu.tar.gz"))
-    reloaded_engine = load_engine_from_package(restored, prepare_native_kernels=False)
+    reloaded_engine = load_engine_from_package(
+        restored, prepare_native_kernels=False, allow_uncertified=True
+    )
     actual_logits, _ = reloaded_engine.forward(prompt)
     np.testing.assert_array_equal(actual_logits, logits)
     assert reloaded_engine.generate(prompt, max_tokens=3, temperature=0.0) == expected_tokens

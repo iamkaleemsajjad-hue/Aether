@@ -20,6 +20,7 @@ def artifact(tmp_path):
     source = tmp_path / "checkpoint"
     _write_probe_checkpoint(source)
     config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         precision="FP32",
         optimization_level=0,
@@ -44,6 +45,7 @@ def test_actual_onnx_session_reuses_only_bound_state(artifact, provider, tmp_pat
     handle = backend.load_model(
         "model",
         artifact,
+        allow_uncertified=True,
         providers=[provider],
         allow_provider_fallback=False,
         enable_profiling=True,

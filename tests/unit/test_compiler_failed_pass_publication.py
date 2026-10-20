@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 def _config(root: Path, *, merging: bool, sources: list[str]) -> CompilerConfig:
     config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"], optimization_level=0, skip_download=True,
         overwrite=True, cache_dir=str(root / "cache"),
         model_merging_sources=sources, model_merging_coefficients=[0.5] if sources else [],
@@ -42,7 +43,7 @@ def _inventory(root: Path) -> dict[str, str]:
 
 
 def _capture(root: Path) -> tuple[NDArray[np.float32], list[int]]:
-    engine = load_engine_from_path(root, prepare_native_kernels=False)
+    engine = load_engine_from_path(root, prepare_native_kernels=False, allow_uncertified=True)
     prompt = np.asarray([1, 2], dtype=np.int64)
     logits, _ = engine.forward(prompt)
     tokens = list(engine.generate_iter(prompt, max_tokens=3, temperature=0.0))
@@ -136,7 +137,7 @@ def test_real_source_merge_cli_failure_does_not_publish_an_artifact(
     output = tmp_path / "cli-output.aeg"
     result = CliRunner().invoke(
         cli,
-        ["--cache-dir", str(tmp_path / "cli-cache"), "merge",
+        ["--diagnostic", "--cache-dir", str(tmp_path / "cli-cache"), "merge",
          str(tiny_local_safetensors_model), str(tmp_path / "missing-source"),
          "--method", "linear", "--output", str(output)],
         env={"AETHER_HF_OFFLINE": "1"},

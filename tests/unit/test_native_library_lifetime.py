@@ -61,6 +61,7 @@ def test_real_artifact_removal_does_not_poison_later_compilation(tmp_path, monke
     checkpoint = tmp_path / "checkpoint"
     _write_probe_checkpoint(checkpoint)
     config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         precision="FP32",
         optimization_level=0,
@@ -70,6 +71,7 @@ def test_real_artifact_removal_does_not_poison_later_compilation(tmp_path, monke
         if item.name.startswith("enable_"):
             setattr(config, item.name, item.name == "enable_precision_assignment")
     runtime_config = RuntimeConfig(
+        allow_uncertified=True,
         backend_name="aether_cpu",
         execution_devices=["cpu"],
         speculative_decoding=False,

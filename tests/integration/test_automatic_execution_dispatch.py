@@ -83,9 +83,12 @@ def test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers(tmp_path
 
         artifact = tmp_path / "compiled.aeg"
         Compiler(CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx2"], calibration_tokens=16, cache_dir=str(tmp_path / "compiler-cache"),
         )).compile(str(source), output_path=artifact)
-        handle = backend.load_model("compiled-cpu", str(artifact), execution_devices=["cpu"])
+        handle = backend.load_model(
+            "compiled-cpu", str(artifact), execution_devices=["cpu"], allow_uncertified=True
+        )
         request = GenerationRequest(model_id="compiled-cpu", prompt="hello world", max_tokens=2, temperature=0.0)
         baseline = backend.generate(request)
         backend._device = "cuda:99"
@@ -95,5 +98,10 @@ def test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers(tmp_path
         assert compiled_result.text == baseline.text
         assert compiled_result.metrics["device"] == "cpu"
         assert compiled_result.metrics["runtime_family"] == "cpu"
-        assert backend.load_model("compiled-cpu", str(artifact), execution_devices=["cpu"]) is handle
+        assert (
+            backend.load_model(
+                "compiled-cpu", str(artifact), execution_devices=["cpu"], allow_uncertified=True
+            )
+            is handle
+        )
         backend.unload_model("compiled-cpu")

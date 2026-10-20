@@ -45,8 +45,8 @@
 
 Supported CPU models compile to an integrity-verified AEG, reload and generate
 through the framework-free CPU engine. On an Intel Core i5-1334U running Windows,
-an earlier complete collection with Torch and Transformers installed passed **5,059 tests**
-with 41 explicit skips in two serial processes on 2026-10-18. A before/after
+the last complete green collection with Torch and Transformers installed passed
+**5,214 tests** with 41 explicit skips in two serial processes. A before/after
 replay preserved all 16 greedy tokens and produced zero logit difference. See the [environment, coverage and
 limits](docs/mission-validation.md), [architecture](docs/mission-architecture-note.md)
 and [current implementation status](IMPLEMENTATION_STATUS.md).
@@ -64,9 +64,13 @@ require explicit opt-in. The [measured default-policy correction](docs/mission-d
 records exact synthetic A/B numerics, restored native CPU decode dispatch,
 artifact reductions and mixed TTFT results. Larger trained-model speed and
 component-memory improvements remain to be established.
-The latest policy collection returned 5,069 passed, 41 skipped and two existing
-localhost HTTP failures, reproduced on unchanged source; its full-suite and
-coverage requirements remain open in the [validation record](docs/mission-validation.md#default-pass-correction-measured-execution-validation-still-incomplete).
+Ordinary compilation now measures original FP32 Hugging Face output against the
+actual CPU and Torch CPU AEG before publishing it. Ordinary loading requires the
+bound report. Compilation needs Torch/Transformers; admitted CPU execution remains
+framework-free. Explicit diagnostic mode supports uncertified development and
+legacy artifacts without waiving recorded failures. The real tiny run matched
+16/16 greedy IDs per executor; larger-model and ONNX/accelerator admission remain
+open. See [the gate, costs and current verification](docs/mission-numerical-admission.md).
 
 ## Multi-Engine Benchmark Results — Aether vs Competitor Engines
 
@@ -243,7 +247,7 @@ models, precision policies or hardware.
 | Principle | Implementation |
 |-----------|---------------|
 | **Compile once, run anywhere** | Portable graphs and weights execute through declared compatible executable/portable contracts and installed adapters; `plan_only` is compilation metadata, not an execution engine |
-| **PyTorch-free core** | The runtime, compiler, and CPU engine require only NumPy + tokenizers. PyTorch is optional (`pip install "aether-runtime[pytorch]"`) |
+| **Framework-free CPU execution** | Admitted CPU AEGs run without Torch/Transformers. Normal compilation needs both for original-HF validation; planning and explicitly diagnostic compilation remain framework-free |
 | **Hardware capability evidence** | Separates detected devices, available vendor runtimes, implemented backends, and physical execution validation |
 | **Multi-GPU placement** | Plans compatible selected meshes using memory capacity and workload cost; physical multi-GPU execution needs a supporting backend and validation |
 | **Framework-free native kernels** | C++ kernels compiled at runtime: INT4-GEMV, FlashAttention-2, fused RMSNorm+SwiGLU+Linear, GeGLU, RoPE, OpenMP parallel SGEMM |
@@ -305,10 +309,10 @@ not establish fused engine execution; see [pass flags and consumers](docs/optimi
 ## Quick Start
 
 ```bash
-pip install aether-runtime
+pip install "aether-runtime[transformers-frontend]"
 
 # Compile a public model to a self-contained CPU AEG (also usable on GPU hosts)
-aether compile HuggingFaceTB/SmolLM2-135M-Instruct --target cpu_avx2 --output smollm2.aeg
+aether compile HuggingFaceTB/SmolLM2-135M-Instruct --target cpu_avx2 --precision fp32 --output smollm2.aeg
 
 # Inspect the compiled artifact
 aether inspect smollm2.aeg
@@ -326,8 +330,9 @@ aether serve smollm2.aeg --port 8080
 
 Use `cpu_neon` on ARM. To request quantization explicitly, add
 `--precision q4_k_m` or `--precision q8_0`; otherwise compilation preserves
-automatic precision assignment. Explicit lossy precision requires your own
-model-quality evaluation. For accelerator execution, install the backend your
+automatic precision assignment. Every ordinary compile must pass the numerical
+gate; lossy opt-ins can be refused. Use representative `--quality-dataset` probes
+and separate task-quality evaluation. For accelerator execution, install the backend your
 artifact needs (portable CUDA/ROCm/MPS AEGs use `aether-runtime[pytorch]`) and
 compile with the target reported by `aether hardware detect`.
 
@@ -344,8 +349,8 @@ and feature prerequisites.
 ```python
 from aether import Compiler, CompilerConfig, Runtime
 
-# Compile — no PyTorch required
-compiler = Compiler(CompilerConfig(targets=["cpu_avx2"]))
+# Compile with an original-HF reference (Torch and Transformers required)
+compiler = Compiler(CompilerConfig(targets=["cpu_avx2"], precision="FP32"))
 artifact = compiler.compile(
     "HuggingFaceTB/SmolLM2-135M-Instruct", output_path="smollm2.aeg"
 )
@@ -815,6 +820,10 @@ different things. **Integrity is not identity:** a self-signed manifest proves t
 artifact is unmodified and says nothing about who produced it, and `aether verify`
 states that rather than printing "verified".
 
+Post-hoc signing changes package bytes and can invalidate numerical admission.
+A workflow that both signs and recertifies the final AEG is still required; see
+[the admission scope](docs/mission-numerical-admission.md).
+
 ---
 
 ## Phase 6 — Ecosystem
@@ -862,7 +871,7 @@ pip install aether-runtime
 # With PyTorch for .pt/.pth model ingestion
 pip install "aether-runtime[pytorch]"
 
-# With HuggingFace Transformers for AutoTokenizer, AutoConfig
+# Normal compilation with original-HF numerical admission
 pip install "aether-runtime[transformers-frontend]"
 
 # Development/test/server tools and PyTorch frontend

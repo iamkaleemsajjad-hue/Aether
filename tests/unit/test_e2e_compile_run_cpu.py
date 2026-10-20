@@ -275,7 +275,9 @@ class TestGraphWeightQuantizer:
 
         arch = _make_architecture()
         graph = _build_aeg_graph(arch, _make_model_weights())
-        _, report = PruningSparsityPass().run(graph, arch, CompilerConfig())
+        _, report = PruningSparsityPass().run(
+            graph, arch, CompilerConfig(quality_mode="diagnostic")
+        )
         assert report.details["masks_computed"] > 0
         assert graph.get_node("layer_0_qkv").get_attribute("pruning_mask") is not None
 
@@ -450,14 +452,14 @@ class TestAEGLoaderToCPUEngine:
         package, _ = _compile_and_save(tmp_path)
         reloaded = AEGPackage(package.root)
         reloaded.load()
-        engine = load_engine_from_package(reloaded)
+        engine = load_engine_from_package(reloaded, allow_uncertified=True)
         assert isinstance(engine, CPUExecutionEngine)
 
     def test_engine_produces_logits_of_correct_shape(self, tmp_path: Path) -> None:
         package, _ = _compile_and_save(tmp_path)
         reloaded = AEGPackage(package.root)
         reloaded.load()
-        engine = load_engine_from_package(reloaded)
+        engine = load_engine_from_package(reloaded, allow_uncertified=True)
 
         prompt = np.array([1, 2, 3], dtype=np.int64)
         logits, cache = engine.forward(prompt)
@@ -470,7 +472,7 @@ class TestAEGLoaderToCPUEngine:
         package, _ = _compile_and_save(tmp_path)
         reloaded = AEGPackage(package.root)
         reloaded.load()
-        engine = load_engine_from_package(reloaded)
+        engine = load_engine_from_package(reloaded, allow_uncertified=True)
 
         logits, _ = engine.forward(np.array([5, 10, 15, 20], dtype=np.int64))
         assert np.all(np.isfinite(logits)), "Logits contain NaN or Inf"
@@ -479,7 +481,7 @@ class TestAEGLoaderToCPUEngine:
         package, _ = _compile_and_save(tmp_path)
         reloaded = AEGPackage(package.root)
         reloaded.load()
-        engine = load_engine_from_package(reloaded)
+        engine = load_engine_from_package(reloaded, allow_uncertified=True)
 
         prompt = np.array([1, 2], dtype=np.int64)
         tokens = engine.generate(prompt, max_tokens=5, temperature=0.0)
@@ -494,7 +496,7 @@ class TestAEGLoaderToCPUEngine:
         package, _ = _compile_and_save(tmp_path)
         reloaded = AEGPackage(package.root)
         reloaded.load()
-        engine = load_engine_from_package(reloaded)
+        engine = load_engine_from_package(reloaded, allow_uncertified=True)
 
         # Prefill [A, B] → get logits for position 1 (last token).
         ab = np.array([10, 20], dtype=np.int64)
@@ -516,7 +518,7 @@ class TestAEGLoaderToCPUEngine:
         package, _ = _compile_and_save(tmp_path)
         reloaded = AEGPackage(package.root)
         reloaded.load()
-        engine = load_engine_from_package(reloaded)
+        engine = load_engine_from_package(reloaded, allow_uncertified=True)
 
         prompt = np.array([1, 5, 7], dtype=np.int64)
         t1 = engine.generate(prompt, max_tokens=8, temperature=0.0)
@@ -535,7 +537,7 @@ class TestAEGLoaderToCPUEngine:
         reloaded = AEGPackage(pkg_path)
         reloaded.load()
         with pytest.raises(AEGLoadError):
-            load_engine_from_package(reloaded)
+            load_engine_from_package(reloaded, allow_uncertified=True)
 
 
 # ── Tests: full compile pipeline → run CPU ────────────────────────────────────
@@ -556,6 +558,7 @@ class TestFullCompilePipelineToCPU:
         from aether.compiler.config import CompilerConfig
 
         config = CompilerConfig(
+            quality_mode="diagnostic",
             optimization_level=1,
             targets=["cpu_avx512"],
             overwrite=True,
@@ -592,6 +595,7 @@ class TestFullCompilePipelineToCPU:
         from aether.compiler.config import CompilerConfig
 
         config = CompilerConfig(
+            quality_mode="diagnostic",
             optimization_level=1,
             targets=["cpu_avx512"],
             overwrite=True,
@@ -612,7 +616,7 @@ class TestFullCompilePipelineToCPU:
             pytest.skip("Compiled package has no weights (HuggingFace model not downloaded)")
 
         try:
-            engine = load_engine_from_package(reloaded)
+            engine = load_engine_from_package(reloaded, allow_uncertified=True)
         except AEGLoadError as exc:
             # Raised when the compiled package is missing tensors whose default
             # allocations would OOM (e.g. a 7B LLaMA compiled without local

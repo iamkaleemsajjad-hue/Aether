@@ -15,12 +15,14 @@ from aether.runtime.runtime import Runtime
 
 
 def _runtime(tmp_path, host_target, *, backend_name=None, execution_devices=None):
+    """Inspect mocked dispatch for deliberately uncertified manual artifacts."""
     runtime = object.__new__(Runtime)
     runtime.config = RuntimeConfig(
         backend_name=backend_name,
         execution_devices=execution_devices,
         model_cache_dir=str(tmp_path),
         hf_offline=True,
+        allow_uncertified=True,
     )
     runtime.fingerprint = SimpleNamespace(
         target_id=host_target,

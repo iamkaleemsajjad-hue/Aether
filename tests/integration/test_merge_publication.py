@@ -34,7 +34,8 @@ assert cache_initially_absent
 os.environ["AETHER_CACHE_DIR"] = str(cache)
 source = root / "source"
 _write_probe_checkpoint(source)
-config = CompilerConfig(targets=["cpu_generic"], precision="FP32", optimization_level=0,
+config = CompilerConfig(quality_mode="diagnostic", targets=["cpu_generic"],
+                        precision="FP32", optimization_level=0,
                         cache_dir=str(root / "compiler-cache"))
 for item in fields(config):
     if item.name.startswith("enable_"):
@@ -43,7 +44,8 @@ base = Compiler(config).compile(str(source), output_path=root / "base.aeg")
 weights = base.weight_store().dequantize_all()
 task = root / "task.safetensors"
 save_file({"lm_head": weights["lm_head"] + np.float32(.03)}, str(task))
-with Runtime(RuntimeConfig(backend_name="aether_cpu", execution_devices=["cpu"],
+with Runtime(RuntimeConfig(allow_uncertified=True, backend_name="aether_cpu",
+                           execution_devices=["cpu"],
                            speculative_decoding=False, dynamic_precision=False,
                            enable_semantic_cache=False,
                            model_cache_dir=str(root / "models"),
@@ -97,6 +99,7 @@ def test_public_aeg_merge_rejects_existing_dangling_output_link(tmp_path):
     source = tmp_path / "source"
     _write_probe_checkpoint(source)
     config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         precision="FP32",
         optimization_level=0,

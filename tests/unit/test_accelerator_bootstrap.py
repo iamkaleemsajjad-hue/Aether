@@ -12,8 +12,13 @@ from aether.runtime import aeg_loader
 
 @pytest.fixture
 def compiled_cpu_model(tiny_local_safetensors_model, tmp_path):
-    config = CompilerConfig(targets=["cpu_generic"], precision="FP32", optimization_level=0,
-                            cache_dir=str(tmp_path / "cache"))
+    config = CompilerConfig(
+        quality_mode="diagnostic",
+        targets=["cpu_generic"],
+        precision="FP32",
+        optimization_level=0,
+        cache_dir=str(tmp_path / "cache"),
+    )
     for item in fields(config):
         if item.name.startswith("enable_"):
             setattr(config, item.name, item.name == "enable_precision_assignment")
@@ -21,7 +26,7 @@ def compiled_cpu_model(tiny_local_safetensors_model, tmp_path):
 
 
 def test_reference_bootstrap_skips_native_preparation_and_compiler_discovery(compiled_cpu_model, monkeypatch):
-    expected = aeg_loader.load_engine_from_path(compiled_cpu_model.root)
+    expected = aeg_loader.load_engine_from_path(compiled_cpu_model.root, allow_uncertified=True)
     expected_logits, _ = expected.forward(np.array([1, 2, 3]))
     with monkeypatch.context() as patch:
         def unused(*args, **kwargs):
@@ -30,8 +35,12 @@ def test_reference_bootstrap_skips_native_preparation_and_compiler_discovery(com
         patch.setattr(aeg_loader, "get_native_kernels", unused)
         patch.setattr("aether.runtime.cpu_engine.get_native_kernels", unused)
         patch.setattr("aether.kernels.native_cpu.detect_toolchain", unused)
-        reference = aeg_loader.load_engine_from_path(compiled_cpu_model.root, prepare_native_kernels=False)
-        package_reference = aeg_loader.load_engine_from_package(compiled_cpu_model, prepare_native_kernels=False)
+        reference = aeg_loader.load_engine_from_path(
+            compiled_cpu_model.root, prepare_native_kernels=False, allow_uncertified=True
+        )
+        package_reference = aeg_loader.load_engine_from_package(
+            compiled_cpu_model, prepare_native_kernels=False, allow_uncertified=True
+        )
         actual, cache = reference.forward(np.array([1, 2, 3]))
         package_actual, _ = package_reference.forward(np.array([1, 2, 3]))
         assert reference.kernels.is_native is False
@@ -41,7 +50,7 @@ def test_reference_bootstrap_skips_native_preparation_and_compiler_discovery(com
     prepare = []
     original = aeg_loader._prepare_native_kernels
     monkeypatch.setattr(aeg_loader, "_prepare_native_kernels", lambda package: prepare.append(package.root) or original(package))
-    cpu = aeg_loader.load_engine_from_path(compiled_cpu_model.root)
+    cpu = aeg_loader.load_engine_from_path(compiled_cpu_model.root, allow_uncertified=True)
     assert prepare == [compiled_cpu_model.root]
     assert cpu.kernels.is_native == expected.kernels.is_native
 

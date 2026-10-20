@@ -113,8 +113,18 @@ def _runtime_config(ctx: click.Context, **overrides: Any) -> RuntimeConfig:
         data.update(supplied)
     if ctx.obj.get("cache_dir") is not None:
         data["model_cache_dir"] = ctx.obj["cache_dir"]
+    if ctx.obj.get("diagnostic"):
+        data["allow_uncertified"] = True
     data.update(overrides)
     return RuntimeConfig.from_dict(data)
+
+
+def _compiler_config(ctx: click.Context, **overrides: Any) -> CompilerConfig:
+    """Carry the explicit development decision through every compiler command."""
+    return CompilerConfig(
+        quality_mode="diagnostic" if ctx.obj.get("diagnostic") else "require_hf",
+        **overrides,
+    )
 
 
 class _AetherGroup(click.Group):
@@ -144,8 +154,15 @@ class _FiniteFloatRange(click.FloatRange):
 @click.option("--cache-dir", type=click.Path(), help="Custom Aether cache directory.")
 @click.option("--runtime-config", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               help="RuntimeConfig JSON for serving, generation and execution features.")
+@click.option(
+    "--diagnostic", is_flag=True,
+    help="Explicit uncertified development compilation/execution; recorded failures still refuse.",
+)
 @click.pass_context
-def cli(ctx: click.Context, verbose: bool, cache_dir: str | None, runtime_config: Path | None) -> None:
+def cli(
+    ctx: click.Context, verbose: bool, cache_dir: str | None, runtime_config: Path | None,
+    diagnostic: bool,
+) -> None:
     """Aether Runtime — compile any AI model, run it on any hardware."""
     configure_logging(level="DEBUG" if verbose else "INFO")
     # Rich captures the stream that existed when this module was imported.
@@ -156,6 +173,7 @@ def cli(ctx: click.Context, verbose: bool, cache_dir: str | None, runtime_config
     ctx.obj["verbose"] = verbose
     ctx.obj["cache_dir"] = cache_dir
     ctx.obj["runtime_config"] = runtime_config
+    ctx.obj["diagnostic"] = diagnostic
 
 
 @cli.command("compile")
@@ -166,6 +184,9 @@ def cli(ctx: click.Context, verbose: bool, cache_dir: str | None, runtime_config
     default=None, help="Explicit uniform layer precision; default preserves automatic assignment.",
 )
 @click.option("--quality-budget", type=_FiniteFloatRange(min=0.0), default=0.02, help="Maximum perplexity increase budget.")
+@click.option("--quality-dataset", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Fixed numerical probe JSONL; default uses fixed text probes.")
+@click.option("--revision", default="main", help="Hub revision resolved to one immutable commit.")
 @click.option("--calibration-dataset", default="wikitext-2", help="Calibration dataset for sensitivity analysis.")
 @click.option("--upload", is_flag=True, help="Upload compiled AEG to Aether Hub.")
 @click.option("--output", "-o", type=click.Path(), help="Output path for the AEG artifact.")
@@ -221,6 +242,8 @@ def cmd_compile(
     target: tuple[str, ...],
     precision: str | None,
     quality_budget: float,
+    quality_dataset: str | None,
+    revision: str,
     calibration_dataset: str,
     upload: bool,
     output: str | None,
@@ -242,10 +265,12 @@ def cmd_compile(
     if not mdlm_drafter and any(value is not None for value in (mdlm_weights, mdlm_k, mdlm_t)):
         raise click.UsageError("--mdlm-weights/--mdlm-K/--mdlm-T require --mdlm-drafter")
     targets = list(target) if target else ["auto"]
-    config = CompilerConfig(
+    config = _compiler_config(ctx,
         targets=targets,
         precision=precision,
         quality_budget=quality_budget,
+        quality_dataset=quality_dataset,
+        model_revision=revision,
         calibration_dataset=calibration_dataset,
         upload_kernels=upload,
         dry_run=dry_run,
@@ -308,7 +333,8 @@ def cmd_compile(
         requested_passes.append(("tee_kernel_wrapping", "TEE compilation"))
     for pass_name, feature in requested_passes:
         _require_applied_pass(aeg, pass_name, feature)
-    console.print(f"[bold green]Compiled AEG saved to[/bold green] {aeg.root}")
+    label = "Uncertified diagnostic AEG" if config.quality_mode == "diagnostic" else "Compiled AEG"
+    console.print(f"[bold green]{label} saved to[/bold green] {aeg.root}")
 
 
 @cli.command()
@@ -319,7 +345,7 @@ def pull(ctx: click.Context, model: str, compile_local: bool) -> None:
     """Download and compile a model to the local AEG cache."""
     with console.status(f"[bold green]Pulling {model}..."):
         if compile_local:
-            Compiler(CompilerConfig(
+            Compiler(_compiler_config(ctx,
                 cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
                 overwrite=True,
             )).compile(model)
@@ -799,7 +825,7 @@ def grammar(
     if schema is None:
         raise click.UsageError("--schema is required to define the grammar")
     schema_path = Path(schema)
-    config = CompilerConfig(
+    config = _compiler_config(ctx,
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
         enable_grammar_constraint=True,
     )
@@ -854,7 +880,7 @@ def merge(ctx: click.Context, models: tuple[str, ...], method: str, output: str 
             raise click.BadParameter("provide one finite coefficient per model", param_hint="--weights")
         if method == "linear" and not math.isclose(sum(merge_weights), 1.0, abs_tol=1e-9):
             raise click.BadParameter("linear interpolation coefficients must sum to 1", param_hint="--weights")
-    config = CompilerConfig(
+    config = _compiler_config(ctx,
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
         enable_model_merging=True,
         model_merging_method="task_arithmetic" if method == "linear" else method,
@@ -918,7 +944,7 @@ def ttt_config(ctx: click.Context, model: str, adapter_rank: int, ttl: int | Non
     if ttl is not None:
         raise click.ClickException("--ttl token expiry is not implemented by the TTT engine")
 
-    config = CompilerConfig(
+    config = _compiler_config(ctx,
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
         enable_ttt=True,
     )
@@ -960,7 +986,7 @@ def kv_compress(ctx: click.Context, model: str, method: str, retention: float, c
     if cross_layer_groups is not None:
         raise click.ClickException("--cross-layer-groups is not implemented by the cross-layer KV compilation pass")
 
-    config = CompilerConfig(
+    config = _compiler_config(ctx,
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
         enable_semantic_kv=method in ("semantic", "both"),
         enable_cross_layer_kv=method in ("cross-layer", "both"),
@@ -1008,7 +1034,7 @@ def green_profile(
     into the AEG so the runtime can defer batch execution to windows with
     higher renewable energy availability, using Electricity Maps or WattTime APIs.
     """
-    config = CompilerConfig(
+    config = _compiler_config(ctx,
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
         enable_green_energy=True,
     )
@@ -1161,7 +1187,7 @@ def tee(ctx: click.Context, tee_args: tuple[str, ...], backend: str, output: str
     if args:
         raise click.UsageError(f"unexpected TEE arguments: {' '.join(args)}")
 
-    config = CompilerConfig(
+    config = _compiler_config(ctx,
         cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(),
         enable_tee=True,
     )
@@ -1779,7 +1805,9 @@ def runtime_reweight(
 @click.pass_context
 def kv_share(ctx: click.Context, model: str, output_path: str | None) -> None:
     """Compile with cross-layer KV sharing enabled (Pass 15)."""
-    config = CompilerConfig(cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(), enable_cross_layer_kv=True)
+    config = _compiler_config(
+        ctx, cache_dir=ctx.obj.get("cache_dir") or aether_cache_dir(), enable_cross_layer_kv=True
+    )
     result = Compiler(config).compile(model, output_path=output_path)
     _require_applied_pass(result, "cross_layer_kv_sharing", "cross-layer KV sharing")
     console.print(f"[bold green]Cross-layer KV AEG saved to[/bold green] {result.root}")

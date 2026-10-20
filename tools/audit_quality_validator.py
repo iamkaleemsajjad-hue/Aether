@@ -92,7 +92,9 @@ def measure(job: dict[str, Any]) -> dict[str, Any]:
     from aether.runtime.aeg_loader import load_engine_from_path
 
     mark_phase(work, "load")
-    engine = load_engine_from_path(job["artifact"], prepare_native_kernels=False)
+    engine = load_engine_from_path(
+        job["artifact"], prepare_native_kernels=False, allow_uncertified=True
+    )
     prompt = PROMPTS["A"]
     mark_phase(work, "full_prefix_oracle")
     expected: list[int] = []

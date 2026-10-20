@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   precision assignment and packing. Real original-HF/CPU/Torch CPU probes
   recovered 16/16 greedy agreement per executor; the tiny fixture's weight blob
   costs 8,256 additional bytes. See [storage and numerical evidence](docs/mission-fp32-storage.md).
+- Require measured original-FP32 HF numerical admission before ordinary AEG
+  publication and execution, with explicit uncertified diagnostic mode, pinned
+  source identities, serial owned workers and bound CPU/Torch CPU evidence.
+  Authenticate/parse bounded report bytes once; invalidate numerical evidence on
+  merging. See [executed checks, compilation costs and remaining scope](docs/mission-numerical-admission.md).
 - Preserve existing AEG output when packaging or optional evaluation fails. Build
   and verify private candidates, serialize cooperating writers with native locks,
   and restore previous output on promotion failure. Evaluators receive the actual
@@ -600,8 +605,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Made evaluation quality checks reject absent, mismatched and nonfinite
   evidence, measure uncapped KL/PPL correctly, count greedy suffix mismatches,
   and validate append-only engine histories against fixed labels. Mutable empty
-  reports cannot assert success. Mandatory compiler/admission integration remains
-  open; measured benefits and costs are in `docs/mission-quality-validation.md`.
+  reports cannot assert success. The subsequent compiler/admission integration is
+  scoped in `docs/mission-numerical-admission.md`; original validator measurements
+  remain in `docs/mission-quality-validation.md`.
 - Returned a one-dimensional FP32 vocabulary vector from Torch's public
   last-position `forward_step`, preserving all-position output and append-only
   caches. Real CPU/Torch prefill/decode regressions cover both cache modes.

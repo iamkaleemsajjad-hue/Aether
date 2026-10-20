@@ -73,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     default = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         skip_download=True,
         reproducible_builds=True,
@@ -100,7 +101,10 @@ def main(argv: list[str] | None = None) -> int:
             "Fresh workers and cold per-worker native caches, including integrity check"
         ),
         "runtime_scope": "Native CPU, fixed A/B prompts, fresh cache for each request",
-        "quality_scope": "Untrained fixtures; original-FP32 HF only when its worker succeeds",
+        "quality_scope": (
+            "Explicit diagnostic compilation/execution of untrained fixtures; "
+            "original-FP32 HF only when its worker succeeds"
+        ),
         "versions": {
             name: importlib.metadata.version(name)
             for name in ("numpy", "safetensors", "psutil", "tokenizers")

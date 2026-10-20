@@ -241,13 +241,14 @@ def actual_cpu_engine(tmp_path: Path, tiny_local_safetensors_model: Path) -> Any
 
     package = Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_generic"],
             skip_download=True,
             cache_dir=str(tmp_path / "cache"),
         )
     ).compile(str(tiny_local_safetensors_model), output_path=tmp_path / "model.aeg")
     package.verify_integrity()
-    return load_engine_from_path(package.root, prepare_native_kernels=False)
+    return load_engine_from_path(package.root, prepare_native_kernels=False, allow_uncertified=True)
 
 
 class TracedEngine:

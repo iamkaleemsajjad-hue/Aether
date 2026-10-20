@@ -60,6 +60,7 @@ def test_all_22_flags_explicitly_off_survive_real_config_clone(tmp_path: Path) -
     assert all(not enabled for enabled in pipeline._pass_enabled.values())
     assert {p.flag for p in PASSES} <= options.keys()
     assert config.precision is None
+    assert config.quality_mode == "diagnostic"
 
 
 @pytest.mark.parametrize("numbers", [[1], [3], [19], *map(list, COMBINATIONS)])

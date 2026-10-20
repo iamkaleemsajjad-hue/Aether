@@ -236,6 +236,7 @@ def compiler_options(
         raise ValueError("Pass numbers must be in 1..22")
     options: JsonObject = {p.flag: p.number in selected for p in PASSES}
     options.update(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         optimization_level=0,
         skip_download=True,
@@ -979,6 +980,7 @@ def _worker(job: JsonObject) -> JsonObject:
         from aether import Runtime, RuntimeConfig
 
         config = RuntimeConfig(
+            allow_uncertified=True,
             backend_name="aether_cpu",
             execution_devices=["cpu"],
             hf_offline=True,
@@ -1011,7 +1013,9 @@ def _worker(job: JsonObject) -> JsonObject:
     from aether.runtime.aeg_loader import load_engine_from_path
 
     before_load = mark_phase(work, "load")
-    engine = load_engine_from_path(job["artifact"], prepare_native_kernels=job["native"])
+    engine = load_engine_from_path(
+        job["artifact"], prepare_native_kernels=job["native"], allow_uncertified=True
+    )
     resident = mark_phase(work, "loaded")
     if action == "load":
         return {
@@ -1327,8 +1331,8 @@ def main(argv: list[str] | None = None) -> int:
             else "not_requested",
         },
         "quality_scope": (
-            "Synthetic numerical regression, not task/perplexity quality certification; "
-            "no evaluator supplied to compile"
+            "Explicit diagnostic compilation/execution; synthetic numerical regression, "
+            "not compiler admission or trained-model quality certification"
         ),
         "sparse_scope": (
             "Forced threshold 16 differs from default 32768; "

@@ -376,9 +376,17 @@ class NativeCPUBackend(Backend):
         """The backend is available whenever the base NumPy runtime is usable."""
         return True
 
-    def load_model(self, model_id: str, aeg_path: str | None = None, **_: Any) -> Any:
+    def load_model(
+        self, model_id: str, aeg_path: str | None = None,
+        *, allow_uncertified: bool = False, **_: Any,
+    ) -> Any:
         """Load and authenticate a self-contained AEG package."""
         if model_id in self._models:
+            from aether.backends.artifact_validation import validate_cached_evaluation
+
+            validate_cached_evaluation(
+                self._models[model_id], allow_uncertified=allow_uncertified, backend_name=self.name,
+            )
             return self._models[model_id]
         if aeg_path is None:
             raise BackendError(
@@ -395,10 +403,12 @@ class NativeCPUBackend(Backend):
             from aether.backends.artifact_validation import validate_aeg_evaluation, verify_aeg_integrity
 
             verify_aeg_integrity(package, backend_name=self.name)
-            validate_aeg_evaluation(package, backend_name=self.name)
+            numerical_quality_admitted = validate_aeg_evaluation(
+                package, backend_name=self.name, allow_uncertified=allow_uncertified,
+            )
             if not package_is_runnable(package):
                 raise BackendError(f"AEG artifact {root} is not executable", backend_name=self.name)
-            engine = load_engine_from_path(root)
+            engine = load_engine_from_path(root, allow_uncertified=allow_uncertified)
             tokenizer = PackagedTokenizer(root / "tokenizer" / "tokenizer.json")
             manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
             metadata_path = root / "graph" / "metadata.json"
@@ -414,6 +424,7 @@ class NativeCPUBackend(Backend):
                 engine=engine,
                 tokenizer=tokenizer,
                 lora_adapters=load_compiled_lora_adapters(root),
+                numerical_quality_admitted=numerical_quality_admitted,
             )
         except BackendError:
             raise

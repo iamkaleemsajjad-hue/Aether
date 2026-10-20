@@ -206,7 +206,9 @@ class TestTorchBackendCompiledAEG:
         from aether.core.exceptions import BackendError
 
         backend = TorchBackend()
-        model = backend.load_model("test-model", str(minimal_aeg_package.root))
+        model = backend.load_model(
+            "test-model", str(minimal_aeg_package.root), allow_uncertified=True
+        )
         assert isinstance(model, CompiledAEGHandle)
         with pytest.raises(BackendError, match="tokenizer-backed generation adapter"):
             backend.generate(

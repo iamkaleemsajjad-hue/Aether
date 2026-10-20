@@ -67,6 +67,7 @@ def test_mamba2_ssd_compiles_serializes_and_generates(tmp_path: Path) -> None:
 
     artifact = tmp_path / "mamba2.aeg"
     Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
         overwrite=True, calibration_tokens=4, cache_dir=str(tmp_path / "cache"),
     )).compile(
@@ -83,15 +84,15 @@ def test_mamba2_ssd_compiles_serializes_and_generates(tmp_path: Path) -> None:
     names = set(package.weight_store().entries)
     assert "layer_0_ssm_in_proj" in names
     assert "layer_0_ssm_dt" in names
-    result = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
-        str(artifact), prompt="hello", max_tokens=2, temperature=0.0
-    )
+    result = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2)
+    ).generate(str(artifact), prompt="hello", max_tokens=2, temperature=0.0)
     assert result.text
 
     torch = pytest.importorskip("torch")
     from aether.runtime.torch_state_engine import TorchMamba2AEGEngine
 
-    cpu_engine = load_engine_from_path(artifact)
+    cpu_engine = load_engine_from_path(artifact, allow_uncertified=True)
     cpu_logits, _ = cpu_engine.forward(np.asarray([1, 2, 3], dtype=np.int64))
     portable = TorchMamba2AEGEngine(cpu_engine, "cpu")
     portable_logits, _ = portable.forward(np.asarray([1, 2, 3], dtype=np.int64))

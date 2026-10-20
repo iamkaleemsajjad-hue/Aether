@@ -45,13 +45,13 @@ def test_failed_report_cannot_be_edited_to_pass_without_updating_its_declared_ha
 
 
 def test_declared_gate_cannot_disappear_to_become_uncertified(tmp_path):
-    """Missing recorded policy fails closed, while absent optional evaluation is allowed."""
+    """Missing recorded policy fails closed; only diagnostics can waive absent evidence."""
     package = _failed_package(tmp_path)
     (package.root / "observability" / "eval_report.json").unlink()
     with pytest.raises(ArtifactEvaluationError, match="declared evaluation report is missing"):
         validate_aeg_evaluation(package)
     untouched = _package(tmp_path / "uncertified", ["cpu_avx2"])
-    validate_aeg_evaluation(untouched)
+    validate_aeg_evaluation(untouched, allow_uncertified=True)
 
 
 def test_quality_report_boolean_string_cannot_be_treated_as_success(tmp_path):
@@ -61,3 +61,37 @@ def test_quality_report_boolean_string_cannot_be_treated_as_success(tmp_path):
     package.save()
     with pytest.raises(ArtifactEvaluationError, match="must be boolean"):
         validate_aeg_evaluation(package)
+
+
+def test_benchmark_report_replacement_cannot_erase_its_recorded_rejection(tmp_path, monkeypatch):
+    """Hash authentication and policy parsing must operate on identical bytes."""
+    from aether.core import hash_utils
+
+    package = _package(tmp_path, ["cpu_avx2"])
+    package.metadata["eval_report"] = {"gate": {"passed": False}}
+    package.save()
+    report = package.root / "observability" / "eval_report.json"
+    original_hash = hash_utils.compute_file_hash
+
+    def replace_after_hash(path):
+        digest = original_hash(path)
+        if str(path) == str(report):
+            report.write_text('{"gate":{"passed":true}}', encoding="utf-8")
+        return digest
+
+    monkeypatch.setattr(hash_utils, "compute_file_hash", replace_after_hash)
+    with pytest.raises(ArtifactEvaluationError):
+        validate_aeg_evaluation(package, allow_uncertified=True)
+
+
+def test_benchmark_report_read_is_bounded_before_parsing(tmp_path):
+    """A declared optional report cannot force an unbounded deployment read."""
+    from aether.core.quality_gate import MAX_REPORT_BYTES
+
+    package = _package(tmp_path, ["cpu_avx2"])
+    report = package.root / "observability" / "eval_report.json"
+    report.parent.mkdir(exist_ok=True)
+    report.write_bytes(b" " * MAX_REPORT_BYTES + b'{"gate":{"passed":true}}')
+    package.save()
+    with pytest.raises(ArtifactEvaluationError, match="too large"):
+        validate_aeg_evaluation(package, allow_uncertified=True)

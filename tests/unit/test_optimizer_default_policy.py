@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 def _fusion_only(enabled: bool) -> CompilerConfig:
     return CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         skip_download=True,
         enable_fusion=enabled,

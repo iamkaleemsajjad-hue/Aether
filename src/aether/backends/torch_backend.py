@@ -657,6 +657,14 @@ class TorchBackend(Backend):
             The loaded model instance.
         """
         if model_id in self._models:
+            cached = self._models[model_id]
+            if isinstance(cached, CompiledAEGHandle):
+                from aether.backends.artifact_validation import validate_cached_evaluation
+
+                validate_cached_evaluation(
+                    cached, allow_uncertified=kwargs.get("allow_uncertified", False),
+                    backend_name=self.name,
+                )
             requested = kwargs.get("execution_devices")
             if requested is None:
                 requested = [
@@ -687,7 +695,12 @@ class TorchBackend(Backend):
 
         self._configure_devices(kwargs.get("execution_devices"))
 
-        compiled_handle = self._try_load_compiled_aeg(model_id, aeg_path, retain_host_weights=True) if kwargs.get("retain_host_weights") else self._try_load_compiled_aeg(model_id, aeg_path)
+        compiled_options = {}
+        if kwargs.get("retain_host_weights"):
+            compiled_options["retain_host_weights"] = True
+        if "allow_uncertified" in kwargs:
+            compiled_options["allow_uncertified"] = kwargs["allow_uncertified"]
+        compiled_handle = self._try_load_compiled_aeg(model_id, aeg_path, **compiled_options)
         if compiled_handle is not None:
             self._models[model_id] = compiled_handle
             self._remember_execution(model_id, compiled_handle)
@@ -757,7 +770,15 @@ class TorchBackend(Backend):
         # particular, passing ``offline`` or ``download_timeout_s`` through to
         # Transformers can make otherwise valid local/HF loads fail or be
         # interpreted by custom config classes.
-        control_keys = {"offline", "download_timeout_s", "trust_remote_code", "execution_devices", "target_id", "retain_host_weights"}
+        control_keys = {
+            "offline",
+            "download_timeout_s",
+            "trust_remote_code",
+            "execution_devices",
+            "target_id",
+            "retain_host_weights",
+            "allow_uncertified",
+        }
         load_kwargs.update(
             {key: value for key, value in kwargs.items() if key not in control_keys}
         )
@@ -796,7 +817,10 @@ class TorchBackend(Backend):
         self._remember_execution(model_id, model)
         return model
 
-    def _try_load_compiled_aeg(self, model_id: str, aeg_path: str | None, *, retain_host_weights: bool = False) -> CompiledAEGHandle | None:
+    def _try_load_compiled_aeg(
+        self, model_id: str, aeg_path: str | None, *, retain_host_weights: bool = False,
+        allow_uncertified: bool = False,
+    ) -> CompiledAEGHandle | None:
         """Load local AEG metadata without contacting a model registry."""
         if aeg_path is None:
             return None
@@ -827,11 +851,14 @@ class TorchBackend(Backend):
             # Verify every declared artifact before decoding adapter bytes.
             # Adapter parsing is part of the untrusted AEG boundary.
             verify_aeg_integrity(package, backend_name=self.name)
-            validate_aeg_evaluation(package, backend_name=self.name)
+            numerical_quality_admitted = validate_aeg_evaluation(
+                package, backend_name=self.name, allow_uncertified=allow_uncertified,
+            )
             lora_adapters = load_compiled_lora_adapters(root)
             if package_is_runnable(package):
                 engine = load_engine_from_path(
                     root, prepare_native_kernels=self._device == "cpu",
+                    allow_uncertified=allow_uncertified,
                 )
                 if self._device != "cpu":
                     if not package.supports_portable_backend("pytorch"):
@@ -952,6 +979,7 @@ class TorchBackend(Backend):
             engine=engine,
             tokenizer=tokenizer,
             lora_adapters=lora_adapters,
+            numerical_quality_admitted=numerical_quality_admitted,
         )
 
     def unload_model(self, model_id: str) -> None:
