@@ -119,6 +119,10 @@ belongs to its launched process tree, then keeps that worker selected; a Windows
 venv launcher or compiler child never substitutes for main-worker RSS.
 `phase_peak_rss_bytes` measures that worker, while
 `phase_tree_peak_rss_bytes` aggregates launcher, worker and descendants separately.
+The allocation regression probe touches a real anonymous mapping and keeps it
+resident until the parent samples its peak, then explicitly closes it. This
+avoids depending on malloc releasing a deleted bytearray or the scheduler
+observing a fixed-duration pulse; it does not change production RSS sampling.
 Unverified or reused identities remain explicit, rather than being inferred from
 a boundary RSS value. These are actual sampled RSS values; brief peaks may be
 missed and shared pages can be counted twice. They are not GPU memory, USS, or

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Make the resident-memory sampler probe use an explicitly closed anonymous
+  mapping and wait for a real parent RSS observation before releasing it.
+  Preserve its peak-size assertion across platforms without relying on malloc
+  returning a deleted bytearray or a fixed sampling window.
 - Preserve explicitly requested FP32 globals and projection biases through
   precision assignment and packing. Real original-HF/CPU/Torch CPU probes
   recovered 16/16 greedy agreement per executor; the tiny fixture's weight blob

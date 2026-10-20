@@ -408,16 +408,21 @@ def test_worker_peak_samples_touched_allocation_behind_launcher(tmp_path: Path) 
     root = Path(__file__).resolve().parents[2]
     worker = tmp_path / "allocation_worker.py"
     worker.write_text(
-        "import gc, json, sys, time\n"
+        "import json, mmap, sys, time\n"
         "from pathlib import Path\n"
         "from tools.pass_audit import mark_phase, memory_point\n"
         "work = Path(sys.argv[1])\n"
         "mark_phase(work, 'allocation')\n"
-        "slab = bytearray(64 * 1024 * 1024)\n"
-        "for index in range(0, len(slab), 4096): slab[index] = 17\n"
-        "time.sleep(0.3)\n"
-        "del slab\n"
-        "gc.collect()\n"
+        # Closing an anonymous mapping releases its pages independently of
+        # the platform malloc allocator's retention of a freed bytearray.
+        # https://docs.python.org/3.10/library/mmap.html#mmap.close
+        "with mmap.mmap(-1, 64 * 1024 * 1024) as slab:\n"
+        "    for index in range(0, len(slab), 4096): slab[index] = 17\n"
+        "    deadline = time.monotonic() + 10\n"
+        "    while not (work / 'peak_observed').exists():\n"
+        "        if time.monotonic() > deadline:\n"
+        "            raise TimeoutError('parent did not observe the resident allocation')\n"
+        "        time.sleep(0.005)\n"
         "mark_phase(work, 'released')\n"
         "(work / 'final.json').write_text(json.dumps(memory_point('released')))\n",
         encoding="utf-8",
@@ -451,6 +456,14 @@ def test_worker_peak_samples_touched_allocation_behind_launcher(tmp_path: Path) 
             with contextlib.suppress(OSError, ValueError):
                 marker = json.loads((tmp_path / "phase.json").read_text(encoding="utf-8"))
             sampler.sample(marker)
+            if (
+                marker is not None
+                and marker.get("phase") == "allocation"
+                and sampler.phase_peaks.get("allocation", 0) >= marker["rss_bytes"] + 56 * MIB
+            ):
+                # Hold the mapping until a real parent RSS sample sees it;
+                # scheduler delays must not hide a fixed-duration pulse.
+                (tmp_path / "peak_observed").touch()
             if time.monotonic() - started > 15:
                 pytest.fail("Allocation subprocess did not complete within 15 seconds")
             time.sleep(0.005)
