@@ -136,8 +136,51 @@ runtime hashes as well as HEAD, so uncommitted fixes are distinguishable.
 
 The first focused run returned **93 passed** across convolution, hybrid rotary,
 typed handoff, speculative execution and real SafeTensors hybrid integration.
-The expanded integration and complete-suite results will be recorded after
-they finish; this paragraph is not a complete-suite claim.
+The complete local run, including all expanded hybrid cases, returned
+**5,337 passed, 43 skipped, four failures** in 872.97 seconds. This is not a
+green full-suite result. The [complete run record](measurements/hybrid-convolution-complete-suite.json)
+retains the individual failure messages, skip reasons, input hashes and the
+previous area's full local result; separate reruns are not added to its totals.
+
+- The Unicode pass-audit worker refused to run with 259,829,760 available
+  bytes versus 406,938,624 estimated worker bytes plus 134,217,728 headroom.
+  The guard remained intact. The separate 64 MiB allocation probe also skipped
+  for insufficient RAM, accounting for the additional local skip.
+- The calibration noise-band test asserted `linear` after measuring a 1.66x
+  candidate with `_MIN_MARGIN=0.5`. The unchanged selector accepts gains of
+  at least `1+margin=1.5`; the test does not control measured times, so its
+  assertion does not establish an inside-band candidate. This path does not
+  invoke the hybrid SSM loop. No calibration code or assertion was weakened.
+- Both recurring MCP HTTP handshake cases failed at `connect()`. Their
+  transport/environment issue remains unresolved; this change does not fix it.
+
+Local line coverage increased from **45,031/57,244 (78.6650129%)** in the
+previous area's failed full run to **45,043/57,244 (78.6859758%)**. These are
+same-host observations, not a comparison with hosted Linux coverage. The
+blocking pinned CPU/HF CI job independently runs the complete suite and
+enforces the measured 78.6% coverage floor, with JUnit and coverage artifacts.
+CI remains necessary; local full-suite failures have not been reclassified
+as passes or silently excluded.
+
+The blocking hosted CPU job on runtime commit
+[`395b835`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39614770007)
+returned **5,333 passed, 51 skipped, zero failures** in 121.937 JUnit seconds.
+It ran on Ubuntu 24.04, AMD EPYC 9V45 (four visible logical CPUs), Python
+3.11.14, Torch 2.9.1+cpu, Transformers 4.57.3, NumPy 1.26.4 and CPU ONNX
+Runtime 1.23.2. The original-HF/API/CLI check, complete suite and blocking
+78.6% coverage gate all passed. Measured line coverage is **45,043/57,244
+(78.6859758%)**, with 10,762/17,228 covered branches. All 11 scoped hybrid
+unit/integration cases passed in that run. Raw JUnit/coverage/parity
+and the exact dependency freeze are attached as `hf-mamba2-parity`; hashes and
+hardware are recorded in the complete-run JSON. This record asserts the
+completed CPU job; other CI matrix jobs were still running when collected.
+
+A separate local followup reran the four failing cases: **four failed** in
+13.24 seconds. Worker RAM was still below its unchanged admission requirement;
+the calibration measured a 2.62x `addmm` candidate, again above the test's
+1.5x selection threshold. MCP reported a stream ending without a matching
+response. These observations remain failures in the report; the hosted success
+does not resolve the local transport/resource issues.
 
 The touched shared runtime retains 112 Ruff findings and 48 mypy findings
 before/after, with identical code/message counters after ignoring line shifts.

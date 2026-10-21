@@ -1,0 +1,207 @@
+{
+  "scope": "Complete suite records, not a union of focused reruns or cross-platform coverage evidence.",
+  "local": {
+    "tests": 5384,
+    "counts": {
+      "passed": 5337,
+      "skipped": 43,
+      "failed": 4
+    },
+    "seconds": 871.059,
+    "line_coverage": {
+      "covered": 45043,
+      "valid": 57244,
+      "percent": 78.68597582279365
+    },
+    "branch_coverage": {
+      "branches-covered": 10759,
+      "branches-valid": 17228
+    },
+    "failures": [
+      {
+        "class": "tests.tools.test_pass_audit",
+        "name": "test_worker_compiles_and_runs_unicode_paths_with_ascii_parent",
+        "message": "AssertionError: {'status': 'blocked', 'available_bytes': 259829760, 'estimated_worker_bytes': 406938624, 'required_headroom_bytes': 134217728, ...}\nassert 'blocked' == 'ok'\n  \n  - ok\n  + blocked"
+      },
+      {
+        "class": "tests.unit.test_decode_strategy",
+        "name": "test_a_win_inside_the_noise_band_is_not_a_win",
+        "message": "AssertionError: assert 'padded_rows' == 'linear'\n  \n  - linear\n  + padded_rows"
+      },
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[False]",
+        "message": "assert False\n +  where False = connect()\n +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x0000017952446D70>.connect"
+      },
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[True]",
+        "message": "assert False\n +  where False = connect()\n +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x0000017952446A40>.connect"
+      }
+    ],
+    "skips": {
+      "could not import 'accelerate': No module named 'accelerate'": 2,
+      "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable": 14,
+      "cryptography not installed": 8,
+      "64 MiB allocation probe requires at least 256 MiB available RAM": 1,
+      "Opt-in real subprocess compile/load/Runtime smoke, no timing": 1,
+      "physical DirectML execution requires its optional installed runtime": 1,
+      "real DmlExecutionProvider is not installed": 2,
+      "could not import 'cryptography': No module named 'cryptography'": 1,
+      "Real wikitext-2 data is unavailable locally; provide a calibration file or cache the 'wikitext' dataset before compiling (no local Hugging Face dataset cache at C:\\Users\\pc\\.cache\\huggingface\\datasets)": 1,
+      "Real hellaswag data is unavailable locally; provide a calibration file or cache the 'Rowan/hellaswag' dataset before compiling (no local Hugging Face dataset cache at C:\\Users\\pc\\.cache\\huggingface\\datasets)": 1,
+      "no CUDA device on this host": 1,
+      "process IPC is unavailable in this Windows environment: [WinError 5] Access is denied": 1,
+      "process IPC is unavailable in this environment: [WinError 5] Access is denied": 3,
+      "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path.": 2,
+      "No physical NVIDIA CUDA device and matching PyTorch runtime": 1,
+      "physical DirectML runtime is not installed on this host": 2,
+      "could not import 'opentelemetry.sdk': No module named 'opentelemetry.sdk'": 1
+    },
+    "inputs_sha256": {
+      "build\\mission\\hybrid-conv-full.xml": "7626e12b601aca6ca0989c3bd7699c825bd3ebc59de03f0b8b961c67b4c7ea58",
+      "build\\mission\\hybrid-conv-full-coverage.xml": "0a16cb0f57325a153c259b9a8f93b852b96eec0db1193bf23dbce300ef497f93"
+    },
+    "hybrid_regression_cases": {
+      "passed": 11
+    }
+  },
+  "local_previous_area": {
+    "tests": 5375,
+    "counts": {
+      "passed": 5330,
+      "skipped": 42,
+      "failed": 3
+    },
+    "seconds": 1009.757,
+    "line_coverage": {
+      "covered": 45031,
+      "valid": 57244,
+      "percent": 78.665012927119
+    },
+    "branch_coverage": {
+      "branches-covered": 10751,
+      "branches-valid": 17228
+    },
+    "failures": [
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[False]",
+        "message": "assert False\n +  where False = connect()\n +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x0000017BAA4B1720>.connect"
+      },
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[True]",
+        "message": "assert False\n +  where False = connect()\n +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x0000017BAA4D41F0>.connect"
+      },
+      {
+        "class": "tests.unit.test_placement_planner",
+        "name": "test_the_dispatch_probe_is_reproducible_enough_not_to_trip_its_own_guard",
+        "message": "AssertionError: consecutive probes differ by 2.03x, which would thrash the ledger\nassert 2.029778962162797 < 2.0"
+      }
+    ],
+    "skips": {
+      "could not import 'accelerate': No module named 'accelerate'": 2,
+      "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable": 14,
+      "cryptography not installed": 8,
+      "Opt-in real subprocess compile/load/Runtime smoke, no timing": 1,
+      "physical DirectML execution requires its optional installed runtime": 1,
+      "real DmlExecutionProvider is not installed": 2,
+      "could not import 'cryptography': No module named 'cryptography'": 1,
+      "Real wikitext-2 data is unavailable locally; provide a calibration file or cache the 'wikitext' dataset before compiling (no local Hugging Face dataset cache at C:\\Users\\pc\\.cache\\huggingface\\datasets)": 1,
+      "Real hellaswag data is unavailable locally; provide a calibration file or cache the 'Rowan/hellaswag' dataset before compiling (no local Hugging Face dataset cache at C:\\Users\\pc\\.cache\\huggingface\\datasets)": 1,
+      "no CUDA device on this host": 1,
+      "process IPC is unavailable in this Windows environment: [WinError 5] Access is denied": 1,
+      "process IPC is unavailable in this environment: [WinError 5] Access is denied": 3,
+      "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path.": 2,
+      "No physical NVIDIA CUDA device and matching PyTorch runtime": 1,
+      "physical DirectML runtime is not installed on this host": 2,
+      "could not import 'opentelemetry.sdk': No module named 'opentelemetry.sdk'": 1
+    },
+    "inputs_sha256": {
+      "build\\mission\\mamba2-norm-full.xml": "f9eff400e6c332af1818e9b8986c1561e0221e559f5f75428b1e2f39d0edf6d0",
+      "build\\mission\\mamba2-norm-full-coverage.xml": "4988737eb1ec1643dde13895a3352a5a7f7cca8ffbd153828372353024c05ebc"
+    },
+    "hybrid_regression_cases": {
+      "passed": 2
+    }
+  },
+  "hosted": {
+    "tests": 5384,
+    "counts": {
+      "passed": 5333,
+      "skipped": 51
+    },
+    "seconds": 121.937,
+    "line_coverage": {
+      "covered": 45043,
+      "valid": 57244,
+      "percent": 78.68597582279365
+    },
+    "branch_coverage": {
+      "branches-covered": 10762,
+      "branches-valid": 17228
+    },
+    "failures": [],
+    "skips": {
+      "could not import 'accelerate': No module named 'accelerate'": 2,
+      "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable": 14,
+      "cryptography not installed": 8,
+      "Opt-in real subprocess compile/load/Runtime smoke, no timing": 1,
+      "physical DirectML execution requires its optional installed runtime": 1,
+      "real DmlExecutionProvider is not installed": 2,
+      "requires actual Windows file sharing": 3,
+      "could not import 'cryptography': No module named 'cryptography'": 1,
+      "Real wikitext-2 data is unavailable locally; provide a calibration file or cache the 'wikitext' dataset before compiling (no local Hugging Face dataset cache at /home/runner/.cache/huggingface/datasets)": 1,
+      "Real hellaswag data is unavailable locally; provide a calibration file or cache the 'Rowan/hellaswag' dataset before compiling (no local Hugging Face dataset cache at /home/runner/.cache/huggingface/datasets)": 1,
+      "requires real Windows sharing semantics": 1,
+      "Windows DLL lifetime regression": 1,
+      "no CUDA device on this host": 1,
+      "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path.": 2,
+      "No physical NVIDIA CUDA device and matching PyTorch runtime": 1,
+      "GNU PE linker regression": 1,
+      "physical DirectML runtime is not installed on this host": 2,
+      "could not import 'opentelemetry.sdk': No module named 'opentelemetry.sdk'": 1,
+      "the Qwen artifact is not present": 7
+    },
+    "inputs_sha256": {
+      "build\\mission\\hybrid-conv-hosted-395b\\hf-full-results.xml": "08188c85881a78a091576034733f15af10edbb00c4bc19c6d569bea3d22f9613",
+      "build\\mission\\hybrid-conv-hosted-395b\\hf-full-coverage.xml": "2bf87b0e6ca4f488c23352bbe1936a158cab7efa2ff338b9fa16d2012556466b"
+    },
+    "hybrid_regression_cases": {
+      "passed": 11
+    },
+    "revision": "395b8353d189bb27a8fb24c8781bc4d5d4144b7b",
+    "run_id": 39614770007,
+    "url": "https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39614770007",
+    "hardware": {
+      "cpu": "AMD EPYC 9V45 96-Core Processor",
+      "logical_cpus": 4,
+      "host_ram_bytes": 16760344576,
+      "available_ram_bytes_at_start": 15573348352
+    },
+    "python": "3.11.14",
+    "versions": {
+      "numpy": "1.26.4",
+      "torch": "2.9.1+cpu",
+      "transformers": "4.57.3",
+      "psutil": "7.2.2",
+      "safetensors": "0.8.0",
+      "tokenizers": "0.22.2"
+    },
+    "parity_report_sha256": "8e560c4aa56be1412ceedf4335d6b7edb2229486a3e0f04eecc99d122c989f36",
+    "freeze_sha256": "c2d5ebfe42c31346d449de24c9866c46e77c7f6d9db62e049cb4505c57dcbc17",
+    "blocking_steps": {
+      "Compile once and verify real CPU, Torch CPU, API and CLI outputs": "success",
+      "Run complete suite with real Torch, Transformers and format dependencies": "success",
+      "Enforce measured CPU line-coverage floor": "success"
+    },
+    "other_ci_jobs_note": "Other matrix jobs were still running at evidence collection; this record only asserts the completed blocking HF/full-suite/coverage job."
+  },
+  "local_followup": {
+    "tests": 4,
+    "failed": 4,
+    "junit_sha256": "5355e498b7f4c2c3a1aab97e5310d87a4af59138a3338078fd1417ec9a746f75",
+    "note": "The four local failed cases were rerun separately and all four still failed; no union with the complete suite."
+  }
+}
