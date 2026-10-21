@@ -1,18 +1,23 @@
 # Aether Runtime implementation status
 
-Reviewed 2026-10-20. The runtime/compiler mission is in progress.
+Reviewed 2026-10-21. The runtime/compiler mission is in progress.
 
 Supported CPU AEG compilation, integrity verification, reload and generation have
 executed on an Intel Core i5-1334U running Windows. The last complete green
-collection passed 5,214 tests with 41 skips in two serial processes, with Torch
-and Transformers installed; line coverage was 78.6457873%. The numerical-admission
-area's complete verification is recorded in [its report](docs/mission-numerical-admission.md).
-Independent stdlib-only local HTTP POSTs reproduce altered response framing
-affecting two MCP tests. The latest serial product/tools runs returned 5,264
-passed, 41 skipped and four failures (two HTTP framing cases and two RAM-refused
-audit workers), retaining all prior cases and adding 54. Line coverage increased
-to 78.6648254%. Full-suite-green remains open. These are
-functional checks, not production or
+local run at `edc7d8f` passed **5,320 tests with 42 skips**, with Torch and
+Transformers installed; line coverage was **78.7295039%**. A separate explicit
+pass-audit integration run passed one case; it is not included in that full-run
+count. The [convolution correction report](docs/mission-mamba-convolution.md)
+records measured memory/numerical results and mixed timing observations.
+[CI at that exact revision](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39437929183)
+passed all 22 jobs. Hosted core tests do not generally install Torch/HF, and
+repository-wide style/type checks remain advisory. The two formerly failing
+local MCP HTTP cases passed without a product change; this does not establish
+an environment fix. Mamba-2's distinct learned normalization and output bias
+now have independent matrix and real CPU/Torch CPU regressions; its new strict
+original-HF CI comparison is pending. See
+[scope and execution evidence](docs/mission-mamba2-normalization.md).
+These are functional checks, not production or
 throughput certification. Exact environment, evidence, known failures and the
 22-pass matrix are in [the validation record](docs/mission-validation.md).
 

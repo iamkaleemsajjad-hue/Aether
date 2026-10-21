@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -37,9 +37,13 @@ from aether.runtime.mamba_engine import MambaExecutionEngine, MambaLayerWeights,
 from aether.runtime.mamba2_engine import Mamba2ExecutionEngine, Mamba2LayerWeights, Mamba2ModelWeights
 from aether.runtime.rwkv_engine import RWKVExecutionEngine, RWKVLayerWeights, RWKVModelWeights
 from aether.runtime.hybrid_engine import HybridExecutionEngine, HybridLayerWeights, HybridModelWeights
+
 from aether.runtime.encoder_engine import EncoderExecutionEngine, EncoderLayerWeights, EncoderModelWeights
 from aether.runtime.seq2seq_engine import Seq2SeqDecoderLayer, Seq2SeqExecutionEngine, Seq2SeqLayer
 from aether.utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 logger = get_logger(__name__)
 
@@ -743,12 +747,25 @@ def _load_mamba2_engine_from_package(
     embedding = _require(tensors, (None, "embedding"), "token embedding")
     final_norm = _require(tensors, (None, "final_norm"), "final norm")
     lm_head = tensors.get((None, "lm_head"), embedding)
+    hidden = int(embedding.shape[1])
+    inner = int(architecture.get("ssm_inner_size") or hidden * 2)
+
+    def norm_vector(value: Any, size: int, description: str) -> NDArray[np.float32]:
+        # Resizing a learned scale hides a lost/colliding checkpoint tensor.
+        vector = np.asarray(value, dtype=np.float32)
+        if vector.shape != (size,):
+            raise AEGLoadError(
+                f"Mamba-2 {description} has shape {vector.shape}; expected ({size},). "
+                "Recompile the original checkpoint to preserve both learned norms."
+            )
+        return vector
+
     layers: list[Mamba2LayerWeights] = []
     for index in range(int(architecture.get("layers", 0) or 0)):
         def required(component: str) -> np.ndarray:
             return _require(tensors, (index, component), f"Mamba-2 layer {index} {component}")
         layers.append(Mamba2LayerWeights(
-            norm=_norm_vector(required("ssm_norm"), int(embedding.shape[1])),
+            norm=norm_vector(required("ssm_norm"), hidden, f"layer {index} input norm"),
             in_proj=required("ssm_in_proj"),
             conv1d=required("ssm_conv1d"),
             a_log=required("ssm_a_log"),
@@ -757,9 +774,14 @@ def _load_mamba2_engine_from_package(
             out_proj=required("ssm_out_proj"),
             in_proj_bias=tensors.get((index, "ssm_in_proj_bias")),
             conv_bias=tensors.get((index, "ssm_conv1d_bias")),
+            output_norm=(
+                norm_vector(
+                    tensors[(index, "ssm_output_norm")], inner, f"layer {index} output norm"
+                )
+                if (index, "ssm_output_norm") in tensors else None
+            ),
+            out_proj_bias=tensors.get((index, "ssm_out_proj_bias")),
         ))
-    hidden = int(embedding.shape[1])
-    inner = int(architecture.get("ssm_inner_size") or hidden * 2)
     heads = int(architecture.get("ssm_num_heads") or 0)
     groups = int(architecture.get("ssm_num_groups") or 1)
     head_dim = int(architecture.get("ssm_head_dim") or (inner // max(heads, 1)))
@@ -769,7 +791,7 @@ def _load_mamba2_engine_from_package(
         Mamba2ModelWeights(
             embedding=np.asarray(embedding, dtype=np.float32),
             layers=layers,
-            final_norm=_norm_vector(final_norm, hidden),
+            final_norm=norm_vector(final_norm, hidden, "final norm"),
             lm_head=np.asarray(lm_head, dtype=np.float32),
             norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
             norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
@@ -1419,7 +1441,7 @@ def _dequantized_by_key(package: Any) -> dict[tuple[int | None, str | None], np.
             r"attention_norm|ffn_norm|post_attention_norm|post_ffn_norm|"
             r"gate_proj|up_proj|down_proj|moe_router|"
             r"expert_\d+_(?:gate_proj|up_proj|down_proj)|q_a_proj|q_b_proj|"
-            r"kv_a_proj|kv_b_proj|k_rope_proj|q_a_norm|kv_a_norm|ssm_norm|"
+            r"kv_a_proj|kv_b_proj|k_rope_proj|q_a_norm|kv_a_norm|ssm_norm|ssm_output_norm|"
             r"ssm_in_proj|ssm_conv1d|ssm_x_proj|ssm_dt_proj|ssm_dt|ssm_a_log|ssm_d|"
             r"ssm_out_proj|ssm_time_decay|ssm_time_first|ssm_time_mix_k|"
             r"ssm_time_mix_v|ssm_time_mix_r|ssm_ffn_norm|ssm_ffn_time_mix_k|"

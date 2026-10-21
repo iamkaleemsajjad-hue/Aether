@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve Mamba-2's distinct input and learned post-gate RMSNorm scales,
+  expanded HF geometry and output-projection bias through AEG packaging and
+  actual CPU/Torch CPU execution. Add independent SSD-matrix regressions and
+  a blocking original-HF CPU admission/API/CLI check. See
+  [executed checks and remaining scope](docs/mission-mamba2-normalization.md).
 - Keep causal-convolution histories bounded for width-1 kernels in CPU and
   Torch Mamba/Mamba-2 execution. Independent convolution-oracle and real cache
   handoff tests reproduce the former wrong outputs and growing history.

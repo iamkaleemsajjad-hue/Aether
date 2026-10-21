@@ -11,10 +11,13 @@ changing the AEG artifact contract.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 import numpy as np
 from aether.runtime.stopping import stop_token_set
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 
 @dataclass
@@ -28,6 +31,8 @@ class Mamba2LayerWeights:
     out_proj: np.ndarray
     in_proj_bias: np.ndarray | None = None
     conv_bias: np.ndarray | None = None
+    output_norm: NDArray[np.float32] | None = None
+    out_proj_bias: NDArray[np.float32] | None = None
 
 
 @dataclass
@@ -81,6 +86,11 @@ class Mamba2ExecutionEngine:
             raise ValueError("Mamba-2 requires positive n_heads/n_groups with n_heads divisible by n_groups")
         if self.num_heads * self.head_dim != self.inner_size:
             raise ValueError("Mamba-2 head geometry does not match the expanded inner dimension")
+        for index, layer in enumerate(weights.layers):
+            if layer.output_norm is not None and layer.output_norm.shape != (self.inner_size,):
+                raise ValueError(
+                    f"Mamba-2 layer {index} output norm must have {self.inner_size} scales"
+                )
         self.num_kv_heads = self.num_heads
         self.sparse_attention_plan = None
         self.semantic_kv_plan = None
@@ -148,7 +158,17 @@ class Mamba2ExecutionEngine:
         y = np.sum(state * c[:, :, None, :], axis=-1)
         y += x * np.asarray(layer.d, dtype=np.float32).reshape(1, self.num_heads, 1)
         mixed = y.reshape(-1, self.inner_size) * self._silu(z)
-        return hidden + mixed @ layer.out_proj.T
+        if layer.output_norm is not None:
+            # Dao & Gu (2024), section 7.1, and mamba2_simple.py v2.2.4:
+            # g = y*SiLU(z); output = g/sqrt(mean(g**2)+eps)*norm.weight.
+            # This is RMSNorm even for a legacy outer LayerNorm contract.
+            mixed = mixed / np.sqrt(
+                (mixed * mixed).mean(axis=-1, keepdims=True) + self.weights.norm_eps
+            ) * layer.output_norm
+        projected_out = mixed @ layer.out_proj.T
+        if layer.out_proj_bias is not None:
+            projected_out = projected_out + layer.out_proj_bias
+        return hidden + projected_out
 
     def forward(self, token_ids: np.ndarray, cache: Mamba2Cache | None = None) -> tuple[np.ndarray, Mamba2Cache]:
         ids = np.asarray(token_ids, dtype=np.int64).reshape(-1)
@@ -168,6 +188,17 @@ class Mamba2ExecutionEngine:
         logits = np.stack(outputs, axis=0)
         cache.last_logits = logits[-1].copy()
         return logits, cache
+
+    def forward_step(
+        self,
+        token_ids: NDArray[np.int64] | list[int],
+        cache: Mamba2Cache | None = None,
+        *,
+        return_all_logits: bool = False,
+    ) -> tuple[NDArray[np.float32], Mamba2Cache]:
+        """Expose causal rows or the final vocabulary vector with owned caller state."""
+        rows, updated = self.forward(np.asarray(token_ids, dtype=np.int64), cache)
+        return (rows if return_all_logits else rows[-1]), updated
 
     def generate_iter(self, prompt_ids: np.ndarray, max_tokens: int = 16, temperature: float = 0.0,
                       eos_token_id: int | None = None, cache: Mamba2Cache | None = None,

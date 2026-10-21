@@ -1187,7 +1187,7 @@ class IngestionPipeline:
                 f"expert_{int(canonical_moe.group(2))}_{canonical_moe.group(3)}"
             )
         canonical_ssm = re.match(
-            r"^layer_(\d+)_((?:ssm_norm|ssm_in_proj|ssm_conv1d|ssm_x_proj|"
+            r"^layer_(\d+)_((?:ssm_norm|ssm_output_norm|ssm_in_proj|ssm_conv1d|ssm_x_proj|"
             r"ssm_dt_proj|ssm_dt|ssm_a_log|ssm_d|ssm_out_proj|ssm_ffn_norm|"
             r"ssm_time_decay|ssm_time_first|ssm_time_mix_k|ssm_time_mix_v|"
             r"ssm_time_mix_r|ssm_ffn_time_mix_k|ssm_ffn_time_mix_r|ssm_key|"
@@ -1197,9 +1197,18 @@ class IngestionPipeline:
         )
         if canonical_ssm:
             return int(canonical_ssm.group(1)), canonical_ssm.group(2)
+        if layer_match and re.search(
+            r"(?:^|_)layers_\d+_mixer_norm(?:_|$)", lowered_name
+        ):
+            # Mamba-2's learned post-gate RMSNorm is distinct from the outer
+            # input norm (Dao & Gu 2024, section 7.1). Grouping them loses one
+            # scale vector while the binding counters claim both were used.
+            return int(layer_match.group(1)), "ssm_output_norm"
         if layer_match and (
             re.search(r"(?:^|_)backbone_layers_\d+_norm(?:_|$)", lowered_name)
-            or re.search(r"(?:^|_)layers_\d+_(?:mixer|mamba)_norm(?:_|$)", lowered_name)
+            # The hybrid selective-scan contract stores its input scale here;
+            # it is not HF Mamba-2's mixer.norm post-gate scale.
+            or re.search(r"(?:^|_)layers_\d+_mamba_norm(?:_|$)", lowered_name)
         ):
             return int(layer_match.group(1)), "ssm_norm"
         # BERT-family checkpoints expose semantic encoder paths rather than
@@ -1759,7 +1768,7 @@ class IngestionPipeline:
                 slot_channels = inner + 2 * groups * state
                 slots = (
                     ("ssm_norm", hidden, hidden, "rmsnorm"),
-                    ("ssm_ffn_norm", hidden, hidden, "rmsnorm"),
+                    ("ssm_output_norm", inner, inner, "rmsnorm"),
                     ("ssm_in_proj", 2 * inner + 2 * groups * state + heads, hidden, "linear"),
                     ("ssm_conv1d", slot_channels, conv, "linear"),
                     ("ssm_a_log", heads, 1, "parameter"),
@@ -1807,7 +1816,7 @@ class IngestionPipeline:
                     attributes={
                         "in_features": in_features,
                         "out_features": out_features,
-                        "hidden_size": hidden,
+                        "hidden_size": out_features if op_type == "rmsnorm" else hidden,
                         "d_state": state,
                         "dt_rank": dt_rank,
                         "conv_kernel": conv,

@@ -8,12 +8,15 @@ MPS when the corresponding PyTorch device exists.
 
 from __future__ import annotations
 
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 import numpy as np
 
 from aether.runtime.torch_engine import _resolve_device
 from aether.runtime.stopping import stop_token_set
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 
 def _apply_torch_grammar_mask(logits: Any, grammar_session: Any, torch: Any) -> Any:
@@ -150,6 +153,14 @@ class TorchMamba2AEGEngine(_TorchStateBase):
                 "out_proj": self._tensor(layer.out_proj, layer_device),
                 "in_bias": None if layer.in_proj_bias is None else self._tensor(layer.in_proj_bias, layer_device),
                 "conv_bias": None if layer.conv_bias is None else self._tensor(layer.conv_bias, layer_device),
+                "output_norm": (
+                    None if layer.output_norm is None
+                    else self._tensor(layer.output_norm, layer_device)
+                ),
+                "out_bias": (
+                    None if layer.out_proj_bias is None
+                    else self._tensor(layer.out_proj_bias, layer_device)
+                ),
             })
 
     def _new_cache(self) -> Any:
@@ -193,7 +204,13 @@ class TorchMamba2AEGEngine(_TorchStateBase):
         cache.states[index] = state.detach()
         y = (state * c[:, :, None, :]).sum(dim=-1) + x * layer["d"].reshape(1, self.num_heads, 1)
         mixed = y.reshape(-1, self.inner_size) * self._silu(z, torch)
-        return hidden + self._linear(mixed, layer["out_proj"])
+        if layer["output_norm"] is not None:
+            # Post-gate RMSNorm, matching Dao & Gu (2024), section 7.1 and
+            # Transformers v4.57.3 MambaRMSNormGated.forward.
+            mixed = torch.nn.functional.rms_norm(
+                mixed, (self.inner_size,), layer["output_norm"], float(self.weights.norm_eps)
+            )
+        return hidden + self._linear(mixed, layer["out_proj"], layer["out_bias"])
 
     def forward(self, token_ids: Any, cache: Any | None = None) -> tuple[np.ndarray, Any]:
         torch = self.torch
@@ -211,6 +228,13 @@ class TorchMamba2AEGEngine(_TorchStateBase):
                 cache.length += 1
                 cache.last_logits = logits[0].detach()
         return torch.stack(outputs).float().cpu().numpy(), cache
+
+    def forward_step(
+        self, token_ids: Any, cache: Any | None = None, *, return_all_logits: bool = False,
+    ) -> tuple[NDArray[np.float32], Any]:
+        """Expose the same causal row/final-vector contract as the CPU executor."""
+        rows, updated = self.forward(token_ids, cache)
+        return (rows if return_all_logits else rows[-1]), updated
 
     def generate_iter(self, prompt_ids: np.ndarray, max_tokens: int = 16, temperature: float = 0.0,
                       top_k: int = 0, top_p: float = 1.0, eos_token_id: int | None = None,

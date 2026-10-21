@@ -35,7 +35,7 @@ def write_json(path: Path, value: object) -> None:
 
 
 def tokenize_samples(
-    records: list[dict[str, Any]], tokenizer: Any, vocab: int, context: int, greedy: int
+    records: list[dict[str, Any]], tokenizer: Any, vocab: int, context: int | None, greedy: int
 ) -> list[dict[str, Any]]:
     """Resolve a bounded, fixed probe set into explicit prefix and label IDs."""
     if not isinstance(records, list) or not 1 <= len(records) <= 128:
@@ -70,7 +70,12 @@ def tokenize_samples(
             ):
                 raise ValueError("quality probes require nonempty in-vocabulary integer token IDs")
         prefix, labels = ids["prompt_ids"], ids["continuation_ids"]
-        if max(len(prefix) + len(labels), len(prefix) + greedy) > context:
+        positions = max(len(prefix) + len(labels), len(prefix) + greedy)
+        # Recurrent models have no positional-table limit. Bound the reference
+        # workload explicitly without inventing a source-model context length.
+        if context is None and positions > 4096:
+            raise ValueError("recurrent reference probes are bounded to 4096 tokens")
+        if context is not None and positions > context:
             raise ValueError("fixed quality probe exceeds the source context; refusing truncation")
         total_positions += len(labels)
         if total_positions > 4096:
@@ -125,8 +130,11 @@ def _hf(job: dict[str, Any], work: Path) -> dict[str, Any]:
     config = model.config
     if getattr(config, "quantization_config", None) is not None:
         raise ValueError("a pre-quantized source is not the original FP32 quality oracle")
-    context = int(getattr(config, "max_position_embeddings", 0) or 0)
-    if context <= 0:
+    raw_context = getattr(config, "max_position_embeddings", None)
+    context = int(raw_context or 0) if raw_context is not None else None
+    if context is None and getattr(config, "model_type", None) != "mamba2":
+        raise ValueError("HF quality reference requires an explicit source context bound")
+    if context is not None and context <= 0:
         raise ValueError("HF quality reference requires an explicit source context bound")
     vocab = int(config.vocab_size)
     samples = tokenize_samples(job["probes"], tokenizer, vocab, context, job["greedy_tokens"])
@@ -152,7 +160,7 @@ def _hf(job: dict[str, Any], work: Path) -> dict[str, Any]:
     result["reference"] = {
         "kind": "huggingface",
         "dtype": "float32",
-        "method": "original source; eager attention; full-prefix greedy; fixed-label NLL",
+        "method": "original source; FP32 forward; full-prefix greedy; fixed-label NLL",
         "versions": {key: importlib.metadata.version(key) for key in ("torch", "transformers")},
         "evidence_sha256": canonical_hash(result),
     }
@@ -181,14 +189,20 @@ def _candidate(job: dict[str, Any], work: Path) -> dict[str, Any]:
     if job["executor"] == "torch_cpu":
         import torch
 
+        from aether.runtime.cpu_engine import CPUExecutionEngine
+        from aether.runtime.mamba2_engine import Mamba2ExecutionEngine
         from aether.runtime.torch_engine import TorchAEGEngine
+        from aether.runtime.torch_state_engine import TorchMamba2AEGEngine
 
         torch.set_num_threads(1)
-        if type(engine).__name__ != "CPUExecutionEngine":
+        if isinstance(engine, CPUExecutionEngine):
+            engine = TorchAEGEngine(engine, "cpu")
+        elif isinstance(engine, Mamba2ExecutionEngine):
+            engine = TorchMamba2AEGEngine(engine, "cpu")
+        else:
             raise ValueError(
                 "HF numerical admission of this specialized torch executor is not implemented"
             )
-        engine = TorchAEGEngine(engine, "cpu")
     elif job["executor"] != "cpu":
         raise ValueError("unknown quality executor")
     reference = json.loads((work / "hf-result.json").read_text(encoding="utf-8"))
