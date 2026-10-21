@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Validate dispatch convergence and ledger refresh with controlled clock inputs,
+  while preserving a live CPU evidence/thread-setting check. The former
+  cross-call timing assertion failed under changing host load despite valid
+  settled measurements; the runtime's 2x stale-value guard remains intact.
+  See [counterexample and validation scope](docs/mission-dispatch-validation.md).
 - Correct width-1 convolution history in the separate hybrid Torch SSM loop.
   Independent convolution and real artifact regressions cover wrong logits
   and growing history; see [measured results and timing limits](docs/mission-hybrid-convolution.md).
