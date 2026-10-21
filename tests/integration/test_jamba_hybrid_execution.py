@@ -27,11 +27,12 @@ def _write_tokenizer(path: Path, vocab_size: int) -> None:
 
 
 @pytest.mark.integration
-def test_jamba_hybrid_compiles_reloads_and_reuses_cache(tmp_path: Path) -> None:
+@pytest.mark.parametrize("kernel", [1, 3])
+def test_jamba_hybrid_compiles_reloads_and_reuses_cache(tmp_path: Path, kernel: int) -> None:
     safetensors = pytest.importorskip("safetensors.numpy")
     source = tmp_path / "jamba"
     source.mkdir()
-    vocab, hidden, inner, state, dt_rank, kernel = 16, 8, 16, 2, 1, 3
+    vocab, hidden, inner, state, dt_rank = 16, 8, 16, 2, 1
     heads = kv_heads = 2
     head_dim = hidden // heads
     intermediate = 16

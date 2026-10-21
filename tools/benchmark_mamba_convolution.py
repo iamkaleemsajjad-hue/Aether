@@ -18,6 +18,7 @@ import platform
 import runpy
 import statistics
 import subprocess
+import sys
 import time
 from dataclasses import asdict
 from importlib.metadata import version
@@ -49,8 +50,13 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, default=1024)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--cpu-affinity", nargs="+", type=int)
     parser.add_argument(
         "--backends", nargs="+", choices=("cpu", "torch_cpu"), default=["cpu", "torch_cpu"]
+    )
+    parser.add_argument(
+        "--families", nargs="+", choices=("mamba", "mamba2", "hybrid"),
+        default=["mamba", "mamba2"],
     )
     args = parser.parse_args()
     if args.tokens < 2 or args.repeats < 3 or args.warmup < 1:
@@ -66,12 +72,24 @@ def main() -> None:
     root = Path(__file__).resolve().parents[1]
     fixture_path = root / "tests/unit/test_mamba_convolution_history.py"
     fixture = runpy.run_path(str(fixture_path))
+    hybrid_path = root / "tests/unit/test_hybrid_convolution_history.py"
+    hybrid_fixture = None
+    if "hybrid" in args.families:
+        # The fixture imports its independent convolution oracle beside it.
+        sys.path.insert(0, str(fixture_path.parent))
+        try:
+            hybrid_fixture = runpy.run_path(str(hybrid_path))["hybrid_fixture"]
+        finally:
+            sys.path.pop(0)
     process = psutil.Process()
+    if args.cpu_affinity is not None:
+        process.cpu_affinity(args.cpu_affinity)
     report: dict[str, Any] = {
         "scope": "isolated synthetic convolution; not original-HF or trained-model parity",
         "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         "platform": platform.platform(),
         "processor": platform.processor(),
+        "cpu_affinity": process.cpu_affinity() if hasattr(process, "cpu_affinity") else None,
         "versions": {name: version(name) for name in ("numpy", "psutil", "pytest")},
         "python": platform.python_version(),
         "available_memory_at_start": psutil.virtual_memory().available,
@@ -90,6 +108,9 @@ def main() -> None:
                 root / "src/aether/runtime/mamba_engine.py",
                 root / "src/aether/runtime/mamba2_engine.py",
                 root / "src/aether/runtime/torch_state_engine.py",
+                root / "src/aether/runtime/torch_engine.py",
+                root / "src/aether/runtime/hybrid_engine.py",
+                *([hybrid_path] if hybrid_fixture is not None else []),
             )
         },
         "artifact_bytes": None,
@@ -105,10 +126,18 @@ def main() -> None:
             torch.set_num_threads(1)
             torch.set_num_interop_threads(1)
             report["versions"]["torch"] = torch.__version__
-        for family in ("mamba", "mamba2"):
+        for family in args.families:
             for width in (1, 4):
-                source = fixture["_engine"](family, width, True, 3)
-                engine = fixture["_portable"](source, backend)
+                if family == "hybrid":
+                    assert hybrid_fixture is not None
+                    engine, source = hybrid_fixture(width, True)
+                    if backend == "torch_cpu":
+                        from aether.runtime.torch_engine import TorchHybridAEGEngine
+
+                        engine = TorchHybridAEGEngine(engine, "cpu")
+                else:
+                    source = fixture["_engine"](family, width, True, 3)
+                    engine = fixture["_portable"](source, backend)
                 expected = fixture["_oracle"](source, ids[:65])
                 actual, _ = engine.forward(ids[:65])
                 validator = QualityValidator()
@@ -144,7 +173,8 @@ def main() -> None:
                                 "decode_tokens_per_second": (len(ids) - 1) / elapsed,
                             }
                         )
-                logical, backing = _history_bytes(cache)
+                recurrent = cache.ssm if family == "hybrid" and backend == "cpu" else cache
+                logical, backing = _history_bytes(recurrent)
                 rates = [item["decode_tokens_per_second"] for item in samples]
                 case = {
                     "family": family,

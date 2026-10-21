@@ -3246,7 +3246,8 @@ class TorchHybridAEGEngine:
         conv = (window * kernel.reshape(1, self.inner_size, -1)).sum(dim=-1)
         if layer["ssm_conv_bias"] is not None:
             conv = conv + layer["ssm_conv_bias"].reshape(1, -1)
-        cache.conv_history[index] = window[..., -max(self.conv_kernel - 1, 0):].detach()
+        # Drop the oldest column; k=1 must retain an empty history, not -0:.
+        cache.conv_history[index] = window[..., 1:].detach()
         conv = self._silu(conv, self.torch)
         selective = self._linear(conv, layer["ssm_x_proj"])
         dt_raw = selective[..., :self.dt_rank]

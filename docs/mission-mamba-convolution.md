@@ -1,5 +1,10 @@
 # Mamba causal-convolution history correction
 
+Followups: the separate hybrid Torch loop required its own
+[correction and measurements](mission-hybrid-convolution.md). The later
+[Mamba-2 normalization/HF checks](mission-mamba2-normalization.md) address a
+different whole-block contract. The historical results below cover four loops.
+
 Executed on 2026-10-20, Intel Core i5-1334U, Windows AMD64, Python 3.10.11,
 NumPy 1.26.4, Torch 2.9.1+cpu and pytest 9.1.1. This checkpoint establishes
 one convolution/cache correction. Original-HF Mamba/Mamba-2 parity, learned

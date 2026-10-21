@@ -1,0 +1,31 @@
+{
+  "baseline_revision": "fd5aa179cbc9ba05b260880a11e8b0b22f0cfa46",
+  "ruff_source_before_after": [
+    112,
+    112
+  ],
+  "mypy_source_before_after": [
+    48,
+    48
+  ],
+  "ruff_integration_before_after": [
+    7,
+    7
+  ],
+  "mypy_integration_before_after": [
+    3,
+    3
+  ],
+  "new_source_diagnostics": 0,
+  "fixture_builder_ast_sha256": "d9ce2cd1fb3565cc7699e5a58dedb399d109555e8d6a9f266587e0e845fb17f9",
+  "fixture_note": "Measurement test files are byte-identical across each A/B pair. Final test-only typing/assertion/format fixes do not change the fixture builder; AST hashes checked against the source-only parent snapshot.",
+  "initial_timing_note": "Unpinned; slower unchanged controls prevent a speed/no-regression conclusion. Optional affinity reporting was added afterward without changing forward math.",
+  "pinned_timing_note": "After-1 ran first and briefly overlapped source snapshot copying. Before-1 then after-2 ran serially, without other agent benchmarks/tests, on logical CPU 2. Host background load remains uncontrolled; unchanged width-4 control varies substantially.",
+  "reports_sha256": {
+    "hybrid-convolution-before.json": "12e66c1112e8d137df03759f67436bef5f8728d57129c098afa6b05a26c17837",
+    "hybrid-convolution-after.json": "9a7b919754190e44e34381dd98eff2a2651f7af1a423366935c91c7cd52f1b28",
+    "hybrid-convolution-pinned-after-1.json": "e5eef2bd86fc65cf5c6472801ec9448b542b586c6d71dfc9d6b999bc0bd73c3d",
+    "hybrid-convolution-pinned-before-1.json": "36391f6e747d98295a8960c88513f23de556c8789cf38e44e3d1f6fb96ff1f4c",
+    "hybrid-convolution-pinned-after-2.json": "b3e224092177c5342e081ecef5f7867fa8fffdb257c4a04b5bd08dd690f3fc39"
+  }
+}

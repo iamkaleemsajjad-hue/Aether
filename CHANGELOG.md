@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Correct width-1 convolution history in the separate hybrid Torch SSM loop.
+  Independent convolution and real artifact regressions cover wrong logits
+  and growing history; see [measured results and timing limits](docs/mission-hybrid-convolution.md).
 - Verify authenticated native-library cache copies on POSIX as well as Windows
   in the real compile/load/generate integration test. The loader already uses
   this lifetime-safe path on every OS; the previous POSIX path assertion was stale.
