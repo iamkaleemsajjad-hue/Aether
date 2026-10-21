@@ -15,7 +15,14 @@ repository-wide style/type checks remain advisory. The two formerly failing
 local MCP HTTP cases passed without a product change; this does not establish
 an environment fix. Mamba-2's distinct learned normalization and output bias
 now have independent matrix and real CPU/Torch CPU regressions; its new strict
-original-HF CI comparison is pending. See
+original-HF CI comparison passed on two untrained FP32 source fixtures, including
+both public CPU backends and the CLI. All 23
+[CI jobs at `1c6b718`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39546525959)
+passed. The complete local run returned 5,330 passed, 42 skipped and three
+failures (the two local MCP HTTP cases and an unchanged timing guard); a focused
+followup passed the timing guard but retained the HTTP failures. Raw local line
+coverage was 78.6650129%, so full-local-green and the coverage criterion remain
+open. See
 [scope and execution evidence](docs/mission-mamba2-normalization.md).
 These are functional checks, not production or
 throughput certification. Exact environment, evidence, known failures and the

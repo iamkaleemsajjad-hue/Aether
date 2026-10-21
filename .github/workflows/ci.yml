@@ -133,10 +133,16 @@ jobs:
       - name: Install pinned CPU reference stack
         run: |
           python -m pip install 'torch==2.9.1+cpu' --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -e '.[test]' 'numpy==1.26.4' 'transformers==4.57.3' 'safetensors==0.8.0' 'tokenizers==0.22.2' 'psutil==7.2.2'
+          python -m pip install -e '.[test,server,formats]' 'numpy==1.26.4' 'transformers==4.57.3' 'safetensors==0.8.0' 'tokenizers==0.22.2' 'psutil==7.2.2'
           python -m pip freeze > hf-parity-freeze.txt
       - name: Compile once and verify real CPU, Torch CPU, API and CLI outputs
         run: python tools/validate_mamba2_hf.py --output hf-parity-results --baseline-src historical-mamba2/src
+      - name: Run complete suite with real Torch, Transformers and format dependencies
+        env:
+          AETHER_CACHE_DIR: ${{ runner.temp }}/aether-hf-full-cache
+          AETHER_KERNEL_CACHE: ${{ runner.temp }}/aether-hf-full-kernels
+          PYTHONHASHSEED: "0"
+        run: python -m pytest tests -q --timeout=180 --junitxml=hf-full-results.xml --cov-report=xml:hf-full-coverage.xml --cov-report=term
       - name: Upload measured parity evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -145,6 +151,8 @@ jobs:
           path: |
             hf-parity-results/
             hf-parity-freeze.txt
+            hf-full-results.xml
+            hf-full-coverage.xml
           if-no-files-found: error
 
   docs-build:
