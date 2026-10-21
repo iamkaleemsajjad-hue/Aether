@@ -24,6 +24,12 @@ followup passed the timing guard but retained the HTTP failures. Raw local line
 coverage was 78.6650129%, so full-local-green and the coverage criterion remain
 open. See
 [scope and execution evidence](docs/mission-mamba2-normalization.md).
+The expanded hosted Linux job at `2bb08d2` subsequently passed the complete
+suite with Torch, Transformers, server/format extras and CPU ONNX Runtime:
+**5,324 passed, 51 skipped, zero failures**, with **78.6772413%** line coverage.
+[All 23 CI jobs passed](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39554606771).
+That job now enforces a measured 78.6% line-coverage floor; differing platform
+and optional-dependency skips remain explicit in the linked record.
 These are functional checks, not production or
 throughput certification. Exact environment, evidence, known failures and the
 22-pass matrix are in [the validation record](docs/mission-validation.md).

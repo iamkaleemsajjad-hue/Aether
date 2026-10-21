@@ -166,13 +166,28 @@ bytes across artifact removal. The corrected assertion requires actual native
 dispatch and hash-identical independent cache bytes on every OS. This corrects
 a false-positive test, not a runtime numerical defect. The job also now pins
 CPU ONNX Runtime 1.23.2 to execute existing ONNX cases previously skipped for
-missing dependencies. The updated full-suite outcome remains pending.
+missing dependencies. The corrected
+[run at `2bb08d2`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39554606771)
+passed **all 23 jobs**, including HF parity again and the complete CPU suite:
+**5,324 passed, 51 skipped, zero failures** in 168.87 seconds. The
+[complete-suite record](measurements/mamba2-complete-suite.json) retains exact
+coverage, skip reasons, collection-ID differences and raw evidence hashes.
+Its hosted CPU was AMD EPYC 7763 (four logical CPUs); the timing table above
+continues to describe the earlier EPYC 9V45 measurement, without mixing runs.
+The 51 skips include optional Accelerate, cryptography and OTLP SDK, offline
+datasets/models, opt-in audit and unavailable physical/device/Windows contracts.
+The existing CPU ONNX cases executed; this does not establish Mamba-2 ONNX parity.
 
 Raw full-run coverage is **45,031/57,244 (78.6650129%)**, versus
 **45,038/57,206 (78.7295039%)** before. Branch coverage is 10,751/17,228 versus
 10,756/17,206. The reduction is retained honestly; this run does not satisfy
 the mission's coverage/no-failures completion criterion. It must not be replaced
 by the union of isolated reruns or inferred from the hosted pass status.
+The subsequent green Linux run measured **45,038/57,244 (78.6772413%)** lines
+and **10,762/17,228** branches. Different platform/dependency coverage prevents
+a direct Windows before/after no-regression claim. The blocking hosted job now
+enforces a **78.6% line-coverage floor**, derived from this Linux baseline and
+ready to ratchet upward; it does not resolve the failed Windows environment.
 
 The six changed source files retain 317 Ruff and 102 mypy findings, with no
 added file/code or file/message diagnostic against their before baseline.

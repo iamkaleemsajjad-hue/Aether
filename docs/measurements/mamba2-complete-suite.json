@@ -1,0 +1,444 @@
+{
+  "revision": "2bb08d25a5585604d5eac6b9f4023c941115dbea",
+  "ci_url": "https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39554606771",
+  "successful_jobs": 23,
+  "suite": [
+    {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "0",
+      "skipped": "51",
+      "tests": "5375",
+      "time": "168.866",
+      "timestamp": "2026-10-21T06:20:09.125869+00:00",
+      "hostname": "runnervmxehtw"
+    }
+  ],
+  "passed": 5324,
+  "same_collected_case_identities_as_local_full_run": false,
+  "collection_identity_differences": {
+    "remote_only": [
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[10]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[11]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[12]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[13]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[14]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[8]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[2]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[3]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[6]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[7]"
+        ],
+        1
+      ]
+    ],
+    "local_only": [
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q2_K]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q3_K]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q4_K]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q5_K]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q6_K]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q8_0]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q4_0]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q4_1]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q5_0]"
+        ],
+        1
+      ],
+      [
+        [
+          "tests.unit.test_gguf_kquant",
+          "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q5_1]"
+        ],
+        1
+      ]
+    ]
+  },
+  "coverage": {
+    "version": "7.16.2",
+    "timestamp": "1792563768573",
+    "lines-valid": "57244",
+    "lines-covered": "45038",
+    "line-rate": "0.7868",
+    "branches-valid": "17228",
+    "branches-covered": "10762",
+    "branch-rate": "0.6247",
+    "complexity": "0"
+  },
+  "line_coverage_percent": 78.67724128292922,
+  "raw_evidence_sha256": {
+    "hf-full-results.xml": "a2f4405377380c3862cf8714d43acb6f54d7b587974e0aa8a76a6f7a9c32cc70",
+    "hf-full-coverage.xml": "bbb454a8d005747de7ce795c54592fd7e599d73c3c8f82196fe51b2778dbaf65",
+    "hf-parity-freeze.txt": "88a1bca4d5dc84431ff6b14b209744c9319eb5b9a16208b0454ce0d0093334bd"
+  },
+  "skips": [
+    {
+      "class": "tests.integration.test_automatic_execution_dispatch",
+      "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[llama]",
+      "reason": "could not import 'accelerate': No module named 'accelerate'"
+    },
+    {
+      "class": "tests.integration.test_automatic_execution_dispatch",
+      "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[gpt2]",
+      "reason": "could not import 'accelerate': No module named 'accelerate'"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_compile_small_model",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_end_to_end_generate",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_chat_completion",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_compile_plan_dry_run",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_model_info",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_openai_compatible_server",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_model_list_and_remove",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_backend_detection",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_hardware_detection",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_benchmark_smoke",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_aeg_format_roundtrip",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_cross_hardware_portability",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+      "name": "test_ssl_server_credentials_creation",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+      "name": "test_ssl_server_credentials_mtls",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+      "name": "test_ssl_channel_credentials_creation",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+      "name": "test_credential_bytes_helper",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+      "name": "test_credential_bytes_missing_file",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+      "name": "test_credential_bytes_none_passthrough",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+      "name": "test_require_grpc_no_error",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+      "name": "test_service_name_constant",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.tools.test_pass_audit",
+      "name": "test_real_public_compile_audit_smoke",
+      "reason": "Opt-in real subprocess compile/load/Runtime smoke, no timing"
+    },
+    {
+      "class": "tests.unit.test_adversarial.TestExecutionFidelity",
+      "name": "test_real_pretrained_model",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.unit.test_aeg_onnx_export",
+      "name": "test_real_directml_exported_aeg_operators",
+      "reason": "physical DirectML execution requires its optional installed runtime"
+    },
+    {
+      "class": "tests.unit.test_aeg_onnx_export",
+      "name": "test_actual_compiled_artifact_backend_generation_stream_and_unload[DmlExecutionProvider]",
+      "reason": "real DmlExecutionProvider is not installed"
+    },
+    {
+      "class": "tests.unit.test_artifact_publication",
+      "name": "test_real_member_handle_blocks_rename_then_retry_publishes",
+      "reason": "requires actual Windows file sharing"
+    },
+    {
+      "class": "tests.unit.test_artifact_publication",
+      "name": "test_real_persistent_member_lock_fails_after_bounded_attempts",
+      "reason": "requires actual Windows file sharing"
+    },
+    {
+      "class": "tests.unit.test_artifact_publication",
+      "name": "test_destination_created_during_real_lock_retry_is_preserved",
+      "reason": "requires actual Windows file sharing"
+    },
+    {
+      "class": "tests.unit.test_c2pa_signing",
+      "name": "test_pure_python_and_native_backends_agree",
+      "reason": "could not import 'cryptography': No module named 'cryptography'"
+    },
+    {
+      "class": "tests.unit.test_calibration.TestDatasets",
+      "name": "test_wikitext2",
+      "reason": "Real wikitext-2 data is unavailable locally; provide a calibration file or cache the 'wikitext' dataset before compiling (no local Hugging Face dataset cache at /home/runner/.cache/huggingface/datasets)"
+    },
+    {
+      "class": "tests.unit.test_calibration.TestDatasets",
+      "name": "test_hellaswag",
+      "reason": "Real hellaswag data is unavailable locally; provide a calibration file or cache the 'Rowan/hellaswag' dataset before compiling (no local Hugging Face dataset cache at /home/runner/.cache/huggingface/datasets)"
+    },
+    {
+      "class": "tests.unit.test_compiler_publication_transaction",
+      "name": "test_real_windows_old_member_lock_preserves_published_output",
+      "reason": "requires real Windows sharing semantics"
+    },
+    {
+      "class": "tests.unit.test_cpu_host_portability",
+      "name": "test_real_packaged_windows_aeg_can_be_removed_while_engine_is_live",
+      "reason": "Windows DLL lifetime regression"
+    },
+    {
+      "class": "tests.unit.test_device_placement.TestDeviceResolution",
+      "name": "test_cuda_spec_gains_an_explicit_index",
+      "reason": "no CUDA device on this host"
+    },
+    {
+      "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+      "name": "test_compiler_compile_produces_weight_blob",
+      "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+    },
+    {
+      "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+      "name": "test_compiled_package_is_loadable_and_runnable",
+      "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+    },
+    {
+      "class": "tests.unit.test_hardware_evidence",
+      "name": "test_real_cuda_aeg_execution_never_uses_cpu_fallback",
+      "reason": "No physical NVIDIA CUDA device and matching PyTorch runtime"
+    },
+    {
+      "class": "tests.unit.test_native_cpu_reproducibility",
+      "name": "test_two_cold_gnu_pe_builds_are_identical_and_execute",
+      "reason": "GNU PE linker regression"
+    },
+    {
+      "class": "tests.unit.test_onnx_provider_contract",
+      "name": "test_real_directml_offline_workload_requires_gpu_node_execution",
+      "reason": "physical DirectML runtime is not installed on this host"
+    },
+    {
+      "class": "tests.unit.test_onnx_provider_contract",
+      "name": "test_real_directml_runtime_routes_generation_and_stream_to_gpu",
+      "reason": "physical DirectML runtime is not installed on this host"
+    },
+    {
+      "class": "tests.unit.test_onnx_session_contract",
+      "name": "test_actual_onnx_session_reuses_only_bound_state[DmlExecutionProvider]",
+      "reason": "real DmlExecutionProvider is not installed"
+    },
+    {
+      "class": "tests.unit.test_otlp_conformance",
+      "name": "test_sdk_bridge_preserves_aether_trace_ids",
+      "reason": "could not import 'opentelemetry.sdk': No module named 'opentelemetry.sdk'"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_the_packaged_tokenizer_renders_the_checkpoints_own_template",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_templating_changes_the_token_sequence_the_model_sees",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_a_template_needing_undefined_names_still_renders",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_tokenize_true_is_refused_rather_than_silently_ignored",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_the_packaged_tokenizer_honours_add_special_tokens",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_a_missing_template_is_reported_not_guessed",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_an_override_also_works_through_the_packaged_tokenizer",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_v31_features",
+      "name": "test_compiled_package_contains_v31_artifacts",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    }
+  ],
+  "notes": [
+    "Linux hosted CPU execution; not a replacement for the failed Windows run.",
+    "Full style/type checks remain advisory; the suite and HF parity steps are blocking.",
+    "Coverage is not directly comparable across different OS/dependency environments."
+  ]
+}

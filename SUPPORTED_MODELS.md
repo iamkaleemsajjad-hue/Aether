@@ -143,7 +143,7 @@ earlier documentation, which asserted support without a parity check:
 | Family | Status detail |
 |--------|---------------|
 | **Mamba** | Runs; selective-scan output diverges from the reference (cosine ≈ 0.97). Not correct. |
-| **Mamba-2 / SSD** | Runs; output badly diverges (cosine ≈ 0.21). Not correct. |
+| **Mamba-2 / SSD** | Historical parity check diverged (cosine ≈ 0.21). Learned normalization, HF expansion and output bias are now corrected; two untrained FP32 HF fixtures pass CPU/Torch CPU, API and CLI checks. Trained checkpoints and other config/normalization variants remain unverified; see [executed evidence](docs/mission-mamba2-normalization.md). |
 | **RWKV-7** | Does not currently bind its time-mix/channel-mix weights during compile. |
 | **Jamba** | Hybrid attention+SSM+MoE (also Zamba2, Hymba, Falcon-H1, Bamba, PLaMo); the reference path requires CUDA Mamba kernels, so it is unverified on CPU. |
 
