@@ -502,14 +502,16 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
         packaged_path = artifact / packaged_kernels[0]["path"]
         assert packaged_path.is_file()
         loaded_path = Path(engine.kernels.library_path).resolve()
-        if os.name == "nt":
-            import hashlib
+        import hashlib
 
-            assert loaded_path != packaged_path.resolve()
-            assert loaded_path.name.startswith("aether_packaged_")
-            assert hashlib.sha256(loaded_path.read_bytes()).hexdigest() == hashlib.sha256(packaged_path.read_bytes()).hexdigest()
-        else:
-            assert loaded_path == packaged_path.resolve()
+        # Every host caches authenticated executable bytes so later emission
+        # and live engines survive removal of the original artifact.
+        assert engine.kernels.is_native
+        assert loaded_path != packaged_path.resolve()
+        assert loaded_path.name.startswith("aether_packaged_")
+        assert hashlib.sha256(loaded_path.read_bytes()).hexdigest() == hashlib.sha256(
+            packaged_path.read_bytes()
+        ).hexdigest()
 
     runtime = Runtime(RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=3))
     response = runtime.generate(str(artifact), prompt="hello world", max_tokens=3, temperature=0.0)

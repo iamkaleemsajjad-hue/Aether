@@ -157,8 +157,16 @@ both HTTP failures, including outside the sandbox. No assertion, threshold or
 RAM guard was relaxed. This local run is **not green**, despite hosted CI being
 green; the local HTTP environment and repeatability remain unresolved.
 The HF job now also installs server/format extras and runs the complete suite
-with real Torch/Transformers, retaining JUnit and coverage. That extended
-step's first outcome is pending until the updated workflow executes.
+with real Torch/Transformers, retaining JUnit and coverage. Its first run at
+`93d1628` returned **5,305 passed, 67 skipped, one failure** in 168.54 seconds;
+the HF parity step passed again. The failure was a stale integration assertion
+requiring POSIX to load its shared library directly from the artifact. The
+loader already uses `_cache_packaged_library` on every OS to preserve verified
+bytes across artifact removal. The corrected assertion requires actual native
+dispatch and hash-identical independent cache bytes on every OS. This corrects
+a false-positive test, not a runtime numerical defect. The job also now pins
+CPU ONNX Runtime 1.23.2 to execute existing ONNX cases previously skipped for
+missing dependencies. The updated full-suite outcome remains pending.
 
 Raw full-run coverage is **45,031/57,244 (78.6650129%)**, versus
 **45,038/57,206 (78.7295039%)** before. Branch coverage is 10,751/17,228 versus

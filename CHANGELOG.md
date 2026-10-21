@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Verify authenticated native-library cache copies on POSIX as well as Windows
+  in the real compile/load/generate integration test. The loader already uses
+  this lifetime-safe path on every OS; the previous POSIX path assertion was stale.
 - Preserve Mamba-2's distinct input and learned post-gate RMSNorm scales,
   expanded HF geometry and output-projection bias through AEG packaging and
   actual CPU/Torch CPU execution. Add independent SSD-matrix regressions and
