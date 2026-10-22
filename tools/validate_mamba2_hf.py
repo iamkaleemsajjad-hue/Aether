@@ -198,6 +198,7 @@ def _compile(job: dict[str, Any]) -> None:
                 "compiler/stage1_ingestion/ingestion.py",
                 "compiler/stage1_ingestion/architecture_detector.py",
                 "evaluation/admission_worker.py",
+                "backends/native_cpu_backend.py",
             )
         },
     }

@@ -77,6 +77,7 @@ class PackagedTokenizer:
             ) from exc
         config = self._read_json(tokenizer_path.with_name("tokenizer_config.json"))
         special = self._read_json(tokenizer_path.with_name("special_tokens_map.json"))
+        config = self._restore_added_tokens(config, special)
         self.eos_token_id = self._special_id(config.get("eos_token"), special.get("eos_token"))
         self.pad_token_id = self._special_id(config.get("pad_token"), special.get("pad_token"))
         self.bos_token_id = self._special_id(config.get("bos_token"), special.get("bos_token"))
@@ -86,6 +87,86 @@ class PackagedTokenizer:
         self.eos_token = self._special_text(config.get("eos_token"), special.get("eos_token"))
         self.pad_token = self._special_text(config.get("pad_token"), special.get("pad_token"))
         self.unk_token = self._special_text(config.get("unk_token"), special.get("unk_token"))
+
+    def _restore_added_tokens(
+        self, config: dict[str, Any], special: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Restore the source's token matching and special-token semantics.
+
+        Follow Transformers 4.57.3's PreTrainedTokenizerBase._from_pretrained
+        and PreTrainedTokenizerFast.__init__: declared AddedTokens precede
+        missing canonical markers. A serialized token ID cannot be renumbered.
+        https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/tokenization_utils_fast.py
+        """
+        from tokenizers import AddedToken
+
+        roles = (
+            "bos_token", "eos_token", "unk_token", "sep_token", "pad_token",
+            "cls_token", "mask_token", "additional_special_tokens",
+        )
+        effective = dict(config)
+        decoder = config.get("added_tokens_decoder", {})
+        def token(value: Any, *, is_special: bool | None = None) -> AddedToken:
+            if isinstance(value, str):
+                return AddedToken(value, special=bool(is_special))
+            if not isinstance(value, dict) or not isinstance(value.get("content"), str):
+                raise ValueError("declared token must have string content")
+            options = {key: value[key] for key in (
+                "single_word", "lstrip", "rstrip", "normalized", "special",
+            ) if key in value}
+            if is_special is not None:
+                options["special"] = is_special
+            return AddedToken(value["content"], **options)
+
+        try:
+            if "added_tokens_decoder" not in config:
+                for role in roles:
+                    if role not in special:
+                        continue
+                    if role == "additional_special_tokens":
+                        configured = config.get(role) or []
+                        if not isinstance(configured, list):
+                            raise ValueError("additional_special_tokens must be a list")
+                        combined = list(configured)
+                        values = special[role] or []
+                        if not isinstance(values, list):
+                            raise ValueError("additional_special_tokens must be a list")
+                        combined.extend(value for value in values if value not in combined)
+                        effective[role] = combined
+                    else:
+                        effective[role] = special[role]
+            if not isinstance(decoder, dict):
+                raise ValueError("added_tokens_decoder must be an object")
+            declared = [(int(index), token(descriptor)) for index, descriptor in
+                        sorted(decoder.items(), key=lambda item: int(item[0]))]
+            if declared:
+                self._tokenizer.add_tokens([added for _, added in declared])
+            for index, added in declared:
+                if self._tokenizer.token_to_id(added.content) != index:
+                    raise ValueError(f"declared token {added.content!r} does not match ID {index}")
+            registered = {
+                added.content for added in self._tokenizer.get_added_tokens_decoder().values()
+            }
+            pending = []
+            for role in roles:
+                value = effective.get(role)
+                if value is None:
+                    continue
+                values = value if role == "additional_special_tokens" else [value]
+                if not isinstance(values, list):
+                    raise ValueError("additional_special_tokens must be a list")
+                for value in values:
+                    added = token(value, is_special=True)
+                    if added.content not in registered:
+                        pending.append(added)
+                        registered.add(added.content)
+            if pending:
+                self._tokenizer.add_tokens(pending)
+        except (TypeError, ValueError) as exc:
+            raise BackendError(
+                f"Invalid packaged AddedToken declarations: {exc}", backend_name="aether_cpu",
+            ) from exc
+        return effective
 
     @staticmethod
     def _special_text(*values: Any) -> str | None:

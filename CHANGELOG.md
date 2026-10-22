@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Restore declared AddedToken and special-token semantics when loading packaged
+  tokenizers, preserving flags and IDs without importing a model framework.
+  Actual HF tokenizer and CPU/Torch public-output regressions cover the former
+  literal-UNK output; see [executed checks and remaining scope](docs/mission-mamba1-fidelity.md#hosted-integration-finding-special-token-reconstruction).
 - Preserve source generation settings through both tokenizer packaging paths,
   including a declared model-config EOS when no generation file exists. Actual
   CPU/Torch API and streaming regressions cover the formerly lost stop boundary;

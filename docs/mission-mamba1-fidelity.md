@@ -172,3 +172,78 @@ sampling default, or legacy artifact. Existing runtime merging of canonical
 tokenizer delimiters requires separate conflicting-settings tests. No weights or
 logit computation change in this packaging follow-up; it claims a correct stop
 boundary for the tested sources, not a throughput or resident-memory gain.
+
+The complete local packaging follow-up subsequently returned **5405 passed,
+42 skipped, 2 failed** in 1631.96 seconds. The RAM-admission case passed without
+a guard change; both MCP HTTP handshake failures remained. Coverage was
+45107/57295 (**78.7276377%**) lines and 10790/17252 branches. This single run
+includes all 42 Mamba-1 cases and all 14 packaging regressions; it is still not
+a green local suite. The two HTTP failures also reproduced outside the sandbox.
+Plain standard-library loopback HTTP succeeded independently, so a generic
+network outage does not explain them. No MCP transport code was changed.
+
+## Hosted integration finding: special-token reconstruction
+
+At `1a21639`, the [next hosted run](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39733176852)
+passed original-HF, CPU, Torch CPU, public API/streaming and strict CLI checks
+for default, expanded/biased, zero-epsilon and large-delta Mamba-1 fixtures.
+The fifth, negative-gate fixture passed numerical admission but exposed a second
+public-text defect: both backends rendered eight literal `<unk>` markers while
+the original HF tokenizer omitted these declared special tokens. Later fixtures
+and the full HF-environment suite did not run after that failure.
+
+`PackagedTokenizer` loaded raw `tokenizer.json` but did not restore AddedToken
+declarations from the surrounding tokenizer config/special-token map. The
+original [HF fast-tokenizer constructor](https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/tokenization_utils_fast.py)
+does restore them. The correction applies those declarations once during
+framework-free loading, retains matching/whitespace/normalization flags,
+checks declared token IDs and preserves already serialized flags. It is shared
+by CPU, Torch and ONNX tokenizer loading; this is not accelerator execution
+evidence. Registration uses batched calls. It changes actual token matching
+and decoding rather than filtering generated strings after decoding.
+
+The valid pre-change regression returned **20 failed**; an earlier test-setup
+attempt used a nonexistent adapter convenience method and is excluded from that
+count. Additional malformed-declaration/repeated-load controls returned two
+failed and one passed against the historical loader. The corrected focused
+selection passed **135 cases with 2 optional skips**, including all 23 new
+cases, generation-settings regressions, prompt/stop wiring, framework-free and
+ONNX backend controls. Actual HF tokenization is the oracle for token matching,
+special-token removal and vocabulary/ID equality. Constructor tests forbid
+Torch/Transformers imports during packaged loading. Repeated loading preserves
+source bytes. Native-backend Ruff remains 61 findings and mypy 11, with no new
+diagnostics; the new test and HF tool pass Ruff/mypy. Raw records are
+`build/mission/tokenizer-special-*`. The complete local follow-up and next
+hosted nine-fixture run are pending; no new speed or resident-memory result is
+claimed for this correction.
+
+## Unchanged optimizer dispositions
+
+These changes repair checkpoint and public execution contracts. They do not
+establish a benefit for any additional optimizer pass; the linked audit retains
+its actual measurements and outstanding ordering/idempotency checks.
+
+| Pass | Default/disposition | Runtime benefit status |
+|---|---|---|
+| 1 fusion | Off, experimental IR | No schedule consumer |
+| 2 sensitivity | Off, diagnostic | Reconstruction proxy |
+| 3 precision | On | Stored formats consumed; these checks use FP32 |
+| 4 KV structure | Off, experimental IR | Engine caches independent |
+| 5 MoE tiers | Off, experimental hints | Placement benefit unproved |
+| 6 parallelism | Off, inspection | No device-placement consumer |
+| 7 reasoning | Off, experimental IR | Serving/quality benefit unproved |
+| 8 sparse attention | Off, experimental lossy | Dense masking; sparse benefit unproved |
+| 9 pruning | Off, experimental lossy | No sparse-kernel benefit |
+| 10 MTP | Off, supplied heads | End-to-end benefit unproved |
+| 11 grammar | Off, explicit functional | FSM consumer; full constrained A/B pending |
+| 12 merging | Off, explicit transform | Weights consumed; task quality requires evaluation |
+| 13 TTT | Off, experimental | Useful slot/model effect unproved |
+| 14 semantic KV | Off, experimental lossy | CPU consumer; quality losses recorded |
+| 15 shared KV | Off, experimental lossy | CPU consumer; quality losses recorded |
+| 16 green | Off, accounting | No measured energy reduction |
+| 17 TEE | Off, unsupported execution | No attested backend kernels |
+| 18 MDLM | Off, supplied trained heads | Real-draft benefit unproved |
+| 19 sub-2-bit | Off, experimental lossy | Dense dequantization; optimized kernel/QAT unverified |
+| 20 video | Off, unsupported CPU execution | No verified VLM benefit |
+| 21 adapter | Off, supplied tensors | Scaling/parity unresolved |
+| 22 RLVR | Off, experimental training | Gradient backend required |
