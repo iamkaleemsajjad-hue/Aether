@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve source generation settings through both tokenizer packaging paths,
+  including a declared model-config EOS when no generation file exists. Actual
+  CPU/Torch API and streaming regressions cover the formerly lost stop boundary;
+  malformed generation files refuse publication. See the
+  [hosted finding and follow-up scope](docs/mission-mamba1-fidelity.md#hosted-integration-finding-generation-settings).
 - Preserve Mamba-1's HF normalization, expansion, projection biases and explicit
   zero epsilon through real CPU/Torch execution; stabilize finite softplus/SiLU
   inputs and refuse unsupported activations or malformed learned norms.

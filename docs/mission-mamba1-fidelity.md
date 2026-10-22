@@ -127,3 +127,48 @@ controlled performance, bounded serving memory and the remaining family/pass
 corrections remain unverified. Planning/dry-run does not execute ingestion or
 certify the unsupported-activation check. Earlier trained-family divergence
 records and family grades remain unchanged.
+
+## Hosted integration finding: generation settings
+
+The first hosted run at `48ce3b0` executed the original-HF default fixture on
+an AMD EPYC 7763 CPU (four logical CPUs, Linux x86_64, Python 3.11.14,
+NumPy 1.26.4, Torch 2.9.1+cpu, Transformers 4.57.3). Its independent default
+comparison passed: 16/16 greedy IDs, worst-position KL 1.15727e-15, minimum
+cosine 0.9999999999999917. Ordinary CPU/Torch numerical admission passed.
+However, the [blocking job failed](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39725488801)
+at the public API check: both backends emitted eight tokens rather than stopping
+at the sixth generated token, the model config's EOS ID 16. The remaining eight
+Mamba-1 fixtures and complete HF-environment suite did not run. All other 22 CI
+jobs and the separate security run passed. This is a failed integration result,
+not a complete HF or whole-suite pass.
+
+The root was shared packaging: it copied tokenizer files but dropped
+`generation_config.json`, and never transferred a model-config-only stop ID.
+The existing packaged tokenizer and both engines already consume stop IDs.
+The correction packages the source generation file byte-for-byte, or emits its
+declared top-level model EOS when that file is absent. This common boundary
+covers both the framework-free fast-tokenizer copy and actual AutoTokenizer
+materialization. Malformed JSON/non-object generation files refuse publication;
+existing destination bytes survive. Source files and the graph/manifest
+integrity chain are retained. Recompile affected artifacts to recover settings
+that earlier packaging discarded.
+
+Read the complete compiler and native backend, stop helpers, tokenizer/rotary
+wiring tests and the public generation paths. The precedence follows the pinned
+Transformers `PreTrainedModel.from_pretrained` generation-file selection and
+`GenerationConfig.from_model_config`; it requires no new decoding algorithm.
+The new ten-case API/stream/payload regression failed 10/10 before correction.
+Two additional real slow-tokenizer and two malformed-file regressions failed
+4/4 against the actual historical compiler. After correction, all **82 focused
+cases passed**, covering those 14 cases, Mamba-1/Mamba-2 and existing rotary/stop
+wiring. Compiler Ruff remains 26 findings and mypy 11, with no added diagnostics;
+the new test and HF tool pass Ruff/mypy. The complete local follow-up and hosted
+nine-fixture check remain pending. Raw local records use
+`build/mission/generation-settings-*`.
+
+This corrects preserved source settings. It does not establish equivalence for
+every tokenizer-specific stop convention, nested model generation config,
+sampling default, or legacy artifact. Existing runtime merging of canonical
+tokenizer delimiters requires separate conflicting-settings tests. No weights or
+logit computation change in this packaging follow-up; it claims a correct stop
+boundary for the tested sources, not a throughput or resident-memory gain.

@@ -194,6 +194,7 @@ def _compile(job: dict[str, Any]) -> None:
                 "runtime/torch_engine.py",
                 "hybrid/state.py",
                 "runtime/aeg_loader.py",
+                "compiler/compiler.py",
                 "compiler/stage1_ingestion/ingestion.py",
                 "compiler/stage1_ingestion/architecture_detector.py",
                 "evaluation/admission_worker.py",

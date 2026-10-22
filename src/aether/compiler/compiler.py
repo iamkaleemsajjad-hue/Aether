@@ -113,6 +113,36 @@ def _copy_tokenizer_files(source_model_path: str, destination: Path) -> bool:
     return True
 
 
+def _copy_generation_config(source_model_path: str, destination: Path) -> None:
+    """Preserve the source stop settings consumed by PackagedTokenizer.
+
+    Transformers 4.57.3 loads an explicit generation_config.json when present;
+    otherwise GenerationConfig.from_model_config supplies legacy model settings.
+    Keep that precedence, including explicit null/empty overrides, without
+    importing the optional model framework. Only EOS is consumed here.
+    https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/generation/configuration_utils.py
+    """
+    source = Path(source_model_path)
+    if not source.is_dir():
+        return
+    generation = source / "generation_config.json"
+    model_config = source / "config.json"
+    source_config = generation if generation.is_file() else model_config
+    if not source_config.is_file():
+        return
+    payload = json.loads(source_config.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Source generation settings must be a JSON object: {source_config}")
+    target = destination / "generation_config.json"
+    if source_config == generation:
+        shutil.copy2(generation, target)
+    elif "eos_token_id" in payload:
+        target.write_text(
+            json.dumps({"eos_token_id": payload["eos_token_id"]}, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+
+
 def _verify_layer_invariants(
     graph: Any,
     architecture: ModelArchitecture,
@@ -1515,6 +1545,7 @@ class Compiler:
                         trust_remote_code=False,
                     )
                     tokenizer.save_pretrained(package.root / "tokenizer")
+                _copy_generation_config(source_model_path, package.root / "tokenizer")
                 package.metadata["tokenizer_path"] = "tokenizer"
             except Exception as exc:
                 raise CompilationError(
