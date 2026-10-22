@@ -1,8 +1,19 @@
 # Aether Runtime implementation status
 
-Reviewed 2026-10-22. The runtime/compiler mission is in progress.
+Reviewed 2026-10-23. The runtime/compiler mission is in progress.
 
-The latest [CI at `ad77e08`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39747608124)
+The [normalization-epsilon correction](docs/mission-normalization-epsilon.md)
+preserves explicit zero in the shared loader. Its final regression failed 12
+cases against the unchanged prior runtime; focused validation now passes 102
+cases with two optional DirectML skips, including actual Llama CPU/Torch/ONNX
+and Mamba-2 CPU/Torch comparisons against original HF. The first strict local
+benchmark refused a Torch worker for insufficient live RAM; no benchmark
+success or memory improvement is inferred from the focused checks. Its complete
+local run returned **5459 passed, 42 skipped, two existing MCP HTTP failures**;
+all 31 new cases passed and line coverage rose to **78.7816445%**. The local
+suite remains red; hosted results and broader mission work remain separate.
+
+The previous measured [CI at `ad77e08`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39747608124)
 passed all 23 jobs and security passed separately. Nine untrained FP32 Mamba-1
 contracts passed original-HF/CPU/Torch CPU admission, public generation/streaming
 and CLI checks; both Mamba-2 controls passed too. The complete hosted suite

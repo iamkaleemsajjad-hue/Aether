@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve explicitly declared zero normalization epsilon across dense/MoE,
+  MLA, hybrid, Mamba-2, RWKV and encoder AEG loading. Retain existing null
+  fallbacks and Mamba-1/seq2seq behavior; real loader and original-HF
+  CPU/Torch/ONNX regressions cover the correction. See
+  [validation scope and resource limits](docs/mission-normalization-epsilon.md).
 - Restore declared AddedToken and special-token semantics when loading packaged
   tokenizers, preserving flags and IDs without importing a model framework.
   Actual HF tokenizer and CPU/Torch public-output regressions cover the former

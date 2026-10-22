@@ -432,7 +432,7 @@ def load_engine_from_package(
             if final_norm_bias is not None else None
         ),
         rope_theta=float(architecture.get("rope_theta", 10000.0) or 10000.0),
-        norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+        norm_eps=_normalization_epsilon(architecture),
         norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
         ffn_type=str(architecture.get("ffn_type", "SwiGLU") or "SwiGLU"),
         position_type=str(architecture.get("position_type", "RoPE") or "RoPE"),
@@ -558,7 +558,7 @@ def _load_mla_engine_from_package(
             layers=layers,
             final_norm=_norm_vector(final_norm, int(embedding.shape[1])),
             lm_head=np.asarray(lm_head, dtype=np.float32),
-            norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+            norm_eps=_normalization_epsilon(architecture),
             norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
             ffn_type=str(architecture.get("ffn_type", "SwiGLU") or "SwiGLU"),
         ),
@@ -609,9 +609,7 @@ def _load_mamba_engine_from_package(
             layers=layers,
             final_norm=norm_vector(final_norm, "final norm"),
             lm_head=np.asarray(lm_head, dtype=np.float32),
-            norm_eps=float(
-                1e-5 if architecture.get("norm_eps") is None else architecture["norm_eps"]
-            ),
+            norm_eps=_normalization_epsilon(architecture),
             norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
         ),
         state_size=int(architecture.get("ssm_state_size") or 16),
@@ -740,7 +738,7 @@ def _load_hybrid_engine_from_package(
                 int(architecture["context_length"])
                 if architecture.get("context_length") else None
             ),
-            norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+            norm_eps=_normalization_epsilon(architecture),
             norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
             ffn_type=ffn_type,
         ),
@@ -809,7 +807,7 @@ def _load_mamba2_engine_from_package(
             layers=layers,
             final_norm=norm_vector(final_norm, hidden, "final norm"),
             lm_head=np.asarray(lm_head, dtype=np.float32),
-            norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+            norm_eps=_normalization_epsilon(architecture),
             norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
         ),
         state_size=int(architecture.get("ssm_state_size") or 16),
@@ -850,7 +848,7 @@ def _load_rwkv_engine_from_package(
     return RWKVExecutionEngine(RWKVModelWeights(
         embedding=np.asarray(embedding, dtype=np.float32), layers=layers,
         final_norm=_norm_vector(final_norm, hidden), lm_head=np.asarray(lm_head, dtype=np.float32),
-        norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+        norm_eps=_normalization_epsilon(architecture),
     ))
 
 
@@ -1007,7 +1005,7 @@ def _load_encoder_engine_from_package(
         layers=layers,
         embedding_norm_bias=optional("embedding_norm_bias"),
         pooler_bias=optional("pooler_bias"),
-        norm_eps=float(architecture.get("norm_eps", 1e-12) or 1e-12),
+        norm_eps=_normalization_epsilon(architecture, default=1e-12),
     )
     return EncoderExecutionEngine(weights, num_heads=num_heads)
 
@@ -1308,6 +1306,17 @@ def _rope_scaling_mapping(architecture: dict[str, Any]) -> dict[str, Any] | None
             f"{sorted(SUPPORTED_ROPE_SCALING)}"
         )
     return dict(value)
+
+
+def _normalization_epsilon(architecture: dict[str, Any], *, default: float = 1e-5) -> float:
+    """Preserve explicit epsilon, including zero; only absent/null uses a fallback.
+
+    This is a source-model constant in sqrt(variance + epsilon), not a flag.
+    See LlamaRMSNorm.forward in Transformers v4.57.3:
+    https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/llama/modeling_llama.py
+    """
+    value = architecture.get("norm_eps")
+    return default if value is None else float(value)
 
 
 def _architecture_dict(package: Any) -> dict[str, Any]:

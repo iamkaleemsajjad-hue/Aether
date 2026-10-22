@@ -314,6 +314,8 @@ def main() -> None:
                 ("multi-layer", {"layers": 2, "with_bias": True, "expansion": 3}),
             ]
         )
+    else:
+        fixture_cases.append(("zero-epsilon", {"epsilon": 0.0}))
     for case_name, options in fixture_cases:
         case = work / case_name
         case.mkdir()

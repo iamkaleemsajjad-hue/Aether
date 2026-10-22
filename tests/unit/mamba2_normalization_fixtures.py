@@ -23,6 +23,7 @@ def checkpoint_data(
     expansion: int = 2,
     with_bias: bool = False,
     rms_norm: bool = True,
+    epsilon: float = 1e-5,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """Return distinct learned norm scales and all real source parameter arrays."""
     hidden, heads, state, groups, width, vocab = 16, 4, 4, 2, 3, 17
@@ -41,7 +42,7 @@ def checkpoint_data(
         "num_hidden_layers": 1,
         "vocab_size": vocab,
         "chunk_size": 4,
-        "layer_norm_epsilon": 1e-5,
+        "layer_norm_epsilon": epsilon,
         "rms_norm": rms_norm,
         "hidden_act": "silu",
         "use_bias": with_bias,
