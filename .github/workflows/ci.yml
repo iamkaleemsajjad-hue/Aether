@@ -127,6 +127,10 @@ jobs:
         with:
           ref: edc7d8f378c05d563a935bebe2afbbf40dc4f025
           path: historical-mamba2
+      - uses: actions/checkout@v4
+        with:
+          ref: 2f2a2c4659063b31797011ac03373a1c4e539173
+          path: historical-mamba1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11.14"
@@ -137,6 +141,8 @@ jobs:
           python -m pip freeze > hf-parity-freeze.txt
       - name: Compile once and verify real CPU, Torch CPU, API and CLI outputs
         run: python tools/validate_mamba2_hf.py --output hf-parity-results --baseline-src historical-mamba2/src
+      - name: Verify Mamba-1 original-HF admission, CPU, Torch CPU, API and CLI
+        run: python tools/validate_mamba2_hf.py --family mamba --output hf-mamba1-results --baseline-src historical-mamba1/src
       - name: Run complete suite with real Torch, Transformers and format dependencies
         env:
           AETHER_CACHE_DIR: ${{ runner.temp }}/aether-hf-full-cache
@@ -159,6 +165,7 @@ jobs:
           name: hf-mamba2-parity
           path: |
             hf-parity-results/
+            hf-mamba1-results/
             hf-parity-freeze.txt
             hf-full-results.xml
             hf-full-coverage.xml

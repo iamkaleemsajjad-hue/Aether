@@ -117,6 +117,21 @@ class IngestionPipeline:
                 if graph.get_metadata(key) is None:
                     graph.set_metadata(key, value)
             self._specialised_fallback_metadata = {}
+
+        # Validate after every loader/fallback, including a materialized Hub
+        # snapshot. A swallowed specialization error must not turn a source's
+        # unsupported mixer activation into the runtime's hard-coded SiLU.
+        source_root = Path(graph.get_metadata("source_model_path") or model)
+        source_config_path = source_root / "config.json"
+        if source_config_path.is_file():
+            source_config = json.loads(source_config_path.read_text(encoding="utf-8"))
+            if str(source_config.get("model_type", "")).lower() == "mamba":
+                activation = source_config.get("hidden_act", "silu")
+                if activation not in ("silu", "swish"):
+                    raise IngestionError(
+                        f"Unsupported Mamba-1 hidden_act activation {activation!r}; "
+                        "the runtime currently supports only 'silu' and 'swish'."
+                    )
         return graph
 
     def _try_specialised_loader(

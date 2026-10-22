@@ -1,6 +1,6 @@
 # Aether Runtime implementation status
 
-Reviewed 2026-10-21. The runtime/compiler mission is in progress.
+Reviewed 2026-10-22. The runtime/compiler mission is in progress.
 
 Supported CPU AEG compilation, integrity verification, reload and generation have
 executed on an Intel Core i5-1334U running Windows. The last complete green
@@ -44,7 +44,7 @@ throughput certification. Exact environment, evidence, known failures and the
 | Legacy tree speculation | Fabricated candidates removed; unsupported drafting fails closed. Manual verification requires target evidence. [Migration and tests](docs/legacy-speculation.md). |
 | Executable speculation | Explicit draft/target execution and cache tests pass. Medusa/self-speculation require separate review; no blanket distribution or acceleration guarantee is claimed. |
 | Quality gate | Default compilation measures original FP32 HF against actual CPU and Torch CPU AEG execution before publication. Loader/backend/cache admission requires bound evidence; diagnostics waive absence only. Real tiny public API/CLI execution passed. ONNX/accelerator checks, trained-model/corpus quality, transformed references and runtime adaptation remain unfinished; see [scope and costs](docs/mission-numerical-admission.md). |
-| Model families | [The graded family registry](SUPPORTED_MODELS.md) distinguishes parity checks, execution-only coverage, known divergence and refused families. Mamba/Mamba-2/RWKV-7/Jamba require numerical correction. |
+| Model families | [The graded family registry](SUPPORTED_MODELS.md) distinguishes parity checks, execution-only coverage, known divergence and refused families. Mamba-1 checkpoint corrections pass independent matrix and CPU/Torch tests; original-HF execution is pending, and its trained-family grade remains unchanged. See [scope](docs/mission-mamba1-fidelity.md). Mamba/Mamba-2/RWKV-7/Jamba still need broader validation. |
 | KV and batching | Real storage and runtime tests exist. Bounded memory, eviction, copy-on-write and long-running serving require per-path measurement; a pool implementation alone does not prove end-to-end behavior. |
 | Hardware | [The maintained matrix](hardware_validation_matrix.json) separates recorded execution, compilation checks and incomplete integration. Historical Intel UHD DirectML evidence is scoped and dated; other accelerator paths need their own execution records. |
 | Static checks | Critical Ruff passes at baseline. Full Ruff and full-package mypy fail (5,341 source lint findings and 1,796 type errors with the recorded tools). Narrow passing checks do not clear those errors. |

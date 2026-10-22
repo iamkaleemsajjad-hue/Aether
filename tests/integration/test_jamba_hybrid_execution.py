@@ -11,6 +11,7 @@ import pytest
 from aether import Compiler, CompilerConfig, Runtime, RuntimeConfig
 from aether.core.aeg_format import load_aeg_package
 from aether.runtime.aeg_loader import load_engine_from_path
+from aether.runtime.hybrid_engine import HybridExecutionEngine
 
 
 def _write_tokenizer(path: Path, vocab_size: int) -> None:
@@ -28,7 +29,10 @@ def _write_tokenizer(path: Path, vocab_size: int) -> None:
 
 @pytest.mark.integration
 @pytest.mark.parametrize("kernel", [1, 3])
-def test_jamba_hybrid_compiles_reloads_and_reuses_cache(tmp_path: Path, kernel: int) -> None:
+@pytest.mark.parametrize("projection_bias", [False, True])
+def test_jamba_hybrid_compiles_reloads_and_reuses_cache(
+    tmp_path: Path, kernel: int, projection_bias: bool,
+) -> None:
     safetensors = pytest.importorskip("safetensors.numpy")
     source = tmp_path / "jamba"
     source.mkdir()
@@ -80,6 +84,9 @@ def test_jamba_hybrid_compiles_reloads_and_reuses_cache(tmp_path: Path, kernel: 
         "model.layers.1.mlp.up_proj.weight": matrix((intermediate, hidden)),
         "model.layers.1.mlp.down_proj.weight": matrix((hidden, intermediate)),
     }
+    if projection_bias:
+        tensors["model.layers.0.mamba.in_proj.bias"] = matrix((2 * inner,))
+        tensors["model.layers.0.mamba.out_proj.bias"] = matrix((hidden,))
     (source / "config.json").write_text(json.dumps(config), encoding="utf-8")
     safetensors.save_file(tensors, str(source / "model.safetensors"))
     _write_tokenizer(source, vocab)
@@ -109,6 +116,13 @@ def test_jamba_hybrid_compiles_reloads_and_reuses_cache(tmp_path: Path, kernel: 
     assert "pytorch" in package.manifest.kernels.portable_backends
 
     engine = load_engine_from_path(artifact, allow_uncertified=True)
+    assert isinstance(engine, HybridExecutionEngine)
+    if projection_bias:
+        mamba = engine.weights.layers[0].mamba
+        assert mamba is not None
+        assert mamba.in_proj_bias is not None and mamba.in_proj_bias.shape == (2 * inner,)
+        assert mamba.out_proj_bias is not None and mamba.out_proj_bias.shape == (hidden,)
+        assert np.any(mamba.in_proj_bias != 0) and np.any(mamba.out_proj_bias != 0)
     full_logits, full_cache = engine.forward(np.asarray([1, 2, 3], dtype=np.int64))
     step_logits, step_cache = engine.forward(np.asarray([1, 2], dtype=np.int64))
     step_logits_2, step_cache = engine.forward(np.asarray([3], dtype=np.int64), step_cache)

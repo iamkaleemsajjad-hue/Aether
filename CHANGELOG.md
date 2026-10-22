@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve Mamba-1's HF normalization, expansion, projection biases and explicit
+  zero epsilon through real CPU/Torch execution; stabilize finite softplus/SiLU
+  inputs and refuse unsupported activations or malformed learned norms.
+  Independent matrix and actual SDK/CLI regressions cover the correction;
+  [validation scope and pending HF measurements](docs/mission-mamba1-fidelity.md)
+  distinguish executed checks from unverified trained-model behavior.
 - Validate dispatch convergence and ledger refresh with controlled clock inputs,
   while preserving a live CPU evidence/thread-setting check. The former
   cross-call timing assertion failed under changing host load despite valid

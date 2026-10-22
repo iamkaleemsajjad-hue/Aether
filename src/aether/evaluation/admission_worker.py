@@ -132,7 +132,7 @@ def _hf(job: dict[str, Any], work: Path) -> dict[str, Any]:
         raise ValueError("a pre-quantized source is not the original FP32 quality oracle")
     raw_context = getattr(config, "max_position_embeddings", None)
     context = int(raw_context or 0) if raw_context is not None else None
-    if context is None and getattr(config, "model_type", None) != "mamba2":
+    if context is None and getattr(config, "model_type", None) not in {"mamba", "mamba2"}:
         raise ValueError("HF quality reference requires an explicit source context bound")
     if context is not None and context <= 0:
         raise ValueError("HF quality reference requires an explicit source context bound")
@@ -191,14 +191,17 @@ def _candidate(job: dict[str, Any], work: Path) -> dict[str, Any]:
 
         from aether.runtime.cpu_engine import CPUExecutionEngine
         from aether.runtime.mamba2_engine import Mamba2ExecutionEngine
+        from aether.runtime.mamba_engine import MambaExecutionEngine
         from aether.runtime.torch_engine import TorchAEGEngine
-        from aether.runtime.torch_state_engine import TorchMamba2AEGEngine
+        from aether.runtime.torch_state_engine import TorchMamba2AEGEngine, TorchMambaAEGEngine
 
         torch.set_num_threads(1)
         if isinstance(engine, CPUExecutionEngine):
             engine = TorchAEGEngine(engine, "cpu")
         elif isinstance(engine, Mamba2ExecutionEngine):
             engine = TorchMamba2AEGEngine(engine, "cpu")
+        elif isinstance(engine, MambaExecutionEngine):
+            engine = TorchMambaAEGEngine(engine, "cpu")
         else:
             raise ValueError(
                 "HF numerical admission of this specialized torch executor is not implemented"

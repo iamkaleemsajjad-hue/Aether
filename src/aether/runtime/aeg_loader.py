@@ -575,12 +575,22 @@ def _load_mamba_engine_from_package(
     final_norm = _require(tensors, (None, "final_norm"), "final norm")
     lm_head = tensors.get((None, "lm_head"), embedding)
     hidden = int(embedding.shape[1])
+
+    def norm_vector(value: Any, description: str) -> NDArray[np.float32]:
+        vector = np.asarray(value, dtype=np.float32)
+        if vector.shape != (hidden,):
+            raise AEGLoadError(
+                f"Mamba-1 {description} has shape {vector.shape}; expected ({hidden},). "
+                "Recompile the original checkpoint to preserve its learned norms."
+            )
+        return vector
+
     layers: list[MambaLayerWeights] = []
     for index in range(int(architecture.get("layers", 0) or 0)):
         def required(component: str) -> np.ndarray:
             return _require(tensors, (index, component), f"Mamba layer {index} {component}")
         layers.append(MambaLayerWeights(
-            norm=_norm_vector(required("ssm_norm"), hidden),
+            norm=norm_vector(required("ssm_norm"), f"layer {index} input norm"),
             in_proj=required("ssm_in_proj"),
             conv1d=required("ssm_conv1d"),
             x_proj=required("ssm_x_proj"),
@@ -590,14 +600,18 @@ def _load_mamba_engine_from_package(
             out_proj=required("ssm_out_proj"),
             conv_bias=tensors.get((index, "ssm_conv1d_bias")),
             dt_bias=tensors.get((index, "ssm_dt_proj_bias")),
+            in_proj_bias=tensors.get((index, "ssm_in_proj_bias")),
+            out_proj_bias=tensors.get((index, "ssm_out_proj_bias")),
         ))
     return MambaExecutionEngine(
         MambaModelWeights(
             embedding=np.asarray(embedding, dtype=np.float32),
             layers=layers,
-            final_norm=_norm_vector(final_norm, hidden),
+            final_norm=norm_vector(final_norm, "final norm"),
             lm_head=np.asarray(lm_head, dtype=np.float32),
-            norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+            norm_eps=float(
+                1e-5 if architecture.get("norm_eps") is None else architecture["norm_eps"]
+            ),
             norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
         ),
         state_size=int(architecture.get("ssm_state_size") or 16),
@@ -691,6 +705,8 @@ def _load_hybrid_engine_from_package(
                 out_proj=required("ssm_out_proj"),
                 conv_bias=tensors.get((index, "ssm_conv1d_bias")),
                 dt_bias=tensors.get((index, "ssm_dt_proj_bias")),
+                in_proj_bias=tensors.get((index, "ssm_in_proj_bias")),
+                out_proj_bias=tensors.get((index, "ssm_out_proj_bias")),
             )
             layers.append(HybridLayerWeights(kind=kind, transformer=dummy_transformer(), mamba=actual))
 

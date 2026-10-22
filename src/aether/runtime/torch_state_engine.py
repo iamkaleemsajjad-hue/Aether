@@ -265,6 +265,16 @@ class TorchMambaAEGEngine(_TorchStateBase):
                 "d": self._tensor(layer.d, layer_device), "out_proj": self._tensor(layer.out_proj, layer_device),
                 "conv_bias": None if layer.conv_bias is None else self._tensor(layer.conv_bias, layer_device),
                 "dt_bias": None if layer.dt_bias is None else self._tensor(layer.dt_bias, layer_device),
+                "in_proj_bias": (
+                    None
+                    if layer.in_proj_bias is None
+                    else self._tensor(layer.in_proj_bias, layer_device)
+                ),
+                "out_proj_bias": (
+                    None
+                    if layer.out_proj_bias is None
+                    else self._tensor(layer.out_proj_bias, layer_device)
+                ),
             })
 
     def _new_cache(self) -> Any:
@@ -279,7 +289,7 @@ class TorchMambaAEGEngine(_TorchStateBase):
         torch = self.torch
         layer = self.layers[index]
         normalized = self._norm(hidden, layer["norm"])
-        projected = self._linear(normalized, layer["in_proj"])
+        projected = self._linear(normalized, layer["in_proj"], layer["in_proj_bias"])
         ssm_input, gate = projected.split(self.inner_size, dim=-1)
         kernel = layer["conv1d"].reshape(self.inner_size, -1)
         window = torch.cat((cache.conv_history[index], ssm_input.unsqueeze(-1)), dim=-1)
@@ -304,7 +314,9 @@ class TorchMambaAEGEngine(_TorchStateBase):
         state = state + dt.unsqueeze(1) * conv.unsqueeze(1) * b.unsqueeze(-1)
         cache.states[index] = state.detach()
         output = (state * c.unsqueeze(-1)).sum(dim=1) + conv * layer["d"].reshape(1, -1)
-        return hidden + self._linear(output * self._silu(gate, torch), layer["out_proj"])
+        return hidden + self._linear(
+            output * self._silu(gate, torch), layer["out_proj"], layer["out_proj_bias"]
+        )
 
     def forward(self, token_ids: Any, cache: Any | None = None) -> tuple[np.ndarray, Any]:
         torch = self.torch
@@ -322,6 +334,13 @@ class TorchMambaAEGEngine(_TorchStateBase):
                 cache.length += 1
                 cache.last_logits = logits[0].detach()
         return torch.stack(outputs).float().cpu().numpy(), cache
+
+    def forward_step(
+        self, token_ids: Any, cache: Any | None = None, *, return_all_logits: bool = False,
+    ) -> tuple[NDArray[np.float32], Any]:
+        """Expose the same causal row/final-vector contract as the CPU executor."""
+        rows, updated = self.forward(token_ids, cache)
+        return (rows if return_all_logits else rows[-1]), updated
 
     def generate_iter(self, prompt_ids: np.ndarray, max_tokens: int = 16, temperature: float = 0.0,
                       top_k: int = 0, top_p: float = 1.0, eos_token_id: int | None = None,

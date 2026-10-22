@@ -105,3 +105,23 @@ def test_hybrid_forward_and_cached_partitions_match_full_convolution(
     assert prefix.length == 3 and continued.length == len(ids)
     np.testing.assert_allclose(suffix, expected[3:], rtol=2e-5, atol=2e-6)
     np.testing.assert_array_equal(prefix.last_logits, saved_logits)
+
+
+@pytest.mark.parametrize("backend", ["cpu", "torch_cpu"])
+@pytest.mark.parametrize("width", [1, 3])
+def test_hybrid_consumes_mamba_projection_biases(backend: str, width: int) -> None:
+    """Shared Mamba weight fields must reach both real hybrid executors."""
+    engine: Any
+    engine, source = hybrid_fixture(width, True)
+    layer = source.weights.layers[0]
+    layer.in_proj_bias = np.linspace(-0.2, 0.2, 2 * source.inner_size, dtype=np.float32)
+    layer.out_proj_bias = np.linspace(-0.3, 0.3, source.head_dim, dtype=np.float32)
+    if backend == "torch_cpu":
+        pytest.importorskip("torch")
+        from aether.runtime.torch_engine import TorchHybridAEGEngine
+
+        engine = TorchHybridAEGEngine(engine, "cpu")
+    ids = np.asarray([1, 2, 3, 4, 5, 6, 7], np.int64)
+    expected = _oracle(source, ids)
+    actual, _ = engine.forward(ids)
+    np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)

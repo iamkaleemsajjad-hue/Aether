@@ -1,4 +1,4 @@
-"""Strict offline Mamba-2 compile/save/load/generate parity against original HF.
+"""Strict offline Mamba-1/2 compile/save/load/generate parity against original HF.
 
 Requires test extras, Torch and Transformers. Reference workers retain the
 compiler's normal RAM guards. Optionally measure a separate historical src
@@ -54,6 +54,7 @@ def _compile(job: dict[str, Any]) -> None:
     from aether.core.quality_gate import read_gate
     from aether.runtime.aeg_loader import load_engine_from_path
     from aether.runtime.mamba2_engine import Mamba2ExecutionEngine
+    from aether.runtime.mamba_engine import MambaExecutionEngine
 
     package_dir = Path(aether.__file__).resolve().parent
     if not package_dir.is_relative_to(Path(job["expected_src"]).resolve()):
@@ -84,13 +85,17 @@ def _compile(job: dict[str, Any]) -> None:
     if not diagnostic and gate is None:
         raise RuntimeError("The ordinary artifact has no measured numerical admission")
     engine = load_engine_from_path(artifact, allow_uncertified=diagnostic)
-    if not isinstance(engine, Mamba2ExecutionEngine):
-        raise RuntimeError(f"Expected the actual Mamba-2 executor, got {type(engine).__name__}")
+    family = job.get("family", "mamba2")
+    expected_engine = MambaExecutionEngine if family == "mamba" else Mamba2ExecutionEngine
+    if not isinstance(engine, expected_engine):
+        raise RuntimeError(f"Expected the actual {family} executor, got {type(engine).__name__}")
     probes = [json.loads(line) for line in Path(job["dataset"]).read_text().splitlines()]
     timings = []
     for index, probe in enumerate(probes):
         prefix, labels = probe["prompt_ids"], probe["continuation_ids"]
         rows, _ = engine.forward(np.asarray(prefix + labels[:-1], np.int64))
+        if not np.isfinite(rows).all():
+            raise RuntimeError("The actual candidate produced nonfinite logits")
         np.save(output / f"logits-{index}.npy", rows[len(prefix) - 1 :], allow_pickle=False)
         for repeat in range(9):
             began = time.perf_counter()
@@ -184,11 +189,14 @@ def _compile(job: dict[str, Any]) -> None:
         "code_sha256": {
             name: hashlib.sha256((package_dir / name).read_bytes()).hexdigest()
             for name in (
-                "runtime/mamba2_engine.py",
+                f"runtime/{family}_engine.py",
                 "runtime/torch_state_engine.py",
+                "runtime/torch_engine.py",
+                "hybrid/state.py",
                 "runtime/aeg_loader.py",
                 "compiler/stage1_ingestion/ingestion.py",
                 "compiler/stage1_ingestion/architecture_detector.py",
+                "evaluation/admission_worker.py",
             )
         },
     }
@@ -227,6 +235,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--baseline-src", type=Path)
     parser.add_argument("--compile-job", type=Path)
+    parser.add_argument("--family", choices=("mamba", "mamba2"), default="mamba2")
     args = parser.parse_args()
     for name in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS"):
         os.environ[name] = "1"
@@ -239,7 +248,15 @@ def main() -> None:
     work = args.output.resolve()
     work.mkdir(parents=True, exist_ok=False)
     root = Path(__file__).resolve().parents[1]
-    fixture_path = root / "tests/unit/mamba2_normalization_fixtures.py"
+    fixture_path = (
+        root
+        / "tests/unit"
+        / (
+            "mamba1_fidelity_fixtures.py"
+            if args.family == "mamba"
+            else "mamba2_normalization_fixtures.py"
+        )
+    )
     fixture = runpy.run_path(str(fixture_path))
     import psutil
 
@@ -256,7 +273,7 @@ def main() -> None:
         )
     report: dict[str, Any] = {
         "executed_utc": datetime.now(timezone.utc).isoformat(),
-        "scope": "untrained synthetic original-HF FP32 Mamba-2 fidelity, CPU hardware only",
+        "scope": f"untrained synthetic original-HF FP32 {args.family} fidelity, CPU hardware only",
         "platform": platform.platform(),
         "python": platform.python_version(),
         "hardware": {
@@ -279,10 +296,23 @@ def main() -> None:
     from aether.compiler.numerical_admission import MIB, run_worker, source_binding
     from aether.evaluation.quality_validator import QualityValidator, _log_probs
 
-    for case_name, options in (
+    fixture_cases: list[tuple[str, dict[str, Any]]] = [
         ("default", {}),
         ("expanded-biased", {"expansion": 4, "with_bias": True, "rms_norm": False}),
-    ):
+    ]
+    if args.family == "mamba":
+        fixture_cases.extend(
+            [
+                ("zero-epsilon", {"epsilon": 0.0}),
+                ("large-delta", {"large_delta": True}),
+                ("negative-gate", {"with_bias": True, "large_silu": "gate"}),
+                ("negative-conv", {"with_bias": True, "large_silu": "conv"}),
+                ("swish-alias", {"activation": "swish"}),
+                ("default-activation", {"omit_activation": True}),
+                ("multi-layer", {"layers": 2, "with_bias": True, "expansion": 3}),
+            ]
+        )
+    for case_name, options in fixture_cases:
         case = work / case_name
         case.mkdir()
         source = case / "source"
@@ -308,6 +338,7 @@ def main() -> None:
             512 * MIB + 4 * sum(item["bytes"] for item in binding["files"].values()),
         )
         job = {
+            "family": args.family,
             "source": str(source),
             "dataset": str(dataset),
             "diagnostic": False,

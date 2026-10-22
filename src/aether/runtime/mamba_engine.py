@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 import numpy as np
 
 from aether.hybrid.state import MambaSSM, MambaState
 from aether.runtime.stopping import stop_token_set
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 
 @dataclass
@@ -23,6 +26,8 @@ class MambaLayerWeights:
     out_proj: np.ndarray
     conv_bias: np.ndarray | None = None
     dt_bias: np.ndarray | None = None
+    in_proj_bias: NDArray[np.float32] | None = None
+    out_proj_bias: NDArray[np.float32] | None = None
 
 
 @dataclass
@@ -79,7 +84,18 @@ class MambaExecutionEngine:
 
     @staticmethod
     def _silu(x: np.ndarray) -> np.ndarray:
-        return x / (1.0 + np.exp(-np.clip(x, -60.0, 60.0)))
+        """Evaluate the reference x*sigmoid(x) without clipping finite inputs.
+
+        Mamba.step (state-spaces/mamba v2.2.4) applies SiLU to convolution and
+        gate values. Compute the negative-magnitude sigmoid, then complement
+        it for nonnegative inputs; exp never receives a positive argument.
+        https://arxiv.org/html/2312.00752v2 (section 3.4)
+        """
+        result = np.exp(-np.abs(x))
+        np.divide(result, 1.0 + result, out=result)
+        np.subtract(1.0, result, out=result, where=x >= 0)
+        np.multiply(x, result, out=result)
+        return result
 
     def _conv(self, x: np.ndarray, layer: MambaLayerWeights, history: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         # HF Mamba stores depthwise Conv1d as (inner, 1, kernel) or
@@ -100,6 +116,8 @@ class MambaExecutionEngine:
         layer = self.weights.layers[index]
         x = self._norm(hidden, layer.norm)
         projected = x @ layer.in_proj.T
+        if layer.in_proj_bias is not None:
+            projected = projected + layer.in_proj_bias
         ssm_input, gate = np.split(projected, 2, axis=-1)
         conv_input, cache.conv_history[index] = self._conv(
             ssm_input, layer, cache.conv_history[index]
@@ -116,7 +134,10 @@ class MambaExecutionEngine:
             conv_input, cache.states[index], a, b, c,
             np.asarray(layer.d, dtype=np.float32).reshape(-1), dt,
         )
-        return hidden + y * self._silu(gate) @ layer.out_proj.T
+        output = y * self._silu(gate) @ layer.out_proj.T
+        if layer.out_proj_bias is not None:
+            output = output + layer.out_proj_bias
+        return hidden + output
 
     def _new_cache(self) -> MambaCache:
         return MambaCache(
@@ -146,6 +167,14 @@ class MambaExecutionEngine:
         logits = np.stack(outputs, axis=0)
         cache.last_logits = logits[-1].copy()
         return logits, cache
+
+    def forward_step(
+        self, token_ids: Any, cache: MambaCache | None = None, *,
+        return_all_logits: bool = False,
+    ) -> tuple[NDArray[np.float32], MambaCache]:
+        """Expose causal rows or the final vocabulary vector for admission/decoding."""
+        rows, updated = self.forward(token_ids, cache)
+        return (rows if return_all_logits else rows[-1]), updated
 
     def _sample(self, logits: np.ndarray, temperature: float, top_k: int, top_p: float) -> int:
         if temperature <= 0:

@@ -99,6 +99,8 @@ def _oracle(engine: Any, token_ids: np.ndarray) -> np.ndarray:
 
     hidden = weights.embedding[token_ids].astype(np.float64)
     projected = norm(hidden, layer.norm) @ layer.in_proj.astype(np.float64).T
+    if (bias := getattr(layer, "in_proj_bias", None)) is not None:
+        projected += bias
     if isinstance(engine, MambaExecutionEngine):
         x, gate = np.split(projected, 2, axis=-1)
         skip = layer.d
@@ -119,6 +121,8 @@ def _oracle(engine: Any, token_ids: np.ndarray) -> np.ndarray:
         convolved += layer.conv_bias[: engine.inner_size]
     mixed = convolved / (1 + np.exp(-convolved)) * skip * gate / (1 + np.exp(-gate))
     hidden += mixed @ layer.out_proj.astype(np.float64).T
+    if (bias := getattr(layer, "out_proj_bias", None)) is not None:
+        hidden += bias
     return norm(hidden, weights.final_norm) @ weights.lm_head.astype(np.float64).T
 
 
