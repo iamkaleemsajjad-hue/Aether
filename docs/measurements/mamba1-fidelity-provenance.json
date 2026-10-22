@@ -1,0 +1,1146 @@
+{
+  "revision": "ad77e082da16d6393388500f58180a1e27acc6f9",
+  "baseline_revision": "2f2a2c4659063b31797011ac03373a1c4e539173",
+  "ci_url": "https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39747608124",
+  "successful_ci_jobs_observed": 23,
+  "security_run": 39747608133,
+  "fixture_source_and_successful_execution_code_hashes_match_git": true,
+  "failed_historical_execution_note": "Failed old runs have no execution-code digest; CI pins their checkout and the worker enforces expected import root. No numerical/timing result is assigned to them.",
+  "raw_report_sha256": "66c8fee795d24fa9fa055b66fd867528b5b9280adbc0bd164469b692151bccc7",
+  "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+  "python": "3.11.14",
+  "hardware": {
+    "cpu": "AMD EPYC 9V74 80-Core Processor",
+    "logical_cpus": 4,
+    "host_ram_bytes": 16760344576,
+    "available_ram_bytes_at_start": 15494234112
+  },
+  "versions": {
+    "numpy": "1.26.4",
+    "torch": "2.9.1+cpu",
+    "transformers": "4.57.3",
+    "psutil": "7.2.2",
+    "safetensors": "0.8.0",
+    "tokenizers": "0.22.2"
+  },
+  "cases": [
+    {
+      "case": "default",
+      "greedy": {
+        "cpu": {
+          "matched": 16,
+          "total": 16
+        },
+        "torch_cpu": {
+          "matched": 16,
+          "total": 16
+        }
+      },
+      "worst_kl": 1.1843327992253547e-15,
+      "minimum_cosine": 0.9999999999999853,
+      "worst_relative_ppl_delta": 6.651873740634327e-09,
+      "baseline_status": "executed",
+      "baseline_reason": null,
+      "current_geometry": {
+        "artifact_bytes": 103017,
+        "loaded_weight_array_bytes": 11264,
+        "ssm_state_logical_bytes": 640,
+        "convolution_history_logical_bytes": 256,
+        "activation_peak_bytes": null,
+        "runtime_overhead_bytes": null
+      },
+      "source_parameter_count": 2816,
+      "timing": {
+        "current": {
+          "public": {
+            "median_decode_tokens_per_second": 7313.8138090240745,
+            "min_decode_tokens_per_second": 6812.592395901895,
+            "max_decode_tokens_per_second": 7694.573786593915,
+            "median_first_token_seconds": 0.00013714700000377889,
+            "min_first_token_seconds": 0.0001317380000216417,
+            "max_first_token_seconds": 0.0001520989999903577
+          },
+          "long": {
+            "median_decode_tokens_per_second": 7361.725756757935,
+            "min_decode_tokens_per_second": 7046.8119719387805,
+            "max_decode_tokens_per_second": 7426.3386772452905,
+            "median_first_token_seconds": 0.00644925400001739,
+            "min_first_token_seconds": 0.0063381459999902745,
+            "max_first_token_seconds": 0.006501382000010381
+          }
+        },
+        "baseline": {
+          "public": {
+            "median_decode_tokens_per_second": 6785.292974380608,
+            "min_decode_tokens_per_second": 6563.187083683536,
+            "max_decode_tokens_per_second": 7046.180668131335,
+            "median_first_token_seconds": 0.00014564599999289385,
+            "min_first_token_seconds": 0.0001355720000049132,
+            "max_first_token_seconds": 0.00019944699999996374
+          },
+          "long": {
+            "median_decode_tokens_per_second": 6836.865550941997,
+            "min_decode_tokens_per_second": 6554.147558300897,
+            "max_decode_tokens_per_second": 6947.08406071597,
+            "median_first_token_seconds": 0.0070288740000137295,
+            "min_first_token_seconds": 0.007016415999999026,
+            "max_first_token_seconds": 0.00716526700000486
+          }
+        }
+      },
+      "public_expected": {
+        "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+        "tokens": [
+          6,
+          7,
+          12,
+          5,
+          3,
+          16
+        ]
+      }
+    },
+    {
+      "case": "expanded-biased",
+      "greedy": {
+        "cpu": {
+          "matched": 16,
+          "total": 16
+        },
+        "torch_cpu": {
+          "matched": 16,
+          "total": 16
+        }
+      },
+      "worst_kl": 2.0500495132034067e-15,
+      "minimum_cosine": 0.9999999999999938,
+      "worst_relative_ppl_delta": 1.9395957472830672e-08,
+      "baseline_status": "failed",
+      "baseline_reason": "35 [warning  ] Target cpu_generic has 0.0GB, but model needs ~8.8e-06GB; may require parallelism\n2026-10-22 08:27:35 [info     ] GraphWeightQuantizer: 15 tensors quantized, 20800 bytes\n2026-10-22 08:27:35 [info     ] Quantized 15 weight tensors (20800 bytes) for source\n2026-10-22 08:27:35 [debug    ] Using C++ toolchain: g++ (/usr/bin/g++)\n2026-10-22 08:27:35 [info     ] Native CPU kernels loaded from aether_cpu_e4a41523a875ebad.so\n2026-10-22 08:27:35 [info     ] Wrote 15 weight tensors (20800 bytes) to model.aeg-quant\n2026-10-22 08:27:35 [info     ] Wrote 15 weight tensors (20800 bytes) to model.aeg-quant\n2026-10-22 08:27:35 [info     ] Compilation complete           model_id=source package_path=/home/runner/work/Aether/Aether/hf-mamba1-results/expanded-biased/baseline/model.aeg\nTraceback (most recent call last):\n  File \"/home/runner/work/Aether/Aether/tools/validate_mamba2_hf.py\", line 456, in <module>\n    main()\n  File \"/home/runner/work/Aether/Aether/tools/validate_mamba2_hf.py\", line 246, in main\n    _compile(json.loads(args.compile_job.read_text()))\n  File \"/home/runner/work/Aether/Aether/tools/validate_mamba2_hf.py\", line 96, in _compile\n    rows, _ = engine.forward(np.asarray(prefix + labels[:-1], np.int64))\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/runner/work/Aether/Aether/historical-mamba1/src/aether/runtime/mamba_engine.py\", line 142, in forward\n    hidden = self._step(hidden, index, cache)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/runner/work/Aether/Aether/historical-mamba1/src/aether/runtime/mamba_engine.py\", line 104, in _step\n    conv_input, cache.conv_history[index] = self._conv(\n                                            ^^^^^^^^^^^\n  File \"/home/runner/work/Aether/Aether/historical-mamba1/src/aether/runtime/mamba_engine.py\", line 91, in _conv\n    raise ValueError(\"Mamba conv1d weight must have shape (d_inner, kernel)\")\nValueError: Mamba conv1d weight must have shape (d_inner, kernel)\n",
+      "current_geometry": {
+        "artifact_bytes": 114778,
+        "loaded_weight_array_bytes": 20800,
+        "ssm_state_logical_bytes": 1280,
+        "convolution_history_logical_bytes": 512,
+        "activation_peak_bytes": null,
+        "runtime_overhead_bytes": null
+      },
+      "source_parameter_count": 5200,
+      "timing": {
+        "current": {
+          "public": {
+            "median_decode_tokens_per_second": 7103.836782248047,
+            "min_decode_tokens_per_second": 6793.867272951516,
+            "max_decode_tokens_per_second": 7264.877431026447,
+            "median_first_token_seconds": 0.00014017099999819038,
+            "min_first_token_seconds": 0.00013105700000437537,
+            "max_first_token_seconds": 0.00016079200000262972
+          },
+          "long": {
+            "median_decode_tokens_per_second": 6958.430337301557,
+            "min_decode_tokens_per_second": 6752.454999638146,
+            "max_decode_tokens_per_second": 7028.825212174291,
+            "median_first_token_seconds": 0.006805232000004935,
+            "min_first_token_seconds": 0.006779493000010461,
+            "max_first_token_seconds": 0.006851191999999173
+          }
+        },
+        "baseline": null
+      },
+      "public_expected": {
+        "text": "tok10 tok16",
+        "tokens": [
+          10,
+          16
+        ]
+      }
+    },
+    {
+      "case": "zero-epsilon",
+      "greedy": {
+        "cpu": {
+          "matched": 16,
+          "total": 16
+        },
+        "torch_cpu": {
+          "matched": 16,
+          "total": 16
+        }
+      },
+      "worst_kl": 4.212435306926731e-15,
+      "minimum_cosine": 0.9999999999999925,
+      "worst_relative_ppl_delta": 4.810110514564277e-08,
+      "baseline_status": "executed",
+      "baseline_reason": null,
+      "current_geometry": {
+        "artifact_bytes": 103021,
+        "loaded_weight_array_bytes": 11264,
+        "ssm_state_logical_bytes": 640,
+        "convolution_history_logical_bytes": 256,
+        "activation_peak_bytes": null,
+        "runtime_overhead_bytes": null
+      },
+      "source_parameter_count": 2816,
+      "timing": {
+        "current": {
+          "public": {
+            "median_decode_tokens_per_second": 7189.7740871419455,
+            "min_decode_tokens_per_second": 7090.079459623869,
+            "max_decode_tokens_per_second": 7438.531166317114,
+            "median_first_token_seconds": 0.0001344429999790009,
+            "min_first_token_seconds": 0.0001323390000038671,
+            "max_first_token_seconds": 0.00015191899998967529
+          },
+          "long": {
+            "median_decode_tokens_per_second": 7222.615453573689,
+            "min_decode_tokens_per_second": 7026.214807360105,
+            "max_decode_tokens_per_second": 7245.74674667403,
+            "median_first_token_seconds": 0.006533079999996971,
+            "min_first_token_seconds": 0.006463455000016438,
+            "max_first_token_seconds": 0.006595072999999729
+          }
+        },
+        "baseline": {
+          "public": {
+            "median_decode_tokens_per_second": 6759.7712493640975,
+            "min_decode_tokens_per_second": 6587.875673604147,
+            "max_decode_tokens_per_second": 6874.323615535737,
+            "median_first_token_seconds": 0.0001438660000019354,
+            "min_first_token_seconds": 0.00013626499998053987,
+            "max_first_token_seconds": 0.00016051200000788413
+          },
+          "long": {
+            "median_decode_tokens_per_second": 6766.383831742751,
+            "min_decode_tokens_per_second": 6611.863761702521,
+            "max_decode_tokens_per_second": 6920.606798888727,
+            "median_first_token_seconds": 0.007066973999997117,
+            "min_first_token_seconds": 0.0070159670000009555,
+            "max_first_token_seconds": 0.007175926999991589
+          }
+        }
+      },
+      "public_expected": {
+        "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+        "tokens": [
+          6,
+          7,
+          12,
+          5,
+          3,
+          16
+        ]
+      }
+    },
+    {
+      "case": "large-delta",
+      "greedy": {
+        "cpu": {
+          "matched": 16,
+          "total": 16
+        },
+        "torch_cpu": {
+          "matched": 16,
+          "total": 16
+        }
+      },
+      "worst_kl": 4.043794827343799e-15,
+      "minimum_cosine": 0.9999999999999846,
+      "worst_relative_ppl_delta": 9.822754213854763e-09,
+      "baseline_status": "failed",
+      "baseline_reason": "'video_token_compression' skipped (disabled)\n2026-10-22 08:28:01 [debug    ] Pass 'advanced_peft_compilation' skipped (disabled)\n2026-10-22 08:28:01 [debug    ] Pass 'rlvr_verifier_head_injection' skipped (disabled)\n2026-10-22 08:28:01 [info     ] Target registry loaded with 32 profiles\n2026-10-22 08:28:01 [warning  ] Target cpu_generic has 0.0GB, but model needs ~8.8e-06GB; may require parallelism\n2026-10-22 08:28:01 [info     ] GraphWeightQuantizer: 13 tensors quantized, 11264 bytes\n2026-10-22 08:28:01 [info     ] Quantized 13 weight tensors (11264 bytes) for source\n2026-10-22 08:28:02 [debug    ] Using C++ toolchain: g++ (/usr/bin/g++)\n2026-10-22 08:28:02 [info     ] Native CPU kernels loaded from aether_cpu_e4a41523a875ebad.so\n2026-10-22 08:28:02 [info     ] Wrote 13 weight tensors (11264 bytes) to model.aeg-quant\n2026-10-22 08:28:02 [info     ] Wrote 13 weight tensors (11264 bytes) to model.aeg-quant\n2026-10-22 08:28:02 [info     ] Compilation complete           model_id=source package_path=/home/runner/work/Aether/Aether/hf-mamba1-results/large-delta/baseline/model.aeg\n/home/runner/work/Aether/Aether/historical-mamba1/src/aether/hybrid/state.py:753: RuntimeWarning: overflow encountered in exp\n  dt = np.log1p(np.exp(dt.astype(np.float64))).astype(np.float32)\n/home/runner/work/Aether/Aether/historical-mamba1/src/aether/hybrid/state.py:770: RuntimeWarning: invalid value encountered in multiply\n  h_new_t = A_bar * h_prev_t + B_bar * x_exp  # (batch, d_inner, d_state)\nTraceback (most recent call last):\n  File \"/home/runner/work/Aether/Aether/tools/validate_mamba2_hf.py\", line 456, in <module>\n    main()\n  File \"/home/runner/work/Aether/Aether/tools/validate_mamba2_hf.py\", line 246, in main\n    _compile(json.loads(args.compile_job.read_text()))\n  File \"/home/runner/work/Aether/Aether/tools/validate_mamba2_hf.py\", line 98, in _compile\n    raise RuntimeError(\"The actual candidate produced nonfinite logits\")\nRuntimeError: The actual candidate produced nonfinite logits\n",
+      "current_geometry": {
+        "artifact_bytes": 103025,
+        "loaded_weight_array_bytes": 11264,
+        "ssm_state_logical_bytes": 640,
+        "convolution_history_logical_bytes": 256,
+        "activation_peak_bytes": null,
+        "runtime_overhead_bytes": null
+      },
+      "source_parameter_count": 2816,
+      "timing": {
+        "current": {
+          "public": {
+            "median_decode_tokens_per_second": 7193.05438675561,
+            "min_decode_tokens_per_second": 6892.918510977418,
+            "max_decode_tokens_per_second": 7328.507685636747,
+            "median_first_token_seconds": 0.00013767499999062238,
+            "min_first_token_seconds": 0.00013025399999833098,
+            "max_first_token_seconds": 0.00015672300000346695
+          },
+          "long": {
+            "median_decode_tokens_per_second": 7119.862891724822,
+            "min_decode_tokens_per_second": 6895.172689541812,
+            "max_decode_tokens_per_second": 7268.603991844657,
+            "median_first_token_seconds": 0.006580301999974836,
+            "min_first_token_seconds": 0.00653294999997911,
+            "max_first_token_seconds": 0.006821710999986408
+          }
+        },
+        "baseline": null
+      },
+      "public_expected": {
+        "text": "tok6 tok12 tok5 tok3 tok16",
+        "tokens": [
+          6,
+          12,
+          5,
+          3,
+          16
+        ]
+      }
+    },
+    {
+      "case": "negative-gate",
+      "greedy": {
+        "cpu": {
+          "matched": 16,
+          "total": 16
+        },
+        "torch_cpu": {
+          "matched": 16,
+          "total": 16
+        }
+      },
+      "worst_kl": 1.15371608992021e-15,
+      "minimum_cosine": 0.9999999999999902,
+      "worst_relative_ppl_delta": 1.9355590651051586e-08,
+      "baseline_status": "executed",
+      "baseline_reason": null,
+      "current_geometry": {
+        "artifact_bytes": 105536,
+        "loaded_weight_array_bytes": 11584,
+        "ssm_state_logical_bytes": 640,
+        "convolution_history_logical_bytes": 256,
+        "activation_peak_bytes": null,
+        "runtime_overhead_bytes": null
+      },
+      "source_parameter_count": 2896,
+      "timing": {
+        "current": {
+          "public": {
+            "median_decode_tokens_per_second": 7144.482877242631,
+            "min_decode_tokens_per_second": 6921.065250523723,
+            "max_decode_tokens_per_second": 7369.491568037644,
+            "median_first_token_seconds": 0.000137856999970154,
+            "min_first_token_seconds": 0.00013230799999064402,
+            "max_first_token_seconds": 0.00015488200000390862
+          },
+          "long": {
+            "median_decode_tokens_per_second": 7063.401088362395,
+            "min_decode_tokens_per_second": 7001.701413525955,
+            "max_decode_tokens_per_second": 7150.985916342631,
+            "median_first_token_seconds": 0.006648025999993479,
+            "min_first_token_seconds": 0.006545972999958849,
+            "max_first_token_seconds": 0.0067240199999787365
+          }
+        },
+        "baseline": {
+          "public": {
+            "median_decode_tokens_per_second": 6698.077460597093,
+            "min_decode_tokens_per_second": 6578.118921179582,
+            "max_decode_tokens_per_second": 6927.990467148125,
+            "median_first_token_seconds": 0.0001443259999973634,
+            "min_first_token_seconds": 0.00013787599999659506,
+            "max_first_token_seconds": 0.00016714100001991028
+          },
+          "long": {
+            "median_decode_tokens_per_second": 6721.914401248433,
+            "min_decode_tokens_per_second": 6369.623810178452,
+            "max_decode_tokens_per_second": 6763.343835950129,
+            "median_first_token_seconds": 0.007085383000003276,
+            "min_first_token_seconds": 0.007057431000021097,
+            "max_first_token_seconds": 0.007281867000017428
+          }
+        }
+      },
+      "public_expected": {
+        "text": "",
+        "tokens": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "case": "negative-conv",
+      "greedy": {
+        "cpu": {
+          "matched": 16,
+          "total": 16
+        },
+        "torch_cpu": {
+          "matched": 16,
+          "total": 16
+        }
+      },
+      "worst_kl": 1.15371608992021e-15,
+      "minimum_cosine": 0.9999999999999902,
+      "worst_relative_ppl_delta": 1.9355590651051586e-08,
+      "baseline_status": "executed",
+      "baseline_reason": null,
+      "current_geometry": {
+        "artifact_bytes": 105536,
+        "loaded_weight_array_bytes": 11584,
+        "ssm_state_logical_bytes": 640,
+        "convolution_history_logical_bytes": 256,
+        "activation_peak_bytes": null,
+        "runtime_overhead_bytes": null
+      },
+      "source_parameter_count": 2896,
+      "timing": {
+        "current": {
+          "public": {
+            "median_decode_tokens_per_second": 7250.29467260127,
+            "min_decode_tokens_per_second": 7000.203005895412,
+            "max_decode_tokens_per_second": 7450.708243135752,
+            "median_first_token_seconds": 0.00013588100000561099,
+            "min_first_token_seconds": 0.00013106299996934467,
+            "max_first_token_seconds": 0.00015666299998429167
+          },
+          "long": {
+            "median_decode_tokens_per_second": 7070.807062067136,
+            "min_decode_tokens_per_second": 6718.133971143193,
+            "max_decode_tokens_per_second": 7151.9868729501095,
+            "median_first_token_seconds": 0.006665091000002121,
+            "min_first_token_seconds": 0.006581992000008086,
+            "max_first_token_seconds": 0.006801674000030289
+          }
+        },
+        "baseline": {
+          "public": {
+            "median_decode_tokens_per_second": 6762.07634398628,
+            "min_decode_tokens_per_second": 6606.384976394131,
+            "max_decode_tokens_per_second": 6958.105248138568,
+            "median_first_token_seconds": 0.00014212300004601275,
+            "min_first_token_seconds": 0.0001357440000333554,
+            "max_first_token_seconds": 0.00016192300000739124
+          },
+          "long": {
+            "median_decode_tokens_per_second": 6560.677361998059,
+            "min_decode_tokens_per_second": 5869.573055611975,
+            "max_decode_tokens_per_second": 6745.369063012825,
+            "median_first_token_seconds": 0.007149507999997695,
+            "min_first_token_seconds": 0.007063699000013912,
+            "max_first_token_seconds": 0.007245811999951002
+          }
+        }
+      },
+      "public_expected": {
+        "text": "",
+        "tokens": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "case": "swish-alias",
+      "greedy": {
+        "cpu": {
+          "matched": 16,
+          "total": 16
+        },
+        "torch_cpu": {
+          "matched": 16,
+          "total": 16
+        }
+      },
+      "worst_kl": 1.1843327992253547e-15,
+      "minimum_cosine": 0.9999999999999853,
+      "worst_relative_ppl_delta": 6.651873740634327e-09,
+      "baseline_status": "executed",
+      "baseline_reason": null,
+      "current_geometry": {
+        "artifact_bytes": 103021,
+        "loaded_weight_array_bytes": 11264,
+        "ssm_state_logical_bytes": 640,
+        "convolution_history_logical_bytes": 256,
+        "activation_peak_bytes": null,
+        "runtime_overhead_bytes": null
+      },
+      "source_parameter_count": 2816,
+      "timing": {
+        "current": {
+          "public": {
+            "median_decode_tokens_per_second": 7196.737204770364,
+            "min_decode_tokens_per_second": 7015.490202218921,
+            "max_decode_tokens_per_second": 7265.556074306339,
+            "median_first_token_seconds": 0.00013682700000572368,
+            "min_first_token_seconds": 0.00013459400003057453,
+            "max_first_token_seconds": 0.00015896000002157962
+          },
+          "long": {
+            "median_decode_tokens_per_second": 7095.908296470426,
+            "min_decode_tokens_per_second": 6681.703681719201,
+            "max_decode_tokens_per_second": 7281.3817149578945,
+            "median_first_token_seconds": 0.006483408999997664,
+            "min_first_token_seconds": 0.006430959999988772,
+            "max_first_token_seconds": 0.006615259000000151
+          }
+        },
+        "baseline": {
+          "public": {
+            "median_decode_tokens_per_second": 6708.251436644469,
+            "min_decode_tokens_per_second": 6533.001457008006,
+            "max_decode_tokens_per_second": 6859.409542249127,
+            "median_first_token_seconds": 0.00014387800001713913,
+            "min_first_token_seconds": 0.00013543500000423592,
+            "max_first_token_seconds": 0.00015600600005427623
+          },
+          "long": {
+            "median_decode_tokens_per_second": 6754.742070360306,
+            "min_decode_tokens_per_second": 6471.061873350478,
+            "max_decode_tokens_per_second": 6804.982802489183,
+            "median_first_token_seconds": 0.007140334000041548,
+            "min_first_token_seconds": 0.007110189000002265,
+            "max_first_token_seconds": 0.007337942999981806
+          }
+        }
+      },
+      "public_expected": {
+        "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+        "tokens": [
+          6,
+          7,
+          12,
+          5,
+          3,
+          16
+        ]
+      }
+    },
+    {
+      "case": "default-activation",
+      "greedy": {
+        "cpu": {
+          "matched": 16,
+          "total": 16
+        },
+        "torch_cpu": {
+          "matched": 16,
+          "total": 16
+        }
+      },
+      "worst_kl": 1.1843327992253547e-15,
+      "minimum_cosine": 0.9999999999999853,
+      "worst_relative_ppl_delta": 6.651873740634327e-09,
+      "baseline_status": "executed",
+      "baseline_reason": null,
+      "current_geometry": {
+        "artifact_bytes": 103026,
+        "loaded_weight_array_bytes": 11264,
+        "ssm_state_logical_bytes": 640,
+        "convolution_history_logical_bytes": 256,
+        "activation_peak_bytes": null,
+        "runtime_overhead_bytes": null
+      },
+      "source_parameter_count": 2816,
+      "timing": {
+        "current": {
+          "public": {
+            "median_decode_tokens_per_second": 7393.871537131839,
+            "min_decode_tokens_per_second": 7303.405369069931,
+            "max_decode_tokens_per_second": 7644.233026871123,
+            "median_first_token_seconds": 0.00013427300001467302,
+            "min_first_token_seconds": 0.00012746200002311525,
+            "max_first_token_seconds": 0.00015432300000384203
+          },
+          "long": {
+            "median_decode_tokens_per_second": 7397.160969844365,
+            "min_decode_tokens_per_second": 7242.253375079538,
+            "max_decode_tokens_per_second": 7487.183546025184,
+            "median_first_token_seconds": 0.006377159999999549,
+            "min_first_token_seconds": 0.00634496200001422,
+            "max_first_token_seconds": 0.006420816000002105
+          }
+        },
+        "baseline": {
+          "public": {
+            "median_decode_tokens_per_second": 6740.861077417485,
+            "min_decode_tokens_per_second": 6663.354028078258,
+            "max_decode_tokens_per_second": 6869.452916771273,
+            "median_first_token_seconds": 0.00014797299996871516,
+            "min_first_token_seconds": 0.00013999099996908626,
+            "max_first_token_seconds": 0.00016172399995184605
+          },
+          "long": {
+            "median_decode_tokens_per_second": 6706.066403443525,
+            "min_decode_tokens_per_second": 6572.25774918783,
+            "max_decode_tokens_per_second": 6762.442169032632,
+            "median_first_token_seconds": 0.007170897000037257,
+            "min_first_token_seconds": 0.007154732000003605,
+            "max_first_token_seconds": 0.007222783999964122
+          }
+        }
+      },
+      "public_expected": {
+        "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+        "tokens": [
+          6,
+          7,
+          12,
+          5,
+          3,
+          16
+        ]
+      }
+    },
+    {
+      "case": "multi-layer",
+      "greedy": {
+        "cpu": {
+          "matched": 16,
+          "total": 16
+        },
+        "torch_cpu": {
+          "matched": 16,
+          "total": 16
+        }
+      },
+      "worst_kl": 1.3289440617929198e-15,
+      "minimum_cosine": 0.9999999999999901,
+      "worst_relative_ppl_delta": 2.6910459112337508e-08,
+      "baseline_status": "failed",
+      "baseline_reason": ":08 [warning  ] Target cpu_generic has 0.0GB, but model needs ~1.7056e-05GB; may require parallelism\n2026-10-22 08:29:08 [info     ] GraphWeightQuantizer: 27 tensors quantized, 30144 bytes\n2026-10-22 08:29:08 [info     ] Quantized 27 weight tensors (30144 bytes) for source\n2026-10-22 08:29:08 [debug    ] Using C++ toolchain: g++ (/usr/bin/g++)\n2026-10-22 08:29:08 [info     ] Native CPU kernels loaded from aether_cpu_e4a41523a875ebad.so\n2026-10-22 08:29:08 [info     ] Wrote 27 weight tensors (30144 bytes) to model.aeg-quant\n2026-10-22 08:29:08 [info     ] Wrote 27 weight tensors (30144 bytes) to model.aeg-quant\n2026-10-22 08:29:08 [info     ] Compilation complete           model_id=source package_path=/home/runner/work/Aether/Aether/hf-mamba1-results/multi-layer/baseline/model.aeg\nTraceback (most recent call last):\n  File \"/home/runner/work/Aether/Aether/tools/validate_mamba2_hf.py\", line 456, in <module>\n    main()\n  File \"/home/runner/work/Aether/Aether/tools/validate_mamba2_hf.py\", line 246, in main\n    _compile(json.loads(args.compile_job.read_text()))\n  File \"/home/runner/work/Aether/Aether/tools/validate_mamba2_hf.py\", line 96, in _compile\n    rows, _ = engine.forward(np.asarray(prefix + labels[:-1], np.int64))\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/runner/work/Aether/Aether/historical-mamba1/src/aether/runtime/mamba_engine.py\", line 142, in forward\n    hidden = self._step(hidden, index, cache)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/runner/work/Aether/Aether/historical-mamba1/src/aether/runtime/mamba_engine.py\", line 104, in _step\n    conv_input, cache.conv_history[index] = self._conv(\n                                            ^^^^^^^^^^^\n  File \"/home/runner/work/Aether/Aether/historical-mamba1/src/aether/runtime/mamba_engine.py\", line 91, in _conv\n    raise ValueError(\"Mamba conv1d weight must have shape (d_inner, kernel)\")\nValueError: Mamba conv1d weight must have shape (d_inner, kernel)\n",
+      "current_geometry": {
+        "artifact_bytes": 144094,
+        "loaded_weight_array_bytes": 30144,
+        "ssm_state_logical_bytes": 1920,
+        "convolution_history_logical_bytes": 768,
+        "activation_peak_bytes": null,
+        "runtime_overhead_bytes": null
+      },
+      "source_parameter_count": 7536,
+      "timing": {
+        "current": {
+          "public": {
+            "median_decode_tokens_per_second": 4184.930900889327,
+            "min_decode_tokens_per_second": 4042.513380821017,
+            "max_decode_tokens_per_second": 4256.600010333386,
+            "median_first_token_seconds": 0.00023155799999585724,
+            "min_first_token_seconds": 0.00022215500001721011,
+            "max_first_token_seconds": 0.00024766199999248784
+          },
+          "long": {
+            "median_decode_tokens_per_second": 4006.779470845211,
+            "min_decode_tokens_per_second": 3741.3827937895235,
+            "max_decode_tokens_per_second": 4159.852432151925,
+            "median_first_token_seconds": 0.012424887999998191,
+            "min_first_token_seconds": 0.01238672099998439,
+            "max_first_token_seconds": 0.01273041799998964
+          }
+        },
+        "baseline": null
+      },
+      "public_expected": {
+        "text": "tok6 tok13 tok6 tok13 tok6 tok13 tok6 tok13",
+        "tokens": [
+          6,
+          13,
+          6,
+          13,
+          6,
+          13,
+          6,
+          13
+        ]
+      }
+    }
+  ],
+  "suite": {
+    "tests": 5472,
+    "passed": 5421,
+    "skipped": 51,
+    "failures": 0,
+    "attributes": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "51",
+        "tests": "5472",
+        "time": "167.416",
+        "timestamp": "2026-10-22T08:29:10.418649+00:00",
+        "hostname": "runnervmxehtw"
+      }
+    ],
+    "identical_case_identities_to_local_full_run": false,
+    "identity_differences": {
+      "remote_only": [
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[10]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[11]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[12]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[13]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[14]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[8]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[2]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[3]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[6]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[7]"
+          ],
+          1
+        ]
+      ],
+      "local_only": [
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q2_K]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q3_K]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q4_K]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q5_K]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q6_K]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q8_0]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q4_0]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q4_1]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q5_0]"
+          ],
+          1
+        ],
+        [
+          [
+            "tests.unit.test_gguf_kquant",
+            "test_kquant_matches_gguf_reference[GGMLQuantizationType.Q5_1]"
+          ],
+          1
+        ]
+      ]
+    },
+    "identity_difference_note": "The ten differences are GGUF IntEnum parameter display labels (symbolic locally, numeric on the Python 3.11 worker); the declared codec values are recorded. Raw identities are retained rather than asserted equal.",
+    "gguf_codec_values": {
+      "Q2_K": 10,
+      "Q3_K": 11,
+      "Q4_K": 12,
+      "Q5_K": 13,
+      "Q6_K": 14,
+      "Q8_0": 8,
+      "Q4_0": 2,
+      "Q4_1": 3,
+      "Q5_0": 6,
+      "Q5_1": 7
+    }
+  },
+  "coverage": {
+    "version": "7.16.2",
+    "timestamp": "1792657907627",
+    "lines-valid": "57353",
+    "lines-covered": "45162",
+    "line-rate": "0.7874",
+    "branches-valid": "17290",
+    "branches-covered": "10830",
+    "branch-rate": "0.6264",
+    "complexity": "0"
+  },
+  "line_coverage_percent": 78.74391923700591,
+  "raw_evidence_sha256": {
+    "hf-full-results.xml": "9f0c8cc2b4c26f27cab18077d449bb4c505896e18d62778aec0f5def364032ed",
+    "hf-full-coverage.xml": "2c213d99faa0228650ac14810e07d85eddce98235becb23060edf9a1efd947d3",
+    "hf-parity-freeze.txt": "ad6f124829bcddd025c1a01e3023c5151d1d763e1a33c39fb1ace869fbed29ce"
+  },
+  "skips": [
+    {
+      "class": "tests.integration.test_automatic_execution_dispatch",
+      "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[llama]",
+      "reason": "could not import 'accelerate': No module named 'accelerate'"
+    },
+    {
+      "class": "tests.integration.test_automatic_execution_dispatch",
+      "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[gpt2]",
+      "reason": "could not import 'accelerate': No module named 'accelerate'"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_compile_small_model",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_end_to_end_generate",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_chat_completion",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_compile_plan_dry_run",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_model_info",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_openai_compatible_server",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_model_list_and_remove",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_backend_detection",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_hardware_detection",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_benchmark_smoke",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_aeg_format_roundtrip",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_end_to_end",
+      "name": "test_cross_hardware_portability",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+      "name": "test_ssl_server_credentials_creation",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+      "name": "test_ssl_server_credentials_mtls",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+      "name": "test_ssl_channel_credentials_creation",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+      "name": "test_credential_bytes_helper",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+      "name": "test_credential_bytes_missing_file",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+      "name": "test_credential_bytes_none_passthrough",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+      "name": "test_require_grpc_no_error",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+      "name": "test_service_name_constant",
+      "reason": "cryptography not installed"
+    },
+    {
+      "class": "tests.tools.test_pass_audit",
+      "name": "test_real_public_compile_audit_smoke",
+      "reason": "Opt-in real subprocess compile/load/Runtime smoke, no timing"
+    },
+    {
+      "class": "tests.unit.test_adversarial.TestExecutionFidelity",
+      "name": "test_real_pretrained_model",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    },
+    {
+      "class": "tests.unit.test_aeg_onnx_export",
+      "name": "test_real_directml_exported_aeg_operators",
+      "reason": "physical DirectML execution requires its optional installed runtime"
+    },
+    {
+      "class": "tests.unit.test_aeg_onnx_export",
+      "name": "test_actual_compiled_artifact_backend_generation_stream_and_unload[DmlExecutionProvider]",
+      "reason": "real DmlExecutionProvider is not installed"
+    },
+    {
+      "class": "tests.unit.test_artifact_publication",
+      "name": "test_real_member_handle_blocks_rename_then_retry_publishes",
+      "reason": "requires actual Windows file sharing"
+    },
+    {
+      "class": "tests.unit.test_artifact_publication",
+      "name": "test_real_persistent_member_lock_fails_after_bounded_attempts",
+      "reason": "requires actual Windows file sharing"
+    },
+    {
+      "class": "tests.unit.test_artifact_publication",
+      "name": "test_destination_created_during_real_lock_retry_is_preserved",
+      "reason": "requires actual Windows file sharing"
+    },
+    {
+      "class": "tests.unit.test_c2pa_signing",
+      "name": "test_pure_python_and_native_backends_agree",
+      "reason": "could not import 'cryptography': No module named 'cryptography'"
+    },
+    {
+      "class": "tests.unit.test_calibration.TestDatasets",
+      "name": "test_wikitext2",
+      "reason": "Real wikitext-2 data is unavailable locally; provide a calibration file or cache the 'wikitext' dataset before compiling (no local Hugging Face dataset cache at /home/runner/.cache/huggingface/datasets)"
+    },
+    {
+      "class": "tests.unit.test_calibration.TestDatasets",
+      "name": "test_hellaswag",
+      "reason": "Real hellaswag data is unavailable locally; provide a calibration file or cache the 'Rowan/hellaswag' dataset before compiling (no local Hugging Face dataset cache at /home/runner/.cache/huggingface/datasets)"
+    },
+    {
+      "class": "tests.unit.test_compiler_publication_transaction",
+      "name": "test_real_windows_old_member_lock_preserves_published_output",
+      "reason": "requires real Windows sharing semantics"
+    },
+    {
+      "class": "tests.unit.test_cpu_host_portability",
+      "name": "test_real_packaged_windows_aeg_can_be_removed_while_engine_is_live",
+      "reason": "Windows DLL lifetime regression"
+    },
+    {
+      "class": "tests.unit.test_device_placement.TestDeviceResolution",
+      "name": "test_cuda_spec_gains_an_explicit_index",
+      "reason": "no CUDA device on this host"
+    },
+    {
+      "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+      "name": "test_compiler_compile_produces_weight_blob",
+      "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+    },
+    {
+      "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+      "name": "test_compiled_package_is_loadable_and_runnable",
+      "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+    },
+    {
+      "class": "tests.unit.test_hardware_evidence",
+      "name": "test_real_cuda_aeg_execution_never_uses_cpu_fallback",
+      "reason": "No physical NVIDIA CUDA device and matching PyTorch runtime"
+    },
+    {
+      "class": "tests.unit.test_native_cpu_reproducibility",
+      "name": "test_two_cold_gnu_pe_builds_are_identical_and_execute",
+      "reason": "GNU PE linker regression"
+    },
+    {
+      "class": "tests.unit.test_onnx_provider_contract",
+      "name": "test_real_directml_offline_workload_requires_gpu_node_execution",
+      "reason": "physical DirectML runtime is not installed on this host"
+    },
+    {
+      "class": "tests.unit.test_onnx_provider_contract",
+      "name": "test_real_directml_runtime_routes_generation_and_stream_to_gpu",
+      "reason": "physical DirectML runtime is not installed on this host"
+    },
+    {
+      "class": "tests.unit.test_onnx_session_contract",
+      "name": "test_actual_onnx_session_reuses_only_bound_state[DmlExecutionProvider]",
+      "reason": "real DmlExecutionProvider is not installed"
+    },
+    {
+      "class": "tests.unit.test_otlp_conformance",
+      "name": "test_sdk_bridge_preserves_aether_trace_ids",
+      "reason": "could not import 'opentelemetry.sdk': No module named 'opentelemetry.sdk'"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_the_packaged_tokenizer_renders_the_checkpoints_own_template",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_templating_changes_the_token_sequence_the_model_sees",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_a_template_needing_undefined_names_still_renders",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_tokenize_true_is_refused_rather_than_silently_ignored",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_the_packaged_tokenizer_honours_add_special_tokens",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_a_missing_template_is_reported_not_guessed",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_prompt_format",
+      "name": "test_an_override_also_works_through_the_packaged_tokenizer",
+      "reason": "the Qwen artifact is not present"
+    },
+    {
+      "class": "tests.unit.test_v31_features",
+      "name": "test_compiled_package_contains_v31_artifacts",
+      "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+    }
+  ],
+  "memory_note": "Loaded logical arrays, not inference peak RSS. Activation/overhead peaks unmeasured. State includes MambaState.h and last_x.",
+  "timing_note": "Synthetic CPU engine timings, two warmups/seven repeats per one-/64-token prompt, eight generated IDs without EOS stopping. Different incorrect historical output; no general speed/no-regression certification.",
+  "mamba2_control": {
+    "cases": 2,
+    "ordinary_admission_api_cli_passed": true,
+    "source_and_fixture_hashes_match_git": true,
+    "raw_report_sha256": "cb530c3578a2fcbb82cc77db9bc8530f67dd85156eaef67927596fd29deec44b"
+  },
+  "retained_failed_integration_reports": [
+    {
+      "revision": "48ce3b0e6621081416b32329da3f441074fcf7fd",
+      "ci_run": 39725488801,
+      "sha256": "72c4bc4b4873752695696f763dc0c80e9d7e944a6d0ded54958d1bdbbaf3eed7",
+      "partial_case_count": 1,
+      "note": "Failed public-text integration; later cases/full suite did not run in this job."
+    },
+    {
+      "revision": "1a2163992910cb7ce1f9513fc05af84db0ea708e",
+      "ci_run": 39733176852,
+      "sha256": "5e7993c7a4b647bc23774f4f4549499198e4ece44358049986132f4736a8c64f",
+      "partial_case_count": 5,
+      "note": "Failed public-text integration; later cases/full suite did not run in this job."
+    }
+  ],
+  "runtime_src_tree": "7c552602d0bfbc2a1dcff793aff9ed319dd84116",
+  "local_framing_observation": {
+    "sha256": "0b6a953d6b999f638070e6fce84f43fc53f4a4fbb57b8d7c1a417c0d63f2b1c7",
+    "handler_source_revision": "ad77e082da16d6393388500f58180a1e27acc6f9",
+    "handler_source": "tests/unit/test_mcp_transport_contracts.py",
+    "technique": "Actual test Handler extracted unchanged; observe emitted headers before flush and client headers/body prefix after urlopen; both JSON/SSE and /mcp /rpc routes.",
+    "note": "Header rewriting component unidentified; no transport code changed."
+  }
+}
