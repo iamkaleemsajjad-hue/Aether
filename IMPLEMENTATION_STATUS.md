@@ -11,7 +11,15 @@ benchmark refused a Torch worker for insufficient live RAM; no benchmark
 success or memory improvement is inferred from the focused checks. Its complete
 local run returned **5459 passed, 42 skipped, two existing MCP HTTP failures**;
 all 31 new cases passed and line coverage rose to **78.7816445%**. The local
-suite remains red; hosted results and broader mission work remain separate.
+suite remains red. [Hosted CI at `51c0394`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39874203000)
+passed all 23 jobs; security passed separately. Its complete CPU suite returned
+**5452 passed, 51 skipped, zero failures**, with **78.7921054%** line coverage.
+Three Mamba-2 source contracts and all nine Mamba-1 controls passed original-HF,
+CPU/Torch CPU, public API/streaming and CLI checks. The zero-epsilon correction
+improves numerical fidelity with unchanged logical weight/cache bytes; observed
+tiny-model decode medians were slightly lower and first-output latency higher.
+The linked report retains raw
+spreads and limits; broader mission work remains open.
 
 The previous measured [CI at `ad77e08`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39747608124)
 passed all 23 jobs and security passed separately. Nine untrained FP32 Mamba-1

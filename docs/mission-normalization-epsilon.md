@@ -96,6 +96,73 @@ passing focused cases do not establish controlled performance. The baseline
 regression preceded a metadata-only fixture parameter-count annotation and
 additional finiteness assertions; the complete current run used the final files.
 
+## Hosted original-HF measurements
+
+[All 23 CI jobs](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39874203000)
+and [security](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39874202964)
+passed at `51c03947e52d58657fe28347615e669843c54528`. The blocking job executed
+the three Mamba-2 cases, all nine Mamba-1 controls, ordinary CPU/Torch CPU public
+generation/streaming and CLI checks, then the full suite and coverage gate.
+The complete hosted suite returned **5452 passed, 51 skipped, zero failures**
+across 5503 cases, in 173.833 JUnit seconds. Line coverage increased from
+45162/57353 (**78.7439192%**) in the prior measured Linux run to
+45192/57356 (**78.7921054%**); branches were 10845/17290. The enforced floor
+remains 78.6%. Full style/type backlog checks remain advisory.
+
+The [raw Mamba-2 report](measurements/normalization-epsilon-hf.json),
+[Mamba-1 control report](measurements/mamba1-control-during-epsilon.json),
+[verification record](measurements/normalization-epsilon-provenance.json) and
+[dependency freeze](measurements/normalization-epsilon-freeze.txt) retain exact
+data. Verification matched 210 reported implementation-file hashes to their
+actual Git revisions, both fixture hashes, and all 84 source/reference files.
+Default and expanded/biased Mamba-2 saved fixed-label logits were bit-identical
+between pre-fix `66e0a72` and current CPU execution.
+
+The worker reported AMD EPYC 7763, four logical CPUs and 16,766,414,848 host RAM
+bytes; Linux 6.17.0-1022 Azure x86_64, Python 3.11.14, NumPy 1.26.4, Torch
+2.9.1+cpu, Transformers 4.57.3, SafeTensors 0.8.0, Tokenizers 0.22.2 and psutil
+7.2.2. The corrected zero-epsilon source has 2668 untrained parameters. Two
+fixed probes have one/64 prompt IDs and four labelled continuation positions
+each; they are not corpus PPL or trained-model evaluation.
+
+| Zero-epsilon original-HF comparison | Before, CPU | After, CPU and Torch CPU |
+|---|---:|---:|
+| Worst-position KL | 4.24041e-6 | 1.86884e-14 |
+| Minimum position cosine | 0.9999622372 | 0.9999999999997069 |
+| Maximum absolute logit error | 0.00533836 | 3.93949e-7 |
+| Greedy IDs matched | 16/16 | 16/16 per executor |
+| Worst relative fixed-label PPL increase | +0.0258812% | +0.000011697% |
+| Logical loaded weight bytes | 10672 | 10672 |
+| Logical SSM state / convolution history bytes | 512 / 384 | 512 / 384 |
+| Complete artifact bytes | 93809 | 101964 |
+
+The earlier Mamba-2 result already passed the coarser KL/cosine/greedy/PPL
+thresholds. It failed the exact declared-epsilon numerical contract. The fix
+restores source fidelity without claiming a greedy-quality improvement on these
+probes. The expanded/biased control retains 18112 logical weight bytes and
+1024/640 state/history bytes. These array counts do not measure peak RSS,
+activation memory or runtime overhead. Artifact growth includes mandatory
+numerical-admission evidence in the current build; both builds store the same
+weight bytes. Current zero-epsilon compilation took 6.18937 seconds with
+mandatory HF/CPU/Torch admission, versus 0.305928 seconds for the historical
+diagnostic build. Those are different verification workloads.
+
+Timing uses one BLAS/OpenMP thread, two warmups, seven measured repeats and
+eight generated IDs without EOS stopping per prompt. These are engine-call
+timings, excluding artifact load and tokenization; first output is not API TTFT.
+
+| Zero-epsilon timing, median [minimum, maximum] | Before | After |
+|---|---:|---:|
+| One-ID prompt decode, IDs/s | 5163 [4924,5268] | 5144 [5059,5223] |
+| 64-ID prompt decode, IDs/s | 5209 [5147,5277] | 5157 [4979,5276] |
+| One-ID prompt first output, ms | 0.17870 [0.17333,0.26879] | 0.18130 [0.17443,0.20544] |
+| 64-ID prompt first output, ms | 8.6915 [8.5877,8.8321] | 8.8079 [8.6796,9.0680] |
+
+Observed decode medians decreased 0.36%/0.99%, and first-output medians
+increased 1.46%/1.34%. Ranges overlap on this shared worker. These observations
+establish neither a speedup nor a general no-regression guarantee. The code
+change runs at deserialization; controlled larger-model performance remains open.
+
 Ruff remains **71 findings** and scoped loader mypy **39 errors**, with no added
 file/code/message diagnostics. New test files and the validation tool pass scoped
 mypy; new/changed tests and tool pass Ruff. The existing Mamba-2 fixture retains
@@ -132,8 +199,8 @@ No pass disposition changes or new pass-benefit claims follow from this fix.
 
 | Backend scope | Verification tier and technique for this change |
 |---|---|
-| NumPy CPU | Physical Windows CPU execution; authenticated loader/FP64 checks and original-HF Llama/Mamba-2 prefill, cache and greedy comparisons |
-| Torch CPU | Real CPU tensors and original-HF comparisons on the same compiled source contracts |
+| NumPy CPU | Windows and hosted Linux CPU execution; authenticated loader/FP64 checks, original-HF prefill/cache/greedy, actual public API/CLI |
+| Torch CPU | Real CPU tensors; original-HF admission and the same compiled source/API/CLI contracts |
 | ONNX CPU | Actual Llama prefill/cached-decode/generation operators against original HF; no recurrent ONNX claim |
 | DirectML | Optional physical-provider checks skipped; historical matrix evidence unchanged |
 | CUDA, ROCm, MPS and other targets | No physical execution in this change; existing matrix tiers unchanged |
