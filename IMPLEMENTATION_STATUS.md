@@ -10,8 +10,16 @@ local run returned **5,473 passed, 42 skipped, two existing MCP HTTP failures**,
 with **78.8040446%** line coverage. All 14 new cases passed; the local suite
 remains red. A strict local subprocess comparison was refused for live RAM,
 so no speed or resident-memory improvement is assigned to that attempt.
-The expanded hosted comparison retains the immediate pre-fix baseline and six
-Mamba-2 contracts; its results will be recorded after execution.
+[Hosted CI at `5dbe26d`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39903522524)
+passed all 23 jobs; security passed separately. Its complete suite returned
+**5,466 passed, 51 skipped, zero failures**. All six Mamba-2 contracts and nine
+Mamba-1 controls passed original-HF/CPU/Torch CPU admission and actual API/CLI
+checks. The three stress contracts recovered **16/16 greedy IDs per executor**
+from **2–4/16**. Logical weight/cache bytes remain unchanged. Decode medians
+were **0.29–5.61% lower**; reducing stable-activation overhead remains active
+work. Hosted coverage was **78.7848675%**, slightly below the previous hosted
+run despite more covered Mamba-2 lines. The linked record retains losses,
+spreads and the open coverage criterion.
 
 The [normalization-epsilon correction](docs/mission-normalization-epsilon.md)
 preserves explicit zero in the shared loader. Its final regression failed 12
