@@ -98,7 +98,19 @@ class Mamba2ExecutionEngine:
 
     @staticmethod
     def _silu(value: np.ndarray) -> np.ndarray:
-        return value / (1.0 + np.exp(-np.clip(value, -60.0, 60.0)))
+        """Evaluate x*sigmoid(x) without changing finite convolution/gate inputs.
+
+        Dao & Gu (2024), section 7.1, and Mamba2Simple v2.2.4 use SiLU:
+        https://arxiv.org/html/2405.21060v1
+        https://github.com/state-spaces/mamba/blob/95d8aba8a8c75aedcaa6143713b11e745e7cd0d9/mamba_ssm/modules/mamba2_simple.py
+        With t=exp(-abs(x)), sigmoid is t/(1+t) for negative x and its
+        complement for nonnegative x. The exponential cannot overflow.
+        """
+        result = np.exp(-np.abs(value))
+        np.divide(result, 1.0 + result, out=result)
+        np.subtract(1.0, result, out=result, where=value >= 0)
+        np.multiply(value, result, out=result)
+        return result
 
     def _norm(self, value: np.ndarray, weight: np.ndarray) -> np.ndarray:
         if self.weights.norm_type.lower() == "layernorm":
@@ -149,7 +161,10 @@ class Mamba2ExecutionEngine:
         repeat = self.num_heads // self.num_groups
         b = np.repeat(b, repeat, axis=1)
         c = np.repeat(c, repeat, axis=1)
-        delta = np.log1p(np.exp(np.clip(dt + layer.dt.reshape(1, -1), -60.0, 60.0)))
+        # Mamba2Simple v2.2.4 forward: delta=softplus(raw_dt+dt_bias).
+        # logaddexp(0, x)=log(1+exp(x)) evaluates the same function without
+        # clipping valid time steps or overflowing exp for large positive x.
+        delta = np.logaddexp(0.0, dt + layer.dt.reshape(1, -1))
         a = -np.exp(np.asarray(layer.a_log, dtype=np.float32).reshape(1, -1))
         decay = np.exp(delta[:, :, None, None] * a[:, :, None, None])
         state = cache.states[index]

@@ -24,6 +24,8 @@ def checkpoint_data(
     with_bias: bool = False,
     rms_norm: bool = True,
     epsilon: float = 1e-5,
+    large_delta: bool = False,
+    large_silu: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """Return distinct learned norm scales and all real source parameter arrays."""
     hidden, heads, state, groups, width, vocab = 16, 4, 4, 2, 3, 17
@@ -71,7 +73,10 @@ def checkpoint_data(
         "backbone.layers.0.mixer.conv1d.bias": matrix(channels),
         "backbone.layers.0.mixer.A_log": np.log(np.arange(1, heads + 1, dtype=np.float32)),
         "backbone.layers.0.mixer.D": np.linspace(0.7, 1.3, heads, dtype=np.float32),
-        "backbone.layers.0.mixer.dt_bias": np.linspace(-4, -2, heads, dtype=np.float32),
+        "backbone.layers.0.mixer.dt_bias": (
+            np.full(heads, 1000, dtype=np.float32)
+            if large_delta else np.linspace(-4, -2, heads, dtype=np.float32)
+        ),
         "backbone.layers.0.mixer.out_proj.weight": matrix(hidden, inner),
     }
     if with_bias:
@@ -79,6 +84,15 @@ def checkpoint_data(
             2 * inner + 2 * groups * state + heads
         )
         tensors["backbone.layers.0.mixer.out_proj.bias"] = matrix(hidden)
+    if large_silu is not None:
+        if large_silu == "gate" and with_bias:
+            tensors["backbone.layers.0.mixer.in_proj.bias"][:inner] = -1e20
+        elif large_silu == "conv":
+            # Keep B/C channels active while isolating the X activation.
+            tensors["backbone.layers.0.mixer.conv1d.bias"][:inner] = -1e20
+        else:
+            raise ValueError("large_silu must be conv or a biased gate")
+        tensors["backbone.layers.0.mixer.out_proj.weight"] *= 1e8
     return config, tensors
 
 
@@ -123,7 +137,8 @@ def matrix_logits(
         return value / np.sqrt((value**2).mean(axis=-1, keepdims=True) + eps) * weight
 
     def silu(value: np.ndarray) -> np.ndarray:
-        return value / (1 + np.exp(-value))
+        # Independent FP64 log-sigmoid equation; no runtime activation call.
+        return value * np.exp(-np.logaddexp(0, -value))
 
     def weight(name: str) -> np.ndarray:
         return tensors[f"backbone.layers.0.mixer.{name}"].astype(np.float64)

@@ -315,7 +315,12 @@ def main() -> None:
             ]
         )
     else:
-        fixture_cases.append(("zero-epsilon", {"epsilon": 0.0}))
+        fixture_cases.extend([
+            ("zero-epsilon", {"epsilon": 0.0}),
+            ("large-delta", {"large_delta": True}),
+            ("negative-gate", {"with_bias": True, "large_silu": "gate"}),
+            ("negative-conv", {"large_silu": "conv"}),
+        ])
     for case_name, options in fixture_cases:
         case = work / case_name
         case.mkdir()

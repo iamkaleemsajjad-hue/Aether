@@ -2,6 +2,17 @@
 
 Reviewed 2026-10-23. The runtime/compiler mission is in progress.
 
+The [Mamba-2 finite-input correction](docs/mission-mamba2-stability.md) removes
+CPU SiLU/softplus clipping that changed valid source equations. Five final
+regressions fail on the exact prior runtime; focused validation passes 112
+cases, including original-HF and independent matrix controls. The complete
+local run returned **5,473 passed, 42 skipped, two existing MCP HTTP failures**,
+with **78.8040446%** line coverage. All 14 new cases passed; the local suite
+remains red. A strict local subprocess comparison was refused for live RAM,
+so no speed or resident-memory improvement is assigned to that attempt.
+The expanded hosted comparison retains the immediate pre-fix baseline and six
+Mamba-2 contracts; its results will be recorded after execution.
+
 The [normalization-epsilon correction](docs/mission-normalization-epsilon.md)
 preserves explicit zero in the shared loader. Its final regression failed 12
 cases against the unchanged prior runtime; focused validation now passes 102

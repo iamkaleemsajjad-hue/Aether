@@ -125,9 +125,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          # Immediate pre-epsilon-fix baseline; earlier normalization comparisons
-          # remain in docs/measurements/mamba2-normalization-hf.json.
-          ref: 66e0a72ace69a371d21208c849efcf419bd289d4
+          # Immediate pre-stable-math baseline; earlier epsilon comparisons
+          # remain in docs/measurements/normalization-epsilon-hf.json.
+          ref: c7af1b6331681b9e8e6b337cb5c06368825143b2
           path: historical-mamba2
       - uses: actions/checkout@v4
         with:

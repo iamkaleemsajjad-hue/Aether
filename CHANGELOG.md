@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Evaluate Mamba-2 CPU SiLU and softplus with stable identities instead of
+  clipping finite inputs. Original-HF and independent scalar/matrix regressions
+  cover large time steps and negative convolution/gate values through real AEG
+  execution and cached continuation. See
+  [numerical evidence and validation limits](docs/mission-mamba2-stability.md).
 - Preserve explicitly declared zero normalization epsilon across dense/MoE,
   MLA, hybrid, Mamba-2, RWKV and encoder AEG loading. Retain existing null
   fallbacks and Mamba-1/seq2seq behavior; real loader and original-HF
