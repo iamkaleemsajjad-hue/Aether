@@ -1,5 +1,6 @@
 """Protect benchmark byte accounting against alias inflation and undercounting."""
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -86,4 +87,9 @@ def test_load_warms_the_actual_shared_provider(
         {"artifact": str(destination), "diagnostic": True, "exercise": False}, work
     )
     assert result["status"] == "ok"
+    assert result["loaded_artifact"] == str(destination)
+    assert (
+        result["loaded_manifest_sha256"]
+        == hashlib.sha256((destination / "manifest.json").read_bytes()).hexdigest()
+    )
     assert discoveries == 1

@@ -1,8 +1,8 @@
 """Offline dense AEG source parity, fresh-process load memory and decode profiles.
 
 Uses complete, untrained tiny/27M checkpoints from the pass-audit fixtures.
-Current compilation requires original-HF admission. Historical compilation is
-explicitly diagnostic. Process ownership and RAM guards reuse the pass audit.
+Both compilers require original-HF admission. Timed readers use the same current
+artifact. Process ownership and RAM guards reuse the pass audit.
 """
 
 from __future__ import annotations
@@ -195,6 +195,10 @@ def _load_profile(job: dict[str, Any], work: Path) -> dict[str, Any]:
         raise TypeError("Expected actual dense CPUExecutionEngine")
     result: dict[str, Any] = {
         "status": "ok",
+        "loaded_artifact": job["artifact"],
+        "loaded_manifest_sha256": hashlib.sha256(
+            (Path(job["artifact"]) / "manifest.json").read_bytes()
+        ).hexdigest(),
         "load_seconds": seconds,
         "rss_before_load": before,
         "rss_after_load": after,
@@ -380,6 +384,8 @@ def main() -> int:
         "scope": "Untrained dense FP32 source parity and load/decode measurements",
         "enabled_optimizer_passes": [3],
         "precision_policy": "Uniform FP32; P3 is required for explicit precision",
+        "compile_quality_policy": "Both compilers require original-HF admission",
+        "load_artifact_policy": "All timed readers load the identical current certified artifact",
         "load_sampling": "Two warmup processes, then alternating role order for each sample",
         "source_revisions": {
             role: subprocess.check_output(
@@ -485,7 +491,7 @@ def main() -> int:
                 "probes": probes,
                 "expected_src": str(code_root.resolve()),
                 "artifact": str(case / (role + ".aeg")),
-                "diagnostic": role == "baseline",
+                "diagnostic": False,
                 "dataset": str(dataset),
                 "passes": [],
                 "public_prompt": prompt_text(PROMPTS["A"]),
@@ -508,9 +514,18 @@ def main() -> int:
                 common = role_jobs[role]
                 destination = case / f"{role}-load-{sample}"
                 observed = launch(
-                    {**common, "action": "numerics", "operation": "load", "exercise": sample == 2},
+                    {
+                        **common,
+                        "artifact": str(case / "current.aeg"),
+                        "action": "numerics",
+                        "operation": "load",
+                        "exercise": sample == 2,
+                    },
                     destination,
                 )
+                manifest = row["current"]["compile"]["files"]["manifest.json"]["sha256"]
+                if observed["loaded_manifest_sha256"] != manifest:
+                    raise RuntimeError("Timed reader loaded a different artifact")
                 row[role]["loads"].append(observed)
                 if sample == 2:
                     jobs[role] = (destination, observed)

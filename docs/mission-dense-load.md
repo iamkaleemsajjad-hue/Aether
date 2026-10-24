@@ -51,8 +51,10 @@ The historical checkout must contain the intended baseline `src` tree. The tool
 records both Git revisions and worker source-file hashes. It uses deterministic,
 complete untrained tiny and 27M Llama checkpoints from `pass_audit_fixtures.py`,
 with only P3 enabled for uniform FP32 packaging. Current
-compilation requires the normal original-Transformers quality admission;
-historical compilation is explicitly diagnostic.
+compilation and baseline compilation require normal original-Transformers
+quality admission. Both timed readers load the identical current certified
+artifact and record its manifest digest. Separate baseline compilation remains
+available for artifact-file comparison, without changing the timed input.
 
 Actual CPU, Torch CPU and ONNX CPU outputs are checked against original HF
 fixed-label logits and eight greedy tokens on short and 64-token prompts.
@@ -87,6 +89,10 @@ warming a standalone provider left the loader's process-wide provider cold.
 The harness now warms `get_native_kernels()` itself. The regression observes
 one discovery; it failed with two before this correction. Any earlier timings
 include that additional discovery and must not be labeled as pure warmed load.
+The first corrected-warmup report still compared certified versus diagnostic
+artifacts. It is retained as historical evidence; the final command requires
+ordinary admission for both compilers and times one shared artifact, so their
+reader comparison cannot be explained by different certification payloads.
 
 No pass or hardware tier is promoted by adding this measurement. All 22 pass
 dispositions and backend limits remain those in the
