@@ -43,6 +43,7 @@ def test_actual_linear_aeg_merge_matches_reference_logits_and_cli(
     monkeypatch.setenv("AETHER_HF_OFFLINE", "1")
     first = Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx2"],
             precision="FP32",
             enable_sensitivity=False,
@@ -109,8 +110,10 @@ def test_actual_linear_aeg_merge_matches_reference_logits_and_cli(
         for name, array in expected.items()
     }
     reference.save()
-    engine = load_engine_from_package(merged, prepare_native_kernels=False)
-    reference_engine = load_engine_from_package(reference, prepare_native_kernels=False)
+    engine = load_engine_from_package(merged, prepare_native_kernels=False, allow_uncertified=True)
+    reference_engine = load_engine_from_package(
+        reference, prepare_native_kernels=False, allow_uncertified=True
+    )
     prompt = np.asarray([1, 2], dtype=np.int64)
     np.testing.assert_allclose(
         engine.forward(prompt)[0], reference_engine.forward(prompt)[0], atol=1e-6, rtol=1e-6

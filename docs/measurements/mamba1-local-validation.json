@@ -1,0 +1,371 @@
+{
+  "collected_utc": "2026-10-22T05:00:38.455652+00:00",
+  "revision": "48ce3b0e6621081416b32329da3f441074fcf7fd",
+  "historical_source_revision": "2f2a2c4659063b31797011ac03373a1c4e539173",
+  "platform": "Windows-10-10.0.26200-SP0",
+  "python": "3.10.11",
+  "versions": {
+    "numpy": "1.26.4",
+    "torch": "2.9.1",
+    "transformers": "4.57.3",
+    "safetensors": "0.8.0",
+    "tokenizers": "0.22.2",
+    "psutil": "7.2.2",
+    "pytest": "9.1.1",
+    "coverage": "7.16.2",
+    "ruff": "0.17.1",
+    "mypy": "2.4.0"
+  },
+  "scope": "Physical Windows CPU, synthetic FP32 matrix fidelity. No original-HF worker executed locally.",
+  "tests": [
+    {
+      "file": "mamba1-fidelity-before.xml",
+      "sha256": "0e8dc940aa445e7501f8b28e118059726173e7b850a47554352e4a963a3d3260",
+      "counts": {
+        "failed": 21,
+        "passed": 1
+      },
+      "failures": [
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_hf_mamba1_uses_rmsnorm_despite_layer_norm_epsilon[False]",
+          "message": "AssertionError: assert 'LayerNorm' == 'RMSNorm'\n  \n  - RMSNorm\n  + LayerNorm"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_hf_mamba1_uses_rmsnorm_despite_layer_norm_epsilon[True]",
+          "message": "AssertionError: assert 'LayerNorm' == 'RMSNorm'\n  \n  - RMSNorm\n  + LayerNorm"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_mamba1_minimal_hf_config_preserves_expansion[4]",
+          "message": "assert 32 == (4 * 16)\n +  where 32 = ModelArchitecture(hybrid_ssm_family, 4.4e-06B, L=1, H=16).ssm_inner_size"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[False-1-2-cpu]",
+          "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 119 / 119 (100%)\nMax absolute difference: 0.30809537\nMax relative difference: 16.53579525\n x: array([[ 2.237267e-01, -2.089154e-01, -9.658535e-02, -3.754347e-01,\n         4.638511e-01,  4.038210e-01,  3.747391e-01,  3.514556e-01,\n        -2.226741e-01, -1.615535e-01,  3.845612e-01,  2.677824e-01,...\n y: array([[ 0.196736, -0.108701,  0.21151 , -0.267125,  0.387761,  0.590061,\n         0.682422,  0.057052, -0.40224 , -0.19761 ,  0.468089,  0.103847,\n        -0.091779,  0.141831,  0.06344 ,  0.371425, -0.74523 ],..."
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[False-1-2-torch_cpu]",
+          "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 119 / 119 (100%)\nMax absolute difference: 0.30809537\nMax relative difference: 16.53579525\n x: array([[ 2.237268e-01, -2.089154e-01, -9.658535e-02, -3.754347e-01,\n         4.638511e-01,  4.038210e-01,  3.747391e-01,  3.514556e-01,\n        -2.226741e-01, -1.615535e-01,  3.845612e-01,  2.677824e-01,...\n y: array([[ 0.196736, -0.108701,  0.21151 , -0.267125,  0.387761,  0.590061,\n         0.682422,  0.057052, -0.40224 , -0.19761 ,  0.468089,  0.103847,\n        -0.091779,  0.141831,  0.06344 ,  0.371425, -0.74523 ],..."
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[False-1-4-cpu]",
+          "message": "ValueError: Mamba conv1d weight must have shape (d_inner, kernel)"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[False-1-4-torch_cpu]",
+          "message": "ValueError: too many values to unpack (expected 2)"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[False-3-2-cpu]",
+          "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 119 / 119 (100%)\nMax absolute difference: 0.32667592\nMax relative difference: 18.5329108\n x: array([[ 0.271351, -0.283997, -0.042242, -0.447135,  0.423952,  0.322521,\n         0.377322,  0.420957, -0.160219, -0.120072,  0.35455 ,  0.2322  ,\n        -0.074164,  0.409492,  0.296979,  0.378098, -0.563721],...\n y: array([[ 0.226077, -0.153074,  0.260111, -0.311253,  0.354513,  0.529877,\n         0.688848,  0.094281, -0.367772, -0.17021 ,  0.439987,  0.074785,\n        -0.098057,  0.168317,  0.042538,  0.397093, -0.707879],..."
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[False-3-2-torch_cpu]",
+          "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 119 / 119 (100%)\nMax absolute difference: 0.32667592\nMax relative difference: 18.5329108\n x: array([[ 0.271351, -0.283997, -0.042242, -0.447135,  0.423952,  0.322521,\n         0.377322,  0.420957, -0.160219, -0.120072,  0.35455 ,  0.2322  ,\n        -0.074164,  0.409492,  0.296979,  0.378098, -0.563721],...\n y: array([[ 0.226077, -0.153074,  0.260111, -0.311253,  0.354513,  0.529877,\n         0.688848,  0.094281, -0.367772, -0.17021 ,  0.439987,  0.074785,\n        -0.098057,  0.168317,  0.042538,  0.397093, -0.707879],..."
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[False-3-4-cpu]",
+          "message": "ValueError: Mamba conv1d weight must have shape (d_inner, kernel)"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[False-3-4-torch_cpu]",
+          "message": "ValueError: too many values to unpack (expected 2)"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[True-1-2-cpu]",
+          "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 119 / 119 (100%)\nMax absolute difference: 0.80044022\nMax relative difference: 124.20111195\n x: array([[ 2.237267e-01, -2.089154e-01, -9.658535e-02, -3.754347e-01,\n         4.638511e-01,  4.038210e-01,  3.747391e-01,  3.514556e-01,\n        -2.226741e-01, -1.615535e-01,  3.845612e-01,  2.677824e-01,...\n y: array([[-1.282917e-01, -1.827289e-01, -3.819012e-01,  7.721683e-02,\n         4.661869e-01,  8.058481e-01,  6.702790e-01, -2.506677e-01,\n        -4.447022e-01, -2.230847e-01,  6.633203e-01, -3.616913e-02,..."
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[True-1-2-torch_cpu]",
+          "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 119 / 119 (100%)\nMax absolute difference: 0.80044025\nMax relative difference: 124.20112397\n x: array([[ 2.237268e-01, -2.089154e-01, -9.658535e-02, -3.754347e-01,\n         4.638511e-01,  4.038210e-01,  3.747391e-01,  3.514556e-01,\n        -2.226741e-01, -1.615535e-01,  3.845612e-01,  2.677824e-01,...\n y: array([[-1.282917e-01, -1.827289e-01, -3.819012e-01,  7.721683e-02,\n         4.661869e-01,  8.058481e-01,  6.702790e-01, -2.506677e-01,\n        -4.447022e-01, -2.230847e-01,  6.633203e-01, -3.616913e-02,..."
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[True-1-4-cpu]",
+          "message": "ValueError: Mamba conv1d weight must have shape (d_inner, kernel)"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[True-1-4-torch_cpu]",
+          "message": "ValueError: too many values to unpack (expected 2)"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[True-3-2-cpu]",
+          "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 119 / 119 (100%)\nMax absolute difference: 0.71152318\nMax relative difference: 22.08728915\n x: array([[ 0.271351, -0.283997, -0.042242, -0.447135,  0.423952,  0.322521,\n         0.377322,  0.420957, -0.160219, -0.120072,  0.35455 ,  0.2322  ,\n        -0.074164,  0.409492,  0.296979,  0.378098, -0.563721],...\n y: array([[ 0.713476,  0.133691,  0.274502, -0.471938, -0.111199,  0.365278,\n         0.592757,  0.084496, -0.19919 ,  0.098794,  0.305665,  0.173325,\n         0.222473, -0.150931,  0.040199, -0.226004, -0.810214],..."
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[True-3-2-torch_cpu]",
+          "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 119 / 119 (100%)\nMax absolute difference: 0.71152315\nMax relative difference: 22.08728915\n x: array([[ 0.271351, -0.283997, -0.042242, -0.447135,  0.423952,  0.322521,\n         0.377322,  0.420957, -0.160219, -0.120072,  0.35455 ,  0.2322  ,\n        -0.074164,  0.409492,  0.296979,  0.378098, -0.563721],...\n y: array([[ 0.713476,  0.133691,  0.274502, -0.471938, -0.111199,  0.365278,\n         0.592757,  0.084496, -0.19919 ,  0.098794,  0.305665,  0.173325,\n         0.222473, -0.150931,  0.040199, -0.226004, -0.810214],..."
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[True-3-4-cpu]",
+          "message": "ValueError: Mamba conv1d weight must have shape (d_inner, kernel)"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_packaged_mamba1_forward_and_owned_continuation_match_matrix_oracle[True-3-4-torch_cpu]",
+          "message": "ValueError: too many values to unpack (expected 2)"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_large_finite_mamba1_time_step_bias_matches_finite_matrix_output[cpu]",
+          "message": "FloatingPointError: overflow encountered in exp"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_large_finite_mamba1_time_step_bias_matches_finite_matrix_output[torch_cpu]",
+          "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 68 / 68 (100%)\nMax absolute difference: 0.34058407\nMax relative difference: 20.91119894\n x: array([[ 0.331269, -0.377198,  0.017207, -0.499685,  0.414969,  0.215545,\n         0.380987,  0.503161, -0.098379, -0.078943,  0.331949,  0.197917,\n        -0.061261,  0.440931,  0.308204,  0.427059, -0.530294],...\n y: array([[ 0.286505, -0.21993 ,  0.313702, -0.354283,  0.335029,  0.441446,\n         0.702736,  0.162577, -0.350537, -0.143525,  0.417648,  0.051824,\n        -0.083107,  0.181253,  0.058083,  0.444717, -0.705863],..."
+        }
+      ]
+    },
+    {
+      "file": "mamba1-edges-before.xml",
+      "sha256": "2d27eeda38fa2d58745133705607f15a87811781f62894d8fa1c37e374fc35ad",
+      "counts": {
+        "failed": 8,
+        "passed": 2
+      },
+      "failures": [
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_zero_epsilon_is_preserved_from_checkpoint_to_runtime[cpu]",
+          "message": "AssertionError: assert 1e-05 == 0.0\n +  where 1e-05 = MambaModelWeights(embedding=array([[-0.022328  , -0.00321088, -0.05467464, -0.01919413,  0.03021323,\\n         0.037473...e-01,  2.70668983e-01, -6.92684874e-02,\\n        -1.28416926e-01]], dtype=float32), norm_eps=1e-05, norm_type='RMSNorm').norm_eps\n +    where MambaModelWeights(embedding=array([[-0.022328  , -0.00321088, -0.05467464, -0.01919413,  0.03021323,\\n         0.037473...e-01,  2.70668983e-01, -6.92684874e-02,\\n        -1.28416926e-01]], dtype=float32), norm_eps=1e-05, norm_type='RMSNorm') = <aether.runtime.mamba_engine.MambaExecutionEngine object at 0x000001AC9128DD50>.weights"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_zero_epsilon_is_preserved_from_checkpoint_to_runtime[torch_cpu]",
+          "message": "AssertionError: assert 1e-05 == 0.0\n +  where 1e-05 = MambaModelWeights(embedding=array([[-0.022328  , -0.00321088, -0.05467464, -0.01919413,  0.03021323,\\n         0.037473...e-01,  2.70668983e-01, -6.92684874e-02,\\n        -1.28416926e-01]], dtype=float32), norm_eps=1e-05, norm_type='RMSNorm').norm_eps\n +    where MambaModelWeights(embedding=array([[-0.022328  , -0.00321088, -0.05467464, -0.01919413,  0.03021323,\\n         0.037473...e-01,  2.70668983e-01, -6.92684874e-02,\\n        -1.28416926e-01]], dtype=float32), norm_eps=1e-05, norm_type='RMSNorm') = <aether.runtime.torch_state_engine.TorchMambaAEGEngine object at 0x000001AC99B5FAF0>.weights"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_silu_extremes_follow_the_sigmoid_definition[gate-cpu]",
+          "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 68 / 68 (100%)\nMax absolute difference: 1.475746\nMax relative difference: 18.84584178\n x: array([[ 0.082372,  0.63732 , -0.169515,  0.127   ,  0.147896,  0.67747 ,\n         0.079358, -0.394144, -0.031854, -0.198115,  0.069722,  0.562584,\n        -0.182525, -0.214904,  0.11751 , -0.698277, -0.3537  ],...\n y: array([[ 0.688779,  0.156294,  0.250212, -0.449434, -0.093191,  0.407523,\n         0.597044,  0.060528, -0.219215,  0.086636,  0.319677,  0.183371,\n         0.209016, -0.153973,  0.04302 , -0.239106, -0.820283],..."
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_silu_extremes_follow_the_sigmoid_definition[conv-cpu]",
+          "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 68 / 68 (100%)\nMax absolute difference: 1.2314932\nMax relative difference: 15.53670009\n x: array([[-0.143707,  0.744169, -0.817959,  0.627076,  0.205232,  0.094698,\n        -0.63445 , -0.315977,  0.021031, -0.266602,  0.088116,  0.243713,\n         0.724835, -0.236325,  0.064942, -0.091064,  0.095251],...\n y: array([[ 0.688779,  0.156294,  0.250212, -0.449434, -0.093191,  0.407523,\n         0.597044,  0.060528, -0.219215,  0.086636,  0.319677,  0.183371,\n         0.209016, -0.153973,  0.04302 , -0.239106, -0.820283],..."
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_malformed_learned_norm_is_refused_instead_of_padded",
+          "message": "Failed: DID NOT RAISE any of (AEGLoadError, CompilationError)"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_unsupported_mixer_activation_is_refused_before_publication[relu]",
+          "message": "Failed: DID NOT RAISE CompilationError"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_unsupported_mixer_activation_is_refused_before_publication[gelu]",
+          "message": "Failed: DID NOT RAISE CompilationError"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_unsupported_mixer_activation_is_refused_before_publication[tanh]",
+          "message": "Failed: DID NOT RAISE CompilationError"
+        }
+      ]
+    },
+    {
+      "file": "mamba1-refusal-before.xml",
+      "sha256": "1cf85d0065bba5e03943e5272789f9efe13dc7fa84ea0001d190f4f49d244142",
+      "counts": {
+        "failed": 4
+      },
+      "failures": [
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_specialized_loader_failure_cannot_bypass_activation_refusal",
+          "message": "Failed: DID NOT RAISE IngestionError"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_materialized_snapshot_cannot_bypass_activation_refusal",
+          "message": "Failed: DID NOT RAISE IngestionError"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_cli_activation_refusal_never_publishes_or_replaces_destination[False]",
+          "message": "assert 0 != 0\n +  where 0 = <Result okay>.exit_code"
+        },
+        {
+          "class": "tests.unit.test_mamba1_fidelity",
+          "name": "test_cli_activation_refusal_never_publishes_or_replaces_destination[True]",
+          "message": "assert 0 != 0\n +  where 0 = <Result okay>.exit_code"
+        }
+      ]
+    },
+    {
+      "file": "mamba1-fidelity-final.xml",
+      "sha256": "872d12f39600ac3d52c50833fddc287655ecdc120e703d38d42e23e0169673c3",
+      "counts": {
+        "passed": 42
+      },
+      "failures": []
+    },
+    {
+      "file": "mamba1-fidelity-controls.xml",
+      "sha256": "f1aedeb44cbd38e1a88f3093f5da241ca316caa8cf05c390453c36d04dfbd748",
+      "counts": {
+        "passed": 204
+      },
+      "failures": []
+    },
+    {
+      "file": "mamba1-final-integration.xml",
+      "sha256": "1ea7e3b5ff756639554626bd67926f9af03e99ea76b6b38f9865ce46051ac81c",
+      "counts": {
+        "passed": 47
+      },
+      "failures": []
+    },
+    {
+      "file": "mamba1-full.xml",
+      "sha256": "3fa7b23a9b823c3e8ed74db22e302b9abfe00d45633845a24199a42806b361d3",
+      "counts": {
+        "passed": 5386,
+        "skipped": 42,
+        "failed": 3
+      },
+      "failures": [
+        {
+          "class": "tests.tools.test_pass_audit",
+          "name": "test_worker_compiles_and_runs_unicode_paths_with_ascii_parent",
+          "message": "AssertionError: {'status': 'blocked', 'available_bytes': 464261120, 'estimated_worker_bytes': 406938624, 'required_headroom_bytes': 134217728, ...}\nassert 'blocked' == 'ok'\n  \n  - ok\n  + blocked"
+        },
+        {
+          "class": "tests.unit.test_mcp_transport_contracts",
+          "name": "test_real_http_mcp_cli_handshake_session_and_tool[False]",
+          "message": "assert False\n +  where False = connect()\n +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x000001E1D1BAFDC0>.connect"
+        },
+        {
+          "class": "tests.unit.test_mcp_transport_contracts",
+          "name": "test_real_http_mcp_cli_handshake_session_and_tool[True]",
+          "message": "assert False\n +  where False = connect()\n +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x000001E1D018D510>.connect"
+        }
+      ]
+    }
+  ],
+  "coverage": [
+    {
+      "file": "dispatch-assertion-full-coverage.xml",
+      "sha256": "c73f9fb33c6fb86264a2272791c6d9ccaa8eda7658debde04ab2170a3ae9d062",
+      "lines-covered": 45028,
+      "lines-valid": 57244,
+      "branches-covered": 10754,
+      "branches-valid": 17228,
+      "line_percent": 78.65977220320033
+    },
+    {
+      "file": "mamba1-full-coverage.xml",
+      "sha256": "98a5631e27aa83d28be5b75d1ed8e2d6032c85d2094bd4fef65f87dd3c02f3f0",
+      "lines-covered": 45016,
+      "lines-valid": 57277,
+      "branches-covered": 10685,
+      "branches-valid": 17242,
+      "line_percent": 78.593501754631
+    }
+  ],
+  "static": {
+    "fidelity": {
+      "ruff": {
+        "before": 408,
+        "after": 408,
+        "added": [],
+        "exit": 1
+      },
+      "mypy": {
+        "before": 168,
+        "after": 168,
+        "added": [],
+        "exit": 1
+      }
+    },
+    "ingestion": {
+      "ruff": {
+        "before": 101,
+        "after": 101,
+        "added": [],
+        "exit": 1
+      },
+      "mypy": {
+        "before": 8,
+        "after": 8,
+        "added": [],
+        "exit": 1
+      }
+    },
+    "shared": {
+      "ruff": {
+        "before": 7,
+        "after": 7,
+        "added": [],
+        "exit": 1
+      },
+      "mypy": {
+        "before": 8,
+        "after": 8,
+        "added": [],
+        "exit": 1
+      }
+    },
+    "new": {
+      "ruff": {
+        "before": 0,
+        "after": 0,
+        "added": [],
+        "exit": 0
+      },
+      "mypy": {
+        "before": 0,
+        "after": 0,
+        "added": [],
+        "exit": 0
+      }
+    }
+  },
+  "source_sha256": {
+    "src/aether/runtime/mamba_engine.py": "a97771e1c7655312f7423900c6e7aa55c4a1f0a9212811a659c1d02c2e898942",
+    "src/aether/runtime/torch_state_engine.py": "3ed7278da9b5d4cd795a85c8e9ba50fef992aa152802e26692cd4f2122a1af08",
+    "src/aether/runtime/torch_engine.py": "7c6b3b523f049da36a4afb90c7a3324e31608546e33f7ad7ce61d26f03596974",
+    "src/aether/hybrid/state.py": "117d1ee5195d6dfad45c69dfbd473518e4dff4c1e72c25d81d190625f241d617",
+    "src/aether/runtime/aeg_loader.py": "5e450736164ca21e0c1e69e4a2d9daedbab39013b6740472f86aa907e144614d",
+    "src/aether/compiler/stage1_ingestion/ingestion.py": "479399c447c5fd728e51d3f44985753a2416cff46c019bbe7e5699114115fc82",
+    "src/aether/compiler/stage1_ingestion/architecture_detector.py": "2f9999604f39b0a7976c43edac68d244b6afba729bd8747cc94df12cab508c39",
+    "src/aether/evaluation/admission_worker.py": "6b733d1978eabbbc4b19955445c8a410f9a81713ef127a278dfb0a5c55209ea3",
+    "tests/unit/mamba1_fidelity_fixtures.py": "d4481d3cfaadc38a8d238dc58653942516ef57687c02fe625b5746b0ae4fe342",
+    "tests/unit/test_mamba1_fidelity.py": "622cbc03516ab1e15cd2a84084d85fddb1f0109fd4a1579582573e6b78352f08",
+    "tools/validate_mamba2_hf.py": "a5d5adc33c379aec68c23fd6e0b954dc636a74ee207850d5abe13fc44416a274"
+  },
+  "hf_refusal": {
+    "available_bytes": 494948352,
+    "estimated_worker_bytes": 536925852,
+    "required_headroom_bytes": 268435456,
+    "executed": false
+  },
+  "performance": {
+    "tokens_per_second": null,
+    "ttft_seconds": null,
+    "peak_rss_bytes": null,
+    "note": "Not measured here. Hosted original-HF harness records its own real repeats and geometry."
+  },
+  "full_run_scope": "Full collection contained 38 Mamba-1 cases. Four later refusal cases are covered by the final 47-case focused integration run. Full coverage is a single run, not a union of reruns.",
+  "remaining_local_failures": "RAM admission refusal and two preexisting MCP HTTP handshake failures. No guard or assertion waived."
+}

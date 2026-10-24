@@ -72,6 +72,7 @@ def checkpoint(request, tmp_path_factory):
 
 def _compile(source, destination, precision):
     config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         precision=precision,
         optimization_level=0,
@@ -140,7 +141,7 @@ def test_compiled_codec_prefill_decode_and_request_clones(
                 )
         package.save()
         package = AEGPackage(package.root).load()
-    engine = load_engine_from_package(package, prepare_native_kernels=False)
+    engine = load_engine_from_package(package, prepare_native_kernels=False, allow_uncertified=True)
     if architecture == "learned":
         assert engine.weights.norm_type.lower() == "layernorm"
         assert engine.weights.position_embedding is not None
@@ -223,7 +224,7 @@ def test_active_encoded_projection_delta_is_rejected_without_mutation(tmp_path):
     source = tmp_path / "source"
     _write_probe_checkpoint(source)
     package = _compile(source, tmp_path / "encoded.aeg", "INT8")
-    engine = load_engine_from_package(package, prepare_native_kernels=False)
+    engine = load_engine_from_package(package, prepare_native_kernels=False, allow_uncertified=True)
     encoded = np.ones_like(engine.weights.layers[0].q_proj, dtype=np.int8)
     layer = replace(
         engine.weights.layers[0],

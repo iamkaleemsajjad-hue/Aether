@@ -160,3 +160,37 @@ def test_torch_portable_executor_falls_back_to_exact_dense_attention_for_unverif
     reference.semantic_kv_plan = {"format": "aether_kv_compression_v1"}
     portable = TorchAEGEngine(reference, "cpu")
     assert portable._ignored_optimized_plans["semantic_kv"] is True
+
+
+@pytest.mark.parametrize("prompt_length", [1, 4])
+@pytest.mark.parametrize("explicit_cache", [False, True])
+@pytest.mark.parametrize("return_all_logits", [False, True])
+def test_torch_forward_step_preserves_public_shapes_and_append_only_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_length: int,
+    explicit_cache: bool,
+    return_all_logits: bool,
+) -> None:
+    """The shared forward-step contract agrees with real CPU prefill and decode."""
+    pytest.importorskip("torch")
+    from aether.runtime.torch_engine import TorchAEGEngine
+
+    monkeypatch.setenv("AETHER_TORCH_DTYPE", "fp32")
+    reference = _tiny_engine()
+    portable = TorchAEGEngine(reference, "cpu", retain_host_weights=True)
+    cache = portable.init_kv_cache() if explicit_cache else None
+    reference_cache = None
+    prompt = [1, 3, 5, 2][:prompt_length]
+    for ids, total in [(prompt, prompt_length), ([6], prompt_length + 1)]:
+        expected, reference_cache = reference.forward_step(
+            ids, reference_cache, return_all_logits=return_all_logits,
+        )
+        actual, cache = portable.forward_step(ids, cache, return_all_logits=return_all_logits)
+        shape = (len(ids), 17) if return_all_logits else (17,)
+        assert actual.shape == expected.shape == shape
+        assert actual.dtype == np.float32
+        assert cache.length == reference_cache.length == total
+        np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)
+        assert int(np.argmax(actual[-1] if return_all_logits else actual)) == int(
+            np.argmax(expected[-1] if return_all_logits else expected)
+        )

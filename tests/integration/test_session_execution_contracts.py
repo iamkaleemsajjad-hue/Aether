@@ -13,7 +13,7 @@ from aether.runtime.spec_decode import numpy_logits
 
 
 def _config(tmp_path, backend):
-    return RuntimeConfig(backend_name=backend, execution_devices=["cpu"],
+    return RuntimeConfig(allow_uncertified=True, backend_name=backend, execution_devices=["cpu"],
                          speculative_decoding=False, enable_semantic_cache=False,
                          dynamic_precision=False, model_cache_dir=str(tmp_path / "runtime-cache"),
                          kv_cache_path=str(tmp_path / "stored"))
@@ -36,8 +36,14 @@ def adapted_artifact(tmp_path_factory):
         tensors[prefix + ".lora_A.weight"] = rng.normal(0, .7, (2, 16)).astype(np.float32)
         tensors[prefix + ".lora_B.weight"] = rng.normal(0, .7, (8, 2)).astype(np.float32)
     save_file(tensors, str(adapter / "adapter_model.safetensors"))
-    config = CompilerConfig(targets=["cpu_generic"], precision="FP32", optimization_level=0,
-                            cache_dir=str(root / "compiler-cache"), peft_adapter_paths=[str(adapter)])
+    config = CompilerConfig(
+        quality_mode="diagnostic",
+        targets=["cpu_generic"],
+        precision="FP32",
+        optimization_level=0,
+        cache_dir=str(root / "compiler-cache"),
+        peft_adapter_paths=[str(adapter)],
+    )
     for item in fields(config):
         if item.name.startswith("enable_"):
             setattr(config, item.name, item.name in {"enable_precision_assignment", "enable_advanced_peft"})

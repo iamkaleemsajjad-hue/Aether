@@ -1,0 +1,121 @@
+{
+  "scope": "Physical Windows CPU; warmed tiny FP32 default generation; Python and traced NumPy allocations only, excluding loaded weights and prompt; not RSS/native/BLAS allocation completeness or larger-model evidence",
+  "current_revision": "bd3db302254420ac07f49741f6a25f48b3d1bf23",
+  "baseline_revision": "c7af1b6331681b9e8e6b337cb5c06368825143b2",
+  "numpy": "1.26.4",
+  "numpy_allocation_hook_observation": {
+    "array_bytes": 4194304,
+    "current_traced_bytes": 4194400,
+    "peak_traced_bytes": 4194400
+  },
+  "cases": {
+    "short": {
+      "baseline": {
+        "peak_traced_bytes": [
+          19120,
+          19120,
+          19120,
+          19120,
+          19120,
+          19120,
+          19120,
+          19120,
+          19120,
+          19120,
+          19120,
+          19120,
+          19120,
+          19300,
+          19120,
+          19120,
+          19120,
+          19120,
+          19120
+        ],
+        "median": 19120,
+        "minimum": 19120,
+        "maximum": 19300
+      },
+      "current": {
+        "peak_traced_bytes": [
+          14128,
+          14128,
+          14128,
+          14128,
+          14128,
+          14128,
+          14128,
+          16615,
+          14128,
+          14128,
+          14128,
+          14128,
+          14128,
+          14128,
+          14128,
+          14128,
+          14128,
+          14128,
+          14128
+        ],
+        "median": 14128,
+        "minimum": 14128,
+        "maximum": 16615
+      }
+    },
+    "long": {
+      "baseline": {
+        "peak_traced_bytes": [
+          52496,
+          52496,
+          52496,
+          52496,
+          52496,
+          55828,
+          52496,
+          52496,
+          52496,
+          52496,
+          52496,
+          52496,
+          52496,
+          52496,
+          52496,
+          52496,
+          52496,
+          52496,
+          52496
+        ],
+        "median": 52496,
+        "minimum": 52496,
+        "maximum": 55828
+      },
+      "current": {
+        "peak_traced_bytes": [
+          52040,
+          52040,
+          52040,
+          52040,
+          52040,
+          52040,
+          55301,
+          52040,
+          52040,
+          52040,
+          52040,
+          52040,
+          52040,
+          52040,
+          52040,
+          52040,
+          52040,
+          52040,
+          52040
+        ],
+        "median": 52040,
+        "minimum": 52040,
+        "maximum": 55301
+      }
+    }
+  }
+}

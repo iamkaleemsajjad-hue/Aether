@@ -75,6 +75,7 @@ def speculative_artifact(tmp_path, request):
 
 def _compile(source, artifact, cache_dir):
     config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"], precision="FP32", optimization_level=0, cache_dir=str(cache_dir)
     )
     for field in fields(config):
@@ -85,6 +86,7 @@ def _compile(source, artifact, cache_dir):
 
 def _config(tmp_path, artifact, backend):
     return RuntimeConfig(
+        allow_uncertified=True,
         backend_name=backend,
         execution_devices=["cpu"],
         draft_model_id=artifact,

@@ -383,7 +383,19 @@ class TestOptimizerPipeline:
     def test_runs_all_passes(
         self, graph: AEGGraph, architecture: ModelArchitecture
     ) -> None:
-        pipeline = OptimizerPipeline(CompilerConfig())
+        pipeline = OptimizerPipeline(
+            CompilerConfig(
+                enable_fusion=True,
+                enable_sensitivity=True,
+                enable_precision_assignment=True,
+                enable_kv_cache_structuring=True,
+                enable_moe_routing=True,
+                enable_parallelism_discovery=True,
+                enable_reasoning_graph=True,
+                enable_sparse_attention=True,
+                enable_pruning=True,
+            )
+        )
         # Pipeline has 22 passes: 9 original (v3.1) + 13 new (v4.0/v5.0)
         assert pipeline.pass_count >= 9
         _, reports = pipeline.run(graph, architecture)
@@ -412,7 +424,18 @@ class TestOptimizerPipeline:
     def test_no_pass_fails_in_a_full_run(
         self, graph: AEGGraph, architecture: ModelArchitecture
     ) -> None:
-        _, reports = OptimizerPipeline(CompilerConfig()).run(graph, architecture)
+        config = CompilerConfig(
+            enable_fusion=True,
+            enable_sensitivity=True,
+            enable_precision_assignment=True,
+            enable_kv_cache_structuring=True,
+            enable_moe_routing=True,
+            enable_parallelism_discovery=True,
+            enable_reasoning_graph=True,
+            enable_sparse_attention=True,
+            enable_pruning=True,
+        )
+        _, reports = OptimizerPipeline(config).run(graph, architecture)
         failed = [r.pass_name for r in reports if r.status == "failed"]
         assert not failed, failed
 
@@ -465,7 +488,13 @@ class TestOptimizerPipeline:
     def test_graph_metadata_accumulates_across_passes(
         self, graph: AEGGraph, architecture: ModelArchitecture
     ) -> None:
-        result, _ = OptimizerPipeline(CompilerConfig()).run(graph, architecture)
+        config = CompilerConfig(
+            enable_sensitivity=True,
+            enable_parallelism_discovery=True,
+            enable_reasoning_graph=True,
+            enable_pruning=True,
+        )
+        result, _ = OptimizerPipeline(config).run(graph, architecture)
         for key in ("sensitivity_map", "sharding_plans", "reasoning_graph", "sparsity_plan"):
             assert key in result.metadata, key
 

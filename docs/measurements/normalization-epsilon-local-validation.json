@@ -1,0 +1,746 @@
+{
+  "baseline_revision": "66e0a72ace69a371d21208c849efcf419bd289d4",
+  "baseline_archive": {
+    "revision": "66e0a72ace69a371d21208c849efcf419bd289d4",
+    "checked_files": 304,
+    "archive_sha256": "f262ba079438bab1e822097de3e7531e2afbf537929647a62bff9d6caf633103",
+    "files": {
+      "src/aether/__init__.py": "f8abb0b169b303cfb485617300d95d33d3c8fcc5ea21af17e10682141c1d3536",
+      "src/aether/__init__.pyi": "1648c6014506edeaa2fc9a98d1ada9e8dce1218db8728fb306480f25be856f01",
+      "src/aether/__main__.py": "dba71336494252409edb3781974da44b6bcd0f95c881294c250801fa66dbb56f",
+      "src/aether/adapters/__init__.py": "f883c9c68e739a6481e603a9565172661410b5607cda2379d7964da15e4b3776",
+      "src/aether/adapters/lora.py": "6b46eded1f70559de6b6d0ceaf6b6033a7a66c89687e11437dce5bb9eff026a3",
+      "src/aether/agentic/__init__.py": "7062a8cae10496299ec42bde5977b4bbd7cfbd6cf9753432e22e10cf95d5e512",
+      "src/aether/agentic/workflow.py": "f3bb2e115eee211c69c2bc065fa187d9496aeec847d044af69d75f66426281b7",
+      "src/aether/attention/__init__.py": "860f2096da328745f9ca92527651f456736000356767cabb476e021f158a2eca",
+      "src/aether/attention/mla.py": "37f212340285ad5a3c53fe38a12c7516660b242f90c0137f1cc56afac7701078",
+      "src/aether/backends/__init__.py": "a498216ecdc5b896cfec4498e2e1efc58bdacfb64fc4c83475458649c028ab0c",
+      "src/aether/backends/artifact_validation.py": "a2ca8940a6b00a61f4f9ec0b7b554bec17695464f734d468fcf24c79ae374459",
+      "src/aether/backends/auxiliary_detection.py": "6b006df9359f2d29be8c0cc2e17e85dd5d25f386207cec7e124acb8f4361f159",
+      "src/aether/backends/base.py": "291a501033cf199cad8fac1ee76f071c8670eb5e7bced022d88657471f0ac323",
+      "src/aether/backends/batched_generation.py": "8dec92dcb22c28c4df11a2daf62b107c5b23ed5f469577b6644ff4b2d2c96bac",
+      "src/aether/backends/capabilities.py": "32db1a4bdaec8b85b8d1d53351a28324034c416ac03dd9f3edce8a9a8b44c5e5",
+      "src/aether/backends/compiled_handle.py": "361e112adaa96daaeb8984d1a5f9d85045c8b212a9eaf35ca8ea11a8714164fb",
+      "src/aether/backends/cuda_detection.py": "e0d7b5c7015cdef166060d11ae889e3fc943f0abae9e2818f7563a3d92f6a009",
+      "src/aether/backends/hardware_backends.py": "b0dba9d67e173575460037959a0a4e1015361b4ca8cf8aa1540976c9d14e2741",
+      "src/aether/backends/hardware_detector.py": "f989ffdba120ce30ae4ecfb84ad374e3ca0f17fc0231ff479309eda7a6b17d8f",
+      "src/aether/backends/hardware_inventory.py": "197862ee3ebdf47c2a2a0bb44e75208fc9aeb8757cb465dd61a98c169138eb1b",
+      "src/aether/backends/hardware_validation.py": "51e3c88386c0d8340cef2730aa1d0561874b5fad309dc6bb89be71dc9f68636d",
+      "src/aether/backends/llamacpp_backend.py": "1790a360939a15e1b98c7d55c1563a9ea89f004c9756d577c255225e51f9a586",
+      "src/aether/backends/mlx_backend.py": "7796b66eda45ec3e7bab75cb6dca6d70c510c81fb8ec69598d35f5cc68fc8b23",
+      "src/aether/backends/model_contract.py": "0798ee82a6a16c3944c6b981f480724941612a1cbe36caabc03d166b78a5a5a0",
+      "src/aether/backends/native_cpu_backend.py": "47b9bc7c9ed39f17c279de7b5336bc07bec3049ce711e373c65efbf6dd7be982",
+      "src/aether/backends/native_cuda_backend.py": "e926ed4a46d161da613488483fcab7a331807e3451fdcfd6ea0cdea27ccfad5d",
+      "src/aether/backends/onnx_backend.py": "7d939f3d3e4110189fc8a202aca1c3ea648f0de5de9fa62b2aa8e1d75c0faaae",
+      "src/aether/backends/prompt_format.py": "74d557cc169c881d6d3f856d48c0c13b6d94de48a36d465d69c2fc7ab7e31f07",
+      "src/aether/backends/registry.py": "bf0ef23b2371939af7bb40b1c5baa518db6dc187d569df7a3b9a71cc0edd6ea4",
+      "src/aether/backends/torch_backend.py": "65e6053f05e08d9c34b0b4787ce42ee4c2f9838ed74c29a39cfdd4e460277a5c",
+      "src/aether/backends/trtllm_backend.py": "134489cd2bda370831806189032c666216701111e75e6f8dd4f82e9c87010e22",
+      "src/aether/backends/vllm_backend.py": "14c1e37b0e8afd564d66fb5d3965929ed7f255074ebebe438e386335df106e08",
+      "src/aether/cli.py": "fb4f965b51d3372c99acb8f09dbe5815c61ef06d7ff05cb5f5819d36c410808b",
+      "src/aether/compiler/__init__.py": "af382834d365aab8462ccecfb032e96b101c7a9b18aa03c925eb2aabe42ce185",
+      "src/aether/compiler/aeg_format_v2.py": "c3ff296101b1ad9a03d00c6600671d37c30f56acca6ed288e9b2e9a56936377a",
+      "src/aether/compiler/aeg_merging.py": "cbfcd6534b50e0e48202cb441e3aeaf7da35c9e5d995491e9b3780d24d7daa53",
+      "src/aether/compiler/calibration/__init__.py": "d723ab5e9e19ddb010c4a2f4ce04a23e2d5e0aa22be10a619a07a9f97f200c56",
+      "src/aether/compiler/calibration/datasets.py": "eced092e25a50686f342c70e5f4c7a0e928adeb545b9129b7f72ddc8d13a4d05",
+      "src/aether/compiler/calibration/perplexity.py": "5465ef8c5f62fb66d9d8d848cddc7a1962778f30b94b10aaf650ff39ce5a9692",
+      "src/aether/compiler/calibration/sensitivity.py": "5b19db9b4a1fbfa37fdda65d8b6c5b1c94ac73e80460699314ef02dd78ba5c51",
+      "src/aether/compiler/compiler.py": "1d879b304d34230e2a030a064062f0741841659d86e6c1c36dbadac86fb61662",
+      "src/aether/compiler/config.py": "5fc928a2fb6062f9c7bb6d14549dc3ec571797094f21e8f2eb089d26b95159fa",
+      "src/aether/compiler/numerical_admission.py": "307716c081ccaac379732fa918df2ae4942d37aab767b8d015036d89dc58a4f9",
+      "src/aether/compiler/plan.py": "98f92e32d7657a06adda885a2cd3e57685a39c1319b95e1eb0254edb7d661ae2",
+      "src/aether/compiler/publication.py": "c47c71858b8f90cbd99695359ddd6d658d376518cfc1d5a36ccc42ad099bd6b1",
+      "src/aether/compiler/report.py": "587400a7c23682353138ee68462fc0dc8178699195e804111b99f07f9efc3823",
+      "src/aether/compiler/stage1_ingestion/__init__.py": "7a367746ed5faa5d2550852f47df56d9a993542da9c4def6edbac1c5112bcc1f",
+      "src/aether/compiler/stage1_ingestion/architecture_detector.py": "2f9999604f39b0a7976c43edac68d244b6afba729bd8747cc94df12cab508c39",
+      "src/aether/compiler/stage1_ingestion/checkpoint_paths.py": "176e01d13eba9d1c37211649ab1467aecb3904db44796bef724704087caeb131",
+      "src/aether/compiler/stage1_ingestion/gguf_loader.py": "2e3b8fa772af1f0dc74875262ddf8f34df9f170d18af19461fb563a4e913cb39",
+      "src/aether/compiler/stage1_ingestion/gguf_loader_complete.py": "ab8e1f34712744b2955cb6e5d792bbacacf3064e87d24b0bac8de04f97693aee",
+      "src/aether/compiler/stage1_ingestion/ingestion.py": "479399c447c5fd728e51d3f44985753a2416cff46c019bbe7e5699114115fc82",
+      "src/aether/compiler/stage1_ingestion/mla_loader.py": "cdf9bb3f1cb8d46daabeb259aa32f5cd0379398eb91c955074d55c89aab38cc8",
+      "src/aether/compiler/stage1_ingestion/mlx_loader.py": "d86191b82901aca39f5944596ed2cc4821ef391db0dbb9480d96adf9f3925896",
+      "src/aether/compiler/stage1_ingestion/moe_loader.py": "aefadca776e21b7e048258220f2e3239fbf382895fa067b405c5a5abfd6d6a33",
+      "src/aether/compiler/stage1_ingestion/onnx_loader.py": "389ee0281ae818e5244b81c9f9ad971fd2221820f1d51e14a458804f2293bd4d",
+      "src/aether/compiler/stage1_ingestion/pytorch_loader.py": "d0ed588ea126c131a6cb2fbac1e61ff1a29c4692e6ede073f310ccaf39bcc655",
+      "src/aether/compiler/stage1_ingestion/safetensors_loader.py": "8def276c7ff31778e111f564ead530d0976d6384118352f275bb6af129f584e2",
+      "src/aether/compiler/stage1_ingestion/ssm_loader.py": "17fa160be871965840421b5322673843576ffc51d1f0c93b2c602775449b6b81",
+      "src/aether/compiler/stage1_ingestion/video_loader.py": "9925196bd4f7d3eb165fbfc894fe2e59e769669cfcca1f5eb29b6711eb0602f2",
+      "src/aether/compiler/stage1_ingestion/vlm_loader.py": "6d9ad749eabf097f5bae7207d68623400f4f179a0b2987d9f4b8dbf4eb20496d",
+      "src/aether/compiler/stage2_optimizer/__init__.py": "f6059ec35622ea591dd1c3d73ac803d60b8572a31d511a03b2f1d99efa8e341d",
+      "src/aether/compiler/stage2_optimizer/base_pass.py": "bd9db82a3dbc080b75620df737e39c4d2916f3adffd80fcdd2c66e65b220e450",
+      "src/aether/compiler/stage2_optimizer/optimizer.py": "9a112c16dd096b107ef60ce8eb8b2976f74ace0654dd4828d6a8709ec77ae977",
+      "src/aether/compiler/stage2_optimizer/pass10_mtp_head.py": "4af2293fb21f597b9c7286aefe9d7f1e571c6ab42320e7623da14cc4bb6a8cf3",
+      "src/aether/compiler/stage2_optimizer/pass11_grammar_constraint.py": "b63d4a2494505123af934aebd89310d3cfc9f65c8048990871d36ed4f841d9a8",
+      "src/aether/compiler/stage2_optimizer/pass12_model_merging.py": "b96003fad269a3327cefe536e563eab43c578bb43d5044f271cce002f1010ac3",
+      "src/aether/compiler/stage2_optimizer/pass13_ttt_fast_weight.py": "f6b86c027483c07a7dd12728577e2de85ab16453af1b3da6927e974479ab21b4",
+      "src/aether/compiler/stage2_optimizer/pass14_semantic_kv_compression.py": "f15331cc814af2ee73e88af6dfbb4970d2c5dfb51d11ab98efd1367b5b61caa3",
+      "src/aether/compiler/stage2_optimizer/pass15_cross_layer_kv.py": "27becf785dba74b503c37252e38811c157e8d587e8ce6a034facdc356172ce1d",
+      "src/aether/compiler/stage2_optimizer/pass16_green_energy.py": "828b1b7380b7cc1427d5f21d98ece9cb6de028fc676850eef34f2f8999d61208",
+      "src/aether/compiler/stage2_optimizer/pass17_tee_wrapping.py": "1135a19dfe5bf871ac60a2e5f54e83dc7abbf11f51d16fb0b69289d8bdbfe39e",
+      "src/aether/compiler/stage2_optimizer/pass18_mdlm_drafter.py": "900364a1e4398cc2eef9fd5b0216db9e089b4d342e7343a4d1c094d9e227219d",
+      "src/aether/compiler/stage2_optimizer/pass19_sub2bit_quant.py": "c671e521a77676423403039722899483fb7afa678d080dc493d652aed583fc0d",
+      "src/aether/compiler/stage2_optimizer/pass1_operator_fusion.py": "b1d5644beeacdc214703f7ae9bb0332023bad1dddd46a51cb2e20e3fe0b48d23",
+      "src/aether/compiler/stage2_optimizer/pass20_video_compression.py": "0691d652647975aa20bf23dc2c38c99cf2755b7178157a24d723f1f494c86d7d",
+      "src/aether/compiler/stage2_optimizer/pass21_advanced_peft.py": "a7372db4ed9f7bcb2b6f3804579a279792d8eafbe873cd40c78c9119f8a6f95a",
+      "src/aether/compiler/stage2_optimizer/pass22_rlvr_verifier.py": "f65819288facce19719f6d30702a99e1fc8a15c90a77a983fa2bff8c897938ee",
+      "src/aether/compiler/stage2_optimizer/pass2_sensitivity_analysis.py": "8569c70f01b4028ba8e6e6be2e36ef81861eae379125409f973695c6a15bf166",
+      "src/aether/compiler/stage2_optimizer/pass3_precision_assignment.py": "678b0764bd3a616efe8691603ae94685f86059a8776c1b6fb32b877fce37b7b8",
+      "src/aether/compiler/stage2_optimizer/pass4_kv_cache_structuring.py": "1a83c21597aac03566a8a01f1b6b4696bf1fbfe1d0c73037a3b4fb93a4b69958",
+      "src/aether/compiler/stage2_optimizer/pass5_moe_routing.py": "52003ede48b3198abc036e2ac5168ef9fc4c2e983bb533e261f45433c55ea028",
+      "src/aether/compiler/stage2_optimizer/pass6_parallelism_discovery.py": "57f0a98e18551febbf5a43a46508f75c44b9dcb0a073fd29e731bbd09f0a1958",
+      "src/aether/compiler/stage2_optimizer/pass7_reasoning_graph.py": "744d0a94c3bb1353a4b0405e04a834d7e8be55baebe98c12ffecd6ec3d679c0b",
+      "src/aether/compiler/stage2_optimizer/pass8_minference.py": "c92a4f0c18947c6a0471bc74ce9b0e39a083728ccf2592e1ad50f3075c9886a6",
+      "src/aether/compiler/stage2_optimizer/pass8_sparse_attention.py": "221f1e731d2619852cddfde1d7a532db28e25308c42e9cb5f3f8d0665b5518cc",
+      "src/aether/compiler/stage2_optimizer/pass9_pruning_sparsity.py": "caedfe01456b8151c81757581bd5b35fb2bd7134e46661f793c6f106cc822646",
+      "src/aether/compiler/stage3_targeting/__init__.py": "364426b7430146f039c786cf5d7bc9cfca78255c4efb9799062d599c8e0c3c89",
+      "src/aether/compiler/stage3_targeting/backend_selector.py": "b350797c5f284f138eae4a33faf1a08994500f187a45c3a8d42313a4a59f9d64",
+      "src/aether/compiler/stage3_targeting/hardware_profile.py": "cdab3f80a2c37758f05c8291a5bd24697b4c491c75fcb8697ee29adf104542e6",
+      "src/aether/compiler/stage3_targeting/kernel_emitter.py": "3f9094ff15183ece8e1de000916fac84f3b8d8215f1d3a9e385809f927b85f48",
+      "src/aether/compiler/stage3_targeting/riscv_npu_ir.py": "3e3a40f12e49f0fb078fb2a2ddce758630f07fbfd66a849fc69ec63fda7c6637",
+      "src/aether/compiler/stage3_targeting/target_cpu.py": "92be2e408a4dd000d7a36a01a8d1f67eda37b60a6be9afd305343a3a41112edf",
+      "src/aether/compiler/stage3_targeting/target_cuda.py": "f7a3cb8964d130b4df164a925fd3d21ab4b4a92cb3e4fe82a820d6c119f2a639",
+      "src/aether/compiler/stage3_targeting/target_metal.py": "d2fabaa873b0980058b8bea731f03fca529378de4a9314a64e679233935db533",
+      "src/aether/compiler/stage3_targeting/target_openvino.py": "0edc69cdc2b5be78c2c3bfe9993b3645a182775e16d02ae3b7241a6ced0c2d63",
+      "src/aether/compiler/stage3_targeting/target_registry.py": "9a16d867081f873e2e55849443fc82f1bc308938eafecae53354212fda988534",
+      "src/aether/compiler/stage3_targeting/target_riscv_cervell.py": "8978ba68e373b366bfc79e04d4ede43ba58ca4ad16a572b794f7dc1bc9cb2402",
+      "src/aether/compiler/stage3_targeting/target_riscv_mips.py": "2b7aab31354cef7a5426d25d949791aedcdd8bebe30a9d2cb10858c2ae4a9d9f",
+      "src/aether/compiler/stage3_targeting/target_riscv_sifive.py": "b5c78574c88d5b3b594e00f09ec9bb81ed3a2f2b2baa945be6ce0dc440860af0",
+      "src/aether/compiler/stage3_targeting/target_riscv_xuantie.py": "0675a4935ce408ca900e10cff6f4cf2f9e1f98711f12219cc4e3dafdfb78b16e",
+      "src/aether/compiler/stage3_targeting/target_rocm.py": "6f6c9799c38fb668a361aa99568bf481d5401ab56296ed4c44aa7cc2dc4ef3d8",
+      "src/aether/compiler/weight_quantizer.py": "a70332a6ebe3a613d1eab4b15d9ac7da44808624aeb852640cecfd657d0528c4",
+      "src/aether/core/__init__.py": "f57f63eb0ea37d91f3c4890597c9c07e2a2fa072f84de4366f6f234942a1dc2b",
+      "src/aether/core/aeg_format.py": "7c9a5b7a85bd4a2a053ef2fc674dc8980cf112b5e1c271895bd93727311abc47",
+      "src/aether/core/aeg_format_v31.py": "e1921f635518513535873d64a904c45a4f38f48a85a2112fa0c20236ff2b2789",
+      "src/aether/core/aeg_ir.py": "b3233ca358b00b9e4b17e852460f46c3f5b551a4460febab75f68a91380ccce1",
+      "src/aether/core/constants.py": "83e260c2d55c235c469f8e4a2dcd7a9f0161fe24ab1769314e45d0ce0d965615",
+      "src/aether/core/exceptions.py": "81dd86da0d54aae02e7387e79fa9207da20f201724119c79dec620c4b1933b2b",
+      "src/aether/core/graph.py": "9660ba4a074ffe03ca1f63d71ed4ed6f8968cf48a650e363d2354938e4cf7e89",
+      "src/aether/core/hash_utils.py": "afb80140f2e8de01533fd11a48a74cc502a4b40fc799b7d254416839cbc13867",
+      "src/aether/core/model_families.py": "43666f3573403ce0f7804c7fc952db1fa3754c529c478de0647c826a84bc8aad",
+      "src/aether/core/quality_gate.py": "1bd46cbceb9f52d0c622e353f9f024c0fa6b4e64cbcedf7319670888f345adfa",
+      "src/aether/core/types.py": "cff3c73e6de89978949d2a46bc15556f59700f2b6c12338fbecc63d69b528762",
+      "src/aether/core/weight_store.py": "3a95f93c6fd929cbfcd11f89c218357990b7f97470ab988efc807d91bf0e3e96",
+      "src/aether/cuda/__init__.py": "6d617f3e75b5d9906ac8f605ec6d82bab56690ab46889911166f745b5f865074",
+      "src/aether/cuda/graph_manifest.py": "9dbc109e428fd4a49ca593953269224cda086ef7d36f407bdda6ca29fb945fd9",
+      "src/aether/cuda/graphs.py": "f43ac0f06fa0abb3463cb0e8d3d0c73da1ad168d9c33a8120c6f0064ac97150f",
+      "src/aether/distillation/__init__.py": "8cf095f9f280893dd29ec3ac85c770e7ddf4a1e107f3ba2e0624044535381eef",
+      "src/aether/distillation/pipeline.py": "9cadf08e111984d8051c2977ac9d0b39616944e8fddd3df70fdede67a961ff69",
+      "src/aether/distillation/reward_model.py": "ef596006ff905b8520de166f3b63abc20346e0edb0d6a9dff72242895d3e58b5",
+      "src/aether/ecosystem/__init__.py": "1b6cd54a1fe5903c38bf5e86df82dcbc8aa99d669bb2faf04102259ce10e423f",
+      "src/aether/ecosystem/sdks.py": "4205cafb0346bcf5d7b0e6dbddaf6dc5e8c28b8df39b7048551ad7b96f3f8afb",
+      "src/aether/ecosystem/vscode_plugin.py": "75aec5269f4537f9ba53fd09f8df096133496fd74c1a2691a13785b4a8571634",
+      "src/aether/evaluation/__init__.py": "c738cbbdc184088de2342065550f3b75a2b56ebc4496ba8efe3fff4f287d133c",
+      "src/aether/evaluation/admission_worker.py": "bc2ba4e8392b166f64c56ddadcc557b0008c837483b957d8e378a7563384abcb",
+      "src/aether/evaluation/quality_validator.py": "d47521ed8ccda7cb7a442bee00fc9f2cf4c343431ee4ad61149b3995e11c9823",
+      "src/aether/fleet/__init__.py": "791166d0f70511a6ccb9cded19dba96634349b5c569bec0a56f3f00cba5bb0ba",
+      "src/aether/fleet/health.py": "6e58bc04341fca03832c3c7d5fcb57b294ad7ffa65c44237036667aec7ddaf75",
+      "src/aether/fleet/manager.py": "efc6fd018e61ac013241488c4e002d839a0be47b445f9e34ec479f6b405a2107",
+      "src/aether/hub/__init__.py": "c72bebd8af4aa9b8c06e61c1cfbb01a80e356aa7119a0f059856bda3c587afaa",
+      "src/aether/hub/auth.py": "96a2ab9b6d5efdb907a9f8d29638e883b62992346dfcab1bc2893fc3cbe0884a",
+      "src/aether/hub/cache.py": "15acd07ae04c5dc6ce921604efaf48f132ab8868747e2d0612bebac40daa92a3",
+      "src/aether/hub/client.py": "4d899810c6830b59dba92b6db59f57ee06de233a03eccdbbf926aff91e16ceeb",
+      "src/aether/hub/server.py": "d6de42c7d4236ddcc5877528027f7a1760f4fb3671963143f3c969720ac2f5a5",
+      "src/aether/hybrid/__init__.py": "48069b9e78cc8c36ce172366bff94517d36c604378dfe748f86a9ef432979d91",
+      "src/aether/hybrid/state.py": "117d1ee5195d6dfad45c69dfbd473518e4dff4c1e72c25d81d190625f241d617",
+      "src/aether/inference/__init__.py": "5838bbf44a4b038355f956ac6d41da1e9ff83e7cf479776e3e850574992ed4fc",
+      "src/aether/inference/multimodal.py": "77d581c90300ad4ed703960a721a4290302850bc8ce88b7f97cef8ab212f647b",
+      "src/aether/inference/rag.py": "0a9121c375e5130ba37e4e400d50d09853fa50bac4b7b7530172e55f8bb2d7e3",
+      "src/aether/kernels/__init__.py": "765e694a50dee4b5a02a894e525413bc970f7943cb4068c1716bb5131e70a0f5",
+      "src/aether/kernels/attention.py": "86671e91abcb00729325a422c902619e86a02ad1a78794ea0568eaa62b430b72",
+      "src/aether/kernels/base.py": "7d1e9b4e2ff4c391aa5e2ca85151352a66719e2da14ed1302f04ec7eca6103e8",
+      "src/aether/kernels/ffn.py": "df85831664455cdcd998f1c4e36adbd76d796ddbdf3e53aaf804b38ad1f52f24",
+      "src/aether/kernels/gemm.py": "d4038f38dd4b4dc1d19910c0e3e3242f5016321a057179ccdcd066ca061a316d",
+      "src/aether/kernels/kernel_falcon.py": "adf6b6df5088a298bc85f77c5060fa48313816d0c44b500e83e33b4a87f777b4",
+      "src/aether/kernels/native_cpu.py": "8f2acdb823d85381d373c7ac6b609e26f30464690b79350722d61835ad3fd0e8",
+      "src/aether/kernels/native_cuda.py": "ad8153e8aa21f2a51aad296f936866315831796b3b4ec76d6c96e616de442668",
+      "src/aether/kernels/native_metal.py": "5094c89d83229a0670ce37f16c6983bc47066ef68332e0d8cd376d1bb24a5a30",
+      "src/aether/kernels/native_rocm.py": "8f8af1954762bfa77860243e4135637d413bc6f88aaa88eadc6003670ee5092c",
+      "src/aether/kernels/norm.py": "1917defcb0d8283dd44f79ea815c2d3466c6c900e11d269a4a7090129961044a",
+      "src/aether/kernels/quantized_linear.py": "97a297934229b09340e849e347ab4909f990b14c9469d4961ffe219b379f750e",
+      "src/aether/kernels/rope.py": "f97415333f6361f72b98edf830c77f4259e87e2ae28aafa0165cdcfd82ccebb0",
+      "src/aether/moe/__init__.py": "900d5648a6cce3092a6a6650eb1548e6a1992739a36747138be4a3836091aa45",
+      "src/aether/moe/expert_manager.py": "d937b4681f2cbb24ea3732e64e82c19b165d284b188b8bf5d5c8ce0a92c1dae5",
+      "src/aether/moe/planner.py": "a7fbdb1dc30b263bfa3b0994a22e7f489ad7de39b4ee5bf796eb0fd85b27ebe3",
+      "src/aether/moe/router.py": "feb0cc58baaed65ea891c92ed52898b9f72f12919846683176b811a83459cda2",
+      "src/aether/moe/sparsity.py": "62f6e27b5dbf9c3fb6fdfc6a9997bb627b87d47e6badd4aedba4f301602237a8",
+      "src/aether/observability/__init__.py": "0fec9738904cb6d125f0c11e2cf1ec25acae6d62b5e602ba072763efe5499f86",
+      "src/aether/observability/benchmark_runner.py": "51d2c59d7f63eefa5ec6d4ae6cc173a3598ad6a0fa4c4b61c63123827138ab24",
+      "src/aether/observability/ci_pipeline.py": "94d5bea7b2dac893ca9f6cddb040cd193b8e91eb1646b0867135416f0d013247",
+      "src/aether/observability/evaluators.py": "87f7965a58f324847fe575f16d481aa6943f9ef0dac8f11bc7727a3f0081edd8",
+      "src/aether/observability/gates.py": "20a29bfce85144d13154147bf2a1e354810b4bf13d520808f10e8c45c0d9415b",
+      "src/aether/observability/otel.py": "dabb2cf9ad56465a39f263d1262b6c5730b1c429de1d02f8ebc82547b1f66630",
+      "src/aether/observability/otel_sdk.py": "e9a8848e53a07109b33a51123d82f31453a87c81bf0ecea77ab61a5a332c6c48",
+      "src/aether/parallelism/__init__.py": "136d117b3ff56b5b0e36cb80ff461b30e3a7e96e246a36bd52217a6a93233812",
+      "src/aether/parallelism/collective_backends.py": "e2680e172c60c6a55cb50384e624b9af466a8103a62019f02e24714b5d262d37",
+      "src/aether/parallelism/distributed.py": "db71064bfe1c861c65ffb38bce699ba110b81d41e25302635ac221225c78c1cc",
+      "src/aether/parallelism/hardware_topology.py": "d07bea74864e9e4609d295c60b7e8d76e2279b23971c0a0c965d2b12c76f285b",
+      "src/aether/parallelism/mesh.py": "5c64ff83d22697b92f04c30c2350662a6623702bacd97e2c3c0ae5f9a4e075df",
+      "src/aether/parallelism/p2p_ring.py": "c607b4951fb0753fdb2603508ed43a017fde00bc54151784a0308f7b6ae38bca",
+      "src/aether/parallelism/planner.py": "a788f64ad81ae461a8606bded0a3029cf34784be5a8eb23691da188b7af0f27e",
+      "src/aether/parallelism/sharding.py": "ff8a2ea65a30f47880301816036bc5f1e431a3fe414534d9abf171940e599a48",
+      "src/aether/placement/__init__.py": "64277be53d9498342b8d83a01914c02038d341876868ee3c65205b713a1565c9",
+      "src/aether/placement/bootstrap.py": "e19df7044fcdb3669c05782c0c64b25fa3af6b60e31f15a40569d7152319731a",
+      "src/aether/placement/census.py": "cbfcdd40efd38e7ab459283cf21ab2cb0c53ebb4ece32650448d44331636e612",
+      "src/aether/placement/cost.py": "99649e54191cd48aa66b94172a7f77f393ec8d6f05575dbbebed46222c3e88a1",
+      "src/aether/placement/homogeneity.py": "c2346e146795ef023af9c77beb3b6a1c7c387633e09842afc6bde9794605055d",
+      "src/aether/placement/ledger.py": "7e8ebabf2943b8beb0f54c87a50fcf86ed56e786e27a1a228a6064a889d49a68",
+      "src/aether/placement/memory.py": "7ba66f530072db5b710b1cde0759988919401a9b2da49e627238331707e83fc7",
+      "src/aether/placement/model_profile.py": "f14be6e8a2a937254166856316defcc01a0cfe9fd772ca927d1f8fc1aff21c38",
+      "src/aether/placement/planner.py": "c27c93ac1cb29664a23731559fae6791cd89c16e82521ee3698553b18764f372",
+      "src/aether/placement/plans.py": "6da58a50908f89f923e1f67c57754611cfbfa51a98b7afcbd4feff67f6f59553",
+      "src/aether/placement/record.py": "c214ba53cd624172ef785b8b0a014e1e6973612fbe6a5808792a25632d671cb9",
+      "src/aether/placement/waterfill.py": "356d7e660935bb14f27ef6aac54c2c41985a438beba950c87fa4624cd4aaeacb",
+      "src/aether/placement/workload.py": "3230e0fb4b3c475a22918c99a9d3e6adbede3491be0e34d155775dfc69617d7c",
+      "src/aether/provenance/__init__.py": "99a8c91ca45b52f84c6aee38cc7866549388df4641c55e9a06aea6ec58671c7c",
+      "src/aether/provenance/c2pa.py": "c867b8098e425cf0c9e96c685d614098eafff36feb4fe823db643fd02c414be6",
+      "src/aether/provenance/cbor.py": "8bd5d0c1d9f0875dcd3434df3d1518fe8e694aed6c2b1bdcc6439a71420b71fb",
+      "src/aether/provenance/cose.py": "9ae7c6bb44fabdb7208e1e83da565632ec5ef301372e4621d803b6672919df8f",
+      "src/aether/provenance/ed25519.py": "3d9bbbb3973bb0c32a357ed306ae151aed4f32480b462d86e46163ab640f103d",
+      "src/aether/provenance/fingerprint.py": "57e1ec96014f5791fb073ed25aaadfe18c69c277533e24004069f6ea6edb02ec",
+      "src/aether/provenance/jumbf.py": "ad2b13cf5067f131d11e2be0fde03e8082b8bea475522ed49f652dc38874df7f",
+      "src/aether/provenance/manifest.py": "7f3deca75cb39b200e12a44723e497ae03c84c459bc35269e5966f6cb7f5713e",
+      "src/aether/provenance/watermark.py": "8860c1e0501719e84d4ba02f82eaaaff1c898539dd69d9beb752ce393aa90740",
+      "src/aether/provenance/x509.py": "a5b2ec557883735376a5206d70c25e8c0f792d40223be180a4ade58575f3d743",
+      "src/aether/py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "src/aether/quantization/__init__.py": "76caa696b167cedfaf26b7934ee103fc114870f5d3d1cb029e72f94c3b004d1c",
+      "src/aether/quantization/assignment.py": "bdb189254d88aed8f59ae47d5964d15a5bd4f0131bc308fdc5301c90ef714a02",
+      "src/aether/quantization/codecs.py": "5d853fb3c42a4ea772bd91d04c0141f04e02de45fb0fda3391aeaf3243cbe365",
+      "src/aether/quantization/formats.py": "236f5c38b9fadda4f888b12a8993f1e9e400910faefb6793ff70a18df8658128",
+      "src/aether/quantization/packing.py": "0d9a670351265744394a3494116156fead01611cbb6d3e6a1edad9ceccfe53c6",
+      "src/aether/quantization/pruning.py": "21b1f1b9750a2201fa524670410d405ca1cc482c5ee2ee99c4e0c6f3d9a6d701",
+      "src/aether/quantization/quantizer.py": "8d335f5c885518e03283fa36acdf13fd13b996bc433d9f7f2795145dd2342d59",
+      "src/aether/quantization/sensitivity.py": "f7593562602f9f3bd0d82080fd356884afa3de879c13b1c349ff1d31627d6879",
+      "src/aether/runtime/__init__.py": "0ba3f4e4bda2edbca69f4cd6dbc9fc859da4af7edc93cc24c7c159018b172482",
+      "src/aether/runtime/aeg_loader.py": "5e450736164ca21e0c1e69e4a2d9daedbab39013b6740472f86aa907e144614d",
+      "src/aether/runtime/agentic_session.py": "9cff1cef0d8ebc1b07940d16704e0e815c4055c33febdfd0d44d50692f1d2af8",
+      "src/aether/runtime/batch.py": "bef131432171a19756e8cfbf1b3797f80df89ed494065fecd83dca6248c1b677",
+      "src/aether/runtime/cache_handoff.py": "d8c56fb07d1f633e027277dc90aeafec42391ee7296fad4f88614360bad56021",
+      "src/aether/runtime/cascade_router.py": "9d338e04ffcc23ce96fb9cfeb9d5b2180340c9389f10723d7b221d81b6bb01ff",
+      "src/aether/runtime/compute_controller.py": "b7a5d4765e1498687fb0ed5c128f0d9a8b7833500dd333096b922a0002d47482",
+      "src/aether/runtime/config.py": "8c64c939bf9b88a0a646fb567ecbf55c96688cf7d2fd3f69555172ae8d45c17f",
+      "src/aether/runtime/continuous_batcher.py": "6ec62e32e9cccae20a49d86b43560d1980b78f6a2a5a3627f87f6b370f57ce69",
+      "src/aether/runtime/cpu_engine.py": "36304b65770f26fd7ef10a34cc66db5b3239c43c198226769263e45c4e6be365",
+      "src/aether/runtime/decode_profile.py": "d2d4fdbacc74cdd4ccf143ed6acf8eeff98cd864cd07a647f22d8bd7c5615c96",
+      "src/aether/runtime/disaggregated_execution.py": "95bdca71b2b7dd8bdec902ed399b677a5aabd49fab7dd5302fb6ec2d38418981",
+      "src/aether/runtime/eagle.py": "f95ef740eef9c6f1e3bc55a72dc1daeb5f9420e9aa3b82830f5b564856a0a613",
+      "src/aether/runtime/encoder_engine.py": "b39038799cc2fa317ba7d13cceb97cdf2dbbab45f96afb64a4d5b0106f04afbf",
+      "src/aether/runtime/execution_features.py": "fee6e9ae8ceddb3c631a72c8de58afd01fe8efc751b940faf93430d54d3cf2d1",
+      "src/aether/runtime/execution_precision.py": "020301ebfa6ca7cbbda5c5f28d1d8743df49817a910b772f0cd886146ca65dd5",
+      "src/aether/runtime/executor.py": "5f9ef00fa7cf97885707865be290e52911e9ecfed15e989c9a4252241a7f754f",
+      "src/aether/runtime/hardware.py": "8421591acdcaaeced407d753dc624a0574037b70c84eab4fb355517ffeadfd2b",
+      "src/aether/runtime/hot_reload.py": "ad468bc65345480daafc9e474d5e43185997715a3dbf883d9e04bb0e1c420c20",
+      "src/aether/runtime/hybrid_engine.py": "4aa36d78004c9ff83d4e122fc2c79dd0850d5f0dfd4eb777dc3db220eee56200",
+      "src/aether/runtime/kernel_strategy.py": "7fea8091d4aa039104cab35b423ceeb1d08d1e7924730724fda2c650fcf59f60",
+      "src/aether/runtime/kv_cache.py": "3e2fefbb55d058a136c047b3ecd36b75c83911e02ca8e68e3686faa9dbd9b22b",
+      "src/aether/runtime/kv_payload.py": "c9a57675ab72325c302e6251b1c9b5fc7d184db4ef626be54e5b9afde04ae2b5",
+      "src/aether/runtime/kv_storage.py": "cae3db8621e6edff85bf6f8c1d7af66cd1093e69968e3ad7ce9499bc42ed8ccc",
+      "src/aether/runtime/lifecycle.py": "f5a7142b3fb851a3edc618c083659d9bbc9c9dfe1e2a0c94837714fdf34f1637",
+      "src/aether/runtime/long_context.py": "8dd3b9f71d45930511ebb502538c88b68993d2491fb67a93b576867b5c71a8cf",
+      "src/aether/runtime/mamba2_engine.py": "b350f8f29ef32eb4403457d3add95dea067edfd31abb8978b0660d2440e6aff0",
+      "src/aether/runtime/mamba_engine.py": "a97771e1c7655312f7423900c6e7aa55c4a1f0a9212811a659c1d02c2e898942",
+      "src/aether/runtime/mla_engine.py": "ffba40109e40aeda65b89bdb9ea77b1ae26aaa917fa19ec351068917a06f3793",
+      "src/aether/runtime/model_registry.py": "8c8defb54021ecac31c6a418062bc23a9700c287c7f4b76ba8e539a8f8c0d10c",
+      "src/aether/runtime/native_distributed_engine.py": "f03091407df89acf8105bcb8966e20bdbee6132b19f60344363d6e5997f6fdcf",
+      "src/aether/runtime/onnx_export.py": "2122237de4b2a9e50c76762222177ac9398b21cc8035d46bbdbfb2a39155b381",
+      "src/aether/runtime/paged_attention.py": "4e01df4d3afbd5902d7cf88125956e8f547946e8faa9e037ab44be9cbec3ff34",
+      "src/aether/runtime/paged_kv_cache.py": "9b18338fa92349df71055f2e0fdc0feb6d8400369077c00a9657e7150a2b36a9",
+      "src/aether/runtime/positional.py": "4eb4b2e00b530c51d18ac7cf827960e898172f0fa7042bbf9445af3d2efbd4a9",
+      "src/aether/runtime/precision_manager.py": "2a28ed1a0dd1d4a2e4a2b6efbc6f37fa4614d76b8ce251853f41c3bba4d17006",
+      "src/aether/runtime/r10_video_kv_manager.py": "25485a91b6af7df17ec1e71c49f8228181579d8f3a9b3f9136d05b802ab29e0a",
+      "src/aether/runtime/r11_semantic_kv_cache.py": "fa35f60532eacf5c5314eb540f53330c2fe7b3385316da067495d99f0b17209e",
+      "src/aether/runtime/r12_cxl_kv_pool.py": "d23a92e2fac9cf2d5a837f94e8649fcc5f01967c698c0c823a9d66611efb646d",
+      "src/aether/runtime/r12_rlvr_harness.py": "b69f9a1e1f0cdf9aa1a37797b5c4e372cfa155da08d6de58d6c6695d583d653a",
+      "src/aether/runtime/r1_peagle_engine.py": "50bb4de86ece899b723c7efe4bc266c5aff32b8637cae323257a50f61bfe665a",
+      "src/aether/runtime/r2_multi_agent_kv.py": "bd529f6c6677712a09bfc3aa4f0fe473a95da69fdb3f15b87756ea601e37555d",
+      "src/aether/runtime/r3_grammar_fsm.py": "8cbfc8f7775b00cada4c9460c71ee5956d9a505f161770e4c25a752881a47c3c",
+      "src/aether/runtime/r4_slo_scheduler.py": "9f221d2bef25b08445644839bbd59ba256c66c2bb00ee8976a110dff53248e50",
+      "src/aether/runtime/r5_ttt_engine.py": "56c6a7341e2bdb74648b346cf672cddfbb73dc3a7ddaa3830f66e13fec87380d",
+      "src/aether/runtime/r6_mcp_integration.py": "c1b01deadb1f2ad61579df48352a2ec35887def1880c7b66ed090a1d831a3358",
+      "src/aether/runtime/r7_green_power_manager.py": "d5c8c7e402cac3d69524d2aa2cf491b8080f5a7c02e27f29c0f96e5ef5b63267",
+      "src/aether/runtime/r8_tee_manager.py": "871bc8853f7f6fee6c1fc2c8d45d0ba16a646fa659a9edf9f1e57ecfcefbf05f",
+      "src/aether/runtime/r9_diffusion_spec_engine.py": "efa54b48293d1606895b587427d38a7fbdbe8f2f142fa60c0412e4d14d9cab2c",
+      "src/aether/runtime/r9_sub2bit_kv_cache.py": "54ca2a3646031a5da58e22d65bb0d7f1f47711ee530f26f70db04913ffa66c87",
+      "src/aether/runtime/rope_scaling.py": "cfd9110da88d517eb7d30cdb6a571d63f97e23a3e8d6ff23abbca94e9d1cef36",
+      "src/aether/runtime/runtime.py": "cb255d87df504a73b0957d14f84f8ed05584c33a84adbf393571073e484d86e0",
+      "src/aether/runtime/rwkv_engine.py": "0b23ef35ee6a1e617beed5d283e843a4baf34ffd3125c1e3ed766533ec83dda3",
+      "src/aether/runtime/sampling.py": "3d372d0195649df6dbad9b4fdc4481dab2a1fe0d16695e6ecad7f31887730582",
+      "src/aether/runtime/scheduler.py": "be63975fb04bc29c2a730055d64568b3d022b33978303f476671267275df832c",
+      "src/aether/runtime/seq2seq_engine.py": "5e5e1f95b0e458d640a40ec83600aef67911f54ec20f8ba111fed151a58ad3ae",
+      "src/aether/runtime/session.py": "6b8f15112b0932eac52e90cb1ced8e833e375aa62e2ef0b943de43340d756539",
+      "src/aether/runtime/session_contract.py": "e1c04220eaca8a51d69152ce42c037078a2fd06c5d1ef58276888f82dddcbb55",
+      "src/aether/runtime/spec_decode.py": "900b14abf6451d2e60ae8316391fd93365aefa8334142cd2081139fbb147d745",
+      "src/aether/runtime/spec_generation.py": "575d67e7ee41dd132bcecbb1efeb5cfa4133032f19a02ad97a6fb268ec2eb67e",
+      "src/aether/runtime/speculative.py": "02de2528521428caa0ad09fb63192e4d67b7e6e20fc919bab04d9f46ac957b0c",
+      "src/aether/runtime/speculative_engine.py": "2f2f3f219b68599bf400d8f182805208c00021325aec318e8d1e130a5f8d847b",
+      "src/aether/runtime/stopping.py": "2de36150bc14eae100e9344101df1c794ca2d6060c414cd6bc96e367c1fd8a98",
+      "src/aether/runtime/torch_cache_handoff.py": "24519251252895142cc8e50004ce7bcf77450ff24df91908fe9887a1d6602130",
+      "src/aether/runtime/torch_engine.py": "7c6b3b523f049da36a4afb90c7a3324e31608546e33f7ad7ce61d26f03596974",
+      "src/aether/runtime/torch_state_engine.py": "3ed7278da9b5d4cd795a85c8e9ba50fef992aa152802e26692cd4f2122a1af08",
+      "src/aether/runtime/torch_tensor_parallel.py": "22c24450208c4f43a0a8196da46d0e3eae3a0e1ac5a6dfd71d9fc284effc44f9",
+      "src/aether/runtime/torch_transformer_engine.py": "eae0f3428131c2b4a61130b46d042eca6614f702d19c7b9a1f17feb834a13dd3",
+      "src/aether/safety/__init__.py": "def97fdf3d09cdc5334c27363670cf5983bb9bdaac50238c196bcf9683435446",
+      "src/aether/safety/guard.py": "15eaa5010cfb395cb3ea630c558940d346f1d26ec187727bee8b958da5f30d8e",
+      "src/aether/safety/guardrails.py": "e175871631ce78b851e86638083568243aeba1307a50490de821e9b69796def6",
+      "src/aether/safety/policy.py": "547348a3707d8f659154efdfee9322328735c6823ec0bc55a329320db2250ffd",
+      "src/aether/safety/production_safety.py": "d1944b0d41965efdab5fa97f803201d98282d9a6fcf9ff016a66058b15079624",
+      "src/aether/sdk.py": "4b52f5f9a552bc189192c2795e6025340da7a285fb2161741f6a3a74420c5abb",
+      "src/aether/server/__init__.py": "7f06dce05d7627117f45f24b0b1f53f4ba9ba67ee08123a8d08f28e89dbd6778",
+      "src/aether/server/app.py": "a1f7b78ab5d6b1494c225da1d4539a968b5a26c799623f21fb742c4735fa5d35",
+      "src/aether/server/grpc_service.py": "f9eac9028ff6ecc8740a58ef595b9b24997449b4a0915edbcc1a4711d77dba22",
+      "src/aether/server/metrics.py": "b651a6fc96932ae727d99996db5c9fab587ef8cd0363a26b8efded9d19862e54",
+      "src/aether/server/middleware.py": "42f85f38aa86622ade59ccb7d8cb76dc340caf1f4b6eb64cf594efc0fcc6e607",
+      "src/aether/server/proto/__init__.py": "87bbeb9d02574df0a99c4a6d574e766b40532c6ee864bcd9a31c0ccba85fbf00",
+      "src/aether/server/proto/aether.proto": "458e4a1a17c8a0cebf960cbb58265470fe5ffa957302905adb5209e1583663d0",
+      "src/aether/server/proto/aether_pb2.py": "1d9777e8071efbfaff66939309c0b7a2ffda1e35c4333b9fe4138f094eefe609",
+      "src/aether/server/proto/aether_pb2_grpc.py": "8dafbcbdaeb4b1942b436d58e51bfcf5e1863df4b45374ed3d4aed6fb909c7f1",
+      "src/aether/server/routes.py": "14363ca329c5b9069c819b955465bdedcdc3e7ccaf2b32a0caeeb3cd80031872",
+      "src/aether/targets/__init__.py": "300d376e78afbcb172a661a16a73171b717a4b01bd8fd0c9b3071a2993634205",
+      "src/aether/targets/cpu_kernels.py": "1c0368677bd0abeb51af0a1ef89b89b321c1d068e5c7b4997f25474b1e6ba054",
+      "src/aether/targets/cuda_kernels.py": "9326bdcb7a9bc6dbb3d627d4704f1ad59cdcfadae98b8e531405af56befc7fbb",
+      "src/aether/targets/metal_kernels.py": "fd915921d61b480e876b8bcfbf6840676d0a48dc2c08e9e0b067fc42f79a970e",
+      "src/aether/targets/registry.py": "87797f8ab8b3a814abdeb0bd91681672d50955ff4e044c08f592467da9431060",
+      "src/aether/targets/rocm_kernels.py": "14c28aa9872a404d70c6375ba76eb2e4bb36a91821feced32df3cf56270920ff",
+      "src/aether/targets/templates.py": "71d1407e406fe295f20ec926e6d69e225aee1c63af942c56febb3f05f79a9ada",
+      "src/aether/utils/__init__.py": "198b78e02339497bce7546a161e5083dfc3a2c8180f43f87529062093dddaaa9",
+      "src/aether/utils/artifact_publication.py": "6d574e0dc704b56cbad44437bb08e6766ccb227d6c6f55a85d801731d651e8a0",
+      "src/aether/utils/file_io.py": "12bad0cf41919b0ef7210c9e8a8b29dbbbc52fee9ab22d226321012f57437493",
+      "src/aether/utils/logging.py": "342c39641699dcca586a2dd03e615ac97e8b012e9848c7e067517aa92073b81d",
+      "src/aether/utils/memory.py": "9ca1904676e4d4314848b3821615b4aa61c6884523464fe22b9d68ca187bedbe",
+      "src/aether/utils/profiling.py": "cafc40ccc24cc5fe8a117a721663a71c009eb3b4c63b1362e4faa64111146ff9",
+      "src/aether/utils/telemetry.py": "b2ccfda584949c656e1932f3dbf7ed85e69a0ea7f4b7226b6b428fb517ba9ef3",
+      "src/aether/utils/threading.py": "3f46bf05433354d6e620d48857b5e8d1bdca52df262ce435c47597528fafade0"
+    }
+  },
+  "scope": "Physical Windows CPU; small untrained/source and loader contracts only",
+  "platform": "Windows-10-10.0.26200-SP0",
+  "cpu": "Intel64 Family 6 Model 186 Stepping 3, GenuineIntel",
+  "python": "3.10.11",
+  "versions": {
+    "numpy": "1.26.4",
+    "torch": "2.9.1",
+    "transformers": "4.57.3",
+    "onnxruntime": "1.23.2",
+    "safetensors": "0.8.0",
+    "tokenizers": "0.22.2",
+    "ruff": "0.17.1",
+    "mypy": "2.4.0"
+  },
+  "before_regressions": {
+    "sha256": "3411dd2ed3213113306d318efda4cd044739deb1bdb18e354802448ee5a54109",
+    "tests": 31,
+    "passed": 19,
+    "failures": [
+      {
+        "class": "tests.unit.test_normalization_epsilon",
+        "name": "test_loaded_normalization_matches_independent_math[0.0-dense]",
+        "message": "AssertionError: \nNot equal to tolerance rtol=2e-06, atol=1e-12\n\nMismatched elements: 8 / 8 (100%)\nMax absolute difference: 2.05947394\nMax relative difference: 0.99998403\n x: array([[ 2.213594e-06, -4.969294e-06,  8.267097e-06,  1.210701e-05,\n        -1.648902e-05,  2.141314e-05,  2.687936e-05, -3.288768e-05]],\n      dtype=float32)\n y: array([[ 0.138621, -0.311189,  0.517706,  0.75817 , -1.032582,  1.340943,\n         1.683251, -2.059507]])",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_loaded_normalization_matc0')\nfamily = 'dense', epsilon = 0.0\n\n    @pytest.mark.parametrize(\"family\", FAMILIES)\n    @pytest.mark.parametrize(\"epsilon\", [0.0, 0.002])\n    def test_loaded_normalization_matches_independent_math(\n        tmp_path: Path, family: str, epsilon: float,\n    ) -> None:\n        \"\"\"A valid zero is a model parameter, not an instruction to substitute 1e-5.\n    \n        RMS contract: HF Transformers v4.57.3 LlamaRMSNorm.forward,\n        https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/llama/modeling_llama.py\n        LayerNorm uses population variance and subtracts the feature mean.\n        \"\"\"\n        package = write_package(tmp_path / \"model.aeg\", family, epsilon)\n        engine: Any = load_engine_from_package(\n            package, prepare_native_kernels=False, allow_uncertified=True,\n        )\n        value = np.asarray([[1, -2, 3, 4, -5, 6, 7, -8]], dtype=np.float32) * 1e-8\n        scale = np.linspace(0.7, 1.3, 8, dtype=np.float32)\n        reference = value.astype(np.float64)\n        if family in {\"encoder\", \"rwkv\"}:\n            reference -= reference.mean(axis=-1, keepdims=True)\n        expected = reference / np.sqrt(np.mean(reference**2, axis=-1, keepdims=True) + epsilon) * scale\n        if family == \"encoder\":\n            actual = engine._layer_norm(value, scale)\n        elif family == \"rwkv\":\n            actual = engine._norm(value, scale, engine.weights.norm_eps)\n        elif family == \"hybrid\":\n            actual = engine._transformer._norm(value, scale)\n            np.testing.assert_allclose(\n                engine._mamba._norm(value, scale), expected, rtol=2e-6, atol=1e-12,\n            )\n        else:\n            actual = engine._norm(value, scale)\n>       np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-12)\n\ntests\\unit\\test_normalization_epsilon.py:50: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000020EA00B9990>, array([[ 2.2135944e-06, -4.9692935e-06,  8.2670967...ay([[ 0.13862065, -0.31118922,  0.51770569,  0.7581701 , -1.03258249,\n         1.3409426 ,  1.68325084, -2.05950683]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=2e-06, atol=1e-12', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=2e-06, atol=1e-12\nE           \nE           Mismatched elements: 8 / 8 (100%)\nE           Max absolute difference: 2.05947394\nE           Max relative difference: 0.99998403\nE            x: array([[ 2.213594e-06, -4.969294e-06,  8.267097e-06,  1.210701e-05,\nE                   -1.648902e-05,  2.141314e-05,  2.687936e-05, -3.288768e-05]],\nE                 dtype=float32)\nE            y: array([[ 0.138621, -0.311189,  0.517706,  0.75817 , -1.032582,  1.340943,\nE                    1.683251, -2.059507]])\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_normalization_epsilon",
+        "name": "test_loaded_normalization_matches_independent_math[0.0-moe]",
+        "message": "AssertionError: \nNot equal to tolerance rtol=2e-06, atol=1e-12\n\nMismatched elements: 8 / 8 (100%)\nMax absolute difference: 2.05947394\nMax relative difference: 0.99998403\n x: array([[ 2.213594e-06, -4.969294e-06,  8.267097e-06,  1.210701e-05,\n        -1.648902e-05,  2.141314e-05,  2.687936e-05, -3.288768e-05]],\n      dtype=float32)\n y: array([[ 0.138621, -0.311189,  0.517706,  0.75817 , -1.032582,  1.340943,\n         1.683251, -2.059507]])",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_loaded_normalization_matc1')\nfamily = 'moe', epsilon = 0.0\n\n    @pytest.mark.parametrize(\"family\", FAMILIES)\n    @pytest.mark.parametrize(\"epsilon\", [0.0, 0.002])\n    def test_loaded_normalization_matches_independent_math(\n        tmp_path: Path, family: str, epsilon: float,\n    ) -> None:\n        \"\"\"A valid zero is a model parameter, not an instruction to substitute 1e-5.\n    \n        RMS contract: HF Transformers v4.57.3 LlamaRMSNorm.forward,\n        https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/llama/modeling_llama.py\n        LayerNorm uses population variance and subtracts the feature mean.\n        \"\"\"\n        package = write_package(tmp_path / \"model.aeg\", family, epsilon)\n        engine: Any = load_engine_from_package(\n            package, prepare_native_kernels=False, allow_uncertified=True,\n        )\n        value = np.asarray([[1, -2, 3, 4, -5, 6, 7, -8]], dtype=np.float32) * 1e-8\n        scale = np.linspace(0.7, 1.3, 8, dtype=np.float32)\n        reference = value.astype(np.float64)\n        if family in {\"encoder\", \"rwkv\"}:\n            reference -= reference.mean(axis=-1, keepdims=True)\n        expected = reference / np.sqrt(np.mean(reference**2, axis=-1, keepdims=True) + epsilon) * scale\n        if family == \"encoder\":\n            actual = engine._layer_norm(value, scale)\n        elif family == \"rwkv\":\n            actual = engine._norm(value, scale, engine.weights.norm_eps)\n        elif family == \"hybrid\":\n            actual = engine._transformer._norm(value, scale)\n            np.testing.assert_allclose(\n                engine._mamba._norm(value, scale), expected, rtol=2e-6, atol=1e-12,\n            )\n        else:\n            actual = engine._norm(value, scale)\n>       np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-12)\n\ntests\\unit\\test_normalization_epsilon.py:50: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000020EA036DCF0>, array([[ 2.2135944e-06, -4.9692935e-06,  8.2670967...ay([[ 0.13862065, -0.31118922,  0.51770569,  0.7581701 , -1.03258249,\n         1.3409426 ,  1.68325084, -2.05950683]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=2e-06, atol=1e-12', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=2e-06, atol=1e-12\nE           \nE           Mismatched elements: 8 / 8 (100%)\nE           Max absolute difference: 2.05947394\nE           Max relative difference: 0.99998403\nE            x: array([[ 2.213594e-06, -4.969294e-06,  8.267097e-06,  1.210701e-05,\nE                   -1.648902e-05,  2.141314e-05,  2.687936e-05, -3.288768e-05]],\nE                 dtype=float32)\nE            y: array([[ 0.138621, -0.311189,  0.517706,  0.75817 , -1.032582,  1.340943,\nE                    1.683251, -2.059507]])\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_normalization_epsilon",
+        "name": "test_loaded_normalization_matches_independent_math[0.0-mla]",
+        "message": "AssertionError: \nNot equal to tolerance rtol=2e-06, atol=1e-12\n\nMismatched elements: 8 / 8 (100%)\nMax absolute difference: 2.05947394\nMax relative difference: 0.99998403\n x: array([[ 2.213594e-06, -4.969294e-06,  8.267097e-06,  1.210701e-05,\n        -1.648902e-05,  2.141314e-05,  2.687936e-05, -3.288769e-05]],\n      dtype=float32)\n y: array([[ 0.138621, -0.311189,  0.517706,  0.75817 , -1.032582,  1.340943,\n         1.683251, -2.059507]])",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_loaded_normalization_matc2')\nfamily = 'mla', epsilon = 0.0\n\n    @pytest.mark.parametrize(\"family\", FAMILIES)\n    @pytest.mark.parametrize(\"epsilon\", [0.0, 0.002])\n    def test_loaded_normalization_matches_independent_math(\n        tmp_path: Path, family: str, epsilon: float,\n    ) -> None:\n        \"\"\"A valid zero is a model parameter, not an instruction to substitute 1e-5.\n    \n        RMS contract: HF Transformers v4.57.3 LlamaRMSNorm.forward,\n        https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/llama/modeling_llama.py\n        LayerNorm uses population variance and subtracts the feature mean.\n        \"\"\"\n        package = write_package(tmp_path / \"model.aeg\", family, epsilon)\n        engine: Any = load_engine_from_package(\n            package, prepare_native_kernels=False, allow_uncertified=True,\n        )\n        value = np.asarray([[1, -2, 3, 4, -5, 6, 7, -8]], dtype=np.float32) * 1e-8\n        scale = np.linspace(0.7, 1.3, 8, dtype=np.float32)\n        reference = value.astype(np.float64)\n        if family in {\"encoder\", \"rwkv\"}:\n            reference -= reference.mean(axis=-1, keepdims=True)\n        expected = reference / np.sqrt(np.mean(reference**2, axis=-1, keepdims=True) + epsilon) * scale\n        if family == \"encoder\":\n            actual = engine._layer_norm(value, scale)\n        elif family == \"rwkv\":\n            actual = engine._norm(value, scale, engine.weights.norm_eps)\n        elif family == \"hybrid\":\n            actual = engine._transformer._norm(value, scale)\n            np.testing.assert_allclose(\n                engine._mamba._norm(value, scale), expected, rtol=2e-6, atol=1e-12,\n            )\n        else:\n            actual = engine._norm(value, scale)\n>       np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-12)\n\ntests\\unit\\test_normalization_epsilon.py:50: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000020EA036E950>, array([[ 2.2135944e-06, -4.9692935e-06,  8.2670967...ay([[ 0.13862065, -0.31118922,  0.51770569,  0.7581701 , -1.03258249,\n         1.3409426 ,  1.68325084, -2.05950683]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=2e-06, atol=1e-12', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=2e-06, atol=1e-12\nE           \nE           Mismatched elements: 8 / 8 (100%)\nE           Max absolute difference: 2.05947394\nE           Max relative difference: 0.99998403\nE            x: array([[ 2.213594e-06, -4.969294e-06,  8.267097e-06,  1.210701e-05,\nE                   -1.648902e-05,  2.141314e-05,  2.687936e-05, -3.288769e-05]],\nE                 dtype=float32)\nE            y: array([[ 0.138621, -0.311189,  0.517706,  0.75817 , -1.032582,  1.340943,\nE                    1.683251, -2.059507]])\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_normalization_epsilon",
+        "name": "test_loaded_normalization_matches_independent_math[0.0-mamba2]",
+        "message": "AssertionError: \nNot equal to tolerance rtol=2e-06, atol=1e-12\n\nMismatched elements: 8 / 8 (100%)\nMax absolute difference: 2.05947394\nMax relative difference: 0.99998403\n x: array([[ 2.213594e-06, -4.969294e-06,  8.267097e-06,  1.210701e-05,\n        -1.648902e-05,  2.141314e-05,  2.687936e-05, -3.288769e-05]],\n      dtype=float32)\n y: array([[ 0.138621, -0.311189,  0.517706,  0.75817 , -1.032582,  1.340943,\n         1.683251, -2.059507]])",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_loaded_normalization_matc4')\nfamily = 'mamba2', epsilon = 0.0\n\n    @pytest.mark.parametrize(\"family\", FAMILIES)\n    @pytest.mark.parametrize(\"epsilon\", [0.0, 0.002])\n    def test_loaded_normalization_matches_independent_math(\n        tmp_path: Path, family: str, epsilon: float,\n    ) -> None:\n        \"\"\"A valid zero is a model parameter, not an instruction to substitute 1e-5.\n    \n        RMS contract: HF Transformers v4.57.3 LlamaRMSNorm.forward,\n        https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/llama/modeling_llama.py\n        LayerNorm uses population variance and subtracts the feature mean.\n        \"\"\"\n        package = write_package(tmp_path / \"model.aeg\", family, epsilon)\n        engine: Any = load_engine_from_package(\n            package, prepare_native_kernels=False, allow_uncertified=True,\n        )\n        value = np.asarray([[1, -2, 3, 4, -5, 6, 7, -8]], dtype=np.float32) * 1e-8\n        scale = np.linspace(0.7, 1.3, 8, dtype=np.float32)\n        reference = value.astype(np.float64)\n        if family in {\"encoder\", \"rwkv\"}:\n            reference -= reference.mean(axis=-1, keepdims=True)\n        expected = reference / np.sqrt(np.mean(reference**2, axis=-1, keepdims=True) + epsilon) * scale\n        if family == \"encoder\":\n            actual = engine._layer_norm(value, scale)\n        elif family == \"rwkv\":\n            actual = engine._norm(value, scale, engine.weights.norm_eps)\n        elif family == \"hybrid\":\n            actual = engine._transformer._norm(value, scale)\n            np.testing.assert_allclose(\n                engine._mamba._norm(value, scale), expected, rtol=2e-6, atol=1e-12,\n            )\n        else:\n            actual = engine._norm(value, scale)\n>       np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-12)\n\ntests\\unit\\test_normalization_epsilon.py:50: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000020EA036FAC0>, array([[ 2.2135944e-06, -4.9692935e-06,  8.2670967...ay([[ 0.13862065, -0.31118922,  0.51770569,  0.7581701 , -1.03258249,\n         1.3409426 ,  1.68325084, -2.05950683]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=2e-06, atol=1e-12', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=2e-06, atol=1e-12\nE           \nE           Mismatched elements: 8 / 8 (100%)\nE           Max absolute difference: 2.05947394\nE           Max relative difference: 0.99998403\nE            x: array([[ 2.213594e-06, -4.969294e-06,  8.267097e-06,  1.210701e-05,\nE                   -1.648902e-05,  2.141314e-05,  2.687936e-05, -3.288769e-05]],\nE                 dtype=float32)\nE            y: array([[ 0.138621, -0.311189,  0.517706,  0.75817 , -1.032582,  1.340943,\nE                    1.683251, -2.059507]])\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_normalization_epsilon",
+        "name": "test_loaded_normalization_matches_independent_math[0.0-hybrid]",
+        "message": "AssertionError: \nNot equal to tolerance rtol=2e-06, atol=1e-12\n\nMismatched elements: 8 / 8 (100%)\nMax absolute difference: 2.05947394\nMax relative difference: 0.99998403\n x: array([[ 2.213594e-06, -4.969294e-06,  8.267097e-06,  1.210701e-05,\n        -1.648902e-05,  2.141314e-05,  2.687936e-05, -3.288769e-05]],\n      dtype=float32)\n y: array([[ 0.138621, -0.311189,  0.517706,  0.75817 , -1.032582,  1.340943,\n         1.683251, -2.059507]])",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_loaded_normalization_matc5')\nfamily = 'hybrid', epsilon = 0.0\n\n    @pytest.mark.parametrize(\"family\", FAMILIES)\n    @pytest.mark.parametrize(\"epsilon\", [0.0, 0.002])\n    def test_loaded_normalization_matches_independent_math(\n        tmp_path: Path, family: str, epsilon: float,\n    ) -> None:\n        \"\"\"A valid zero is a model parameter, not an instruction to substitute 1e-5.\n    \n        RMS contract: HF Transformers v4.57.3 LlamaRMSNorm.forward,\n        https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/llama/modeling_llama.py\n        LayerNorm uses population variance and subtracts the feature mean.\n        \"\"\"\n        package = write_package(tmp_path / \"model.aeg\", family, epsilon)\n        engine: Any = load_engine_from_package(\n            package, prepare_native_kernels=False, allow_uncertified=True,\n        )\n        value = np.asarray([[1, -2, 3, 4, -5, 6, 7, -8]], dtype=np.float32) * 1e-8\n        scale = np.linspace(0.7, 1.3, 8, dtype=np.float32)\n        reference = value.astype(np.float64)\n        if family in {\"encoder\", \"rwkv\"}:\n            reference -= reference.mean(axis=-1, keepdims=True)\n        expected = reference / np.sqrt(np.mean(reference**2, axis=-1, keepdims=True) + epsilon) * scale\n        if family == \"encoder\":\n            actual = engine._layer_norm(value, scale)\n        elif family == \"rwkv\":\n            actual = engine._norm(value, scale, engine.weights.norm_eps)\n        elif family == \"hybrid\":\n            actual = engine._transformer._norm(value, scale)\n>           np.testing.assert_allclose(\n                engine._mamba._norm(value, scale), expected, rtol=2e-6, atol=1e-12,\n            )\n\ntests\\unit\\test_normalization_epsilon.py:45: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000020EA036E290>, array([[ 2.2135944e-06, -4.9692935e-06,  8.2670967...ay([[ 0.13862065, -0.31118922,  0.51770569,  0.7581701 , -1.03258249,\n         1.3409426 ,  1.68325084, -2.05950683]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=2e-06, atol=1e-12', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=2e-06, atol=1e-12\nE           \nE           Mismatched elements: 8 / 8 (100%)\nE           Max absolute difference: 2.05947394\nE           Max relative difference: 0.99998403\nE            x: array([[ 2.213594e-06, -4.969294e-06,  8.267097e-06,  1.210701e-05,\nE                   -1.648902e-05,  2.141314e-05,  2.687936e-05, -3.288769e-05]],\nE                 dtype=float32)\nE            y: array([[ 0.138621, -0.311189,  0.517706,  0.75817 , -1.032582,  1.340943,\nE                    1.683251, -2.059507]])\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_normalization_epsilon",
+        "name": "test_loaded_normalization_matches_independent_math[0.0-rwkv]",
+        "message": "AssertionError: \nNot equal to tolerance rtol=2e-06, atol=1e-12\n\nMismatched elements: 8 / 8 (100%)\nMax absolute difference: 2.27781304\nMax relative difference: 0.99998421\n x: array([[ 5.533988e-07, -6.832779e-06,  6.200323e-06,  9.836943e-06,\n        -1.896237e-05,  1.873649e-05,  2.399943e-05, -3.597090e-05]],\n      dtype=float32)\n y: array([[ 0.035044, -0.432684,  0.392634,  0.622922, -1.200788,  1.186484,\n         1.519758, -2.277849]])",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_loaded_normalization_matc6')\nfamily = 'rwkv', epsilon = 0.0\n\n    @pytest.mark.parametrize(\"family\", FAMILIES)\n    @pytest.mark.parametrize(\"epsilon\", [0.0, 0.002])\n    def test_loaded_normalization_matches_independent_math(\n        tmp_path: Path, family: str, epsilon: float,\n    ) -> None:\n        \"\"\"A valid zero is a model parameter, not an instruction to substitute 1e-5.\n    \n        RMS contract: HF Transformers v4.57.3 LlamaRMSNorm.forward,\n        https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/llama/modeling_llama.py\n        LayerNorm uses population variance and subtracts the feature mean.\n        \"\"\"\n        package = write_package(tmp_path / \"model.aeg\", family, epsilon)\n        engine: Any = load_engine_from_package(\n            package, prepare_native_kernels=False, allow_uncertified=True,\n        )\n        value = np.asarray([[1, -2, 3, 4, -5, 6, 7, -8]], dtype=np.float32) * 1e-8\n        scale = np.linspace(0.7, 1.3, 8, dtype=np.float32)\n        reference = value.astype(np.float64)\n        if family in {\"encoder\", \"rwkv\"}:\n            reference -= reference.mean(axis=-1, keepdims=True)\n        expected = reference / np.sqrt(np.mean(reference**2, axis=-1, keepdims=True) + epsilon) * scale\n        if family == \"encoder\":\n            actual = engine._layer_norm(value, scale)\n        elif family == \"rwkv\":\n            actual = engine._norm(value, scale, engine.weights.norm_eps)\n        elif family == \"hybrid\":\n            actual = engine._transformer._norm(value, scale)\n            np.testing.assert_allclose(\n                engine._mamba._norm(value, scale), expected, rtol=2e-6, atol=1e-12,\n            )\n        else:\n            actual = engine._norm(value, scale)\n>       np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-12)\n\ntests\\unit\\test_normalization_epsilon.py:50: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000020EA036FD90>, array([[ 5.5339882e-07, -6.8327786e-06,  6.2003228...ay([[ 0.03504384, -0.43268404,  0.39263394,  0.62292199, -1.20078768,\n         1.18648397,  1.51975805, -2.27784901]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=2e-06, atol=1e-12', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=2e-06, atol=1e-12\nE           \nE           Mismatched elements: 8 / 8 (100%)\nE           Max absolute difference: 2.27781304\nE           Max relative difference: 0.99998421\nE            x: array([[ 5.533988e-07, -6.832779e-06,  6.200323e-06,  9.836943e-06,\nE                   -1.896237e-05,  1.873649e-05,  2.399943e-05, -3.597090e-05]],\nE                 dtype=float32)\nE            y: array([[ 0.035044, -0.432684,  0.392634,  0.622922, -1.200788,  1.186484,\nE                    1.519758, -2.277849]])\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_normalization_epsilon",
+        "name": "test_loaded_normalization_matches_independent_math[0.0-encoder]",
+        "message": "AssertionError: \nNot equal to tolerance rtol=2e-06, atol=1e-12\n\nMismatched elements: 8 / 8 (100%)\nMax absolute difference: 2.16424058\nMax relative difference: 0.95012469\n x: array([[ 0.001748, -0.02158 ,  0.019583,  0.031068, -0.05989 ,  0.059176,\n         0.075798, -0.113608]], dtype=float32)\n y: array([[ 0.035044, -0.432684,  0.392634,  0.622922, -1.200788,  1.186484,\n         1.519758, -2.277849]])",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_loaded_normalization_matc7')\nfamily = 'encoder', epsilon = 0.0\n\n    @pytest.mark.parametrize(\"family\", FAMILIES)\n    @pytest.mark.parametrize(\"epsilon\", [0.0, 0.002])\n    def test_loaded_normalization_matches_independent_math(\n        tmp_path: Path, family: str, epsilon: float,\n    ) -> None:\n        \"\"\"A valid zero is a model parameter, not an instruction to substitute 1e-5.\n    \n        RMS contract: HF Transformers v4.57.3 LlamaRMSNorm.forward,\n        https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/llama/modeling_llama.py\n        LayerNorm uses population variance and subtracts the feature mean.\n        \"\"\"\n        package = write_package(tmp_path / \"model.aeg\", family, epsilon)\n        engine: Any = load_engine_from_package(\n            package, prepare_native_kernels=False, allow_uncertified=True,\n        )\n        value = np.asarray([[1, -2, 3, 4, -5, 6, 7, -8]], dtype=np.float32) * 1e-8\n        scale = np.linspace(0.7, 1.3, 8, dtype=np.float32)\n        reference = value.astype(np.float64)\n        if family in {\"encoder\", \"rwkv\"}:\n            reference -= reference.mean(axis=-1, keepdims=True)\n        expected = reference / np.sqrt(np.mean(reference**2, axis=-1, keepdims=True) + epsilon) * scale\n        if family == \"encoder\":\n            actual = engine._layer_norm(value, scale)\n        elif family == \"rwkv\":\n            actual = engine._norm(value, scale, engine.weights.norm_eps)\n        elif family == \"hybrid\":\n            actual = engine._transformer._norm(value, scale)\n            np.testing.assert_allclose(\n                engine._mamba._norm(value, scale), expected, rtol=2e-6, atol=1e-12,\n            )\n        else:\n            actual = engine._norm(value, scale)\n>       np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-12)\n\ntests\\unit\\test_normalization_epsilon.py:50: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000020EA036F1C0>, array([[ 0.00174782, -0.02158025,  0.01958274,  0....ay([[ 0.03504384, -0.43268404,  0.39263394,  0.62292199, -1.20078768,\n         1.18648397,  1.51975805, -2.27784901]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=2e-06, atol=1e-12', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=2e-06, atol=1e-12\nE           \nE           Mismatched elements: 8 / 8 (100%)\nE           Max absolute difference: 2.16424058\nE           Max relative difference: 0.95012469\nE            x: array([[ 0.001748, -0.02158 ,  0.019583,  0.031068, -0.05989 ,  0.059176,\nE                    0.075798, -0.113608]], dtype=float32)\nE            y: array([[ 0.035044, -0.432684,  0.392634,  0.622922, -1.200788,  1.186484,\nE                    1.519758, -2.277849]])\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_normalization_epsilon",
+        "name": "test_zero_epsilon_compiled_logits_and_greedy_ids_match_original_hf[llama-cpu]",
+        "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 224 / 224 (100%)\nMax absolute difference: 0.24066503\nMax relative difference: 5.658002\n x: array([[-4.838277e-03, -2.707271e-03, -2.714896e-03,  1.236662e-02,\n        -4.667668e-03, -2.560889e-03, -1.171814e-02,  5.828242e-04,\n        -1.288512e-03,  7.184681e-03,  6.696319e-03,  4.842400e-03,...\n y: array([[-5.881375e-02, -1.029570e-01, -4.876318e-02,  1.764215e-01,\n        -5.777474e-02, -1.389453e-02, -1.490670e-01,  2.506777e-02,\n        -2.440306e-02,  1.134432e-01,  9.149516e-02,  8.181499e-02,...",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_zero_epsilon_compiled_log0')\ntiny_local_safetensors_model = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_zero_epsilon_compiled_log0/tiny-llama')\nfamily = 'llama', backend = 'cpu'\n\n    @pytest.mark.parametrize(\"family,backend\", [\n        (\"llama\", \"cpu\"), (\"llama\", \"torch_cpu\"), (\"llama\", \"onnx_cpu\"),\n        (\"mamba2\", \"cpu\"), (\"mamba2\", \"torch_cpu\"),\n    ])\n    def test_zero_epsilon_compiled_logits_and_greedy_ids_match_original_hf(\n        tmp_path: Path, tiny_local_safetensors_model: Path, family: str, backend: str,\n    ) -> None:\n        \"\"\"Execute complete source checkpoints; compare fresh/cached rows and generation.\"\"\"\n        torch = pytest.importorskip(\"torch\")\n        transformers = pytest.importorskip(\"transformers\")\n        from mamba2_normalization_fixtures import write_checkpoint\n    \n        from aether import Compiler, CompilerConfig\n    \n        source = tiny_local_safetensors_model\n        if family == \"mamba2\":\n            source = tmp_path / \"mamba2\"\n            write_checkpoint(source, epsilon=0.0)\n        else:\n            from safetensors.numpy import load_file, save_file\n    \n            config_path = source / \"config.json\"\n            config = json.loads(config_path.read_text(encoding=\"utf-8\"))\n            config[\"rms_norm_eps\"] = 0.0\n            config_path.write_text(json.dumps(config), encoding=\"utf-8\")\n            # Small embedding variance makes a substituted epsilon observable.\n            # Use ordinary projection scales so FP32 backend order differences\n            # cannot dominate this configuration regression.\n            weights_path = source / \"model.safetensors\"\n            tensors = load_file(str(weights_path))\n            for name, value in tensors.items():\n                if value.ndim == 2:\n                    tensors[name] = value * (1e-4 if \"embed_tokens\" in name else 0.02)\n            save_file(tensors, str(weights_path))\n        artifact = tmp_path / \"compiled.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], precision=\"FP32\",\n            precision_assignment_mode=\"uniform\", skip_download=True,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        from aether.runtime.aeg_loader import load_engine_from_path\n    \n        engine: Any = load_engine_from_path(\n            artifact, prepare_native_kernels=False, allow_uncertified=True,\n        )\n        if backend == \"torch_cpu\":\n            if family == \"mamba2\":\n                from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n                engine = TorchMamba2AEGEngine(engine, \"cpu\")\n            else:\n                from aether.runtime.torch_engine import TorchAEGEngine\n    \n                engine = TorchAEGEngine(engine, \"cpu\")\n        elif backend == \"onnx_cpu\":\n            ort = pytest.importorskip(\"onnxruntime\")\n            pytest.importorskip(\"onnx\")\n            from aether.runtime.onnx_export import ONNXAEGEngine, export_engine_to_onnx\n    \n            bundle = export_engine_to_onnx(engine, tmp_path / \"onnx\")\n            options = ort.SessionOptions()\n            options.intra_op_num_threads = 1\n            engine = ONNXAEGEngine(bundle, *[\n                ort.InferenceSession(str(path), options, providers=[\"CPUExecutionProvider\"])\n                for path in (bundle.prefill_path, bundle.decode_path)\n            ])\n        reference = transformers.AutoModelForCausalLM.from_pretrained(\n            source, local_files_only=True, trust_remote_code=False, torch_dtype=torch.float32,\n        ).eval()\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        with torch.inference_mode():\n            expected = reference(torch.tensor(ids[None, :])).logits[0].numpy()\n            generated = ids[:3].tolist()\n            for _ in range(8):\n                logits = reference(torch.tensor([generated])).logits[0, -1]\n                assert bool(torch.isfinite(logits).all())\n                generated.append(int(logits.argmax()))\n>       actual, _ = engine.forward(ids)\n\ntests\\unit\\test_normalization_epsilon.py:141: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000020EABF7B010>, array([[-4.8382771e-03, -2.7072714e-03, -2.7148961...\n        -7.41885453e-02,  2.49524832e-01, -2.02049352e-02,\n        -3.57047133e-02, -1.41945034e-01]], dtype=float32))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 224 / 224 (100%)\nE           Max absolute difference: 0.24066503\nE           Max relative difference: 5.658002\nE            x: array([[-4.838277e-03, -2.707271e-03, -2.714896e-03,  1.236662e-02,\nE                   -4.667668e-03, -2.560889e-03, -1.171814e-02,  5.828242e-04,\nE                   -1.288512e-03,  7.184681e-03,  6.696319e-03,  4.842400e-03,...\nE            y: array([[-5.881375e-02, -1.029570e-01, -4.876318e-02,  1.764215e-01,\nE                   -5.777474e-02, -1.389453e-02, -1.490670e-01,  2.506777e-02,\nE                   -2.440306e-02,  1.134432e-01,  9.149516e-02,  8.181499e-02,...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_normalization_epsilon",
+        "name": "test_zero_epsilon_compiled_logits_and_greedy_ids_match_original_hf[llama-torch_cpu]",
+        "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 224 / 224 (100%)\nMax absolute difference: 0.24066503\nMax relative difference: 5.6579995\n x: array([[-4.838278e-03, -2.707272e-03, -2.714897e-03,  1.236662e-02,\n        -4.667667e-03, -2.560888e-03, -1.171814e-02,  5.828231e-04,\n        -1.288510e-03,  7.184683e-03,  6.696319e-03,  4.842399e-03,...\n y: array([[-5.881375e-02, -1.029570e-01, -4.876318e-02,  1.764215e-01,\n        -5.777474e-02, -1.389453e-02, -1.490670e-01,  2.506777e-02,\n        -2.440306e-02,  1.134432e-01,  9.149516e-02,  8.181499e-02,...",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_zero_epsilon_compiled_log1')\ntiny_local_safetensors_model = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_zero_epsilon_compiled_log1/tiny-llama')\nfamily = 'llama', backend = 'torch_cpu'\n\n    @pytest.mark.parametrize(\"family,backend\", [\n        (\"llama\", \"cpu\"), (\"llama\", \"torch_cpu\"), (\"llama\", \"onnx_cpu\"),\n        (\"mamba2\", \"cpu\"), (\"mamba2\", \"torch_cpu\"),\n    ])\n    def test_zero_epsilon_compiled_logits_and_greedy_ids_match_original_hf(\n        tmp_path: Path, tiny_local_safetensors_model: Path, family: str, backend: str,\n    ) -> None:\n        \"\"\"Execute complete source checkpoints; compare fresh/cached rows and generation.\"\"\"\n        torch = pytest.importorskip(\"torch\")\n        transformers = pytest.importorskip(\"transformers\")\n        from mamba2_normalization_fixtures import write_checkpoint\n    \n        from aether import Compiler, CompilerConfig\n    \n        source = tiny_local_safetensors_model\n        if family == \"mamba2\":\n            source = tmp_path / \"mamba2\"\n            write_checkpoint(source, epsilon=0.0)\n        else:\n            from safetensors.numpy import load_file, save_file\n    \n            config_path = source / \"config.json\"\n            config = json.loads(config_path.read_text(encoding=\"utf-8\"))\n            config[\"rms_norm_eps\"] = 0.0\n            config_path.write_text(json.dumps(config), encoding=\"utf-8\")\n            # Small embedding variance makes a substituted epsilon observable.\n            # Use ordinary projection scales so FP32 backend order differences\n            # cannot dominate this configuration regression.\n            weights_path = source / \"model.safetensors\"\n            tensors = load_file(str(weights_path))\n            for name, value in tensors.items():\n                if value.ndim == 2:\n                    tensors[name] = value * (1e-4 if \"embed_tokens\" in name else 0.02)\n            save_file(tensors, str(weights_path))\n        artifact = tmp_path / \"compiled.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], precision=\"FP32\",\n            precision_assignment_mode=\"uniform\", skip_download=True,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        from aether.runtime.aeg_loader import load_engine_from_path\n    \n        engine: Any = load_engine_from_path(\n            artifact, prepare_native_kernels=False, allow_uncertified=True,\n        )\n        if backend == \"torch_cpu\":\n            if family == \"mamba2\":\n                from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n                engine = TorchMamba2AEGEngine(engine, \"cpu\")\n            else:\n                from aether.runtime.torch_engine import TorchAEGEngine\n    \n                engine = TorchAEGEngine(engine, \"cpu\")\n        elif backend == \"onnx_cpu\":\n            ort = pytest.importorskip(\"onnxruntime\")\n            pytest.importorskip(\"onnx\")\n            from aether.runtime.onnx_export import ONNXAEGEngine, export_engine_to_onnx\n    \n            bundle = export_engine_to_onnx(engine, tmp_path / \"onnx\")\n            options = ort.SessionOptions()\n            options.intra_op_num_threads = 1\n            engine = ONNXAEGEngine(bundle, *[\n                ort.InferenceSession(str(path), options, providers=[\"CPUExecutionProvider\"])\n                for path in (bundle.prefill_path, bundle.decode_path)\n            ])\n        reference = transformers.AutoModelForCausalLM.from_pretrained(\n            source, local_files_only=True, trust_remote_code=False, torch_dtype=torch.float32,\n        ).eval()\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        with torch.inference_mode():\n            expected = reference(torch.tensor(ids[None, :])).logits[0].numpy()\n            generated = ids[:3].tolist()\n            for _ in range(8):\n                logits = reference(torch.tensor([generated])).logits[0, -1]\n                assert bool(torch.isfinite(logits).all())\n                generated.append(int(logits.argmax()))\n>       actual, _ = engine.forward(ids)\n\ntests\\unit\\test_normalization_epsilon.py:141: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000020EAC3BCDC0>, array([[-4.8382776e-03, -2.7072716e-03, -2.7148966...\n        -7.41885453e-02,  2.49524832e-01, -2.02049352e-02,\n        -3.57047133e-02, -1.41945034e-01]], dtype=float32))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 224 / 224 (100%)\nE           Max absolute difference: 0.24066503\nE           Max relative difference: 5.6579995\nE            x: array([[-4.838278e-03, -2.707272e-03, -2.714897e-03,  1.236662e-02,\nE                   -4.667667e-03, -2.560888e-03, -1.171814e-02,  5.828231e-04,\nE                   -1.288510e-03,  7.184683e-03,  6.696319e-03,  4.842399e-03,...\nE            y: array([[-5.881375e-02, -1.029570e-01, -4.876318e-02,  1.764215e-01,\nE                   -5.777474e-02, -1.389453e-02, -1.490670e-01,  2.506777e-02,\nE                   -2.440306e-02,  1.134432e-01,  9.149516e-02,  8.181499e-02,...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_normalization_epsilon",
+        "name": "test_zero_epsilon_compiled_logits_and_greedy_ids_match_original_hf[llama-onnx_cpu]",
+        "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 224 / 224 (100%)\nMax absolute difference: 0.24066503\nMax relative difference: 5.6580024\n x: array([[-4.838278e-03, -2.707272e-03, -2.714897e-03,  1.236662e-02,\n        -4.667667e-03, -2.560888e-03, -1.171814e-02,  5.828233e-04,\n        -1.288511e-03,  7.184683e-03,  6.696319e-03,  4.842399e-03,...\n y: array([[-5.881375e-02, -1.029570e-01, -4.876318e-02,  1.764215e-01,\n        -5.777474e-02, -1.389453e-02, -1.490670e-01,  2.506777e-02,\n        -2.440306e-02,  1.134432e-01,  9.149516e-02,  8.181499e-02,...",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_zero_epsilon_compiled_log2')\ntiny_local_safetensors_model = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_zero_epsilon_compiled_log2/tiny-llama')\nfamily = 'llama', backend = 'onnx_cpu'\n\n    @pytest.mark.parametrize(\"family,backend\", [\n        (\"llama\", \"cpu\"), (\"llama\", \"torch_cpu\"), (\"llama\", \"onnx_cpu\"),\n        (\"mamba2\", \"cpu\"), (\"mamba2\", \"torch_cpu\"),\n    ])\n    def test_zero_epsilon_compiled_logits_and_greedy_ids_match_original_hf(\n        tmp_path: Path, tiny_local_safetensors_model: Path, family: str, backend: str,\n    ) -> None:\n        \"\"\"Execute complete source checkpoints; compare fresh/cached rows and generation.\"\"\"\n        torch = pytest.importorskip(\"torch\")\n        transformers = pytest.importorskip(\"transformers\")\n        from mamba2_normalization_fixtures import write_checkpoint\n    \n        from aether import Compiler, CompilerConfig\n    \n        source = tiny_local_safetensors_model\n        if family == \"mamba2\":\n            source = tmp_path / \"mamba2\"\n            write_checkpoint(source, epsilon=0.0)\n        else:\n            from safetensors.numpy import load_file, save_file\n    \n            config_path = source / \"config.json\"\n            config = json.loads(config_path.read_text(encoding=\"utf-8\"))\n            config[\"rms_norm_eps\"] = 0.0\n            config_path.write_text(json.dumps(config), encoding=\"utf-8\")\n            # Small embedding variance makes a substituted epsilon observable.\n            # Use ordinary projection scales so FP32 backend order differences\n            # cannot dominate this configuration regression.\n            weights_path = source / \"model.safetensors\"\n            tensors = load_file(str(weights_path))\n            for name, value in tensors.items():\n                if value.ndim == 2:\n                    tensors[name] = value * (1e-4 if \"embed_tokens\" in name else 0.02)\n            save_file(tensors, str(weights_path))\n        artifact = tmp_path / \"compiled.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], precision=\"FP32\",\n            precision_assignment_mode=\"uniform\", skip_download=True,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        from aether.runtime.aeg_loader import load_engine_from_path\n    \n        engine: Any = load_engine_from_path(\n            artifact, prepare_native_kernels=False, allow_uncertified=True,\n        )\n        if backend == \"torch_cpu\":\n            if family == \"mamba2\":\n                from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n                engine = TorchMamba2AEGEngine(engine, \"cpu\")\n            else:\n                from aether.runtime.torch_engine import TorchAEGEngine\n    \n                engine = TorchAEGEngine(engine, \"cpu\")\n        elif backend == \"onnx_cpu\":\n            ort = pytest.importorskip(\"onnxruntime\")\n            pytest.importorskip(\"onnx\")\n            from aether.runtime.onnx_export import ONNXAEGEngine, export_engine_to_onnx\n    \n            bundle = export_engine_to_onnx(engine, tmp_path / \"onnx\")\n            options = ort.SessionOptions()\n            options.intra_op_num_threads = 1\n            engine = ONNXAEGEngine(bundle, *[\n                ort.InferenceSession(str(path), options, providers=[\"CPUExecutionProvider\"])\n                for path in (bundle.prefill_path, bundle.decode_path)\n            ])\n        reference = transformers.AutoModelForCausalLM.from_pretrained(\n            source, local_files_only=True, trust_remote_code=False, torch_dtype=torch.float32,\n        ).eval()\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        with torch.inference_mode():\n            expected = reference(torch.tensor(ids[None, :])).logits[0].numpy()\n            generated = ids[:3].tolist()\n            for _ in range(8):\n                logits = reference(torch.tensor([generated])).logits[0, -1]\n                assert bool(torch.isfinite(logits).all())\n                generated.append(int(logits.argmax()))\n>       actual, _ = engine.forward(ids)\n\ntests\\unit\\test_normalization_epsilon.py:141: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000020EAC3BF7F0>, array([[-4.8382776e-03, -2.7072716e-03, -2.7148966...\n        -7.41885453e-02,  2.49524832e-01, -2.02049352e-02,\n        -3.57047133e-02, -1.41945034e-01]], dtype=float32))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 224 / 224 (100%)\nE           Max absolute difference: 0.24066503\nE           Max relative difference: 5.6580024\nE            x: array([[-4.838278e-03, -2.707272e-03, -2.714897e-03,  1.236662e-02,\nE                   -4.667667e-03, -2.560888e-03, -1.171814e-02,  5.828233e-04,\nE                   -1.288511e-03,  7.184683e-03,  6.696319e-03,  4.842399e-03,...\nE            y: array([[-5.881375e-02, -1.029570e-01, -4.876318e-02,  1.764215e-01,\nE                   -5.777474e-02, -1.389453e-02, -1.490670e-01,  2.506777e-02,\nE                   -2.440306e-02,  1.134432e-01,  9.149516e-02,  8.181499e-02,...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_normalization_epsilon",
+        "name": "test_zero_epsilon_compiled_logits_and_greedy_ids_match_original_hf[mamba2-cpu]",
+        "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 119 / 119 (100%)\nMax absolute difference: 0.00499153\nMax relative difference: 0.24251972\n x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\n         0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\n         0.603422, -0.430729,  0.266555,  0.607351,  0.313205],...\n y: array([[ 0.220533,  0.409081,  0.711368, -0.006023,  0.223643, -0.197245,\n         0.50043 ,  0.014892, -0.078545, -0.389297,  0.147576,  0.084261,\n         0.603471, -0.430871,  0.267649,  0.607557,  0.312944],...",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_zero_epsilon_compiled_log3')\ntiny_local_safetensors_model = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_zero_epsilon_compiled_log3/tiny-llama')\nfamily = 'mamba2', backend = 'cpu'\n\n    @pytest.mark.parametrize(\"family,backend\", [\n        (\"llama\", \"cpu\"), (\"llama\", \"torch_cpu\"), (\"llama\", \"onnx_cpu\"),\n        (\"mamba2\", \"cpu\"), (\"mamba2\", \"torch_cpu\"),\n    ])\n    def test_zero_epsilon_compiled_logits_and_greedy_ids_match_original_hf(\n        tmp_path: Path, tiny_local_safetensors_model: Path, family: str, backend: str,\n    ) -> None:\n        \"\"\"Execute complete source checkpoints; compare fresh/cached rows and generation.\"\"\"\n        torch = pytest.importorskip(\"torch\")\n        transformers = pytest.importorskip(\"transformers\")\n        from mamba2_normalization_fixtures import write_checkpoint\n    \n        from aether import Compiler, CompilerConfig\n    \n        source = tiny_local_safetensors_model\n        if family == \"mamba2\":\n            source = tmp_path / \"mamba2\"\n            write_checkpoint(source, epsilon=0.0)\n        else:\n            from safetensors.numpy import load_file, save_file\n    \n            config_path = source / \"config.json\"\n            config = json.loads(config_path.read_text(encoding=\"utf-8\"))\n            config[\"rms_norm_eps\"] = 0.0\n            config_path.write_text(json.dumps(config), encoding=\"utf-8\")\n            # Small embedding variance makes a substituted epsilon observable.\n            # Use ordinary projection scales so FP32 backend order differences\n            # cannot dominate this configuration regression.\n            weights_path = source / \"model.safetensors\"\n            tensors = load_file(str(weights_path))\n            for name, value in tensors.items():\n                if value.ndim == 2:\n                    tensors[name] = value * (1e-4 if \"embed_tokens\" in name else 0.02)\n            save_file(tensors, str(weights_path))\n        artifact = tmp_path / \"compiled.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], precision=\"FP32\",\n            precision_assignment_mode=\"uniform\", skip_download=True,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        from aether.runtime.aeg_loader import load_engine_from_path\n    \n        engine: Any = load_engine_from_path(\n            artifact, prepare_native_kernels=False, allow_uncertified=True,\n        )\n        if backend == \"torch_cpu\":\n            if family == \"mamba2\":\n                from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n                engine = TorchMamba2AEGEngine(engine, \"cpu\")\n            else:\n                from aether.runtime.torch_engine import TorchAEGEngine\n    \n                engine = TorchAEGEngine(engine, \"cpu\")\n        elif backend == \"onnx_cpu\":\n            ort = pytest.importorskip(\"onnxruntime\")\n            pytest.importorskip(\"onnx\")\n            from aether.runtime.onnx_export import ONNXAEGEngine, export_engine_to_onnx\n    \n            bundle = export_engine_to_onnx(engine, tmp_path / \"onnx\")\n            options = ort.SessionOptions()\n            options.intra_op_num_threads = 1\n            engine = ONNXAEGEngine(bundle, *[\n                ort.InferenceSession(str(path), options, providers=[\"CPUExecutionProvider\"])\n                for path in (bundle.prefill_path, bundle.decode_path)\n            ])\n        reference = transformers.AutoModelForCausalLM.from_pretrained(\n            source, local_files_only=True, trust_remote_code=False, torch_dtype=torch.float32,\n        ).eval()\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        with torch.inference_mode():\n            expected = reference(torch.tensor(ids[None, :])).logits[0].numpy()\n            generated = ids[:3].tolist()\n            for _ in range(8):\n                logits = reference(torch.tensor([generated])).logits[0, -1]\n                assert bool(torch.isfinite(logits).all())\n                generated.append(int(logits.argmax()))\n>       actual, _ = engine.forward(ids)\n\ntests\\unit\\test_normalization_epsilon.py:141: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000020EB0B87EB0>, array([[ 0.21880478,  0.40860692,  0.710787  , -0....   -0.6050882 , -0.2632153 , -0.53330886,  0.28967196,  0.17271166,\n         0.8524232 ,  0.13682836]], dtype=float32))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 119 / 119 (100%)\nE           Max absolute difference: 0.00499153\nE           Max relative difference: 0.24251972\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603422, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.220533,  0.409081,  0.711368, -0.006023,  0.223643, -0.197245,\nE                    0.50043 ,  0.014892, -0.078545, -0.389297,  0.147576,  0.084261,\nE                    0.603471, -0.430871,  0.267649,  0.607557,  0.312944],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_normalization_epsilon",
+        "name": "test_zero_epsilon_compiled_logits_and_greedy_ids_match_original_hf[mamba2-torch_cpu]",
+        "message": "AssertionError: \nNot equal to tolerance rtol=3e-05, atol=3e-06\n\nMismatched elements: 119 / 119 (100%)\nMax absolute difference: 0.00499165\nMax relative difference: 0.24251477\n x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\n         0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\n         0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\n y: array([[ 0.220533,  0.409081,  0.711368, -0.006023,  0.223643, -0.197245,\n         0.50043 ,  0.014892, -0.078545, -0.389297,  0.147576,  0.084261,\n         0.603471, -0.430871,  0.267649,  0.607557,  0.312944],...",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_zero_epsilon_compiled_log4')\ntiny_local_safetensors_model = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2562/test_zero_epsilon_compiled_log4/tiny-llama')\nfamily = 'mamba2', backend = 'torch_cpu'\n\n    @pytest.mark.parametrize(\"family,backend\", [\n        (\"llama\", \"cpu\"), (\"llama\", \"torch_cpu\"), (\"llama\", \"onnx_cpu\"),\n        (\"mamba2\", \"cpu\"), (\"mamba2\", \"torch_cpu\"),\n    ])\n    def test_zero_epsilon_compiled_logits_and_greedy_ids_match_original_hf(\n        tmp_path: Path, tiny_local_safetensors_model: Path, family: str, backend: str,\n    ) -> None:\n        \"\"\"Execute complete source checkpoints; compare fresh/cached rows and generation.\"\"\"\n        torch = pytest.importorskip(\"torch\")\n        transformers = pytest.importorskip(\"transformers\")\n        from mamba2_normalization_fixtures import write_checkpoint\n    \n        from aether import Compiler, CompilerConfig\n    \n        source = tiny_local_safetensors_model\n        if family == \"mamba2\":\n            source = tmp_path / \"mamba2\"\n            write_checkpoint(source, epsilon=0.0)\n        else:\n            from safetensors.numpy import load_file, save_file\n    \n            config_path = source / \"config.json\"\n            config = json.loads(config_path.read_text(encoding=\"utf-8\"))\n            config[\"rms_norm_eps\"] = 0.0\n            config_path.write_text(json.dumps(config), encoding=\"utf-8\")\n            # Small embedding variance makes a substituted epsilon observable.\n            # Use ordinary projection scales so FP32 backend order differences\n            # cannot dominate this configuration regression.\n            weights_path = source / \"model.safetensors\"\n            tensors = load_file(str(weights_path))\n            for name, value in tensors.items():\n                if value.ndim == 2:\n                    tensors[name] = value * (1e-4 if \"embed_tokens\" in name else 0.02)\n            save_file(tensors, str(weights_path))\n        artifact = tmp_path / \"compiled.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], precision=\"FP32\",\n            precision_assignment_mode=\"uniform\", skip_download=True,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        from aether.runtime.aeg_loader import load_engine_from_path\n    \n        engine: Any = load_engine_from_path(\n            artifact, prepare_native_kernels=False, allow_uncertified=True,\n        )\n        if backend == \"torch_cpu\":\n            if family == \"mamba2\":\n                from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n                engine = TorchMamba2AEGEngine(engine, \"cpu\")\n            else:\n                from aether.runtime.torch_engine import TorchAEGEngine\n    \n                engine = TorchAEGEngine(engine, \"cpu\")\n        elif backend == \"onnx_cpu\":\n            ort = pytest.importorskip(\"onnxruntime\")\n            pytest.importorskip(\"onnx\")\n            from aether.runtime.onnx_export import ONNXAEGEngine, export_engine_to_onnx\n    \n            bundle = export_engine_to_onnx(engine, tmp_path / \"onnx\")\n            options = ort.SessionOptions()\n            options.intra_op_num_threads = 1\n            engine = ONNXAEGEngine(bundle, *[\n                ort.InferenceSession(str(path), options, providers=[\"CPUExecutionProvider\"])\n                for path in (bundle.prefill_path, bundle.decode_path)\n            ])\n        reference = transformers.AutoModelForCausalLM.from_pretrained(\n            source, local_files_only=True, trust_remote_code=False, torch_dtype=torch.float32,\n        ).eval()\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        with torch.inference_mode():\n            expected = reference(torch.tensor(ids[None, :])).logits[0].numpy()\n            generated = ids[:3].tolist()\n            for _ in range(8):\n                logits = reference(torch.tensor([generated])).logits[0, -1]\n                assert bool(torch.isfinite(logits).all())\n                generated.append(int(logits.argmax()))\n>       actual, _ = engine.forward(ids)\n\ntests\\unit\\test_normalization_epsilon.py:141: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000020EB0B80E50>, array([[ 0.21880469,  0.40860677,  0.7107869 , -0....   -0.6050882 , -0.2632153 , -0.53330886,  0.28967196,  0.17271166,\n         0.8524232 ,  0.13682836]], dtype=float32))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 119 / 119 (100%)\nE           Max absolute difference: 0.00499165\nE           Max relative difference: 0.24251477\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.220533,  0.409081,  0.711368, -0.006023,  0.223643, -0.197245,\nE                    0.50043 ,  0.014892, -0.078545, -0.389297,  0.147576,  0.084261,\nE                    0.603471, -0.430871,  0.267649,  0.607557,  0.312944],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      }
+    ],
+    "skipped": 0,
+    "skip_details": [],
+    "suites": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "12",
+        "skipped": "0",
+        "tests": "31",
+        "time": "65.698",
+        "timestamp": "2026-10-23T04:17:40.067530+05:00",
+        "hostname": "DESKTOP-MNGKA5K"
+      }
+    ]
+  },
+  "after_focused": {
+    "sha256": "cc4e7ec27ff50ac9bcfc2960e48a3a6e9ffb5786f029e7b825fa27f348112f55",
+    "tests": 104,
+    "passed": 102,
+    "failures": [],
+    "skipped": 2,
+    "skip_details": [
+      {
+        "class": "tests.unit.test_aeg_onnx_export",
+        "name": "test_real_directml_exported_aeg_operators",
+        "reason": "physical DirectML execution requires its optional installed runtime"
+      },
+      {
+        "class": "tests.unit.test_aeg_onnx_export",
+        "name": "test_actual_compiled_artifact_backend_generation_stream_and_unload[DmlExecutionProvider]",
+        "reason": "real DmlExecutionProvider is not installed"
+      }
+    ],
+    "suites": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "2",
+        "tests": "104",
+        "time": "124.438",
+        "timestamp": "2026-10-23T04:19:29.519685+05:00",
+        "hostname": "DESKTOP-MNGKA5K"
+      }
+    ]
+  },
+  "complete_suite": {
+    "sha256": "5da8d4d4362f72314359765a99d071fe967438e298baa927637507062077f7ad",
+    "tests": 5503,
+    "passed": 5459,
+    "failures": [
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[False]",
+        "message": "assert False\n +  where False = connect()\n +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x0000019FDB2FDFF0>.connect",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2564/test_real_http_mcp_cli_handsha0')\nminimal_aeg_package = AEGPackage(C:\\Users\\pc\\AppData\\Local\\Temp\\pytest-of-kaleem\\pytest-2564\\test_real_http_mcp_cli_handsha0\\test_model.aeg, model_id=test-model, loaded=False)\nsse = False\n\n    @pytest.mark.parametrize(\"sse\", [False, True])\n    def test_real_http_mcp_cli_handshake_session_and_tool(tmp_path, minimal_aeg_package, sse):\n        from click.testing import CliRunner\n        from aether.cli import cli\n    \n        events = []\n    \n        class Handler(BaseHTTPRequestHandler):\n            def log_message(self, *args):\n                pass\n    \n            def do_POST(self):\n                message = json.loads(self.rfile.read(int(self.headers[\"Content-Length\"])))\n                events.append(message[\"method\"])\n                assert \"text/event-stream\" in self.headers[\"Accept\"]\n                if message[\"method\"] == \"initialize\":\n                    result = {\"protocolVersion\": message[\"params\"][\"protocolVersion\"], \"capabilities\": {\"tools\": {}}, \"serverInfo\": {\"name\": \"local-http\", \"version\": \"1\"}}\n                else:\n                    assert self.headers[\"MCP-Session-Id\"] == \"local-session\"\n                    if message[\"method\"] == \"notifications/initialized\":\n                        self.send_response(202)\n                        self.end_headers()\n                        return\n                    if message[\"method\"] == \"tools/list\":\n                        result = {\"tools\": [{\"name\": \"echo\", \"inputSchema\": {\"type\": \"object\"}}]}\n                    else:\n                        result = {\"content\": [{\"type\": \"text\", \"text\": message[\"params\"][\"arguments\"][\"text\"]}]}\n                response = json.dumps({\"jsonrpc\": \"2.0\", \"id\": message[\"id\"], \"result\": result})\n                body = (\"data: \" + response + \"\\n\\n\" if sse else response).encode(\"utf-8\")\n                self.send_response(200)\n                self.send_header(\"Content-Type\", \"text/event-stream\" if sse else \"application/json\")\n                self.send_header(\"MCP-Session-Id\", \"local-session\")\n                self.send_header(\"Content-Length\", str(len(body)))\n                self.end_headers()\n                self.wfile.write(body)\n    \n        server = ThreadingHTTPServer((\"127.0.0.1\", 0), Handler)\n        thread = threading.Thread(target=server.serve_forever, daemon=True)\n        thread.start()\n        client = MCPClient(\"local\", \"http\", f\"http://127.0.0.1:{server.server_port}/mcp\", timeout_s=3)\n        try:\n>           assert client.connect()\nE           assert False\nE            +  where False = connect()\nE            +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x0000019FDB2FDFF0>.connect\n\ntests\\unit\\test_mcp_transport_contracts.py:119: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[True]",
+        "message": "assert False\n +  where False = connect()\n +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x0000019FDB324610>.connect",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2564/test_real_http_mcp_cli_handsha1')\nminimal_aeg_package = AEGPackage(C:\\Users\\pc\\AppData\\Local\\Temp\\pytest-of-kaleem\\pytest-2564\\test_real_http_mcp_cli_handsha1\\test_model.aeg, model_id=test-model, loaded=False)\nsse = True\n\n    @pytest.mark.parametrize(\"sse\", [False, True])\n    def test_real_http_mcp_cli_handshake_session_and_tool(tmp_path, minimal_aeg_package, sse):\n        from click.testing import CliRunner\n        from aether.cli import cli\n    \n        events = []\n    \n        class Handler(BaseHTTPRequestHandler):\n            def log_message(self, *args):\n                pass\n    \n            def do_POST(self):\n                message = json.loads(self.rfile.read(int(self.headers[\"Content-Length\"])))\n                events.append(message[\"method\"])\n                assert \"text/event-stream\" in self.headers[\"Accept\"]\n                if message[\"method\"] == \"initialize\":\n                    result = {\"protocolVersion\": message[\"params\"][\"protocolVersion\"], \"capabilities\": {\"tools\": {}}, \"serverInfo\": {\"name\": \"local-http\", \"version\": \"1\"}}\n                else:\n                    assert self.headers[\"MCP-Session-Id\"] == \"local-session\"\n                    if message[\"method\"] == \"notifications/initialized\":\n                        self.send_response(202)\n                        self.end_headers()\n                        return\n                    if message[\"method\"] == \"tools/list\":\n                        result = {\"tools\": [{\"name\": \"echo\", \"inputSchema\": {\"type\": \"object\"}}]}\n                    else:\n                        result = {\"content\": [{\"type\": \"text\", \"text\": message[\"params\"][\"arguments\"][\"text\"]}]}\n                response = json.dumps({\"jsonrpc\": \"2.0\", \"id\": message[\"id\"], \"result\": result})\n                body = (\"data: \" + response + \"\\n\\n\" if sse else response).encode(\"utf-8\")\n                self.send_response(200)\n                self.send_header(\"Content-Type\", \"text/event-stream\" if sse else \"application/json\")\n                self.send_header(\"MCP-Session-Id\", \"local-session\")\n                self.send_header(\"Content-Length\", str(len(body)))\n                self.end_headers()\n                self.wfile.write(body)\n    \n        server = ThreadingHTTPServer((\"127.0.0.1\", 0), Handler)\n        thread = threading.Thread(target=server.serve_forever, daemon=True)\n        thread.start()\n        client = MCPClient(\"local\", \"http\", f\"http://127.0.0.1:{server.server_port}/mcp\", timeout_s=3)\n        try:\n>           assert client.connect()\nE           assert False\nE            +  where False = connect()\nE            +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x0000019FDB324610>.connect\n\ntests\\unit\\test_mcp_transport_contracts.py:119: AssertionError"
+      }
+    ],
+    "skipped": 42,
+    "skip_details": [
+      {
+        "class": "tests.integration.test_automatic_execution_dispatch",
+        "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[llama]",
+        "reason": "could not import 'accelerate': No module named 'accelerate'"
+      },
+      {
+        "class": "tests.integration.test_automatic_execution_dispatch",
+        "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[gpt2]",
+        "reason": "could not import 'accelerate': No module named 'accelerate'"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_compile_small_model",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_end_to_end_generate",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_chat_completion",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_compile_plan_dry_run",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_model_info",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_openai_compatible_server",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_model_list_and_remove",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_backend_detection",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_hardware_detection",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_benchmark_smoke",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_aeg_format_roundtrip",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_cross_hardware_portability",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_server_credentials_creation",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_server_credentials_mtls",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_channel_credentials_creation",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_helper",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_missing_file",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_none_passthrough",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+        "name": "test_require_grpc_no_error",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+        "name": "test_service_name_constant",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.tools.test_pass_audit",
+        "name": "test_real_public_compile_audit_smoke",
+        "reason": "Opt-in real subprocess compile/load/Runtime smoke, no timing"
+      },
+      {
+        "class": "tests.unit.test_adversarial.TestExecutionFidelity",
+        "name": "test_real_pretrained_model",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.unit.test_aeg_onnx_export",
+        "name": "test_real_directml_exported_aeg_operators",
+        "reason": "physical DirectML execution requires its optional installed runtime"
+      },
+      {
+        "class": "tests.unit.test_aeg_onnx_export",
+        "name": "test_actual_compiled_artifact_backend_generation_stream_and_unload[DmlExecutionProvider]",
+        "reason": "real DmlExecutionProvider is not installed"
+      },
+      {
+        "class": "tests.unit.test_c2pa_signing",
+        "name": "test_pure_python_and_native_backends_agree",
+        "reason": "could not import 'cryptography': No module named 'cryptography'"
+      },
+      {
+        "class": "tests.unit.test_calibration.TestDatasets",
+        "name": "test_wikitext2",
+        "reason": "Real wikitext-2 data is unavailable locally; provide a calibration file or cache the 'wikitext' dataset before compiling (no local Hugging Face dataset cache at C:\\Users\\pc\\.cache\\huggingface\\datasets)"
+      },
+      {
+        "class": "tests.unit.test_calibration.TestDatasets",
+        "name": "test_hellaswag",
+        "reason": "Real hellaswag data is unavailable locally; provide a calibration file or cache the 'Rowan/hellaswag' dataset before compiling (no local Hugging Face dataset cache at C:\\Users\\pc\\.cache\\huggingface\\datasets)"
+      },
+      {
+        "class": "tests.unit.test_device_placement.TestDeviceResolution",
+        "name": "test_cuda_spec_gains_an_explicit_index",
+        "reason": "no CUDA device on this host"
+      },
+      {
+        "class": "tests.unit.test_distributed_complete.TestMultiProcessDistributed",
+        "name": "test_single_process_all_reduce",
+        "reason": "process IPC is unavailable in this Windows environment: [WinError 5] Access is denied"
+      },
+      {
+        "class": "tests.unit.test_distributed_complete.TestMultiProcessDistributed",
+        "name": "test_ring_collectives_across_real_processes[2]",
+        "reason": "process IPC is unavailable in this environment: [WinError 5] Access is denied"
+      },
+      {
+        "class": "tests.unit.test_distributed_complete.TestMultiProcessDistributed",
+        "name": "test_ring_collectives_across_real_processes[4]",
+        "reason": "process IPC is unavailable in this environment: [WinError 5] Access is denied"
+      },
+      {
+        "class": "tests.unit.test_distributed_complete.TestMultiProcessDistributed",
+        "name": "test_ring_moves_the_bandwidth_optimal_volume",
+        "reason": "process IPC is unavailable in this environment: [WinError 5] Access is denied"
+      },
+      {
+        "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+        "name": "test_compiler_compile_produces_weight_blob",
+        "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+      },
+      {
+        "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+        "name": "test_compiled_package_is_loadable_and_runnable",
+        "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+      },
+      {
+        "class": "tests.unit.test_hardware_evidence",
+        "name": "test_real_cuda_aeg_execution_never_uses_cpu_fallback",
+        "reason": "No physical NVIDIA CUDA device and matching PyTorch runtime"
+      },
+      {
+        "class": "tests.unit.test_onnx_provider_contract",
+        "name": "test_real_directml_offline_workload_requires_gpu_node_execution",
+        "reason": "physical DirectML runtime is not installed on this host"
+      },
+      {
+        "class": "tests.unit.test_onnx_provider_contract",
+        "name": "test_real_directml_runtime_routes_generation_and_stream_to_gpu",
+        "reason": "physical DirectML runtime is not installed on this host"
+      },
+      {
+        "class": "tests.unit.test_onnx_session_contract",
+        "name": "test_actual_onnx_session_reuses_only_bound_state[DmlExecutionProvider]",
+        "reason": "real DmlExecutionProvider is not installed"
+      },
+      {
+        "class": "tests.unit.test_otlp_conformance",
+        "name": "test_sdk_bridge_preserves_aether_trace_ids",
+        "reason": "could not import 'opentelemetry.sdk': No module named 'opentelemetry.sdk'"
+      },
+      {
+        "class": "tests.unit.test_v31_features",
+        "name": "test_compiled_package_contains_v31_artifacts",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      }
+    ],
+    "suites": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "2",
+        "skipped": "42",
+        "tests": "5503",
+        "time": "1170.675",
+        "timestamp": "2026-10-23T04:24:38.198908+05:00",
+        "hostname": "DESKTOP-MNGKA5K"
+      }
+    ]
+  },
+  "coverage": {
+    "version": "7.16.2",
+    "timestamp": "1792712625594",
+    "lines-valid": "57356",
+    "lines-covered": "45186",
+    "line-rate": "0.7878",
+    "branches-valid": "17290",
+    "branches-covered": "10837",
+    "branch-rate": "0.6268",
+    "complexity": "0"
+  },
+  "coverage_sha256": "fa5b4116bcc098380c0a4835933846919ccc7044874490b75a3f7e7223fadc87",
+  "line_coverage_percent": 78.78164446614129,
+  "static": {
+    "ruff": {
+      "before": 71,
+      "after": 71,
+      "new": []
+    },
+    "loader_mypy": {
+      "before": 39,
+      "after": 39,
+      "new": []
+    },
+    "new_file_mypy": "Success: no issues found in 3 source files",
+    "existing_fixture_mypy_before": {
+      "Missing type arguments for generic type \"ndarray\"  [type-arg]": 8,
+      "Returning Any from function declared to return \"ndarray[Any, Any]\"  [no-any-return]": 2
+    }
+  },
+  "code_sha256_raw_worktree": {
+    "src/aether/runtime/aeg_loader.py": "8a6f2e229cebdc31850e6ebe5ce7e07a8ec6a28a6c4a1e109a5f3ee3e591e225",
+    "tests/unit/mamba2_normalization_fixtures.py": "433d992cdbd0adc0925861955df3f8ca5af2de9b43fe609edadbdc46dc4c7754",
+    "tests/unit/normalization_epsilon_fixtures.py": "a107b57bb02781b529c5a365437e12c8614a9a20ff9ca059bedf6a428982ab7f",
+    "tests/unit/test_normalization_epsilon.py": "6e096548a6de67d88363d88ffbc1f7b579cdc33237905554f609a5ab7a77af6f",
+    "tools/validate_mamba2_hf.py": "383e74b5fb0e017f58fc11522f3ac66fa3a4d0419be5a007db13b9d2a7bedc68",
+    ".github/workflows/ci.yml": "10bbd3a87615da21af9b610e3c561a23659107d366f542d90217ff5f4aa495de"
+  },
+  "code_sha256_lf": {
+    "src/aether/runtime/aeg_loader.py": "9ace25c3ea57531dc9bcaddcec5ad76bcecf1ddc5d7c5c6acdc0e312b95b61dc",
+    "tests/unit/mamba2_normalization_fixtures.py": "433d992cdbd0adc0925861955df3f8ca5af2de9b43fe609edadbdc46dc4c7754",
+    "tests/unit/normalization_epsilon_fixtures.py": "a107b57bb02781b529c5a365437e12c8614a9a20ff9ca059bedf6a428982ab7f",
+    "tests/unit/test_normalization_epsilon.py": "6e096548a6de67d88363d88ffbc1f7b579cdc33237905554f609a5ab7a77af6f",
+    "tools/validate_mamba2_hf.py": "383e74b5fb0e017f58fc11522f3ac66fa3a4d0419be5a007db13b9d2a7bedc68",
+    ".github/workflows/ci.yml": "ef10819ae02bea9854e8a7dd99634038f67e3bf95966155c823dade62d4135a5"
+  },
+  "note": "One complete run, not a union. No failing tests or RAM guards waived. Baseline regression preceded metadata-only fixture parameter-count annotation and additional finiteness assertions; final complete run used the final files.",
+  "strict_local_attempt_sha256_raw": "5b3e279531d1c74eeb038c434a1be9936450a8b77e73dbe848e9cdb633608240",
+  "strict_local_attempt_sha256_lf": "6e9a5ab668af11e5f5365e9953681bbd07ed37e734d2d89019e33294569c3f46",
+  "strict_attempt_copy_note": "Committed JSON uses LF line endings; parsed content equals original Windows CRLF report. Both hashes retained."
+}

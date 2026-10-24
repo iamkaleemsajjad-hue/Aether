@@ -110,6 +110,114 @@ jobs:
           if-no-files-found: ignore
 
   # ── Docs build (no deploy) ─────────────────────────────────────────────────
+  hf-mamba2-parity:
+    name: Original-HF Mamba-2 CPU parity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      AETHER_TORCH_DTYPE: "float32"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          # Correct bounded-runtime baseline before clamp dispatch tuning.
+          # Source-fidelity evidence remains in mamba2-parameters-hf.json.
+          ref: 299d662a0862da077e1f99832410afc4ccdde0d5
+          path: historical-mamba2
+      - uses: actions/checkout@v4
+        with:
+          ref: 2f2a2c4659063b31797011ac03373a1c4e539173
+          path: historical-mamba1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.14"
+      - name: Install pinned CPU reference stack
+        run: |
+          python -m pip install 'torch==2.9.1+cpu' --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e '.[test,server,formats]' 'numpy==1.26.4' 'transformers==4.57.3' 'safetensors==0.8.0' 'tokenizers==0.22.2' 'psutil==7.2.2' 'onnxruntime==1.23.2'
+          python -m pip freeze > hf-parity-freeze.txt
+      - name: Compile once and verify real CPU, Torch CPU, API and CLI outputs
+        run: python tools/validate_mamba2_hf.py --output hf-parity-results --baseline-src historical-mamba2/src
+      - name: Verify Mamba-1 original-HF admission, CPU, Torch CPU, API and CLI
+        run: python tools/validate_mamba2_hf.py --family mamba --output hf-mamba1-results --baseline-src historical-mamba1/src
+      - name: Run complete suite with real Torch, Transformers and format dependencies
+        env:
+          AETHER_CACHE_DIR: ${{ runner.temp }}/aether-hf-full-cache
+          AETHER_KERNEL_CACHE: ${{ runner.temp }}/aether-hf-full-kernels
+          PYTHONHASHSEED: "0"
+        run: python -m pytest tests -q --timeout=180 --junitxml=hf-full-results.xml --cov-report=xml:hf-full-coverage.xml --cov-report=term
+      - name: Enforce measured CPU line-coverage floor
+        run: >-
+          python -c "import xml.etree.ElementTree as ET;
+          report = ET.parse('hf-full-coverage.xml').getroot();
+          covered = int(report.attrib['lines-covered']);
+          total = int(report.attrib['lines-valid']);
+          percent = 100 * covered / total;
+          print(f'CPU line coverage: {covered}/{total} = {percent:.6f}%, minimum 78.6%');
+          raise SystemExit(0 if percent >= 78.6 else 'CPU line coverage fell below the measured 78.6% floor')"
+      - name: Upload measured parity evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hf-mamba2-parity
+          path: |
+            hf-parity-results/
+            hf-mamba1-results/
+            hf-parity-freeze.txt
+            hf-full-results.xml
+            hf-full-coverage.xml
+          if-no-files-found: error
+
+  hf-dense-parity:
+    name: Original-HF dense CPU load and parity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      AETHER_TORCH_DTYPE: "float32"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: 66f0e101d31f12121d07445c5ecb798ae155defd
+          path: historical-dense
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.14"
+      - name: Install pinned CPU reference stack
+        run: |
+          python -m pip install 'torch==2.9.1+cpu' --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e '.[test,server,formats]' 'numpy==1.26.4' 'transformers==4.57.3' 'safetensors==0.8.0' 'tokenizers==0.22.2' 'psutil==7.2.2' 'onnxruntime==1.23.2'
+          python -m pip freeze > dense-hf-freeze.txt
+      - name: Measure tiny and 27M load and validate actual CPU, Torch, ONNX, API and CLI
+        run: python tools/validate_dense_hf.py --output dense-hf-results --baseline-src historical-dense/src
+      - name: Upload reports, reference arrays and profiles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hf-dense-parity
+          # Complete payload hashes are in the report; regenerate deterministic
+          # fixtures rather than upload repeated 109 MB model/ONNX payloads.
+          path: |
+            dense-hf-freeze.txt
+            dense-hf-results/**/*.json
+            dense-hf-results/**/*.jsonl
+            dense-hf-results/**/*.npy
+            dense-hf-results/**/*.log
+            dense-hf-results/**/*.txt
+            dense-hf-results/**/cli.stdout
+            dense-hf-results/**/cli.stderr
+          if-no-files-found: error
+
   docs-build:
     name: Build documentation
     runs-on: ubuntu-latest

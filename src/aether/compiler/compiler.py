@@ -2,14 +2,13 @@
 Aether Compiler API.
 
 The `Compiler` class is the main entry point for compiling AI models into the
-Aether Execution Graph (AEG) format. It orchestrates the five stages of the
+Aether Execution Graph (AEG) format. It orchestrates the four stages of the
 compiler pipeline:
 
 1. Model ingestion and graph extraction
-2. Aether optimizer (six graph-level passes)
+2. Aether optimizer (22 registered passes with explicit selection)
 3. Hardware targeting and backend selection
 4. AEG artifact packaging
-5. Quality report generation
 
 It also exposes the dry-run `plan()` method that previews the compilation
 without doing the expensive work.
@@ -23,7 +22,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aether.compiler.config import CompilerConfig
 from aether.compiler.plan import (
@@ -45,12 +44,16 @@ from aether.compiler.stage2_optimizer.optimizer import OptimizerPipeline
 from aether.compiler.stage3_targeting.hardware_profile import HardwareProfile
 from aether.core.aeg_format import AEGManifest, AEGPackage, KernelSetMetadata, MemoryRequirements, OptimizationMetadata
 from aether.core.constants import AEG_FORMAT_VERSION, AETHER_VERSION, DEFAULT_HUB_URL, SUPPORTED_TARGET_IDS
-from aether.core.exceptions import CompilationError, CompilerConfigError
+from aether.core.exceptions import CompilationError, CompilerConfigError, CompilerPassError
 from aether.core.hash_utils import compute_aeg_cache_key, compute_graph_hash
-from aether.core.types import HardwareTarget, ModelArchitecture, Precision
+from aether.core.quality_gate import NumericalQualityError
+from aether.core.types import HardwareTarget, ModelArchitecture, Precision, ShardingPlan
 from aether.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from aether.compiler.numerical_admission import NumericalAdmission
 
 
 #: Logical per-layer tensors the CPU forward pass requires for every
@@ -108,6 +111,36 @@ def _copy_tokenizer_files(source_model_path: str, destination: Path) -> bool:
         if candidate.is_file():
             shutil.copy2(candidate, destination / optional)
     return True
+
+
+def _copy_generation_config(source_model_path: str, destination: Path) -> None:
+    """Preserve the source stop settings consumed by PackagedTokenizer.
+
+    Transformers 4.57.3 loads an explicit generation_config.json when present;
+    otherwise GenerationConfig.from_model_config supplies legacy model settings.
+    Keep that precedence, including explicit null/empty overrides, without
+    importing the optional model framework. Only EOS is consumed here.
+    https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/generation/configuration_utils.py
+    """
+    source = Path(source_model_path)
+    if not source.is_dir():
+        return
+    generation = source / "generation_config.json"
+    model_config = source / "config.json"
+    source_config = generation if generation.is_file() else model_config
+    if not source_config.is_file():
+        return
+    payload = json.loads(source_config.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Source generation settings must be a JSON object: {source_config}")
+    target = destination / "generation_config.json"
+    if source_config == generation:
+        shutil.copy2(generation, target)
+    elif "eos_token_id" in payload:
+        target.write_text(
+            json.dumps({"eos_token_id": payload["eos_token_id"]}, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
 
 
 def _verify_layer_invariants(
@@ -529,21 +562,21 @@ class Compiler:
             plan.add_fusion_opportunity(
                 OptimizationOpportunity(
                     pass_name="operator_fusion",
-                    description="Fuse RMSNorm + QKV + RoPE into a single megakernel",
+                    description="Inspect experimental RMSNorm/QKV/RoPE IR fusion",
                     nodes=[f"layer_{i}_norm" for i in range(min(architecture.layers, 4))],
-                    estimated_memory_saved_mb=architecture.params_billion * 50.0,
-                    estimated_latency_reduction_ms=0.5 * architecture.layers,
-                    confidence=0.9,
+                    estimated_memory_saved_mb=0.0,
+                    estimated_latency_reduction_ms=0.0,
+                    confidence=0.0,
                 )
             )
             plan.add_fusion_opportunity(
                 OptimizationOpportunity(
                     pass_name="operator_fusion",
-                    description="Fuse attention output projection + residual add",
+                    description="Inspect experimental attention/residual IR fusion",
                     nodes=["attn_out", "residual_add"],
-                    estimated_memory_saved_mb=architecture.params_billion * 20.0,
-                    estimated_latency_reduction_ms=0.2 * architecture.layers,
-                    confidence=0.85,
+                    estimated_memory_saved_mb=0.0,
+                    estimated_latency_reduction_ms=0.0,
+                    confidence=0.0,
                 )
             )
 
@@ -552,21 +585,21 @@ class Compiler:
             plan.add_sensitivity_opportunity(
                 OptimizationOpportunity(
                     pass_name="sensitivity_analysis",
-                    description="Compute d(perplexity)/d(precision) per layer",
+                    description="Inspect weight reconstruction sensitivity; no perplexity gate",
                     nodes=[f"layer_{i}" for i in range(architecture.layers)],
                     estimated_memory_saved_mb=0.0,
                     estimated_latency_reduction_ms=0.0,
-                    confidence=0.95,
+                    confidence=0.0,
                 )
             )
             plan.add_precision_opportunity(
                 OptimizationOpportunity(
                     pass_name="precision_assignment",
-                    description="Assign mixed precision (BF16/FP8/Q4) based on sensitivity",
+                    description="Keep the BF16 sensitivity baseline; explicit formats are separate",
                     nodes=[f"layer_{i}" for i in range(architecture.layers)],
-                    estimated_memory_saved_mb=architecture.params_billion * 500.0,
+                    estimated_memory_saved_mb=0.0,
                     estimated_latency_reduction_ms=0.0,
-                    confidence=0.8,
+                    confidence=0.0,
                 )
             )
 
@@ -575,11 +608,11 @@ class Compiler:
             plan.add_kv_cache_opportunity(
                 OptimizationOpportunity(
                     pass_name="kv_cache_structuring",
-                    description="Paged KV cache with RadixTree prefix hints",
+                    description="Inspect experimental KV graph annotations",
                     nodes=["kv_cache"],
-                    estimated_memory_saved_mb=architecture.context_length * 0.1,
-                    estimated_latency_reduction_ms=0.3,
-                    confidence=0.9,
+                    estimated_memory_saved_mb=0.0,
+                    estimated_latency_reduction_ms=0.0,
+                    confidence=0.0,
                 )
             )
 
@@ -588,11 +621,13 @@ class Compiler:
             plan.add_moe_opportunity(
                 OptimizationOpportunity(
                     pass_name="moe_routing",
-                    description="Hot/warm/cold expert tiering and threshold-based routing",
+                    description=(
+                        "Inspect experimental expert-tier hints; source routing is separate"
+                    ),
                     nodes=["moe_router"],
-                    estimated_memory_saved_mb=architecture.params_billion * 1000.0,
-                    estimated_latency_reduction_ms=1.0,
-                    confidence=0.75,
+                    estimated_memory_saved_mb=0.0,
+                    estimated_latency_reduction_ms=0.0,
+                    confidence=0.0,
                 )
             )
 
@@ -603,11 +638,11 @@ class Compiler:
                     plan.add_parallelism_opportunity(
                         OptimizationOpportunity(
                             pass_name="parallelism_discovery",
-                            description=f"Compute {num_gpus}-GPU tensor/pipeline parallelism plan",
+                            description=f"Inspect experimental {num_gpus}-GPU sharding hints",
                             nodes=[],
                             estimated_memory_saved_mb=0.0,
                             estimated_latency_reduction_ms=0.0,
-                            confidence=0.7,
+                            confidence=0.0,
                         )
                     )
 
@@ -657,10 +692,12 @@ class Compiler:
             quality_budget: Optional quality budget override.
             calibration_dataset: Optional calibration dataset override.
             output_path: Optional path to save the AEG package. If None, uses
-                the Aether cache directory.
+                the Aether cache directory. Candidates are packaged and checked
+                privately; rejected compilation preserves any existing output.
             evaluation_evaluator: Optional measured benchmark callback. When
                 supplied, the callback is executed through the CI evaluation
-                gate before the artifact is accepted.
+                gate before publication. Its spec contains ``aeg_path`` for the
+                private candidate and ``publication_path`` for the destination.
             eval_benchmarks: Benchmark names required by the evaluator.
             eval_baselines: Measured baseline scores keyed by benchmark.
             eval_max_regression: Maximum relative score regression. Defaults
@@ -673,6 +710,11 @@ class Compiler:
             CompilationError: If compilation fails.
         """
         config = self.config.clone()
+        if evaluation_evaluator is not None and not callable(evaluation_evaluator):
+            raise CompilationError(
+                "evaluation_evaluator must be callable",
+                model_id=self._normalize_model_id(model), stage="evaluation",
+            )
         if config.reproducible_builds:
             raw_epoch = os.environ.get("SOURCE_DATE_EPOCH")
             if raw_epoch is None:
@@ -700,9 +742,32 @@ class Compiler:
         if calibration_dataset is not None:
             config.calibration_dataset = calibration_dataset
 
+        from aether.compiler.numerical_admission import numerical_admission
+
+        with numerical_admission(model, config) as admission:
+            return self._compile_candidate(
+                model, config, start_time, output_path, admission,
+                evaluation_evaluator, eval_benchmarks, eval_baselines, eval_max_regression,
+            )
+
+    def _compile_candidate(
+        self,
+        model: str,
+        config: CompilerConfig,
+        start_time: datetime.datetime,
+        output_path: str | Path | None,
+        admission: NumericalAdmission | None,
+        evaluation_evaluator: Any | None,
+        eval_benchmarks: list[str] | None,
+        eval_baselines: dict[str, float] | None,
+        eval_max_regression: float | None,
+    ) -> AEGPackage:
+        """Build while the pre-ingestion reference and its cleanup remain owned."""
+        source = str(admission.source) if admission is not None else model
+
         # Resolve model ID and detect architecture
         try:
-            architecture = self._detect_architecture(model)
+            architecture = self._detect_architecture(source)
         except Exception as exc:
             msg = f"Architecture detection failed for {model}: {exc}"
             raise CompilationError(msg, model_id=model, stage="ingestion") from exc
@@ -717,10 +782,12 @@ class Compiler:
 
         # Stage 1: Ingestion
         try:
-            graph = self._stage1_ingest(model, architecture)
+            graph = self._stage1_ingest(source, architecture)
         except Exception as exc:
             msg = f"Model ingestion failed for {model}: {exc}"
             raise CompilationError(msg, model_id=model_id, stage="stage1_ingestion") from exc
+        if admission is not None:
+            admission.verify_source()
 
         # Stage 1 may materialize a Hub snapshot and replace preliminary
         # name-based metadata with the checkpoint's authoritative config.  The
@@ -761,10 +828,27 @@ class Compiler:
         # Stage 2: Optimize
         try:
             optimized_graph, pass_reports = self._stage2_optimize(graph, architecture, config)
+            # Passes return failure reports instead of raising. Inspection can
+            # retain every report, but a failed transformation cannot authorize
+            # targeting or publication, including replacement of an older AEG.
+            failed_passes = [report for report in pass_reports if report.status == "failed"]
+            if failed_passes:
+                names = ", ".join(report.pass_name for report in failed_passes)
+                raise CompilerPassError(
+                    f"Optimizer passes failed: {names}",
+                    model_id=model_id,
+                    pass_name=failed_passes[0].pass_name,
+                    details={"failed_passes": [report.to_dict() for report in failed_passes]},
+                )
         except Exception as exc:
             shutil.rmtree(pass_artifact_dir, ignore_errors=True)
             msg = f"Optimization failed for {model}: {exc}"
-            raise CompilationError(msg, model_id=model_id, stage="stage2_optimizer") from exc
+            raise CompilationError(
+                msg,
+                model_id=model_id,
+                stage="stage2_optimizer",
+                details=exc.details if isinstance(exc, CompilationError) else None,
+            ) from exc
 
         # Stage 3: Target and backend selection
         try:
@@ -774,26 +858,81 @@ class Compiler:
             msg = f"Hardware targeting failed for {model}: {exc}"
             raise CompilationError(msg, model_id=model_id, stage="stage3_targeting") from exc
 
-        # Stage 4: Package
+        # Package and evaluate a private candidate before any public mutation.
         try:
-            package = self._stage4_package(
-                model_id,
-                architecture,
-                optimized_graph,
-                target_profiles,
-                pass_reports,
-                config,
-                output_path,
-                start_time,
-                source_model_id=model,
+            from aether.compiler.publication import compilation_publication
+            from aether.utils.file_io import aeg_cache_path
+
+            destination = Path(output_path) if output_path is not None else aeg_cache_path(
+                model, config.cache_dir
             )
+            with compilation_publication(
+                destination, overwrite=config.overwrite,
+                source_path=getattr(graph, "metadata", {}).get("source_model_path", model),
+            ) as publication:
+                try:
+                    package = self._stage4_package(
+                        model_id, architecture, optimized_graph, target_profiles,
+                        pass_reports, config, publication.candidate, start_time,
+                        source_model_id=model,
+                    )
+                except Exception as exc:
+                    raise CompilationError(
+                        f"AEG packaging failed for {model}: {exc}",
+                        model_id=model_id, stage="stage4_packaging",
+                    ) from exc
+                self._evaluate_candidate(
+                    package, publication.destination, config, evaluation_evaluator,
+                    eval_benchmarks, eval_baselines, eval_max_regression,
+                )
+                if admission is not None:
+                    admission.accept(package)
+                # Verification and all gates precede promotion. No writes or
+                # model computations are needed after the accepted directory moves.
+                package.verify_integrity()
+                publication.publish()
+                package.root = publication.destination
+                # Any lazy index consulted during eligibility checks referred
+                # to the private path; the next reader must bind the public blob.
+                package._weight_store = None
+        except NumericalQualityError as exc:
+            raise CompilationError(
+                f"Numerical quality admission failed: {exc}",
+                model_id=model_id, stage="numerical_quality",
+            ) from exc
+        except CompilationError as exc:
+            if exc.model_id is None:
+                exc.model_id = model_id
+            raise
         except Exception as exc:
+            raise CompilationError(
+                f"AEG publication failed for {model}: {exc}",
+                model_id=model_id, stage="publication",
+            ) from exc
+        finally:
             shutil.rmtree(pass_artifact_dir, ignore_errors=True)
-            msg = f"AEG packaging failed for {model}: {exc}"
-            raise CompilationError(msg, model_id=model_id, stage="stage4_packaging") from exc
 
-        shutil.rmtree(pass_artifact_dir, ignore_errors=True)
+        logger.info("Compilation complete", model_id=model_id, package_path=str(package.root))
+        return package
 
+    def _evaluate_candidate(
+        self,
+        package: AEGPackage,
+        publication_path: Path,
+        config: CompilerConfig,
+        evaluation_evaluator: Any | None,
+        eval_benchmarks: list[str] | None,
+        eval_baselines: dict[str, float] | None,
+        eval_max_regression: float | None,
+    ) -> None:
+        """Finalize optional benchmark evidence on unpublished candidate bytes.
+
+        Evaluators receive ``spec['aeg_path']`` for actual candidate execution
+        and ``spec['publication_path']`` for its intended destination. They must
+        use the candidate rather than a captured old output path. This callback
+        remains supplementary; it is not the mandatory HF numerical admission.
+        """
+        model_id = package.manifest.model_id if package.manifest else None
         # A missing evaluator is not a passing quality gate. Preserve a
         # truthful uncertified state in the artifact until measured benchmark
         # evidence is supplied below.
@@ -807,12 +946,6 @@ class Compiler:
         package.verify_integrity()
 
         if evaluation_evaluator is not None:
-            if not callable(evaluation_evaluator):
-                raise CompilationError(
-                    "evaluation_evaluator must be callable",
-                    model_id=model_id,
-                    stage="evaluation",
-                )
             try:
                 from aether.observability.ci_pipeline import CIEvalPipeline
 
@@ -828,8 +961,16 @@ class Compiler:
                     aeg_path=package.root,
                     max_regression=max_regression,
                     required_benchmarks=benchmarks,
-                    evaluator=evaluation_evaluator,
+                    evaluator=lambda benchmark, spec: evaluation_evaluator(
+                        benchmark,
+                        {
+                            **spec,
+                            "aeg_path": str(package.root),
+                            "publication_path": str(publication_path),
+                        },
+                    ),
                 ).run(list(benchmarks), baselines=eval_baselines)
+                quality_report.aeg_path = str(publication_path)
                 package.metadata["eval_report"] = quality_report.to_dict()
                 package.metadata["evaluation_status"] = (
                     "certified" if quality_report.gate_decision.passed else "rejected"
@@ -868,9 +1009,6 @@ class Compiler:
                     stage="evaluation",
                 ) from exc
 
-        logger.info("Compilation complete", model_id=model_id, package_path=str(package.root))
-        return package
-
     def quality_report(self, aeg: AEGPackage) -> QualityReport:
         """Generate a quality report from a compiled AEG artifact.
 
@@ -900,10 +1038,7 @@ class Compiler:
                     aeg.metadata.get("fusion_accounting", {}).get("merged_ops_total",
                     aeg.manifest.optimization.fused_ops_count),
                 ),
-                memory_round_trips_saved=int(
-                    aeg.metadata.get("fusion_accounting", {}).get("launches_saved",
-                    aeg.manifest.optimization.fused_ops_count),
-                ),
+                memory_round_trips_saved=0,
                 fusion_patterns=dict(
                     aeg.metadata.get("fusion_accounting", {}).get(
                         "patterns",
@@ -982,13 +1117,13 @@ class Compiler:
         start_time: datetime.datetime,
         source_model_id: str | None = None,
     ) -> AEGPackage:
-        """Run Stage 4: create and save the AEG package.
+        """Run Stage 4: create a fresh, unpublished AEG candidate.
 
         ``source_model_id`` is the reference the caller actually passed — a Hugging
-        Face ID or a local directory. The cache path is derived from it through the
-        shared naming contract so that the runtime, which resolves from the same
-        function, looks exactly where this writes. ``model_id`` is the normalized
-        form recorded inside the manifest and is deliberately not used for the path.
+        Face ID or a local directory. ``compile`` supplies a transaction-owned
+        candidate path. Direct internal callers can omit the path and use the
+        canonical cache name, but must still supply a previously absent directory.
+        ``model_id`` is the normalized manifest identity, not the cache-path input.
         """
         from aether.core.aeg_ir import AEGIRModule
 
@@ -1003,11 +1138,11 @@ class Compiler:
         else:
             output_path = Path(output_path)
 
-        if output_path.exists() and not config.overwrite:
-            msg = f"AEG output path already exists: {output_path}. Use overwrite=True to replace."
+        # This stage only builds a fresh candidate. Overwrite policy and old
+        # artifact retention belong to compile()'s publication transaction.
+        if os.path.lexists(output_path):
+            msg = f"AEG candidate output path already exists: {output_path}"
             raise CompilationError(msg, model_id=model_id)
-        if output_path.exists():
-            shutil.rmtree(output_path)
 
         package = AEGPackage.create(output_path, model_id=model_id, aether_version=AETHER_VERSION)
 
@@ -1050,114 +1185,19 @@ class Compiler:
                 cross_layer_kv_plan.read_text(encoding="utf-8")
             )
         primary_target = target_profiles[0].target_id if target_profiles else "cpu_avx512"
-        from aether.agentic import AgentWorkflowOptimizer, ToolCall
-        from aether.attention import MLAPlanner
-        from aether.cuda import CUDAGraphCapturePlan
-        from aether.distillation import DistillationPipeline
-        from aether.fleet import AetherFleetManager, FleetConfig, FleetNode, HotReloadRouter
-        from aether.inference.multimodal import default_multimodal_plan
-        from aether.observability import ABRolloutController, DriftMonitor, EvalGate
-        from aether.runtime.eagle import EAGLE3Planner
-
-        agentic_trace = [
-            ToolCall("retrieve", {"query": "string"}, average_latency_ms=18.0),
-            ToolCall("rerank", {"documents": "array"}, average_latency_ms=24.0),
-            ToolCall("generate", {"context": "string"}, average_latency_ms=90.0, writes_context=True),
-        ]
-        fleet_nodes = [
-            FleetNode("local-0", primary_target, gpu_count=1 if primary_target.startswith(("cuda", "rocm", "metal")) else 0, memory_gb=80.0),
-            FleetNode("portable-0", "cpu_avx512", memory_gb=max(16.0, architecture.params_billion * 2)),
-        ]
-
-        # Capabilities are derived from what actually ran and what the source
-        # architecture is — never a fixed advertisement.  Infrastructure
-        # plans that every AEG package physically embeds (safety configs,
-        # provenance, observability manifests, rollout/fleet/distillation
-        # plan templates) legitimately count as packaged capabilities;
-        # architecture-specific traits (MLA, SSM) and optimizer features are
-        # gated on their real triggers.
-        applied_passes = {
-            report.pass_name for report in pass_reports if getattr(report, "status", "") == "applied"
-        }
-        family = (architecture.family or "").lower()
-        attention = (architecture.attention_type or "").lower()
-        capabilities = [
-            "safety_guardrails",
-            "provenance",
-            "watermark",
-            "lora_adapters",
-            "rag_pipeline",
-            "agentic_workflow",
-            "multimodal_graph",
-            "quantization_aware_compilation",
-            "observability",
-            "eval_gates",
-            "ab_rollout",
-            "fleet_management",
-            "hot_reload",
-            "distillation",
-            "cuda_graph_capture",
-            "eagle3_speculation",
-        ]
-        if "reasoning_graph" in applied_passes:
-            capabilities.append("reasoning_graph")
-        if "sparse_attention" in applied_passes:
-            capabilities.append("sparse_attention")
-        if "pruning_sparsity" in applied_passes:
-            capabilities.append("pruning_sparsity")
-        if "mla" in attention or "deepseek" in family or "kimi" in family or "glm" in family:
-            capabilities.append("mla_native")
-        if any(marker in family for marker in ("mamba", "rwkv", "jamba", "zamba", "ssm")):
-            capabilities.append("hybrid_ssm")
-
         package.metadata.update({
             "model_id": model_id,
             "architecture": architecture.to_dict(),
-            "capabilities": capabilities,
-            "agentic_workflow": AgentWorkflowOptimizer(min_sequence_frequency=1).compile([agentic_trace]),
-            "eval_gates": EvalGate().manifest(),
-            "drift_monitor": DriftMonitor(baseline_win_rate=0.5).manifest(),
-            "ab_rollout": ABRolloutController("compile_default", candidate_percent=0.01).manifest(),
-            "fleet_deployment": AetherFleetManager(fleet_nodes).plan_manifest(
-                model_id,
-                FleetConfig(replicas=1, preferred_targets=tuple(profile.target_id for profile in target_profiles) or ("cpu_avx512",)),
-            ),
-            "hot_reload": HotReloadRouter(active_aeg=model_id).manifest(),
-            "distillation": DistillationPipeline().compile_manifest(
-                DistillationPipeline().plan(model_id, f"{model_id}-student", task_type="general"),
-            ),
-            "cuda_graphs": CUDAGraphCapturePlan(primary_target, max_context_length=architecture.context_length).to_dict(),
-            "mla_plan": MLAPlanner().plan(architecture, target=primary_target).to_dict(),
-            "eagle3": EAGLE3Planner().plan(architecture).to_dict(),
-            "multimodal_graph": default_multimodal_plan(model_id).to_graph(),
-            "metrics_schema": {
-                "version": "otel_metrics/1.0",
-                "metrics": [
-                    "tokens_per_second",
-                    "ttft_ms",
-                    "eagle3_accept_rate",
-                    "kv_hit_rate",
-                    "mla_compression_ratio",
-                    "reasoning_budget_used",
-                    "gpu_vram_utilization",
-                ],
-            },
-            "quantization_aware_compilation": {
-                "enabled": True,
-                "calibration_dataset": config.calibration_dataset,
-                "quality_budget_ppl_increase": config.quality_budget,
-                "precision_formats": ["BF16", "FP8", "FP4", "Q4_K_M", "Q3_K"],
-            },
+            "numerical_quality_mode": config.quality_mode,
         })
 
         # Compute graph hash
         graph_hash = compute_graph_hash(ir)
 
         # ── Provenance (PRD §35) ────────────────────────────────────────────
-        # Built from the real ProvenanceManifest rather than an inline dict so
-        # the artifact carries a verifiable model hash and the actual
-        # transformation chain. EU AI Act Art. 50 requires a deployer be able
-        # to audit what was done to the model they are running.
+        # Record actual transformations. The IR digest is recorded separately:
+        # it is not a source-weight hash, hardware certification, watermark,
+        # measured quality result, or legal compliance assessment.
         from aether.provenance.manifest import (
             EUAIActRecord,
             HardwareCertification,
@@ -1166,8 +1206,8 @@ class Compiler:
         )
 
         provenance = ProvenanceManifest(
-            model_hash=graph_hash.replace("sha256:", ""),
             source_model_id=model_id,
+            source_license="",
             model_architecture=architecture.family,
             compiler_version=f"aether/{AETHER_VERSION}",
             compile_timestamp=start_time.timestamp(),
@@ -1180,18 +1220,18 @@ class Compiler:
                 for report in pass_reports
             ],
             eu_ai_act=EUAIActRecord(
-                risk_category="limited_risk",
-                transparency_obligations_met=True,
+                risk_category="unknown",
+                transparency_obligations_met=False,
                 intended_purpose="general_text_generation",
             ),
             hardware_certification=HardwareCertification(
-                certified_targets=[p.target_id for p in target_profiles] or ["cpu_avx512"],
+                certified_targets=[],
                 primary_target=primary_target,
             ),
-            watermark_enabled=True,
-            watermark_algorithm="greenlist_statistical",
+            watermark_enabled=False,
         )
         package.metadata["provenance"] = provenance.to_dict()
+        package.metadata["provenance"]["graph_hash"] = graph_hash
 
         # Build precision map from pass reports
         precision_map: dict[str, str] = {}
@@ -1251,7 +1291,12 @@ class Compiler:
                     graph=graph,
                     package=package,
                     precision_map=precision_map,
-                    default_precision="BF16",
+                    default_precision=(
+                        "FP32"
+                        if config.precision_assignment_mode == "uniform"
+                        and config.precision == "FP32"
+                        else "BF16"
+                    ),
                     block_size=32,
                 )
                 if quant_stats.tensors_written == 0:
@@ -1288,12 +1333,16 @@ class Compiler:
         # but only when the logical tensors it stands for are all serialized.
         _verify_weight_accounting(graph, architecture, package, model_id)
 
-        # Sharding plans
-        from aether.core.aeg_format import create_default_sharding_plans
-
-        sharding_plans = create_default_sharding_plans(architecture)
-        for num_gpus, plan in sharding_plans.items():
-            package.set_sharding_plan(num_gpus, plan)
+        # Persist only plans actually emitted by the explicitly selected
+        # inspection pass. Ordinary compilation does not manufacture GPU plans;
+        # runtime device placement is independent of these experimental hints.
+        if any(
+            report.pass_name == "parallelism_discovery" and report.status == "applied"
+            for report in pass_reports
+        ):
+            for payload in getattr(graph, "metadata", {}).get("sharding_plans", {}).values():
+                plan = ShardingPlan.from_dict(payload)
+                package.set_sharding_plan(plan.num_gpus, plan)
 
         # Backend plans per target.  A target profile is a compilation request,
         # not evidence that an executable vendor binary was produced.  Mark
@@ -1301,7 +1350,10 @@ class Compiler:
         # portable PyTorch contract when this is a standard decoder graph.
         kernels = KernelSetMetadata(targets=[p.target_id for p in target_profiles])
         for profile in target_profiles:
-            backend_name = profile.recommended_backend or "pytorch"
+            backend_name = (
+                "aether_cpu" if profile.target_id.startswith("cpu_")
+                else profile.recommended_backend or "pytorch"
+            )
             package.set_backend_plan(profile.target_id, backend_name)
         kernels.backend_plans = {t: package.get_backend_plan(t) for t in kernels.targets if package.get_backend_plan(t)}
         kernels.variant_status = {
@@ -1408,10 +1460,17 @@ class Compiler:
             package.metadata["kernel_artifacts"] = packaged_kernel_artifacts
 
         # Optimization metadata
+        fusion_reports = [
+            report for report in pass_reports
+            if report.pass_name == "operator_fusion" and report.status == "applied"
+        ]
         fused_ops_count = sum(
-            1 for r in pass_reports if r.pass_name == "operator_fusion" and r.status == "applied"
+            int(report.details.get("fused_count", 0)) for report in fusion_reports
         )
-        fusion_passes = [r.details.get("fusion_pattern", "unknown") for r in pass_reports if r.pass_name == "operator_fusion"]
+        fusion_passes = sorted({
+            pattern for report in fusion_reports
+            for pattern, count in report.details.get("fusion_patterns", {}).items() if count > 0
+        })
         applied_passes = [r.pass_name for r in pass_reports if r.status in {"applied", "ok"}]
         package.metadata["optimizer_passes"] = applied_passes
         v4_passes = {
@@ -1437,7 +1496,7 @@ class Compiler:
             package.manifest.format_version = "AEG/2.0"
         package.metadata["aeg_format_version"] = package.manifest.format_version
         optimization = OptimizationMetadata(
-            fusion_passes_applied=fusion_passes or applied_passes,
+            fusion_passes_applied=fusion_passes,
             fused_ops_count=fused_ops_count,
             sensitivity_calibration_dataset=config.calibration_dataset,
             quality_budget_ppl_increase=config.quality_budget,
@@ -1486,6 +1545,7 @@ class Compiler:
                         trust_remote_code=False,
                     )
                     tokenizer.save_pretrained(package.root / "tokenizer")
+                _copy_generation_config(source_model_path, package.root / "tokenizer")
                 package.metadata["tokenizer_path"] = "tokenizer"
             except Exception as exc:
                 raise CompilationError(

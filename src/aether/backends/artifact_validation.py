@@ -6,9 +6,11 @@ import json
 from typing import TYPE_CHECKING
 
 from aether.core.exceptions import AEGError, BackendError
-from aether.core.hash_utils import verify_file_hash
+from aether.core.hash_utils import verify_content_hash
+from aether.core.quality_gate import MAX_REPORT_BYTES, NumericalQualityError, read_gate
 
 if TYPE_CHECKING:
+    from aether.backends.compiled_handle import CompiledAEGHandle
     from aether.core.aeg_format import AEGPackage
 
 
@@ -30,13 +32,17 @@ def verify_aeg_integrity(package: AEGPackage, *, backend_name: str | None = None
         ) from exc
 
 
-def validate_aeg_evaluation(package: AEGPackage, *, backend_name: str | None = None) -> None:
+def validate_aeg_evaluation(
+    package: AEGPackage, *, backend_name: str | None = None, allow_uncertified: bool = False,
+) -> bool:
     """Check persisted evaluation policy without loading weights or initializing devices.
 
-    A missing evaluation is uncertified, not a failed evaluation. A recorded
-    failure or malformed declared gate cannot become runnable through fallback.
+    Normal execution requires measured numerical evidence. An explicit diagnostic
+    decision can waive absence, but no recorded failure or malformed declared gate
+    can become runnable through fallback.
     Full package integrity remains the loader's responsibility; this boundary
     verifies the gate's declared payload hash before interpreting its contents.
+    Returns whether measured numerical evidence admitted this exact artifact.
     """
     relative = "observability/eval_report.json"
     path = package.root / relative
@@ -49,9 +55,15 @@ def validate_aeg_evaluation(package: AEGPackage, *, backend_name: str | None = N
                 raise ValueError("declared evaluation report is missing")
             gate = {}
         else:
-            if expected is not None and not verify_file_hash(path, expected):
+            if path.stat().st_size > MAX_REPORT_BYTES:
+                raise ValueError("evaluation report is too large")
+            with path.open("rb") as handle:
+                content = handle.read(MAX_REPORT_BYTES + 1)
+            if len(content) > MAX_REPORT_BYTES:
+                raise ValueError("evaluation report is too large")
+            if expected is not None and not verify_content_hash(content, expected):
                 raise ValueError("evaluation report failed its declared checksum")
-            report = json.loads(path.read_text(encoding="utf-8"))
+            report = json.loads(content.decode("utf-8"))
             if not isinstance(report, dict) or not isinstance(report.get("gate", {}), dict):
                 raise ValueError("evaluation report and gate must be objects")
             gate = report.get("gate", {})
@@ -74,3 +86,27 @@ def validate_aeg_evaluation(package: AEGPackage, *, backend_name: str | None = N
             f"AEG artifact has an invalid persisted evaluation gate: {exc}",
             backend_name=backend_name,
         ) from exc
+    try:
+        return read_gate(package, allow_uncertified=allow_uncertified) is not None
+    except NumericalQualityError as exc:
+        raise ArtifactEvaluationError(str(exc), backend_name=backend_name) from exc
+
+
+def validate_cached_evaluation(
+    handle: CompiledAEGHandle, *, allow_uncertified: bool, backend_name: str,
+) -> None:
+    """A cached diagnostic load cannot silently authorize a later ordinary load.
+
+    Use the decision attached to the loaded weights, rather than re-reading a
+    possibly replaced artifact that describes different weights at the same path.
+    """
+    if type(allow_uncertified) is not bool:
+        raise ArtifactEvaluationError(
+            "numerical quality diagnostic admission flag must be boolean", backend_name=backend_name
+        )
+    if not allow_uncertified and handle.numerical_quality_admitted is not True:
+        raise ArtifactEvaluationError(
+            "Cached AEG has no measured numerical quality gate; explicitly request diagnostic "
+            "execution or unload and load a numerically admitted artifact",
+            backend_name=backend_name,
+        )

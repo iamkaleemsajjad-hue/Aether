@@ -16,6 +16,7 @@ def executable_artifact(tmp_path):
     source = tmp_path / "source"
     _write_probe_checkpoint(source)
     config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         precision="FP32",
         optimization_level=0,
@@ -31,6 +32,7 @@ def executable_artifact(tmp_path):
 
 def _config(tmp_path, **kwargs):
     return RuntimeConfig(
+        allow_uncertified=True,
         backend_name="aether_cpu",
         execution_devices=["cpu"],
         enable_semantic_cache=False,

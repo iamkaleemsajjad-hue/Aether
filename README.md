@@ -11,7 +11,7 @@
 <h1 align="center">Aether Runtime</h1>
 
 <p align="center">
-  <strong>Compile once. Run on any hardware, forever.</strong>
+  <strong>Compile supported models. Run portable AEG artifacts on compatible backends.</strong>
 </p>
 
 <p align="center">
@@ -33,13 +33,44 @@
 <p align="center">
   <a href="#multi-engine-benchmark-results--aether-vs-competitor-engines">📊 <b>Benchmark Results</b></a> &bull;
   <a href="#quick-start">⚡ <b>Quick Start</b></a> &bull;
-  <a href="#5-stage-compiler-pipeline">⚙️ <b>Architecture</b></a> &bull;
+  <a href="#4-stage-compiler-pipeline">⚙️ <b>Architecture</b></a> &bull;
   <a href="#supported-hardware-targets">🖥️ <b>Hardware Targets</b></a> &bull;
   <a href="#installation">📦 <b>Installation</b></a> &bull;
   <a href="docs/">📚 <b>Documentation</b></a>
 </p>
 
 ---
+
+## Verified execution and current validation
+
+Supported CPU models compile to an integrity-verified AEG, reload and generate
+through the framework-free CPU engine. On an Intel Core i5-1334U running Windows,
+the last complete green collection with Torch and Transformers installed passed
+**5,214 tests** with 41 explicit skips in two serial processes. A before/after
+replay preserved all 16 greedy tokens and produced zero logit difference. See the [environment, coverage and
+limits](docs/mission-validation.md), [architecture](docs/mission-architecture-note.md)
+and [current implementation status](IMPLEMENTATION_STATUS.md).
+
+Hardware evidence uses three tiers: ✅ recorded physical execution with date and
+scope; 🔬 reference/emulation/compile-time checks; 🛠 implemented and awaiting
+hardware validation. Incomplete adapters remain explicit. The [generated target
+table](#supported-hardware-targets) includes historical Intel UHD DirectML evidence.
+Help us validate additional devices with `aether hardware validate TARGET --execute --json`.
+Functional tests and recorded benchmarks have separate scopes; neither is a
+production-readiness certification.
+
+Default compilation now selects BF16 precision assignment; the other 21 passes
+require explicit opt-in. The [measured default-policy correction](docs/mission-default-policy.md)
+records exact synthetic A/B numerics, restored native CPU decode dispatch,
+artifact reductions and mixed TTFT results. Larger trained-model speed and
+component-memory improvements remain to be established.
+Ordinary compilation now measures original FP32 Hugging Face output against the
+actual CPU and Torch CPU AEG before publishing it. Ordinary loading requires the
+bound report. Compilation needs Torch/Transformers; admitted CPU execution remains
+framework-free. Explicit diagnostic mode supports uncertified development and
+legacy artifacts without waiving recorded failures. The real tiny run matched
+16/16 greedy IDs per executor; larger-model and ONNX/accelerator admission remain
+open. See [the gate, costs and current verification](docs/mission-numerical-admission.md).
 
 ## Multi-Engine Benchmark Results — Aether vs Competitor Engines
 
@@ -216,14 +247,14 @@ models, precision policies or hardware.
 | Principle | Implementation |
 |-----------|---------------|
 | **Compile once, run anywhere** | Portable graphs and weights execute through declared compatible executable/portable contracts and installed adapters; `plan_only` is compilation metadata, not an execution engine |
-| **PyTorch-free core** | The runtime, compiler, and CPU engine require only NumPy + tokenizers. PyTorch is optional (`pip install "aether-runtime[pytorch]"`) |
+| **Framework-free CPU execution** | Admitted CPU AEGs run without Torch/Transformers. Normal compilation needs both for original-HF validation; planning and explicitly diagnostic compilation remain framework-free |
 | **Hardware capability evidence** | Separates detected devices, available vendor runtimes, implemented backends, and physical execution validation |
 | **Multi-GPU placement** | Plans compatible selected meshes using memory capacity and workload cost; physical multi-GPU execution needs a supporting backend and validation |
 | **Framework-free native kernels** | C++ kernels compiled at runtime: INT4-GEMV, FlashAttention-2, fused RMSNorm+SwiGLU+Linear, GeGLU, RoPE, OpenMP parallel SGEMM |
 
 ---
 
-## 5-Stage Compiler Pipeline
+## 4-Stage Compiler Pipeline
 
 ```
 Model (HuggingFace / GGUF / SafeTensors / ONNX)
@@ -238,41 +269,27 @@ Model (HuggingFace / GGUF / SafeTensors / ONNX)
         │
         ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ Stage 2: Optimizer (22 Passes)                                  │
-│  Pass 1: Operator Fusion (RMSNorm→QKV→RoPE, SwiGLU fusion)     │
-│  Pass 2: Sensitivity scoring (method recorded)                │
-│  Pass 3: Precision Assignment (mixed-precision per sensitivity) │
-│  Pass 4: KV Cache Structuring (paged blocks, radix-tree hints)  │
-│  Pass 5: MoE Expert Routing (hot/warm/cold tier classification) │
-│  Pass 6: Parallelism Discovery (TP/PP/EP/CP strategy search)   │
-│  Pass 7–22: Graph lowering, sparse attention, pruning, etc.     │
+│ Stage 2: Optimizer (22 registered passes)                       │
+│  • Pass flags select execution independently                  │
+│  • Default: P3 precision assignment (BF16)                     │
+│  • Other passes: explicit experimental/functional requests     │
+│  • Failed reports reject public compilation                   │
 └─────────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ Stage 3: Quantization                                           │
-│  • Q4_K_M (explicit INT4 block-scaled format)                  │
-│  • Q8_0 (INT8 symmetric)                                        │
-│  • BF16 / FP16 / FP8 (E4M3 / E5M2)                            │
-│  • MXFP4 / MXFP6 (microscaling, PRD v4.0+)                     │
+│ Stage 3: Hardware Targeting                                    │
+│  • Select backend contracts and available kernel variants      │
+│  • Distinguish executable, portable and planning-only targets  │
+│  • Target labels alone do not establish hardware validation   │
 └─────────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ Stage 4: AEG Packaging                                          │
-│  • Self-contained .aeg/ directory with manifest, weights,       │
-│    tokenizer, precision map, sharding plans                     │
-│  • Integrity-verified (SHA-256 per artifact)                    │
-│  • Version-stamped (AEG/1.1 – AEG/3.0)                        │
-└─────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Stage 5: Target Code Generation                                 │
-│  • CUDA (sm70–sm130), ROCm (RDNA3, CDNA3/4/5)                 │
-│  • Apple Metal (M1–M5), OpenVINO (NPU/GPU)                     │
-│  • Qualcomm QNN, RISC-V NPU, FPGA                              │
-│  • Native CPU (AVX-512, AVX2, NEON, ternary BitNet)            │
+│  • Encode tensors in their selected storage formats            │
+│  • Package graph, weights, tokenizer and actual payloads       │
+│  • Preserve versioning and graph/manifest integrity chain      │
 └─────────────────────────────────────────────────────────────────┘
         │
         ▼
@@ -284,16 +301,18 @@ entropy proxy; the proxy is not measured model perplexity. Automatic precision
 assignment currently uses BF16 storage, which can round higher-precision source
 weights and still requires workload evaluation. Explicit formats are opt-in;
 storage format does not establish the selected engine's arithmetic precision.
+The CPU/Torch engines own their forward schedules. Experimental IR fusion does
+not establish fused engine execution; see [pass flags and consumers](docs/optimizer-passes.md).
 
 ---
 
 ## Quick Start
 
 ```bash
-pip install aether-runtime
+pip install "aether-runtime[transformers-frontend]"
 
 # Compile a public model to a self-contained CPU AEG (also usable on GPU hosts)
-aether compile HuggingFaceTB/SmolLM2-135M-Instruct --target cpu_avx2 --output smollm2.aeg
+aether compile HuggingFaceTB/SmolLM2-135M-Instruct --target cpu_avx2 --precision fp32 --output smollm2.aeg
 
 # Inspect the compiled artifact
 aether inspect smollm2.aeg
@@ -311,8 +330,9 @@ aether serve smollm2.aeg --port 8080
 
 Use `cpu_neon` on ARM. To request quantization explicitly, add
 `--precision q4_k_m` or `--precision q8_0`; otherwise compilation preserves
-automatic precision assignment. Explicit lossy precision requires your own
-model-quality evaluation. For accelerator execution, install the backend your
+automatic precision assignment. Every ordinary compile must pass the numerical
+gate; lossy opt-ins can be refused. Use representative `--quality-dataset` probes
+and separate task-quality evaluation. For accelerator execution, install the backend your
 artifact needs (portable CUDA/ROCm/MPS AEGs use `aether-runtime[pytorch]`) and
 compile with the target reported by `aether hardware detect`.
 
@@ -329,8 +349,8 @@ and feature prerequisites.
 ```python
 from aether import Compiler, CompilerConfig, Runtime
 
-# Compile — no PyTorch required
-compiler = Compiler(CompilerConfig(targets=["cpu_avx2"]))
+# Compile with an original-HF reference (Torch and Transformers required)
+compiler = Compiler(CompilerConfig(targets=["cpu_avx2"], precision="FP32"))
 artifact = compiler.compile(
     "HuggingFaceTB/SmolLM2-135M-Instruct", output_path="smollm2.aeg"
 )
@@ -495,7 +515,9 @@ print(decision.selected.tokens_max)         # capacity, not a boolean
 print(decision.plan.device_ids)             # which devices, and why
 ```
 
-The compiler embeds sharding plans for 1–8 GPUs in every AEG artifact (Pass 6: Parallelism Discovery). At runtime the distributed engine reads the matching plan and reduces with Aether's own collectives.
+Explicit experimental Pass 6 can emit sharding plans for inspection; ordinary
+compilation omits those files. Runtime device placement uses its separate
+execution planner. The presence of a P6 plan does not prove distributed execution.
 
 **Which collective runs where — precisely.** "No NCCL" is true of two of the three paths, and the difference matters:
 
@@ -664,26 +686,46 @@ adapters retain incomplete integration and report unavailable.
 See [runtime execution, precision and cache integration](docs/runtime-feature-integration.md)
 for real phase workers, persistent sessions, explicit drafts and tested limits.
 
-| Target ID | Hardware |
-|-----------|----------|
-| `cuda_sm89` | NVIDIA RTX 4090 (Ada Lovelace) |
-| `cuda_sm90` | NVIDIA H100 (Hopper) |
-| `cuda_sm100` | NVIDIA B200 (Blackwell) |
-| `cuda_sm130` | CUDA compute capability 13.0 planning profile |
-| `rocm_cdna3` | AMD MI300X |
-| `rocm_cdna5_mi455x` | AMD MI455X (CDNA5) |
-| `metal_m3` | Apple M3/M4/M5 |
-| `openvino_npu` | Intel NPU via OpenVINO provider (operator/device support requires validation) |
-| `qualcomm_qnn` | Qualcomm Snapdragon NPU |
-| `cpu_avx512` | x86-64 with AVX-512 |
-| `cpu_avx2` | x86-64 with process-usable AVX2 |
-| `cpu_generic` | CPU baseline when optimized SIMD is unconfirmed |
-| `cpu_neon` | ARM NEON (mobile, Raspberry Pi) |
-| `cpu_avx512_ternary` | BitNet b1.58 ternary on x86 |
-| `riscv_sifive_x160` | SiFive Intelligence X160 |
-| `fpga_xilinx_vu9p` | Xilinx VU9P planning profile |
+<!-- BEGIN GENERATED HARDWARE EVIDENCE -->
+<!-- Generated by tools/render_hardware_readme.py; edit hardware_validation_matrix.json. -->
+| Target | Hardware | Evidence tier | Technique and scope |
+|---|---|---|---|
+| `cpu` | Generic CPU | ✅ Recorded hardware execution | 2026-10-18: Physical i5-1334U, Windows AMD64; offline compile/save/reload/generate, cached decode and reference parity tests. Python 3.10.11, NumPy 1.26.4, Torch 2.9.1+cpu, Transformers 4.57.3, ORT 1.23.2; synthetic fixtures, no production claim |
+| `directml` | Intel UHD Graphics through ONNX Runtime DirectML | ✅ Recorded hardware execution | 2026-10-14: Historical Intel UHD FP32 ONNX and supported dense AEG prefill/cached decode; DmlExecutionProvider attribution, CPU fallback disabled. ORT DirectML 1.24.4, driver 32.0.101.7085; not rerun in the current CPU environment |
+| `cpu_avx512` | CPU AVX-512 | 🔬 Compile-time checks | Compilation recorded; execution pending |
+| `amd_mi350x` | AMD MI350X | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `cuda_sm100` | NVIDIA Blackwell (B200) | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `cuda_sm100_gb300` | NVIDIA Blackwell Ultra (GB300) | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `cuda_sm120` | CUDA compute capability 12.0 planning profile | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `cuda_sm130` | CUDA compute capability 13.0 planning profile | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `cuda_sm70` | NVIDIA Volta (V100) | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `cuda_sm80` | NVIDIA Ampere (A100) | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `cuda_sm89` | NVIDIA Ada Lovelace (RTX 4090) | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `cuda_sm90` | NVIDIA Hopper (H100) | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `metal_m1` | Apple M1 | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `metal_m3` | Apple M3/M4 | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `rocm_cdna3` | AMD CDNA3 (MI300X) | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `rocm_cdna5_mi455x` | AMD CDNA5 (MI455X) | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `rocm_rdna3` | AMD RDNA3 (RX 7900 XTX) | 🛠 Implemented; awaiting hardware validation | Help us validate with the matching runtime and device |
+| `cuda_sm100_tee` | NVIDIA Blackwell CC (Confidential Computing) | 🚧 Integration incomplete | Requires NVIDIA Confidential Computing hardware + CC attestation |
+| `fpga_ternary` | Ternary BitNet FPGA | 🚧 Integration incomplete | Ternary FPGA backend not implemented |
+| `fpga_xilinx_vu9p` | Xilinx Alveo U250 FPGA | 🚧 Integration incomplete | FPGA backend not implemented |
+| `openvino_gpu` | Intel OpenVINO GPU | 🚧 Integration incomplete | OpenVINO package not installed; Aether task-specific inference adapter is incomplete |
+| `openvino_npu` | Intel OpenVINO / NPU | 🚧 Integration incomplete | OpenVINO package not installed; Aether task-specific inference adapter is incomplete |
+| `qualcomm_cloud_ai100` | Qualcomm Cloud AI 100 | 🚧 Integration incomplete | QNN backend not implemented beyond target profile |
+| `qualcomm_qnn` | Qualcomm QNN NPU | 🚧 Integration incomplete | QNN backend not implemented beyond target profile |
+| `riscv_cervell` | Cervell NPU RISC-V | 🚧 Integration incomplete | No Cervell hardware available |
+| `riscv_mips_s8200` | MIPS/Wave S8200 | 🚧 Integration incomplete | No MIPS S8200 hardware available |
+| `riscv_sifive_x160` | SiFive X160 RISC-V | 🚧 Integration incomplete | No SiFive X160 hardware available |
+| `riscv_xuantie_c930` | XuanTie C930 RISC-V | 🚧 Integration incomplete | No XuanTie C930 hardware available |
+| `tensorrt_llm` | NVIDIA TensorRT-LLM | 🚧 Integration incomplete | Engine loading and inference runner are incomplete; SDK presence is insufficient |
+<!-- END GENERATED HARDWARE EVIDENCE -->
 
-Full list: 30+ targets in [`src/aether/core/constants.py`](src/aether/core/constants.py).
+This evidence table comes from [the maintained catalog](hardware_validation_matrix.json).
+Run `python tools/render_hardware_readme.py` after editing the catalog;
+`python tools/render_hardware_readme.py --check` detects drift. Live hardware
+detection is a separate snapshot. CPU ISA aliases and other planning profiles
+are listed in [`src/aether/core/constants.py`](src/aether/core/constants.py).
 
 ---
 
@@ -778,6 +820,10 @@ different things. **Integrity is not identity:** a self-signed manifest proves t
 artifact is unmodified and says nothing about who produced it, and `aether verify`
 states that rather than printing "verified".
 
+Post-hoc signing changes package bytes and can invalidate numerical admission.
+A workflow that both signs and recertifies the final AEG is still required; see
+[the admission scope](docs/mission-numerical-admission.md).
+
 ---
 
 ## Phase 6 — Ecosystem
@@ -825,7 +871,7 @@ pip install aether-runtime
 # With PyTorch for .pt/.pth model ingestion
 pip install "aether-runtime[pytorch]"
 
-# With HuggingFace Transformers for AutoTokenizer, AutoConfig
+# Normal compilation with original-HF numerical admission
 pip install "aether-runtime[transformers-frontend]"
 
 # Development/test/server tools and PyTorch frontend
@@ -881,4 +927,4 @@ python -m pytest tests/unit/test_v31_elite_extensions.py -v   # v3.1 extensions
 
 Apache 2.0
 
-*Aether Runtime — Compile once. Run on any hardware, forever.*
+*Aether Runtime — portable model artifacts with explicit execution contracts.*

@@ -554,12 +554,12 @@ class ArchitectureDetector:
         elif norm_type:
             norm_type = ""
         if not norm_type:
-            # The epsilon field name is the checkpoint's own structural
-            # declaration of its normalization family and is far more reliable
-            # than matching class names: every RMSNorm family publishes
-            # ``rms_norm_eps`` while LayerNorm families publish one of the
-            # ``layer_norm_*``/``norm_epsilon`` spellings.
-            if config.get("rms_norm_eps") is not None:
+            # HF MambaBlock/Mamba2Block use RMSNorm, despite spelling its
+            # epsilon layer_norm_epsilon. The rms_norm flag is unused by HF
+            # 4.57.3's Mamba implementations; it does not select LayerNorm.
+            # Other families use conventional epsilon aliases as a fallback
+            # heuristic; these HF families are explicit exceptions.
+            if model_type in {"mamba", "mamba2"} or config.get("rms_norm_eps") is not None:
                 norm_type = "RMSNorm"
             elif any(
                 config.get(key) is not None
@@ -840,6 +840,12 @@ class ArchitectureDetector:
             except (TypeError, ValueError):
                 ssm_head_dim = None
             configured_inner = config.get("d_inner")
+            if (
+                configured_inner is None
+                and ssm_variant in {"selective_scan", "ssd"}
+                and "expand" in config
+            ):
+                configured_inner = int(config["expand"] * int(hidden_size))
             if configured_inner is None and ssm_head_dim and ssm_num_heads:
                 configured_inner = ssm_head_dim * ssm_num_heads
             if configured_inner is None:

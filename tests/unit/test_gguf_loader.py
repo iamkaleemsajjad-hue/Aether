@@ -442,6 +442,7 @@ def test_tiny_gguf_compiles_reloads_and_generates(tmp_path: Path) -> None:
     artifact = tmp_path / "model.aeg"
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -455,6 +456,11 @@ def test_tiny_gguf_compiles_reloads_and_generates(tmp_path: Path) -> None:
     assert (artifact / "tokenizer" / "tokenizer.json").is_file()
 
     response = Runtime(
-        RuntimeConfig(hf_offline=True, enable_semantic_cache=False, default_max_tokens=2)
+        RuntimeConfig(
+            allow_uncertified=True,
+            hf_offline=True,
+            enable_semantic_cache=False,
+            default_max_tokens=2,
+        )
     ).generate(str(artifact), "hello", max_tokens=2, temperature=0.0)
     assert response.usage["completion_tokens"] == 2

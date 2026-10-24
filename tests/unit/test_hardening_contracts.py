@@ -658,13 +658,17 @@ def test_agentic_session_preserves_context_and_reports_kv_boundary() -> None:
 
 
 def test_manifest_declared_payload_tampering_is_rejected(minimal_aeg_package) -> None:
+    """Check a declared auxiliary payload independently of manifest file order."""
     from aether.core.exceptions import AEGIntegrityError
     from aether.core.aeg_format import AEGPackage
 
     package = minimal_aeg_package
+    package.metadata["fleet_deployment"] = {"producer": "integrity-regression"}
+    package.save()
     assert package.manifest is not None
     assert package.manifest.artifacts
-    relative_path = next(iter(package.manifest.artifacts))
+    relative_path = "fleet/deployment_plan.json"
+    assert relative_path in package.manifest.artifacts
     payload = Path(package.root) / relative_path
     original = payload.read_bytes()
     payload.write_bytes(original + b"tampered")

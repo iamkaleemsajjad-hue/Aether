@@ -1,0 +1,107 @@
+{
+  "revision": "1c6b71833fe2897d880073d4dbe379d7442656b2",
+  "baseline_revision": "edc7d8f378c05d563a935bebe2afbbf40dc4f025",
+  "ci_url": "https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39546525959",
+  "successful_jobs": 23,
+  "source_and_fixture_hashes_match_git": true,
+  "raw_report_sha256": "8a347b298b177308fbddcf3727785a1672fa41b95ea4bd7af843776718ed926b",
+  "hardware": {
+    "cpu": "AMD EPYC 9V45 96-Core Processor",
+    "logical_cpus": 4,
+    "host_ram_bytes": 16760344576,
+    "available_ram_bytes_at_start": 15630192640
+  },
+  "versions": {
+    "numpy": "1.26.4",
+    "torch": "2.9.1+cpu",
+    "transformers": "4.57.3",
+    "psutil": "7.2.2",
+    "safetensors": "0.8.0",
+    "tokenizers": "0.22.2"
+  },
+  "cases": [
+    {
+      "case": "default",
+      "worst_kl_all_admitted_executors": 1.0122723726672495e-14,
+      "minimum_cosine_all_admitted_executors": 0.9999999999998925,
+      "minimum_greedy_agreement": 1.0,
+      "worst_relative_ppl_delta": 3.839193658961449e-08,
+      "baseline_status": "executed",
+      "current_artifact_bytes": 101956,
+      "current_loaded_weight_array_bytes": 10672,
+      "current_ssm_state_logical_bytes": 512,
+      "current_convolution_history_logical_bytes": 384,
+      "timings": {
+        "current": {
+          "public": {
+            "median_decode_tokens_per_second": 15262.748210648291,
+            "min_decode_tokens_per_second": 13986.712623133797,
+            "max_decode_tokens_per_second": 15591.311630206546,
+            "median_first_token_seconds": 6.377599999041195e-05,
+            "min_first_token_seconds": 6.222400000410744e-05,
+            "max_first_token_seconds": 6.559899999558638e-05
+          },
+          "long": {
+            "median_decode_tokens_per_second": 15219.905897575083,
+            "min_decode_tokens_per_second": 14807.199683451694,
+            "max_decode_tokens_per_second": 15618.132204860049,
+            "median_first_token_seconds": 0.003239040000011073,
+            "min_first_token_seconds": 0.0032114280000001827,
+            "max_first_token_seconds": 0.0033726919999992333
+          }
+        },
+        "baseline": {
+          "public": {
+            "median_decode_tokens_per_second": 15350.271260939904,
+            "min_decode_tokens_per_second": 14610.332009442656,
+            "max_decode_tokens_per_second": 15779.98196584194,
+            "median_first_token_seconds": 6.273500000020249e-05,
+            "min_first_token_seconds": 6.0380999997278195e-05,
+            "max_first_token_seconds": 6.43380000013849e-05
+          },
+          "long": {
+            "median_decode_tokens_per_second": 14277.264476485108,
+            "min_decode_tokens_per_second": 13357.988363343782,
+            "max_decode_tokens_per_second": 14515.022010727223,
+            "median_first_token_seconds": 0.0034582010000008268,
+            "min_first_token_seconds": 0.0033834669999919242,
+            "max_first_token_seconds": 0.003476749000000723
+          }
+        }
+      }
+    },
+    {
+      "case": "expanded-biased",
+      "worst_kl_all_admitted_executors": 8.841799639457921e-15,
+      "minimum_cosine_all_admitted_executors": 0.9999999999999427,
+      "minimum_greedy_agreement": 1.0,
+      "worst_relative_ppl_delta": -1.999562229119663e-08,
+      "baseline_status": "failed",
+      "current_artifact_bytes": 111622,
+      "current_loaded_weight_array_bytes": 18112,
+      "current_ssm_state_logical_bytes": 1024,
+      "current_convolution_history_logical_bytes": 640,
+      "timings": {
+        "current": {
+          "public": {
+            "median_decode_tokens_per_second": 14264.143407412106,
+            "min_decode_tokens_per_second": 14037.536372206001,
+            "max_decode_tokens_per_second": 14480.76127408681,
+            "median_first_token_seconds": 6.884399999762536e-05,
+            "min_first_token_seconds": 6.57989999979236e-05,
+            "max_first_token_seconds": 8.208399999887206e-05
+          },
+          "long": {
+            "median_decode_tokens_per_second": 14418.927520239879,
+            "min_decode_tokens_per_second": 14293.298485146423,
+            "max_decode_tokens_per_second": 14578.625651971905,
+            "median_first_token_seconds": 0.0034489360000122815,
+            "min_first_token_seconds": 0.0033950549999985924,
+            "max_first_token_seconds": 0.003497189999990269
+          }
+        },
+        "baseline": null
+      }
+    }
+  ]
+}

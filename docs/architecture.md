@@ -1,32 +1,40 @@
 # Aether Architecture
 
-Aether is a five-stage compiler plus a backend-orchestrated runtime. The design is inspired by LLVM: just as C/C++ compiles to LLVM IR and then to any ISA, any AI model compiles to AEG-IR and then to any inference backend.
+Aether has four compiler stages and a backend-orchestrated runtime. Supported
+operators execute through compatible declared backend contracts. CPU and Torch
+engines own handwritten forward passes built from weights/config; they do not
+interpret optimized graph nodes. See the [traced architecture decision](mission-architecture-note.md)
+and [measured pass dispositions](mission-default-policy.md#all-22-dispositions-and-remaining-work).
 
-## Five Compiler Stages
+## Compiler, runtime and interfaces
 
 ```
-Any Model Format (safetensors / GGUF / ONNX / MLX / .pt / video / VLM / MoE / MLA)
+Supported model/source (normal numerical admission currently requires HF SafeTensors)
+                    │
+                    ▼
+Original FP32 HF reference worker → bounded fixed-probe evidence, then worker exits
                     │
                     ▼
 Stage 1: Model Ingestion & Graph Extraction → AEG-IR
          (SafeTensors, GGUF, ONNX, MLX, PyTorch, VLM, Video, MLA, MoE, SSM)
                     │
                     ▼
-Stage 2: Aether Optimizer (22 graph-level passes) → optimized AEG-IR
+Stage 2: Aether Optimizer (22 registered passes) → weights / IR / selected payloads
                     │
                     ▼
-Stage 3: Hardware Targeting & Backend Selection → AEG artifact
+Stage 3: Hardware Targeting & Backend Selection → compatible backend contracts
                     │
                     ▼
-Stage 4: Self-Optimizing Runtime (R1–R12 layers) → tokens / embeddings
+Stage 4: Packaging → private AEG → actual CPU + Torch CPU quality gate → publication
                     │
                     ▼
-Stage 5: Developer Interface (Python SDK / REST / CLI / gRPC / OpenAI-compat)
+Runtime: authenticated admission → engine execution → tokens / embeddings
+Interfaces: Python SDK / REST / CLI / gRPC / OpenAI-compat
 ```
 
 ## Stage 1: Model Ingestion
 
-Supported formats and specialized loaders:
+Loader catalog (presence does not establish family execution or parity):
 
 | Format | Loader | Notes |
 |--------|--------|-------|
@@ -49,27 +57,27 @@ Architecture detection inspects `config.json` model_type, tensor key patterns, a
 
 | Pass | Name | Status |
 |---|---|---|
-| 1 | Operator Fusion | Fuses RMSNorm+QKV+RoPE+Attention into megakernels |
-| 2 | Sensitivity Analysis | Computes `d(perplexity)/d(precision)` per layer |
-| 3 | Precision Assignment | Mixed-precision map from sensitivity + quality budget |
-| 4 | KV Cache Structuring | Paged blocks, radix-tree hints, multi-tier offload |
-| 5 | MoE Expert Routing | Hot/warm/cold expert tiering, threshold routing |
-| 6 | Parallelism Discovery | Tensor/pipeline/expert/context parallel search |
-| 7 | Reasoning Graph Compilation | Budget-controlled CoT/tool-call graph |
-| 8 | Sparse Attention (MInference) | Head-level pattern planning for long-context |
-| 9 | Pruning & Sparsity | Magnitude/gradient mask generation |
+| 1 | Operator Fusion | Experimental IR groups; no engine schedule consumer |
+| 2 | Sensitivity Analysis | Experimental reconstruction/entropy proxy, not measured PPL |
+| 3 | Precision Assignment | Default BF16 storage; explicit FP32 preserved; independent numerical gate required |
+| 4 | KV Cache Structuring | Experimental graph hints; engine caches are independent |
+| 5 | MoE Expert Routing | Experimental tiers; source routing executes independently |
+| 6 | Parallelism Discovery | Experimental inspection plans; runtime uses a separate planner |
+| 7 | Reasoning Graph Compilation | Experimental annotations; serving benefit unproved |
+| 8 | Sparse Attention | Experimental dense-score masking; no sparse FLOP savings verified |
+| 9 | Pruning & Sparsity | Experimental lossy zeroed dense weights; sparse-kernel benefit unproved |
 
 ### v4.0 Advanced Passes (10–17)
 
 | Pass | Name | Status |
 |---|---|---|
-| 10 | Native MTP Head Compilation | Real 2-D speculation blobs, greedy verification |
-| 11 | Grammar Constraint Compiler | Tokenizer-aware FSA, vocabulary-width metadata |
-| 12 | Model Merging | SLERP/task-vector merge with integrity hashes |
-| 13 | TTT Fast-Weight Injection | Slot tensors, R5 prompt-driven adaptation |
-| 14 | Semantic KV Compression | Semantic-boundary K/V row compression |
-| 15 | Cross-Layer KV Sharing | Exact-alias K/V sharing between layers |
-| 16 | Green Energy Compilation | Carbon/DVFS metadata, R7 energy recording |
+| 10 | Native MTP Head Compilation | Supplied-head experimental feature; full requested-head benefit unproved |
+| 11 | Grammar Constraint Compiler | Explicit functional FSA; constrained A/B remains required |
+| 12 | Model Merging | Changed weights consumed; independent transformed-reference evaluation required |
+| 13 | TTT Fast-Weight Injection | Experimental slots; independent adaptation quality unproved |
+| 14 | Semantic KV Compression | Experimental CPU retention; generation regressions recorded |
+| 15 | Cross-Layer KV Sharing | Experimental CPU aliases; quality regressions recorded |
+| 16 | Green Energy Compilation | Accounting; no measured device energy reduction |
 | 17 | TEE Enclave Emission | Requires real TEE backend (fail-closed otherwise) |
 
 ### v5.0 Frontier Passes (18–22)
@@ -77,14 +85,21 @@ Architecture detection inspects `config.json` model_type, tensor key patterns, a
 | Pass | Name | Status |
 |---|---|---|
 | 18 | Diffusion Drafter Compilation | MDLM drafter — requires trained weights |
-| 19 | Sub-2-Bit/Ternary Quantization | BitNet two-bit packed CPU AEG, per-block scales |
-| 20 | Video Token Compression | Frame KV manager, temporal compression plan |
-| 21 | Advanced PEFT Compilation | Shape-bearing adapter blobs, CPU BGMV apply |
-| 22 | RLVR Verifier Head Injection | SymPy/subprocess verifier, zero reward for unverified |
+| 19 | Sub-2-Bit/Ternary Quantization | Experimental lossy storage with dense dequantization; no QAT/kernel speed claim |
+| 20 | Video Token Compression | Unsupported end-to-end CPU VLM execution |
+| 21 | Advanced PEFT Compilation | Experimental supplied tensors; scaling/reference checks remain open |
+| 22 | RLVR Verifier Head Injection | Experimental training integration; gradient callbacks required |
+
+Only P3 is enabled by default. An `applied` pass status is not a numerical
+certificate or a measured performance benefit. [Numerical admission](mission-numerical-admission.md)
+checks the resulting base CPU/Torch CPU execution before ordinary publication;
+unsupported references and insufficient memory are explicit refusals.
 
 ## Stage 3: Hardware Targeting
 
-Aether maintains a registry of 28 hardware target profiles. Each profile declares preferred backends:
+Target profiles describe preferred backends. Actual availability and dated
+execution evidence are separate; use the generated README table and
+`hardware_validation_matrix.json` for current status:
 
 | Target Class | Profiles | Preferred Backends |
 |---|---|---|
@@ -101,7 +116,10 @@ CPU compilation embeds a real native shared library (`.dll`/`.so`) in `generated
 
 ## Stage 4: Runtime Layers (R1–R12)
 
-The self-optimizing runtime loads AEG artifacts and applies 12 execution enhancement layers:
+The following runtime module catalog includes optional and experimental paths.
+Module availability does not prove automatic use, correctness or speed. Ordinary
+AEG loads validate [bound numerical evidence](mission-numerical-admission.md)
+before backend selection; diagnostic mode waives absence only.
 
 ### v3.1 Runtime Enhancements
 
@@ -176,23 +194,25 @@ service AetherService {
 
 ## AEG Format
 
-The Aether Execution Graph (AEG) is a self-describing ZIP archive:
+The Aether Execution Graph (AEG) is a directory package with versioned manifests
+and authenticated payloads; distribution archives are unpacked before execution:
 
 ```
 model.aeg/
 ├── manifest.json           # Version, integrity hashes, metadata
-├── graph/graph.json        # AEG-IR computation graph
+├── graph/computation_graph.aeg-ir  # AEG-IR computation graph
 ├── weights/                # Quantized weight blobs (content-addressed)
 ├── kernels/                # Target-specific kernel descriptors
 ├── safety/                 # Guardrail policies, prompt guard config
 ├── tokenizer/              # Vocabulary, merges, model files
 ├── adapters/               # LoRA/PEFT adapter manifests
 ├── provenance/             # Compilation lineage, hardware fingerprint
-└── generated_kernels/      # Native CPU .dll/.so libraries
+├── generated_kernels/      # Optional native CPU .dll/.so libraries
+└── quality/numerical_gate.json  # Measured admission, absent in diagnostic builds
 ```
 
 ### AEG Versions
-- **AEG/1.1** — v3.1 baseline (current production format)
+- **AEG/1.1** — v3.1 baseline reader format
 - **AEG/2.0** — v4.0 extensions (MTP, grammar, TTT, MCP metadata)
 - **AEG/3.0** — v5.0 extensions (video frames, ternary weights, RLVR verifier heads)
 

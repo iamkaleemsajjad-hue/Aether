@@ -35,6 +35,9 @@ def test_optimizer_pipeline_runs_nine_passes() -> None:
     config = CompilerConfig(
         targets=["cpu_avx512"],
         calibration_tokens=128,
+        enable_reasoning_graph=True,
+        enable_sparse_attention=True,
+        enable_pruning=True,
         sparse_attention_context_threshold=32768,
         pruning_target_sparsity=0.5,
     )
@@ -51,7 +54,16 @@ def test_optimizer_pipeline_runs_nine_passes() -> None:
 def test_compiled_package_contains_v31_artifacts(tmp_path) -> None:
     from aether import Compiler
 
-    compiler = Compiler(CompilerConfig(targets=["cpu_avx512"], overwrite=True, calibration_tokens=128))
+    compiler = Compiler(
+        CompilerConfig(
+            quality_mode="diagnostic",
+            targets=["cpu_avx512"],
+            overwrite=True,
+            calibration_tokens=128,
+            enable_reasoning_graph=True,
+            enable_sparse_attention=True,
+        )
+    )
     package = compiler.compile("Qwen/Qwen3-0.6B", output_path=tmp_path / "qwen.aeg")
     _assert_v31_package_artifacts(package)
 
@@ -60,7 +72,16 @@ def test_local_compiled_package_contains_v31_artifacts(tmp_path, tiny_local_safe
     """Core CI compiles real local weights instead of skipping the network contract."""
     from aether import Compiler
 
-    compiler = Compiler(CompilerConfig(targets=["cpu_generic"], overwrite=True, calibration_tokens=128))
+    compiler = Compiler(
+        CompilerConfig(
+            quality_mode="diagnostic",
+            targets=["cpu_generic"],
+            overwrite=True,
+            calibration_tokens=128,
+            enable_reasoning_graph=True,
+            enable_sparse_attention=True,
+        )
+    )
     package = compiler.compile(str(tiny_local_safetensors_model), output_path=tmp_path / "local.aeg")
     _assert_v31_package_artifacts(package)
 
@@ -70,9 +91,9 @@ def _assert_v31_package_artifacts(package: AEGPackage) -> None:
     loaded.verify_integrity()
     assert (loaded.root / "graph" / "reasoning_graph.aeg-ir").exists()
     assert (loaded.root / "graph" / "attention_head_patterns.json").exists()
-    assert (loaded.root / "safety" / "prompt_guard.json").exists()
+    assert not (loaded.root / "safety" / "prompt_guard.json").exists()
     assert (loaded.root / "provenance" / "manifest.json").exists()
-    assert (loaded.root / "watermark" / "config.json").exists()
+    assert not (loaded.root / "watermark" / "config.json").exists()
     assert loaded.manifest is not None
     assert "graph/reasoning_graph.aeg-ir" in loaded.manifest.artifacts
 
@@ -97,8 +118,8 @@ def test_provenance_manifest_and_watermark() -> None:
         eval_results={"hellaswag": 0.8},
     )
     payload = manifest.to_dict()
-    assert payload["model_hash"].startswith("sha256:")
-    assert payload["eu_ai_act"]["transparency_obligations_met"] is True
+    assert payload["model_hash"] == ""
+    assert payload["eu_ai_act"]["transparency_obligations_met"] is False
     watermark = AetherOutputWatermark(vocab_size=16, green_fraction=0.25, delta=2.0, z_threshold=1.0)
     logits = watermark.apply_watermark([0.0] * 16, [1, 2, 3])
     assert max(logits) == 2.0

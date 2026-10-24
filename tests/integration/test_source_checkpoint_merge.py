@@ -32,6 +32,7 @@ def test_actual_source_cli_merge_updates_all_checkpoint_projections(tiny_local_s
     save_file(expected, str(reference_source / "model.safetensors"))
     destination = tmp_path / "merged.aeg"
     response = CliRunner().invoke(cli, [
+        "--diagnostic",
         "--cache-dir", str(tmp_path / "cli-cache"), "merge", str(first), str(second),
         "--method", "linear", "--weights", "0.25,0.75", "--output", str(destination),
     ])
@@ -43,6 +44,7 @@ def test_actual_source_cli_merge_updates_all_checkpoint_projections(tiny_local_s
     # Compile an independently interpolated source; reproduce only storage
     # formats, so sensitivity choices cannot obscure a coordinate mismatch.
     reference = Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2"], enable_sensitivity=False,
         cache_dir=tmp_path / "reference-cache",
     )).compile(str(reference_source), output_path=tmp_path / "reference.aeg")
@@ -51,7 +53,7 @@ def test_actual_source_cli_merge_updates_all_checkpoint_projections(tiny_local_s
     for name, entry in merged.weight_store().entries.items():
         rounded = dequantize_tensor(quantize_tensor(expected_weights[name], entry.precision, entry.block_size))
         np.testing.assert_allclose(actual[name], rounded, rtol=1e-6, atol=1e-6)
-    engine = load_engine_from_package(merged, prepare_native_kernels=False)
+    engine = load_engine_from_package(merged, prepare_native_kernels=False, allow_uncertified=True)
     assert len(engine.generate(np.asarray([1, 2], dtype=np.int64), max_tokens=2, temperature=0)) > 0
 
 
@@ -80,6 +82,7 @@ def test_aeg_base_source_alignment_reuses_pack_names_and_exact_shapes(tiny_local
     from aether.compiler.stage2_optimizer.pass12_model_merging import _load_source_weights
 
     base = Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2"], precision="FP32", enable_sensitivity=False,
         cache_dir=tmp_path / "cache",
     )).compile(str(tiny_local_safetensors_model), output_path=tmp_path / "base.aeg")

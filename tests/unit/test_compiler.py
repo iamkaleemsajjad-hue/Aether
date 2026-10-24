@@ -22,6 +22,7 @@ class TestCompilerConfig:
         assert config.quality_budget == 0.02
         assert config.optimization_level == 2
         assert config.targets == ["auto"]
+        assert config.quality_mode == "require_hf"
 
     def test_quality_budget_out_of_range(self) -> None:
         with pytest.raises(CompilerConfigError):
@@ -122,7 +123,7 @@ class TestArchitectureDetector:
 
     def test_approximate_quality_sensitive_passes_are_opt_in(self) -> None:
         config = CompilerConfig()
-        assert config.enable_sparse_attention is True
+        assert config.enable_sparse_attention is False
         assert config.enable_pruning is False
 
     @pytest.mark.parametrize(
@@ -203,7 +204,7 @@ class TestCompilerPlan:
     """Tests for the compiler dry-run plan."""
 
     def test_plan_returns_opportunities(self) -> None:
-        compiler = Compiler()
+        compiler = Compiler(CompilerConfig(enable_fusion=True))
         plan = compiler.plan("Qwen/Qwen3-8B")
         assert plan.model_id == "Qwen/Qwen3-8B"
         assert plan.total_opportunities > 0
@@ -216,7 +217,9 @@ class TestCompilerPlan:
         assert plan.errors
 
     def test_compile_small_model(self, tmp_cache_dir, tiny_local_safetensors_model) -> None:
-        compiler = Compiler(CompilerConfig(targets=["cpu_avx512"], overwrite=True, dry_run=False))
+        compiler = Compiler(CompilerConfig(
+            quality_mode="diagnostic", targets=["cpu_avx512"], overwrite=True, dry_run=False,
+        ))
         aeg = compiler.compile(str(tiny_local_safetensors_model), output_path=tmp_cache_dir / "qwen3-0.6b.aeg")
         assert aeg.root.exists()
         assert (aeg.root / "manifest.json").exists()
@@ -240,6 +243,7 @@ class TestCompilerPlan:
         artifact = tmp_path / "hub-snapshot.aeg"
         package = Compiler(
             CompilerConfig(
+                quality_mode="diagnostic",
                 targets=["cpu_avx512"],
                 overwrite=True,
                 skip_download=False,
@@ -251,7 +255,7 @@ class TestCompilerPlan:
         assert package.manifest is not None
         assert package.manifest.architecture.vocab_size == 32
         assert package.manifest.architecture.layers == 1
-        engine = load_engine_from_path(artifact)
+        engine = load_engine_from_path(artifact, allow_uncertified=True)
         logits, _ = engine.forward([1, 2])
         assert logits.shape == (2, 32)
 

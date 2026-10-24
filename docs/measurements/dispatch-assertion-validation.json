@@ -1,0 +1,34 @@
+{
+  "baseline_revision": "9167d1d985ff9a5267372eda958a414aeca7a506",
+  "baseline_ci_run": 39615891068,
+  "baseline_complete_suite": {
+    "passed": 5332,
+    "skipped": 51,
+    "failed": 1
+  },
+  "baseline_failed_assertion": "two live settled CPU probes must differ by less than 2x",
+  "baseline_observed_ratio": 2.246305928260903,
+  "baseline_junit_sha256": "c6a03c250e9e82615ec0269ae91e8fe5333fa126a2facdec58bfe4f2f459e846",
+  "controlled_counterexample": {
+    "scope": "test clock inputs, not hardware performance",
+    "first_per_op_seconds": 0.000625,
+    "second_per_op_seconds": 0.0025,
+    "ratio": 4.0,
+    "old_assertion_passed": false,
+    "producer": "actual measure_dispatch_seconds with controlled framework/clock inputs"
+  },
+  "focused_tests": 144,
+  "focused_failures": 0,
+  "ruff_before_after": [
+    86,
+    86
+  ],
+  "mypy_before_after": [
+    153,
+    143
+  ],
+  "new_static_diagnostics": 0,
+  "runtime_src_tree": "af935a911417adaa6f684f126ac88c681a0ad545",
+  "runtime_note": "No production file changed; no speed, TTFT, memory, artifact-size or numerical benchmark is claimed for a test-contract correction.",
+  "case_policy": "Real CPU measurements remain exercised; controlled convergence/refusal and ledger refresh are asserted separately. No staleness threshold or product measurement was changed."
+}

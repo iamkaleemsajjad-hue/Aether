@@ -719,10 +719,15 @@ class MambaSSM:
       h_t = A_bar × h_{t-1} + B_bar × x_t
       y_t = C × h_t + D × x_t
 
-    where A_bar = exp(Δ × A), B_bar = Δ × B (ZOH discretization).
+    where A_bar = exp(Δ × A), B_bar = Δ × B, as implemented by Mamba.step
+    and selective_scan_ref in state-spaces/mamba v2.2.4. The recurrence is
+    Gu & Dao equation (2); this literal input injection is not the full ZOH
+    B_bar in their equation (4). Preserve the trained checkpoint contract.
 
     Reference: Gu & Dao, "Mamba: Linear-Time Sequence Modeling with
     Selective State Spaces", ICLR 2024.
+    https://arxiv.org/html/2312.00752v2
+    https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/modules/mamba_simple.py
     """
 
     def __init__(self, d_model: int = 1024, d_state: int = 16, d_inner: int = 2048) -> None:
@@ -750,7 +755,7 @@ class MambaSSM:
         batch = x.shape[0]
         # Softplus on dt (ensures positive)
         if dt_softplus:
-            dt = np.log1p(np.exp(dt.astype(np.float64))).astype(np.float32)
+            dt = np.logaddexp(0.0, dt.astype(np.float64)).astype(np.float32)
 
         # ZOH discretization: A_bar = exp(dt × A)
         # A is (d_inner, d_state), dt is (batch, d_inner)

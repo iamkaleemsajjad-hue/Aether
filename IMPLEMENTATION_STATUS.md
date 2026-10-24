@@ -1,167 +1,194 @@
-# Aether Runtime — Implementation Status
+# Aether Runtime implementation status
 
-**Last Updated:** 2026-09-17  
-**Audit Type:** Code-level forensic verification (not README-based)  
-**Test Results:** 77/77 new unit tests passing
+Reviewed 2026-10-25. The runtime/compiler mission is in progress.
 
----
+The [dense FP32 loader follow-up](docs/mission-dense-load.md) reuses private
+payloads while keeping existing decoder callers independent. All 17 ownership
+checks and 552 related tests pass. A controlled 27M source comparison uses the
+same certified artifact and checked-hash bytecode caches for both readers:
+observed RSS load delta decreases by **10,244,096 bytes** and sampled load-phase
+peak RSS by **6,393,856 bytes**. Logical weight/KV size and CPU saved logits are
+unchanged. Load time is effectively flat; an earlier apparent **14.79%** gain
+was confounded by source-cache state and is not claimed. All four decode
+medians are lower in the final run, with 27M changes **-3.11%/-0.80%**. General
+generation timing non-regression remains open.
 
-## Summary
+[All 24 CI jobs at `d277e3d`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40121721368)
+pass; security passes separately. The complete hosted suite returns **5,560
+passed, 51 skipped, zero failures**, with **78.812777439%** line coverage. This
+is three covered lines below the initial dense baseline and fifteen below an
+intermediate run on the same production source tree; the variation is retained
+and unexplained. Actual tiny/27M CPU, Torch CPU and ONNX CPU source checks,
+cached continuation, SDK/streaming and CLI pass. All 14 current Mamba-2 and
+nine current Mamba-1 controls also pass. The complete local run returns
+**5,564 passed, 43 skipped, three failures** (two existing MCP HTTP cases and
+unchanged RAM admission), with **78.831926190%** covered lines. The isolated
+RAM check remains blocked before allocation; no guard or test was relaxed.
+The linked report retains raw data, losses, all 22 dispositions and hardware
+tiers. Packed execution, mapped inference weights and trained-model quality
+are not established by this change.
 
-This document records the **actual implementation status** of every subsystem advertised by Aether, verified against source code. It replaces any previous status based on README claims.
+A [Mamba-2 clamp-dispatch follow-up](docs/mission-mamba2-source-parameters.md#clamp-dispatch-profiling-follow-up)
+targets measured NumPy wrapper overhead while preserving the correct source
+bounds. All 151 focused controls pass; all 14 same-artifact A/B contracts retain
+exact logits, prefix state/history and continuation logits. Local bounded
+traced peaks decrease by **168/336 bytes** for short/long prompts. Local timing
+is mixed with broad spreads; no general speed claim is assigned. The complete
+local run returned **5,542 passed, 42 skipped, three failures**: two existing
+MCP HTTP cases and RAM admission before audit-worker execution. That worker
+check passed separately without relaxing its guard. Coverage rose to
+**78.8267038%**; module Ruff/mypy diagnostics are unchanged. Hosted validation
+against the already-correct bounded runtime passed all 23
+[CI jobs at `621e84b`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40083133823),
+with security passing separately. The complete hosted run returned **5,536
+passed, 51 skipped, zero failures**, with **78.8145182%** line coverage.
+All 14 Mamba-2 and nine Mamba-1 contracts passed original-HF admission and
+actual API/CLI checks. Every Mamba-2 saved logit array is byte-identical to the
+correct baseline. Bounded-case decode medians improved in **11/14** rows,
+with observed changes **-1.24% to +6.25%**; full spreads and control losses are
+retained. Broader timing non-regression and peak-RSS validation remain open.
 
----
+The [Mamba-2 source-parameter correction](docs/mission-mamba2-source-parameters.md)
+preserves declared convolution activation and time-step bounds through the
+authenticated AEG header and actual CPU/Torch execution. The final regression
+fails 18 cases on the retained old source; corrected validation passes 70 cases
+and 151 broader controls. Six actual old/new compiler/reader jobs preserve
+default logits and refuse unsupported new semantics in the older reader. The
+complete local run returned **5,543 passed, 42 skipped, two existing MCP HTTP
+failures**. Coverage was **78.7674095%**, slightly below the prior local run;
+local non-reduction remains open. Local default generation medians were
+**0.17% and 2.13% longer** with overlapping spreads; traced allocation peaks
+were unchanged. [Hosted CI at `5c14973`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40076617018)
+passed all 23 jobs, and security passed separately. Its complete run returned
+**5,536 passed, 51 skipped, zero failures**, with **78.8144150%** line coverage.
+All 14 Mamba-2 contracts and nine Mamba-1 controls passed original-HF admission,
+actual CPU/Torch CPU, public API/streaming and CLI checks. ReLU contracts
+recovered **16/16 greedy IDs per executor**; logical weight/state/history bytes
+are unchanged. The six bounded-SiLU contracts decoded **2.30–6.20% slower**
+while executing the formerly omitted clamp; timing non-regression remains open.
+The linked record retains every spread, losses, all 22 pass dispositions and
+hardware tiers; no trained-model or accelerator promotion is implied.
 
-## Phase 0: Audit Baseline (COMPLETE)
+The Mamba-2 activation profiling follow-up replaces masked piecewise sigmoid
+evaluation with the equivalent stable log-sigmoid identity. A randomized
+interleaved local comparison favored it; all 112 focused checks pass with no
+new module lint/type diagnostics. Its complete local run returned **5,470
+passed, 42 skipped, five failures**: the two existing HTTP cases, RAM admission
+and two small exact-equality differences in unchanged Torch paths. The latter
+three passed separately, without relaxing tests; their full-run failures remain
+recorded. Local coverage was **78.7886185%**; local non-reduction remains open.
+[Hosted CI at `bd3db30`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40071277073)
+passed all 23 jobs, and security passed separately. Its complete run returned
+**5,466 passed, 51 skipped, zero failures**, with **78.7921054%** line coverage,
+matching the recorded epsilon hosted run. On that same Xeon worker, six tiny
+Mamba-2 contracts passed original-HF/CPU/Torch CPU admission and API/CLI checks;
+decode medians increased **4.36–12.63%** and first-output medians decreased
+**1.10–9.60%** against the pre-fix runtime. Logical weights/caches are unchanged;
+local traced allocation medians also decreased, without a peak-RSS claim. See the
+[profile, raw series and limits](docs/mission-mamba2-stability.md#profiling-follow-up-stable-log-sigmoid).
 
-| Claim | Status | Evidence |
-|---|---|---|
-| AEG compilation pipeline | ✅ Real | `compiler/compiler.py`, stage1/stage2 |
-| Architecture detection (25+ families) | ✅ Real | `stage1_ingestion/architecture_detection.py` |
-| AEG graph format | ✅ Real | `core/aeg_format.py`, `aeg_format_v2.py` |
-| TorchAEGEngine forward pass | ✅ Real | `runtime/torch_engine.py` (3366 lines) |
-| RoPE (all variants) | ✅ Real | `runtime/rope_scaling.py`, `torch_engine.py` |
-| KV cache (monotonic grow) | ✅ Real | `TorchKVCache._append_kv()` |
-| GQA/MHA/MQA attention | ✅ Real | `torch_engine.py:_attention()` |
-| ALiBi attention (slow path) | ✅ Real → **Optimized** | einsum → SDPA fast path added |
-| Optimizer passes 1–6 | ✅ Real (validated) | `stage2_optimizer/optimizer.py` |
-| Optimizer passes 7–22 | ✅ Real (metadata-producing) | `optimizer.py` |
-| Benchmarking infrastructure | ✅ Real | `benchmark/suite/` |
+The [Mamba-2 finite-input correction](docs/mission-mamba2-stability.md) removes
+CPU SiLU/softplus clipping that changed valid source equations. Five final
+regressions fail on the exact prior runtime; focused validation passes 112
+cases, including original-HF and independent matrix controls. The complete
+local run returned **5,473 passed, 42 skipped, two existing MCP HTTP failures**,
+with **78.8040446%** line coverage. All 14 new cases passed; the local suite
+remains red. A strict local subprocess comparison was refused for live RAM,
+so no speed or resident-memory improvement is assigned to that attempt.
+[Hosted CI at `5dbe26d`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39903522524)
+passed all 23 jobs; security passed separately. Its complete suite returned
+**5,466 passed, 51 skipped, zero failures**. All six Mamba-2 contracts and nine
+Mamba-1 controls passed original-HF/CPU/Torch CPU admission and actual API/CLI
+checks. The three stress contracts recovered **16/16 greedy IDs per executor**
+from **2–4/16**. Logical weight/cache bytes remain unchanged. Decode medians
+were **0.29–5.61% lower**; reducing stable-activation overhead remains active
+work. Hosted coverage was **78.7848675%**, slightly below the previous hosted
+run despite more covered Mamba-2 lines. The linked record retains losses,
+spreads and the open coverage criterion.
 
----
+The [normalization-epsilon correction](docs/mission-normalization-epsilon.md)
+preserves explicit zero in the shared loader. Its final regression failed 12
+cases against the unchanged prior runtime; focused validation now passes 102
+cases with two optional DirectML skips, including actual Llama CPU/Torch/ONNX
+and Mamba-2 CPU/Torch comparisons against original HF. The first strict local
+benchmark refused a Torch worker for insufficient live RAM; no benchmark
+success or memory improvement is inferred from the focused checks. Its complete
+local run returned **5459 passed, 42 skipped, two existing MCP HTTP failures**;
+all 31 new cases passed and line coverage rose to **78.7816445%**. The local
+suite remains red. [Hosted CI at `51c0394`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39874203000)
+passed all 23 jobs; security passed separately. Its complete CPU suite returned
+**5452 passed, 51 skipped, zero failures**, with **78.7921054%** line coverage.
+Three Mamba-2 source contracts and all nine Mamba-1 controls passed original-HF,
+CPU/Torch CPU, public API/streaming and CLI checks. The zero-epsilon correction
+improves numerical fidelity with unchanged logical weight/cache bytes; observed
+tiny-model decode medians were slightly lower and first-output latency higher.
+The linked report retains raw
+spreads and limits; broader mission work remains open.
 
-## Phase 1: New Implementations (THIS SESSION — COMPLETE)
+The previous measured [CI at `ad77e08`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39747608124)
+passed all 23 jobs and security passed separately. Nine untrained FP32 Mamba-1
+contracts passed original-HF/CPU/Torch CPU admission, public generation/streaming
+and CLI checks; both Mamba-2 controls passed too. The complete hosted suite
+returned **5421 passed, 51 skipped, zero failures**, with **78.7439192%** line
+coverage. The complete local run returned **5427 passed, 42 skipped, three
+failures** (RAM admission and two HTTP-framing cases), with **78.7264834%** line
+coverage. [Measurements, losses and limits](docs/mission-mamba1-fidelity.md) retain
+all runs. These synthetic checks do not promote trained-family or accelerator
+grades; full-package style/type checks remain advisory.
 
-### ✅ Quantized Linear Dispatch
-**File:** `src/aether/kernels/quantized_linear.py`
+Supported CPU AEG compilation, integrity verification, reload and generation have
+executed on an Intel Core i5-1334U running Windows. The last complete green
+local run at `edc7d8f` passed **5,320 tests with 42 skips**, with Torch and
+Transformers installed; line coverage was **78.7295039%**. A separate explicit
+pass-audit integration run passed one case; it is not included in that full-run
+count. The [convolution correction report](docs/mission-mamba-convolution.md)
+records measured memory/numerical results and mixed timing observations.
+[CI at that exact revision](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39437929183)
+passed all 22 jobs. Hosted core tests do not generally install Torch/HF, and
+repository-wide style/type checks remain advisory. The two formerly failing
+local MCP HTTP cases passed without a product change; this does not establish
+an environment fix. Mamba-2's distinct learned normalization and output bias
+now have independent matrix and real CPU/Torch CPU regressions; its new strict
+original-HF CI comparison passed on two untrained FP32 source fixtures, including
+both public CPU backends and the CLI. All 23
+[CI jobs at `1c6b718`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39546525959)
+passed. The complete local run returned 5,330 passed, 42 skipped and three
+failures (the two local MCP HTTP cases and an unchanged timing guard); a focused
+followup passed the timing guard but retained the HTTP failures. Raw local line
+coverage was 78.6650129%, so full-local-green and the coverage criterion remain
+open. See
+[scope and execution evidence](docs/mission-mamba2-normalization.md).
+The expanded hosted Linux job at `2bb08d2` subsequently passed the complete
+suite with Torch, Transformers, server/format extras and CPU ONNX Runtime:
+**5,324 passed, 51 skipped, zero failures**, with **78.6772413%** line coverage.
+[All 23 CI jobs passed](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/39554606771).
+That job now enforces a measured 78.6% line-coverage floor; differing platform
+and optional-dependency skips remain explicit in the linked record.
+These are functional checks, not production or
+throughput certification. Exact environment, evidence, known failures and the
+22-pass matrix are in [the validation record](docs/mission-validation.md).
 
-| Format | Execution Path | Backend |
-|---|---|---|
-| FP8 E4M3 | `torch._scaled_mm` (sm89+), dequant fallback | CUDA / NumPy |
-| INT8 symmetric | `torch._int_mm` (sm80+), dequant fallback | CUDA / NumPy |
-| INT8 asymmetric | dequant fallback | NumPy |
-| NF4 | bitsandbytes path, codec dequant fallback | bnb / NumPy |
-| INT4 packed | dequant fallback (no native INT4 GEMM yet) | NumPy |
-| BF16/FP16/FP32 | reference `F.linear` | PyTorch |
-
-Every fallback explicitly labeled `execution_mode="dequant_fallback"`. No silent FP32 conversions.  
-**Codec math verified** via 23 unit tests.
-
----
-
-### ✅ Paged KV Cache (Real Tensor Storage)
-**File:** `src/aether/runtime/paged_kv_cache.py`
-
-The previous `kv_cache.py` stored only page IDs and tier metadata — no tensors. This stores actual KV data.
-
-| Feature | Implementation |
+| Area | Current evidence and remaining work |
 |---|---|
-| Pool tensor | `np.zeros((max_pages, page_size, num_layers, 2, num_kv_heads, head_dim))` |
-| PyTorch mirror | `torch.zeros(same_shape, device=device)` |
-| Block allocator | O(1) alloc/free with ref-counting (thread-safe) |
-| KV write | `pool[page_id, slot, layer_idx, 0/1] = k/v` |
-| KV read | gather pages → `(total_tokens, heads, dim)` |
-| Prefix sharing | SHA-256 content hash + radix-prefix scan |
-| CPU offload | `pool[page_id].cpu().numpy()` → numpy mirror |
-| Pool exhaustion | `RuntimeError("KV pool exhausted")` |
+| Portable AEG | Compile/save/load/generate and graph/manifest integrity checks execute on CPU. Compatibility depends on model operators and the selected backend contract. |
+| Engine execution | CPU and Torch own handwritten forward passes. Graph fusion alone does not change their schedules; see [the architecture note](docs/mission-architecture-note.md). |
+| Precision | Stored tensors can be transformed. The dense loader reconstructs FP32 projections; mmap and small artifact size do not prove quantized execution or low resident weight memory. |
+| Passes 1–22 | Only P3 remains enabled by default; other passes require explicit selection. The [policy report](docs/mission-default-policy.md) records all 22 dispositions, actual consumers and unresolved checks. Full benefit, composition, idempotency and functional verification remain in progress. |
+| Compiler failure admission | Reported optimizer failures now reject compilation before targeting or destination mutation. Original failure details survive; existing artifacts and diagnostic pipeline reports are preserved. This is separate from mandatory numerical quality gating. |
+| Legacy tree speculation | Fabricated candidates removed; unsupported drafting fails closed. Manual verification requires target evidence. [Migration and tests](docs/legacy-speculation.md). |
+| Executable speculation | Explicit draft/target execution and cache tests pass. Medusa/self-speculation require separate review; no blanket distribution or acceleration guarantee is claimed. |
+| Quality gate | Default compilation measures original FP32 HF against actual CPU and Torch CPU AEG execution before publication. Loader/backend/cache admission requires bound evidence; diagnostics waive absence only. Real tiny public API/CLI execution passed. ONNX/accelerator checks, trained-model/corpus quality, transformed references and runtime adaptation remain unfinished; see [scope and costs](docs/mission-numerical-admission.md). |
+| Model families | [The graded family registry](SUPPORTED_MODELS.md) distinguishes parity checks, execution-only coverage, known divergence and refused families. Nine untrained Mamba-1 contracts pass original-HF/CPU/Torch CPU, API and CLI checks; its trained-family grade remains unchanged. See [measurements](docs/mission-mamba1-fidelity.md). Trained Mamba/Mamba-2, RWKV-7 and Jamba still need broader validation/correction. |
+| KV and batching | Real storage and runtime tests exist. Bounded memory, eviction, copy-on-write and long-running serving require per-path measurement; a pool implementation alone does not prove end-to-end behavior. |
+| Hardware | [The maintained matrix](hardware_validation_matrix.json) separates recorded execution, compilation checks and incomplete integration. Historical Intel UHD DirectML evidence is scoped and dated; other accelerator paths need their own execution records. |
+| Static checks | Critical Ruff passes at baseline. Full Ruff and full-package mypy fail (5,341 source lint findings and 1,796 type errors with the recorded tools). Narrow passing checks do not clear those errors. |
+| Performance | Tiny/MoE synthetic default-policy A/Bs restored native decode dispatch with higher observed decode medians and exact A/B logits/tokens. TTFT results were mixed; no general latency or resident-memory improvement is certified. Trained/larger-model measurements remain open. |
 
-**Research basis:** Kwon et al. (2023) "PagedAttention" (OSDI 2023).  
-**Verified** via 21 unit tests.
+To contribute execution evidence, use `aether hardware detect --json` followed by
+`aether hardware validate TARGET --execute --json` with the matching backend
+installed. Report actual placement and numerical parity; detection, emulation,
+compile-only checks and production validation are different claims.
 
----
-
-### ✅ Speculative Decoding (Real Algorithm 1)
-**File:** `src/aether/runtime/speculative_engine.py`
-
-The previous `speculative.py` used `(token_id * 31 + branch_index) % 100000` to generate "draft" tokens. That is not speculative decoding.
-
-| Algorithm | Reference | Status |
-|---|---|---|
-| DraftTargetSpecDecoder | Leviathan et al. 2023 (ICML) | ✅ Real — Algorithm 1 exact |
-| SelfSpeculativeDecoder | Zhang et al. 2024 | ✅ Real — explicit fallback if no early_exit |
-| MedusaDecoder | Cai et al. 2024 | ✅ Real — explicit fallback if no medusa_heads |
-
-**Algorithm 1 correctness:**
-- Draft tokens: real forward passes (not fabricated)
-- Target verifies γ+1 positions in ONE forward pass  
-- Acceptance: `min(1, p_target(x) / p_draft(x))` — exact
-- Rejection: sample from `(p_target - p_draft)⁺` — corrected distribution
-- Bonus token always emitted from target distribution
-- Provably samples from target distribution (Leviathan et al. Theorem 1)
-
-**Verified** via 33 unit tests.
-
----
-
-### ✅ ALiBi Fast Path via SDPA
-**File:** `src/aether/runtime/torch_engine.py`
-
-Previous: ALiBi always used slow `torch.einsum` path, materializing full score matrix, blocking FlashAttention.
-
-Fix: ALiBi bias built as float `attn_mask` `(1, heads, query, key)` and passed to `scaled_dot_product_attention`. PyTorch 2.x SDPA dispatches to FA2 with additive float bias on supported hardware.
-
-Expected speedup: **2–4× for GPT-Neo / BLOOM decode on CUDA**.
-
----
-
-### ✅ ForwardStep Protocol
-**File:** `src/aether/runtime/torch_engine.py`
-
-Added `forward_step(token_ids, kv_cache, return_all_logits) → (np.ndarray, cache)` and `init_kv_cache() → TorchKVCache` to `TorchAEGEngine`.
-
-Enables `ContinuousBatcher` and `DraftTargetSpecDecoder` to drive any engine without device-specific code.
-
----
-
-### ✅ Continuous Batcher (Orca-style)
-**File:** `src/aether/runtime/continuous_batcher.py`
-
-| Feature | Implementation |
-|---|---|
-| Waiting queue | FIFO with configurable max_queue_size |
-| Prefill | Chunked (Sarathi-Serve) or full-sequence |
-| Decode | Continuous: all active seqs run each step |
-| Admission | max_decode_seqs capacity gate |
-| Lifecycle | WAITING → PREFILLING → DECODING → FINISHED/ERROR |
-| Stats | Throughput (TPS), TTFT per request |
-| Sync API | `generate_sync()` |
-
-**Research basis:** Yu et al. (2022) "Orca" (OSDI 2022); Agrawal et al. (2024) "Sarathi-Serve".
-
----
-
-### ✅ Quality Validator
-**File:** `src/aether/evaluation/quality_validator.py`
-
-| Check | Metric | Default Threshold |
-|---|---|---|
-| Logit KL divergence | KL(ref \|\| cand) | ≤ 0.01 |
-| Logit MAE | mean \|ref - cand\| | ≤ 0.10 |
-| Cosine similarity | cos(ref, cand) | ≥ 0.999 |
-| Token agreement | greedy match rate | ≥ 95% |
-| Perplexity | relative PPL increase | ≤ 1% |
-| Activation | per-layer relative error | ≤ 5% |
-
----
-
-## Phase 2: Remaining Work (Priority Order)
-
-| Subsystem | Status | Priority |
-|---|---|---|
-| Quantized dispatch wired into `_matmul` | Not wired | HIGH |
-| PagedKVPool wired into TorchAEGEngine | Not wired | HIGH |
-| Continuous batcher end-to-end test | Missing | HIGH |
-| Quality validator integration test | Missing | MEDIUM |
-| `speculative.py` → `speculative_engine.py` migration | Parallel files | LOW |
-| Prefix sharing in ContinuousBatcher | Not connected | LOW |
-
----
-
-## What Is NOT Implemented (Honest)
-
-1. **Triton flash attention** — `kernels/flash_attn_triton.py` is a skeleton. Requires GPU.
-2. **FP8 `torch._scaled_mm`** — CPU always dequants. Correctly labeled.
-3. **INT8 W8A8 on CPU** — CPU always dequants. Correctly labeled.
-4. **Medusa heads** — Requires fine-tuned checkpoints. Fallback is labeled.
-5. **MLA (Multi-head Latent Attention)** — `attention/mla.py` at 21% coverage.
-6. **CPU offload scheduling** — `PagedKVPool.offload_to_cpu()` works but no eviction policy calls it.
+The previous September status report's blanket completion, expected speedup and
+algorithm guarantees have been superseded by this evidence-based record. Its
+history remains in Git.

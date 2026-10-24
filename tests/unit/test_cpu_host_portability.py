@@ -416,14 +416,21 @@ def test_generic_artifact_compiles_reloads_and_generates(tiny_local_safetensors_
     from aether import Compiler, CompilerConfig, Runtime, RuntimeConfig
 
     artifact = Compiler(
-        CompilerConfig(targets=["cpu_generic"], cache_dir=str(tmp_path / "cache"))
+        CompilerConfig(
+            quality_mode="diagnostic", targets=["cpu_generic"], cache_dir=str(tmp_path / "cache")
+        )
     ).compile(str(tiny_local_safetensors_model), output_path=tmp_path / "generic.aeg")
     artifact.verify_integrity()
     assert artifact.manifest.kernels.targets == ["cpu_generic"]
     for descriptor in artifact.metadata.get("kernel_artifacts", []):
         assert native.library_compatibility_error(descriptor["build_identity"]) is None
     response = Runtime(
-        RuntimeConfig(backend_name="aether_cpu", execution_devices=["cpu"], hf_offline=True)
+        RuntimeConfig(
+            allow_uncertified=True,
+            backend_name="aether_cpu",
+            execution_devices=["cpu"],
+            hf_offline=True,
+        )
     ).generate(str(artifact.root), "hello", max_tokens=2, temperature=0.0)
     assert response.usage["completion_tokens"] == 2
     assert response.metrics.backend_name == "aether_cpu"
@@ -477,10 +484,15 @@ def test_real_packaged_windows_aeg_can_be_removed_while_engine_is_live(tmp_path,
         checkpoint = root / "checkpoint"
         _write_probe_checkpoint(checkpoint)
         artifact = Compiler(
-            CompilerConfig(targets=["cpu_generic"], precision="FP32", cache_dir=str(root / "cache"))
+            CompilerConfig(
+                quality_mode="diagnostic",
+                targets=["cpu_generic"],
+                precision="FP32",
+                cache_dir=str(root / "cache"),
+            )
         ).compile(str(checkpoint), output_path=root / "compiled.aeg")
         assert artifact.metadata.get("kernel_artifacts")
-        engine = load_engine_from_path(artifact.root)
+        engine = load_engine_from_path(artifact.root, allow_uncertified=True)
         logits, _ = engine.forward(np.array([1, 2]))
         assert engine.kernels.is_native
         assert np.isfinite(logits).all()

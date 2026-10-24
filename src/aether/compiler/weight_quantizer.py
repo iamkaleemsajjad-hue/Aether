@@ -245,11 +245,12 @@ class GraphWeightQuantizer:
                     if bias is None:
                         continue
                     bias_name = f"layer_{layer_index}_{projection}_proj_bias"
+                    bias_precision = "FP32" if precision == "FP32" else "BF16"
                     bias_qt = quantize_tensor(
-                        np.asarray(bias, dtype=np.float32), "BF16", self.block_size
+                        np.asarray(bias, dtype=np.float32), bias_precision, self.block_size
                     )
                     quantized[bias_name] = bias_qt
-                    stats.record("BF16", bias_qt)
+                    stats.record(bias_precision, bias_qt)
             else:
                 name = self._weight_name(node_id, op_type, layer_index)
                 if name is None:
@@ -258,7 +259,7 @@ class GraphWeightQuantizer:
                 qt = quantize_tensor(weight, precision, self.block_size)
                 quantized[name] = qt
                 stats.record(precision, qt)
-                self._store_biases(node, name, quantized, stats)
+                self._store_biases(node, name, quantized, stats, precision)
                 # The ingestion graph models SwiGLU's gate and up projections
                 # as one logical node, but they are distinct checkpoint tensors.
                 # Persist both real tensors so the CPU engine can reconstruct
@@ -284,14 +285,18 @@ class GraphWeightQuantizer:
         weight_name: str,
         quantized: dict[str, QuantizedTensor],
         stats: QuantizationStats,
+        precision: str,
     ) -> None:
         """Persist parameter biases alongside the real weight tensor."""
         attrs = getattr(node, "attributes", {}) or {}
         bias = attrs.get("bias")
         if bias is not None:
-            qt = quantize_tensor(np.asarray(bias, dtype=np.float32), "BF16", self.block_size)
+            bias_precision = "FP32" if precision == "FP32" else "BF16"
+            qt = quantize_tensor(
+                np.asarray(bias, dtype=np.float32), bias_precision, self.block_size
+            )
             quantized[f"{weight_name}_bias"] = qt
-            stats.record("BF16", qt)
+            stats.record(bias_precision, qt)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -393,9 +398,10 @@ class GraphWeightQuantizer:
                 return self.precision_map[key]
         if node_id in self.precision_map:
             return self.precision_map[node_id]
-        # Embedding and LM head often stay in BF16 for quality.
+        # Compact plans retain BF16 global defaults. Explicit FP32 packing is
+        # lossless for every source tensor, including final normalization.
         if node_id in ("embedding", "lm_head", "final_norm"):
-            return self.precision_map.get(node_id, "BF16")
+            return "FP32" if self.default_precision == "FP32" else "BF16"
         return self.default_precision
 
     def _weight_name(

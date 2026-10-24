@@ -129,6 +129,9 @@ class RuntimeConfig:
     hf_offline: bool = False
     """Only use local Hugging Face files when true; never contact the Hub."""
 
+    allow_uncertified: bool = False
+    """Explicit uncertified development compilation/execution; failures still refuse."""
+
     allow_remote_code: bool = False
     """Explicitly allow execution of custom code from a model repository.
 
@@ -377,6 +380,7 @@ class RuntimeConfig:
             "model_cache_dir": self.model_cache_dir,
             "model_download_timeout_s": self.model_download_timeout_s,
             "hf_offline": self.hf_offline,
+            "allow_uncertified": self.allow_uncertified,
             "allow_remote_code": self.allow_remote_code,
             "enable_memory_profiling": self.enable_memory_profiling,
             "enable_telemetry": self.enable_telemetry,
@@ -456,6 +460,7 @@ class RuntimeConfig:
             model_cache_dir=data.get("model_cache_dir"),
             model_download_timeout_s=data.get("model_download_timeout_s", 30.0),
             hf_offline=data.get("hf_offline", False),
+            allow_uncertified=data.get("allow_uncertified", False),
             allow_remote_code=data.get("allow_remote_code", False),
             enable_memory_profiling=data.get("enable_memory_profiling", False),
             enable_telemetry=data.get("enable_telemetry", True),

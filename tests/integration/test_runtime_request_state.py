@@ -16,6 +16,7 @@ from aether.core.exceptions import RuntimeError as AetherRuntimeError
 
 def config(root, **kwargs):
     return RuntimeConfig(
+        allow_uncertified=True,
         backend_name="aether_cpu", execution_devices=["cpu"], hf_offline=True,
         model_cache_dir=str(root / "models"), dynamic_precision=False,
         speculative_decoding=False, **kwargs,
@@ -30,6 +31,7 @@ def task_artifact(tmp_path_factory):
     source = root / "checkpoint"
     _write_probe_checkpoint(source)
     compiler_config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"], precision="FP32", optimization_level=0,
         cache_dir=str(root / "compile-cache"),
     )

@@ -224,6 +224,7 @@ def test_actual_compiled_artifact_backend_generation_stream_and_unload(
 
     _write_probe_checkpoint(tmp_path / "source")
     config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         precision="FP32",
         optimization_level=0,
@@ -241,13 +242,16 @@ def test_actual_compiled_artifact_backend_generation_stream_and_unload(
     handle = backend.load_model(
         "logical",
         str(artifact),
+        allow_uncertified=True,
         providers=[provider],
         allow_provider_fallback=False,
         enable_profiling=True,
         profile_file_prefix=str(tmp_path / "profile"),
     )
     engine = handle.engine
-    reference = load_engine_from_path(artifact, prepare_native_kernels=False)
+    reference = load_engine_from_path(
+        artifact, prepare_native_kernels=False, allow_uncertified=True
+    )
     prompt = np.array([1, 2])
     expected = reference.generate(prompt, max_tokens=3, temperature=0.0)
     request = GenerationRequest(
@@ -264,7 +268,9 @@ def test_actual_compiled_artifact_backend_generation_stream_and_unload(
     bundle_path = engine.bundle.root
     assert bundle_path.is_dir()
     with pytest.raises(Exception, match="different providers"):
-        backend.load_model("logical", str(artifact), providers=["not-the-same-provider"])
+        backend.load_model(
+            "logical", str(artifact), providers=["not-the-same-provider"], allow_uncertified=True
+        )
     backend.unload_model("logical")
     assert not backend._models and not bundle_path.exists()
     if provider in {"DmlExecutionProvider", "CPUExecutionProvider"}:
@@ -284,6 +290,7 @@ def test_actual_compiled_artifact_backend_generation_stream_and_unload(
 
         runtime = Runtime(
             RuntimeConfig(
+                allow_uncertified=True,
                 backend_name="onnx",
                 execution_devices=[device],
                 prefill_devices=[device],

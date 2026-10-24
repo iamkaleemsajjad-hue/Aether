@@ -10,11 +10,17 @@ changing the AEG artifact contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Iterator
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+from aether.core.mamba2_parameters import Mamba2Parameters
 from aether.runtime.stopping import stop_token_set
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+    from numpy.typing import NDArray
 
 
 @dataclass
@@ -28,6 +34,8 @@ class Mamba2LayerWeights:
     out_proj: np.ndarray
     in_proj_bias: np.ndarray | None = None
     conv_bias: np.ndarray | None = None
+    output_norm: NDArray[np.float32] | None = None
+    out_proj_bias: NDArray[np.float32] | None = None
 
 
 @dataclass
@@ -38,6 +46,7 @@ class Mamba2ModelWeights:
     lm_head: np.ndarray
     norm_eps: float = 1e-5
     norm_type: str = "RMSNorm"
+    parameters: Mamba2Parameters = field(default_factory=Mamba2Parameters)
 
 
 @dataclass
@@ -71,6 +80,10 @@ class Mamba2ExecutionEngine:
         head_dim: int | None = None,
     ) -> None:
         self.weights = weights
+        self._conv_activation: Callable[[NDArray[np.float32]], NDArray[np.float32]] = (
+            self._relu if weights.parameters.conv_activation == "relu" else self._silu
+        )
+        self._time_step_limit = weights.parameters.time_step_limit
         self.state_size = int(state_size)
         self.inner_size = int(inner_size)
         self.num_heads = int(num_heads)
@@ -81,6 +94,11 @@ class Mamba2ExecutionEngine:
             raise ValueError("Mamba-2 requires positive n_heads/n_groups with n_heads divisible by n_groups")
         if self.num_heads * self.head_dim != self.inner_size:
             raise ValueError("Mamba-2 head geometry does not match the expanded inner dimension")
+        for index, layer in enumerate(weights.layers):
+            if layer.output_norm is not None and layer.output_norm.shape != (self.inner_size,):
+                raise ValueError(
+                    f"Mamba-2 layer {index} output norm must have {self.inner_size} scales"
+                )
         self.num_kv_heads = self.num_heads
         self.sparse_attention_plan = None
         self.semantic_kv_plan = None
@@ -88,7 +106,19 @@ class Mamba2ExecutionEngine:
 
     @staticmethod
     def _silu(value: np.ndarray) -> np.ndarray:
-        return value / (1.0 + np.exp(-np.clip(value, -60.0, 60.0)))
+        """Evaluate x*sigmoid(x) without changing finite convolution/gate inputs.
+
+        Dao & Gu (2024), section 7.1, and Mamba2Simple v2.2.4 use SiLU:
+        https://arxiv.org/html/2405.21060v1
+        https://github.com/state-spaces/mamba/blob/95d8aba8a8c75aedcaa6143713b11e745e7cd0d9/mamba_ssm/modules/mamba2_simple.py
+        sigmoid(x)=exp(-logaddexp(0, -x)) keeps the exponential argument
+        nonpositive, without clipping inputs or dispatching masked ufuncs.
+        """
+        return value * np.exp(-np.logaddexp(0.0, -value))
+
+    @staticmethod
+    def _relu(value: NDArray[np.float32]) -> NDArray[np.float32]:
+        return np.maximum(value, 0)
 
     def _norm(self, value: np.ndarray, weight: np.ndarray) -> np.ndarray:
         if self.weights.norm_type.lower() == "layernorm":
@@ -114,7 +144,8 @@ class Mamba2ExecutionEngine:
         result = np.sum(kernel[None, :, :] * window, axis=2)
         if layer.conv_bias is not None:
             result = result + np.asarray(layer.conv_bias, dtype=np.float32).reshape(1, -1)
-        return self._silu(result), window[:, :, -max(kernel.shape[1] - 1, 0):]
+        # The window contains k columns; keep k-1, including an empty k=1 history.
+        return self._conv_activation(result), window[:, :, 1:]
 
     def _step(self, hidden: np.ndarray, index: int, cache: Mamba2Cache) -> np.ndarray:
         layer = self.weights.layers[index]
@@ -138,7 +169,22 @@ class Mamba2ExecutionEngine:
         repeat = self.num_heads // self.num_groups
         b = np.repeat(b, repeat, axis=1)
         c = np.repeat(c, repeat, axis=1)
-        delta = np.log1p(np.exp(np.clip(dt + layer.dt.reshape(1, -1), -60.0, 60.0)))
+        # Mamba2Simple v2.2.4 forward: delta=softplus(raw_dt+dt_bias).
+        # logaddexp(0, x)=log(1+exp(x)) evaluates the same function without
+        # clipping valid time steps or overflowing exp for large positive x.
+        delta = np.logaddexp(0.0, dt + layer.dt.reshape(1, -1))
+        if self._time_step_limit is not None:
+            # Source torch_forward clamps AFTER softplus for decay and input.
+            # Preserve NumPy's one-sided ufuncs and two-sided clip semantics,
+            # avoiding generic array-function dispatch on this owned ndarray.
+            # https://numpy.org/doc/1.26/reference/generated/numpy.clip.html
+            minimum, maximum = self._time_step_limit
+            if minimum is None and maximum is not None:
+                np.minimum(delta, maximum, out=delta)
+            elif maximum is None and minimum is not None:
+                np.maximum(delta, minimum, out=delta)
+            else:
+                delta.clip(minimum, maximum, out=delta)
         a = -np.exp(np.asarray(layer.a_log, dtype=np.float32).reshape(1, -1))
         decay = np.exp(delta[:, :, None, None] * a[:, :, None, None])
         state = cache.states[index]
@@ -147,7 +193,17 @@ class Mamba2ExecutionEngine:
         y = np.sum(state * c[:, :, None, :], axis=-1)
         y += x * np.asarray(layer.d, dtype=np.float32).reshape(1, self.num_heads, 1)
         mixed = y.reshape(-1, self.inner_size) * self._silu(z)
-        return hidden + mixed @ layer.out_proj.T
+        if layer.output_norm is not None:
+            # Dao & Gu (2024), section 7.1, and mamba2_simple.py v2.2.4:
+            # g = y*SiLU(z); output = g/sqrt(mean(g**2)+eps)*norm.weight.
+            # This is RMSNorm even for a legacy outer LayerNorm contract.
+            mixed = mixed / np.sqrt(
+                (mixed * mixed).mean(axis=-1, keepdims=True) + self.weights.norm_eps
+            ) * layer.output_norm
+        projected_out = mixed @ layer.out_proj.T
+        if layer.out_proj_bias is not None:
+            projected_out = projected_out + layer.out_proj_bias
+        return hidden + projected_out
 
     def forward(self, token_ids: np.ndarray, cache: Mamba2Cache | None = None) -> tuple[np.ndarray, Mamba2Cache]:
         ids = np.asarray(token_ids, dtype=np.int64).reshape(-1)
@@ -167,6 +223,17 @@ class Mamba2ExecutionEngine:
         logits = np.stack(outputs, axis=0)
         cache.last_logits = logits[-1].copy()
         return logits, cache
+
+    def forward_step(
+        self,
+        token_ids: NDArray[np.int64] | list[int],
+        cache: Mamba2Cache | None = None,
+        *,
+        return_all_logits: bool = False,
+    ) -> tuple[NDArray[np.float32], Mamba2Cache]:
+        """Expose causal rows or the final vocabulary vector with owned caller state."""
+        rows, updated = self.forward(np.asarray(token_ids, dtype=np.int64), cache)
+        return (rows if return_all_logits else rows[-1]), updated
 
     def generate_iter(self, prompt_ids: np.ndarray, max_tokens: int = 16, temperature: float = 0.0,
                       eos_token_id: int | None = None, cache: Mamba2Cache | None = None,

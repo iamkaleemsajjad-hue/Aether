@@ -1,0 +1,60 @@
+{
+  "corresponding_runtime_revision": "1a2163992910cb7ce1f9513fc05af84db0ea708e",
+  "platform": "Windows AMD64, Python 3.10.11",
+  "complete_suite": {
+    "sha256": "7b7c974ad38430ab0c16ed461338e3d715307e150bd09759192031e5a405929e",
+    "tests": 5449,
+    "passed": 5405,
+    "skipped": 42,
+    "failures": [
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[False]",
+        "message": "assert False\n +  where False = connect()\n +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x000001D591602F50>.connect"
+      },
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[True]",
+        "message": "assert False\n +  where False = connect()\n +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x000001D591519E40>.connect"
+      }
+    ],
+    "suites": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "2",
+        "skipped": "42",
+        "tests": "5449",
+        "time": "1626.932",
+        "timestamp": "2026-10-22T10:19:46.571739+05:00",
+        "hostname": "DESKTOP-MNGKA5K"
+      }
+    ]
+  },
+  "coverage": {
+    "version": "7.16.2",
+    "timestamp": "1792647956951",
+    "lines-valid": "57295",
+    "lines-covered": "45107",
+    "line-rate": "0.7873",
+    "branches-valid": "17252",
+    "branches-covered": "10790",
+    "branch-rate": "0.6254",
+    "complexity": "0"
+  },
+  "coverage_sha256": "3043fa5a344a948df4e4be2379b003f914777ffc0ce12741bcf9643341e9fee1",
+  "line_coverage_percent": 78.72763766471769,
+  "static": {
+    "ruff": {
+      "before": 26,
+      "after": 26,
+      "new": []
+    },
+    "mypy": {
+      "before": 11,
+      "after": 11,
+      "new": []
+    }
+  },
+  "note": "Single complete run; not a union of focused reruns. No failure or resource guard waived."
+}

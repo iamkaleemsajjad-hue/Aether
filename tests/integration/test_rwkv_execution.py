@@ -64,6 +64,7 @@ def test_rwkv_time_mix_compiles_serializes_and_generates(tmp_path: Path) -> None
 
     artifact = tmp_path / "rwkv.aeg"
     Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
         overwrite=True, calibration_tokens=4, cache_dir=str(tmp_path / "cache"),
     )).compile(
@@ -79,15 +80,15 @@ def test_rwkv_time_mix_compiles_serializes_and_generates(tmp_path: Path) -> None
     names = set(package.weight_store().entries)
     assert "layer_0_ssm_time_decay" in names
     assert "layer_0_ssm_ffn_time_mix_k" in names
-    result = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
-        str(artifact), prompt="hello", max_tokens=2, temperature=0.0
-    )
+    result = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2)
+    ).generate(str(artifact), prompt="hello", max_tokens=2, temperature=0.0)
     assert result.text
 
     pytest.importorskip("torch")
     from aether.runtime.torch_state_engine import TorchRWKVAEGEngine
 
-    cpu_engine = load_engine_from_path(artifact)
+    cpu_engine = load_engine_from_path(artifact, allow_uncertified=True)
     cpu_logits, _ = cpu_engine.forward(np.asarray([1, 2, 3], dtype=np.int64))
     portable = TorchRWKVAEGEngine(cpu_engine, "cpu")
     portable_logits, _ = portable.forward(np.asarray([1, 2, 3], dtype=np.int64))

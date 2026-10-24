@@ -1,9 +1,9 @@
 # Aether Runtime — Supported Model Matrix
 
 Aether detects model architecture from `config.json`, GGUF headers, SafeTensors
-metadata, or structural graph analysis — **not** from the model name. Any model
-whose architecture is recognized by the detector can be compiled to a
-self-contained `.aeg` artifact and executed on any supported target.
+metadata, or structural graph analysis. Compilation and execution require
+supported operators, a compatible backend and passing numerical admission.
+The table below records verified contracts and historical family gaps.
 
 ## Support at a glance
 
@@ -15,9 +15,9 @@ model-name and Hugging Face architecture-class spellings.
 |-------|---------:|---------|
 | ✅ Parity-verified | **26** | every logit matches the reference (~1e-6) on the CPU, PyTorch and tensor-parallel engines, prefill and decode |
 | 🟡 Runs, not gated | **6** | compiles and executes with round-trip tests; no per-logit comparison yet |
-| 🔬 Known-incorrect | **4** | executes with *measured* divergence from the reference |
+| 🔬 Known-incorrect | **4** | historical divergence or incomplete specialized contracts; scoped corrections below |
 | ❌ Refused | **4** | detected, then rejected at compile time rather than emitting a wrong artifact |
-| **Executable** | **36** | parity-verified + runs + known-incorrect |
+| **Engine paths** | **36** | registered engine families, including degraded contracts |
 
 Three quantities are easy to conflate, so they are kept apart here:
 **families** are computation contracts (40); **detection keys** are the names and
@@ -36,6 +36,10 @@ python -c "from aether.core.model_families import support_summary; print(support
 ```
 
 ## How this matrix is verified
+
+Registry grades retain the historical family checks described here. Ordinary
+compilation additionally requires independent original-FP32 HF/CPU/Torch CPU
+numerical admission; the scoped Mamba-1 results are linked below.
 
 Every family marked **✅ Parity-verified** is checked by
 [`scripts/validate_family_parity.py`](../scripts/validate_family_parity.py),
@@ -63,7 +67,7 @@ python scripts/validate_family_parity.py llama qwen3 gemma2 gpt_neo   # etc.
 |--------|---------|
 | ✅ | **Parity-verified**: compiled output matches the 🤗 Transformers reference to ~1e-6 on prefill and decode, on the CPU, PyTorch, and tensor-parallel engines. |
 | 🟡 | **Runs, not parity-gated**: compiles and executes through the shared decoder path, but has no automatic per-logit comparison against a reference implementation yet. |
-| 🔬 | **Specialized engine, known-incorrect**: ingests and runs, but its dedicated engine does **not** currently match the reference. Do not rely on it. |
+| 🔬 | **Specialized contract with a degraded grade**: historical divergence or incomplete execution remains recorded; read the scoped corrections and remaining validation below. |
 | ❌ | **Not yet supported**: fails to compile or has no execution path. |
 
 ---
@@ -133,17 +137,16 @@ bit-for-bit.
 
 ---
 
-## State-space & hybrid — specialized engine, currently incorrect 🔬 (4)
+## State-space & hybrid — historical divergence / incomplete validation 🔬 (4)
 
-These ingest and run through their own engines, but **do not currently match the
-reference implementation** when checked with `validate_family_parity.py`, so they
-must not be relied on for correct output yet. This is a deliberate downgrade from
-earlier documentation, which asserted support without a parity check:
+These families retain the registry's degraded grades while trained checkpoints
+and complete execution contracts are revalidated. Historical reference checks,
+scoped corrections and incomplete bindings are recorded individually below:
 
 | Family | Status detail |
 |--------|---------------|
-| **Mamba** | Runs; selective-scan output diverges from the reference (cosine ≈ 0.97). Not correct. |
-| **Mamba-2 / SSD** | Runs; output badly diverges (cosine ≈ 0.21). Not correct. |
+| **Mamba** | Historical trained-family check diverged (cosine ≈ 0.97). Checkpoint normalization, expansion, biases and finite-value handling are now corrected; nine untrained FP32 contracts pass original-HF/CPU/Torch CPU, public API and CLI checks. Trained checkpoints remain unverified and the family grade is unchanged; see [measurements and limits](docs/mission-mamba1-fidelity.md). |
+| **Mamba-2 / SSD** | Historical parity check diverged (cosine ≈ 0.21). Learned normalization, HF expansion and output bias are now corrected; two untrained FP32 HF fixtures pass CPU/Torch CPU, API and CLI checks. Trained checkpoints and other config/normalization variants remain unverified; see [executed evidence](docs/mission-mamba2-normalization.md). |
 | **RWKV-7** | Does not currently bind its time-mix/channel-mix weights during compile. |
 | **Jamba** | Hybrid attention+SSM+MoE (also Zamba2, Hymba, Falcon-H1, Bamba, PLaMo); the reference path requires CUDA Mamba kernels, so it is unverified on CPU. |
 
@@ -162,13 +165,16 @@ earlier documentation, which asserted support without a parity check:
 
 ## Compile-once, run-everywhere
 
-The portability promise holds and is verified:
+Portable AEG execution uses a compatible backend that supports the artifact's
+operators. The [hardware matrix](hardware_validation_matrix.json) records
+per-target execution and validation evidence:
 
-* An `.aeg` compiled for **any** target (`cuda_sm70`, `metal_m1`, `cpu_avx512`, …)
-  executes on **any** host with a supported backend. Artifacts built for the
-  three targets above produce **identical** logits when run on the same machine.
+* Supported CPU/Torch CPU contracts have compile/save/load and numerical
+  comparisons. The nine untrained Mamba-1 contracts above execute through both
+  public CPU backends from the same admitted artifact. Accelerator and ONNX
+  parity require their own supported operators and execution evidence.
 * The `.aeg` is **fully self-contained**: it embeds the quantized weights, the
-  complete tokenizer, the computation graph, and integrity hashes. After
+  complete supported tokenizer assets, the computation graph, and integrity hashes. After
   compilation the original checkpoint can be **deleted**, and
   `aether run model.aeg --prompt "…"` still loads and generates correctly with
   no network access and no reference to the source model.
@@ -176,10 +182,10 @@ The portability promise holds and is verified:
 Verify both properties yourself:
 
 ```bash
-aether compile ./some-model -t cpu_avx512 -o model.aeg
-rm -rf ./some-model                 # delete the original entirely
+aether compile ./some-model -t cpu_generic --precision FP32 -o model.aeg
+mv ./some-model ./some-model-source-backup
 aether run model.aeg --prompt "The capital of France is" --temperature 0
-# → "Paris. …"  (runs from the artifact alone)
+# Inspect the actual generated text and admission report for this checkpoint.
 ```
 
 ---
@@ -195,9 +201,8 @@ dequantized on load.
 
 ## A note on decode throughput
 
-Small-model decode is bound by the *number of tensor operations per layer*, not
-by arithmetic. A 135M model with 30 layers issues more work per token than a
-350M model with 24, which is why parameter count alone does not predict speed.
+Small-model decode can be limited by per-layer operations and dispatch overhead.
+Parameter count alone does not predict throughput across models and hardware.
 Measure the per-layer operation count for any family with:
 
 ```bash
@@ -205,19 +210,16 @@ python scripts/benchmark_dispatch.py llama     # Aether vs HuggingFace, per laye
 python scripts/profile_decode.py model.aeg cuda 100
 ```
 
-Architectures without rotary embeddings (GPT-2, GPT-Neo, BLOOM, MPT — all of
-which use learned or ALiBi positions) issue roughly a third fewer operations per
-layer than rotary families, so they decode faster at equal depth. The rotary
-path is evaluated in its minimal five-operation form, with the sin/cos tables
-pre-expanded at build time and Q/K rotated in a single pass.
+Learned-position, ALiBi and rotary architectures have different operator
+schedules. Profile their actual attention and projection paths when comparing
+latency; operation counts alone do not establish a hardware speedup.
 
 ## A note on accelerator memory
 
-Position-indexed tables (rotary sin/cos) are sized by sequence length and capped
-by the artifact's declared context length, so their footprint stays proportional
-to the tokens actually generated. They are never grown multiplicatively: a
-40960-position context would otherwise reserve gigabytes of accelerator memory
-for positions the request can never reach.
+Position tables are part of runtime memory. Their allocation depends on the
+artifact's context/rotary contract and the selected executor. Measure the actual
+table footprint alongside weights, KV, activations and overhead at the intended
+workload ceiling.
 
 ## A note on multi-GPU
 
@@ -231,12 +233,12 @@ Three consequences worth knowing:
 * **Tensor parallelism is not automatically a speed-up.** For small models decode is
   *dispatch*-bound, not bandwidth-bound, and TP roughly doubles the host op count. The
   planner predicts that and keeps such models on one device.
-* **It is a speed-up when the bandwidth roof binds and the fabric is fast.** A 34B model
-  on two NVLink A100s runs ~1.97× faster sharded and holds ~4.6× the KV cache. The same
-  question on two PCIe T4s with a 0.6B model answers the opposite way — one formula, both
-  answers.
-* **Capacity is reported, not discovered.** Every plan carries `tokens_max`, so the batch
-  and context ceiling is known at load time instead of arriving as an OOM.
+* **The planner estimates sharding benefit** from compute, weight bandwidth,
+  dispatch and fabric costs. Predicted gains require execution measurements on
+  the proposed hardware and workload.
+* **The planner reports estimated capacity.** Its `tokens_max` follows a memory
+  model; actual allocations and concurrent memory use still require admission
+  control and measurement.
 
 Inspect the decision for any artifact and any workload:
 

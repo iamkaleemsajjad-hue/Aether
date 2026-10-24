@@ -1,24 +1,32 @@
 """Estimator failure/convergence contracts; these fixtures do not validate hardware."""
 
+from __future__ import annotations
+
 import itertools
 import sys
 import time
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
 from aether.placement import census
+from aether.placement.ledger import CalibrationLedger
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
 
 
 class _Clock:
-    def __init__(self, durations, tensor):
+    def __init__(self, durations: Iterable[float], tensor: SimpleNamespace) -> None:
         self.durations = iter(durations)
         self.tensor = tensor
         self.previous_calls = 0
         self.current = 0.0
         self.start = True
 
-    def __call__(self):
+    def __call__(self) -> float:
         if not self.start:
             count = self.tensor.calls - self.previous_calls
             self.current += next(self.durations) * count / 8
@@ -27,10 +35,16 @@ class _Clock:
         return self.current
 
 
-def _probe(monkeypatch, durations, *, device="cpu", passes=20):
+def _probe(
+    monkeypatch: pytest.MonkeyPatch,
+    durations: Iterable[float],
+    *,
+    device: str = "cpu",
+    passes: int = 20,
+) -> tuple[float, int]:
     tensor = SimpleNamespace(calls=0)
 
-    def add(_value):
+    def add(_value: float) -> None:
         tensor.calls += 1
 
     tensor.add_ = add
@@ -46,6 +60,40 @@ def _probe(monkeypatch, durations, *, device="cpu", passes=20):
         scope.setattr(census, "_DISPATCH_PROBE_MIN_SECONDS", 0.03)
         result = census.measure_dispatch_seconds(device, operations=8)
     return result, tensor.calls
+
+
+@pytest.mark.parametrize("factor,replaced", [(1.1, False), (4.0, True), (0.25, True)])
+def test_independently_settled_probe_costs_reach_the_ledger_without_being_censored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, factor: float, replaced: bool
+) -> None:
+    """Stable clock costs may drift; ledger hysteresis decides whether to refresh.
+
+    These are controlled timing inputs to the real probe, not measured device
+    performance. Every pass has a known per-operation cost, so their ratio is
+    an independent oracle even when adaptive block operation counts differ.
+    """
+    first, _ = _probe(
+        monkeypatch, itertools.chain([0.1] * 3 + [0.005], itertools.repeat(0.005))
+    )
+    second_cost = 0.005 * factor
+    second, _ = _probe(
+        monkeypatch,
+        itertools.chain([0.1] * 3 + [second_cost], itertools.repeat(second_cost)),
+    )
+    assert first == pytest.approx(0.005 / 8)
+    assert second == pytest.approx(second_cost / 8)
+    assert second / first == pytest.approx(factor)
+    store = CalibrationLedger(tmp_path / "calibration.json", autosave=False)
+    store.record_dispatch("cpu:controlled:1GiB", "controlled-clock", first, measured=True)
+    in_force, refreshed = store.reconcile_dispatch(
+        "cpu:controlled:1GiB", "controlled-clock", second
+    )
+    assert refreshed is replaced
+    expected = second if replaced else first
+    assert in_force == pytest.approx(expected)
+    entry = store.get("cpu:controlled:1GiB", "controlled-clock")
+    assert entry.dispatch_measured
+    assert entry.dispatch_seconds == pytest.approx(expected)
 
 
 def test_probe_discards_cold_passes_and_does_not_publish_an_isolated_minimum(monkeypatch):

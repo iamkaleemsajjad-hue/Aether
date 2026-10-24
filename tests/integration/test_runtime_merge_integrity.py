@@ -21,6 +21,7 @@ def original_aeg(tmp_path_factory):
     checkpoint = root / "checkpoint"
     _write_probe_checkpoint(checkpoint)
     config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         precision="FP32",
         optimization_level=0,
@@ -43,6 +44,7 @@ def base_aeg(original_aeg, tmp_path):
 def runtime(tmp_path):
     instance = Runtime(
         RuntimeConfig(
+            allow_uncertified=True,
             model_cache_dir=str(tmp_path / "cache"),
             backend_name="aether_cpu",
             execution_devices=["cpu"],

@@ -879,6 +879,7 @@ class Runtime:
             target = self.fingerprint.target_id
             execution_devices = self.config.execution_devices
             load_options = {
+                **({"allow_uncertified": True} if self.config.allow_uncertified else {}),
                 "offline": self.config.hf_offline,
                 "download_timeout_s": self.config.model_download_timeout_s,
                 "trust_remote_code": self.config.allow_remote_code,
@@ -892,7 +893,7 @@ class Runtime:
                     raise AetherRuntimeError(
                         f"Unable to validate AEG target compatibility for {aeg_path}: {exc}"
                     ) from exc
-                validate_aeg_evaluation(package)
+                validate_aeg_evaluation(package, allow_uncertified=self.config.allow_uncertified)
             # A local ONNX file has an explicit execution contract. Do not
             # route it to the generic PyTorch backend merely because that
             # backend is available on the host.
@@ -1346,7 +1347,10 @@ class Runtime:
             return
         logger.info(f"Pulling and compiling model {model_id}")
         from aether import Compiler, CompilerConfig
-        compiler = Compiler(CompilerConfig(cache_dir=str(aether_cache_dir(self.config.model_cache_dir))))
+        compiler = Compiler(CompilerConfig(
+            cache_dir=str(aether_cache_dir(self.config.model_cache_dir)),
+            quality_mode="diagnostic" if self.config.allow_uncertified else "require_hf",
+        ))
         # No explicit output path: the compiler derives the canonical cache path
         # from the same naming contract this class resolves through, so passing one
         # here could only reintroduce a divergence between writer and reader.
@@ -2576,6 +2580,7 @@ class Runtime:
                 resolved_target = target if target != "auto" else self.fingerprint.target_id
                 # Build kwargs with only known CompilerConfig fields
                 cfg_kwargs: dict[str, Any] = {
+                    "quality_mode": "diagnostic" if self.config.allow_uncertified else "require_hf",
                     "targets": [resolved_target],
                     "quality_budget": quality_budget,
                     "enable_mtp_head": enable_mtp,

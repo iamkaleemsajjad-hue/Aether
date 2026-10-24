@@ -2823,6 +2823,8 @@ class TorchAEGEngine:
         else:
             logits_np = np.asarray(device_logits, dtype=np.float32)
 
+        if not return_all_logits:
+            logits_np = logits_np[-1]
         return logits_np, new_cache
 
     def _new_batched_cache(
@@ -3094,6 +3096,8 @@ class TorchHybridAEGEngine:
                 "ssm_out_proj": self._tensor(mamba.out_proj, layer_device),
                 "ssm_conv_bias": self._optional_tensor(mamba.conv_bias, layer_device),
                 "ssm_dt_bias": self._optional_tensor(mamba.dt_bias, layer_device),
+                "ssm_in_proj_bias": self._optional_tensor(mamba.in_proj_bias, layer_device),
+                "ssm_out_proj_bias": self._optional_tensor(mamba.out_proj_bias, layer_device),
             })
         self._cos: Any | None = None
         self._sin: Any | None = None
@@ -3237,14 +3241,15 @@ class TorchHybridAEGEngine:
     def _ssm_step(self, hidden: Any, index: int, cache: TorchHybridCache) -> Any:
         layer = self.layers[index]
         normalized = self._norm(hidden, layer["ssm_norm"])
-        projected = self._linear(normalized, layer["ssm_in_proj"])
+        projected = self._linear(normalized, layer["ssm_in_proj"], layer["ssm_in_proj_bias"])
         ssm_input, gate = projected.split(self.inner_size, dim=-1)
         kernel = layer["ssm_conv1d"]
         window = self.torch.cat((cache.conv_history[index], ssm_input.unsqueeze(-1)), dim=-1)
         conv = (window * kernel.reshape(1, self.inner_size, -1)).sum(dim=-1)
         if layer["ssm_conv_bias"] is not None:
             conv = conv + layer["ssm_conv_bias"].reshape(1, -1)
-        cache.conv_history[index] = window[..., -max(self.conv_kernel - 1, 0):].detach()
+        # Drop the oldest column; k=1 must retain an empty history, not -0:.
+        cache.conv_history[index] = window[..., 1:].detach()
         conv = self._silu(conv, self.torch)
         selective = self._linear(conv, layer["ssm_x_proj"])
         dt_raw = selective[..., :self.dt_rank]
@@ -3260,7 +3265,9 @@ class TorchHybridAEGEngine:
         state = state + dt.unsqueeze(-1) * conv.unsqueeze(-1) * b.unsqueeze(1)
         cache.states[index] = state.detach()
         output = (state * c.unsqueeze(1)).sum(dim=-1) + conv * layer["ssm_d"].reshape(1, -1)
-        return hidden + self._linear(output * self._silu(gate, self.torch), layer["ssm_out_proj"])
+        return hidden + self._linear(
+            output * self._silu(gate, self.torch), layer["ssm_out_proj"], layer["ssm_out_proj_bias"]
+        )
 
     def _attention_step(self, hidden: Any, index: int, cache: TorchHybridCache, past: int) -> Any:
         torch = self.torch

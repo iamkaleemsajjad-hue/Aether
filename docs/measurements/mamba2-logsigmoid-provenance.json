@@ -1,0 +1,1410 @@
+{
+  "current_revision": "bd3db302254420ac07f49741f6a25f48b3d1bf23",
+  "baseline_revision": "c7af1b6331681b9e8e6b337cb5c06368825143b2",
+  "ci_run": "https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40071277073",
+  "security_run": "https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40071277054",
+  "fixture_code_hashes_verified": true,
+  "reported_code_hashes_verified": 270,
+  "source_and_reference_files_verified": 105,
+  "measurements": {
+    "mamba2": {
+      "report_sha256": "94cbda17ce571ce1a599a483a91d54c52f91e416137b9194942705cec3b8bd84",
+      "hardware": {
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "logical_cpus": 4,
+        "host_ram_bytes": 16765378560,
+        "available_ram_bytes_at_start": 15608074240
+      },
+      "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+      "python": "3.11.14",
+      "versions": {
+        "numpy": "1.26.4",
+        "torch": "2.9.1+cpu",
+        "transformers": "4.57.3",
+        "psutil": "7.2.2",
+        "safetensors": "0.8.0",
+        "tokenizers": "0.22.2"
+      },
+      "cases": [
+        {
+          "case": "default",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 7.192177027265126e-15,
+              "min_cosine": 0.9999999999999081,
+              "max_absolute_logit_error": 2.561137080192566e-07,
+              "max_relative_ppl_change": 4.132365290960238e-08,
+              "min_relative_ppl_change": -3.6149971251409494e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 9.184767273429185e-15,
+              "min_cosine": 0.9999999999999107,
+              "max_absolute_logit_error": 2.980232238769531e-07,
+              "max_relative_ppl_change": 3.021278561898173e-08,
+              "min_relative_ppl_change": -4.321285191790652e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 9.184767273429185e-15,
+            "min_cosine": 0.9999999999999081,
+            "max_absolute_logit_error": 2.980232238769531e-07,
+            "max_relative_ppl_change": 4.132365290960238e-08,
+            "min_relative_ppl_change": -4.321285191790652e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 1.1778105942462986e-14,
+            "min_cosine": 0.9999999999998456,
+            "max_absolute_logit_error": 2.980232238769531e-07,
+            "max_relative_ppl_change": 3.402191475353194e-08,
+            "min_relative_ppl_change": -5.8723572279265114e-08,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 8590.633019273222,
+                "min_decode_tokens_per_second": 8383.775717255392,
+                "max_decode_tokens_per_second": 9050.967289723885,
+                "median_first_token_seconds": 0.00010902599998985352,
+                "min_first_token_seconds": 0.0001051170000039292,
+                "max_first_token_seconds": 0.00011254800000415344
+              },
+              "long": {
+                "median_decode_tokens_per_second": 8420.627168158717,
+                "min_decode_tokens_per_second": 7701.6427605027,
+                "max_decode_tokens_per_second": 8728.77815803455,
+                "median_first_token_seconds": 0.0054170360000114215,
+                "min_first_token_seconds": 0.005377417999994805,
+                "max_first_token_seconds": 0.00563993599999435
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 9665.411083604182,
+                "min_decode_tokens_per_second": 8383.343972219367,
+                "max_decode_tokens_per_second": 10028.49525298004,
+                "median_first_token_seconds": 0.00010782699999367651,
+                "min_first_token_seconds": 9.89620000098057e-05,
+                "max_first_token_seconds": 0.0001530109999805518
+              },
+              "long": {
+                "median_decode_tokens_per_second": 9032.444540754539,
+                "min_decode_tokens_per_second": 8553.316487376353,
+                "max_decode_tokens_per_second": 9814.285674568066,
+                "median_first_token_seconds": 0.004995747999998912,
+                "min_first_token_seconds": 0.0048767940000118415,
+                "max_first_token_seconds": 0.005036391000004414
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94140,
+              "compile_seconds": 0.26262458600001537
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102204,
+              "compile_seconds": 6.675767326999988
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        },
+        {
+          "case": "expanded-biased",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.0640040500252002e-14,
+              "min_cosine": 0.9999999999999218,
+              "max_absolute_logit_error": 2.5331974029541016e-07,
+              "max_relative_ppl_change": -1.7655929451363913e-08,
+              "min_relative_ppl_change": -8.460522324538587e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 8.708161554822174e-15,
+              "min_cosine": 0.9999999999999145,
+              "max_absolute_logit_error": 2.8312206268310547e-07,
+              "max_relative_ppl_change": -4.253232342465936e-08,
+              "min_relative_ppl_change": -6.863277621626887e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.0640040500252002e-14,
+            "min_cosine": 0.9999999999999145,
+            "max_absolute_logit_error": 2.8312206268310547e-07,
+            "max_relative_ppl_change": -1.7655929451363913e-08,
+            "min_relative_ppl_change": -8.460522324538587e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok12 tok7 tok2 tok7 tok15 tok9 tok15 tok9",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok12 tok7 tok2 tok7 tok15 tok9 tok15 tok9",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 1.07116358479323e-14,
+            "min_cosine": 0.9999999999999282,
+            "max_absolute_logit_error": 3.2782554626464844e-07,
+            "max_relative_ppl_change": -1.9653694034494345e-08,
+            "min_relative_ppl_change": -5.0654630761509785e-08,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 8742.263097315565,
+                "min_decode_tokens_per_second": 8573.71372846499,
+                "max_decode_tokens_per_second": 8924.052488844565,
+                "median_first_token_seconds": 0.0001114789999974164,
+                "min_first_token_seconds": 0.00010646300000871634,
+                "max_first_token_seconds": 0.00014166100001489212
+              },
+              "long": {
+                "median_decode_tokens_per_second": 8133.96406402745,
+                "min_decode_tokens_per_second": 7732.95243022385,
+                "max_decode_tokens_per_second": 8548.929185641506,
+                "median_first_token_seconds": 0.005703155000020388,
+                "min_first_token_seconds": 0.005612776999981861,
+                "max_first_token_seconds": 0.005924211999996487
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 9224.885578587255,
+                "min_decode_tokens_per_second": 8581.418042498317,
+                "max_decode_tokens_per_second": 9780.757337868805,
+                "median_first_token_seconds": 0.00010495300000457064,
+                "min_first_token_seconds": 0.00010285700000167708,
+                "max_first_token_seconds": 0.00011597099998539306
+              },
+              "long": {
+                "median_decode_tokens_per_second": 9161.464263716116,
+                "min_decode_tokens_per_second": 8584.933197115937,
+                "max_decode_tokens_per_second": 9269.313276320388,
+                "median_first_token_seconds": 0.00522401500001024,
+                "min_first_token_seconds": 0.005193184999995992,
+                "max_first_token_seconds": 0.0054050349999954506
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 18112,
+              "ssm_state_logical_bytes": 1024,
+              "convolution_history_logical_bytes": 640,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 103806,
+              "compile_seconds": 0.26422459299999446
+            },
+            "current": {
+              "loaded_weight_array_bytes": 18112,
+              "ssm_state_logical_bytes": 1024,
+              "convolution_history_logical_bytes": 640,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 111874,
+              "compile_seconds": 5.240439378000019
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        },
+        {
+          "case": "zero-epsilon",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.5810630335112667e-14,
+              "min_cosine": 0.999999999999793,
+              "max_absolute_logit_error": 3.7532299757003784e-07,
+              "max_relative_ppl_change": 3.9561873227264223e-08,
+              "min_relative_ppl_change": -1.1748569204576171e-07,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.0227739689192818e-14,
+              "min_cosine": 0.9999999999998371,
+              "max_absolute_logit_error": 3.8743019104003906e-07,
+              "max_relative_ppl_change": 1.179612681164395e-08,
+              "min_relative_ppl_change": -4.156137036978238e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.5810630335112667e-14,
+            "min_cosine": 0.999999999999793,
+            "max_absolute_logit_error": 3.8743019104003906e-07,
+            "max_relative_ppl_change": 3.9561873227264223e-08,
+            "min_relative_ppl_change": -1.1748569204576171e-07,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 9.570011134916453e-15,
+            "min_cosine": 0.999999999999843,
+            "max_absolute_logit_error": 4.76837158203125e-07,
+            "max_relative_ppl_change": 4.9296948628163423e-08,
+            "min_relative_ppl_change": -1.4108718397500478e-07,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 8935.124613301901,
+                "min_decode_tokens_per_second": 8797.893533114286,
+                "max_decode_tokens_per_second": 9043.063066418294,
+                "median_first_token_seconds": 0.00010694999997440391,
+                "min_first_token_seconds": 0.0001027950000036526,
+                "max_first_token_seconds": 0.00010973499999522573
+              },
+              "long": {
+                "median_decode_tokens_per_second": 8651.342255639152,
+                "min_decode_tokens_per_second": 7636.685765427247,
+                "max_decode_tokens_per_second": 8944.326677408186,
+                "median_first_token_seconds": 0.005322931999984348,
+                "min_first_token_seconds": 0.00524009599999431,
+                "max_first_token_seconds": 0.00656933499999468
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 9602.286990467677,
+                "min_decode_tokens_per_second": 9196.852048917877,
+                "max_decode_tokens_per_second": 9973.768987642658,
+                "median_first_token_seconds": 0.00010394500000643347,
+                "min_first_token_seconds": 9.956799999599752e-05,
+                "max_first_token_seconds": 0.00014229999999315623
+              },
+              "long": {
+                "median_decode_tokens_per_second": 9579.330541714662,
+                "min_decode_tokens_per_second": 8509.696799480807,
+                "max_decode_tokens_per_second": 9761.621210309359,
+                "median_first_token_seconds": 0.004873876000004884,
+                "min_first_token_seconds": 0.004798394000005146,
+                "max_first_token_seconds": 0.0050607350000007045
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94139,
+              "compile_seconds": 0.26245453999999313
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102204,
+              "compile_seconds": 5.138846008999991
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        },
+        {
+          "case": "large-delta",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.0417472718892372e-14,
+              "min_cosine": 0.9999999999999029,
+              "max_absolute_logit_error": 3.5762786865234375e-07,
+              "max_relative_ppl_change": 4.0766263640854464e-08,
+              "min_relative_ppl_change": -5.179512862141618e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.028359461125828e-14,
+              "min_cosine": 0.9999999999999054,
+              "max_absolute_logit_error": 2.980232238769531e-07,
+              "max_relative_ppl_change": 1.8633641914312557e-08,
+              "min_relative_ppl_change": 6.526001538254271e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.0417472718892372e-14,
+            "min_cosine": 0.9999999999999029,
+            "max_absolute_logit_error": 3.5762786865234375e-07,
+            "max_relative_ppl_change": 4.0766263640854464e-08,
+            "min_relative_ppl_change": -5.179512862141618e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok15 tok10 tok7 tok2 tok14 tok7 tok15 tok12",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok15 tok10 tok7 tok2 tok14 tok7 tok15 tok12",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 0.32827305504996773,
+            "min_cosine": -0.9284036142022835,
+            "max_absolute_logit_error": 1.8789274096488953,
+            "max_relative_ppl_change": -0.05740032163348366,
+            "min_relative_ppl_change": -0.29850708831776085,
+            "matched_ids": 4,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 8901.51491045838,
+                "min_decode_tokens_per_second": 8611.939839480416,
+                "max_decode_tokens_per_second": 9010.249802808767,
+                "median_first_token_seconds": 0.00010879900000304588,
+                "min_first_token_seconds": 0.0001057810000020254,
+                "max_first_token_seconds": 0.0001467530000240913
+              },
+              "long": {
+                "median_decode_tokens_per_second": 8682.795165431788,
+                "min_decode_tokens_per_second": 8475.007203682488,
+                "max_decode_tokens_per_second": 8780.413156071667,
+                "median_first_token_seconds": 0.005394013000000086,
+                "min_first_token_seconds": 0.005289454999996224,
+                "max_first_token_seconds": 0.00561246899999901
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 9422.951887939233,
+                "min_decode_tokens_per_second": 8855.82713422134,
+                "max_decode_tokens_per_second": 9850.34511401378,
+                "median_first_token_seconds": 0.0001066289999869241,
+                "min_first_token_seconds": 9.753099999443293e-05,
+                "max_first_token_seconds": 0.00014979199997355863
+              },
+              "long": {
+                "median_decode_tokens_per_second": 9107.586619571788,
+                "min_decode_tokens_per_second": 8795.37313128318,
+                "max_decode_tokens_per_second": 9545.406818238362,
+                "median_first_token_seconds": 0.005011327999994819,
+                "min_first_token_seconds": 0.0049048159999927066,
+                "max_first_token_seconds": 0.005230320999999094
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94144,
+              "compile_seconds": 0.2641752990000157
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102204,
+              "compile_seconds": 5.152287790000003
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        },
+        {
+          "case": "negative-gate",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.5553215945866518e-15,
+              "min_cosine": 0.9999999999999951,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 9.870599941705921e-09,
+              "min_relative_ppl_change": 7.306062448408436e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.1152511406198482e-15,
+              "min_cosine": 0.9999999999999949,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 1.9859703412478657e-08,
+              "min_relative_ppl_change": 6.835233735725817e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.5553215945866518e-15,
+            "min_cosine": 0.9999999999999949,
+            "max_absolute_logit_error": 1.1920928955078125e-07,
+            "max_relative_ppl_change": 1.9859703412478657e-08,
+            "min_relative_ppl_change": 6.835233735725817e-09,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok15 tok14 tok3 tok15 tok14 tok3 tok15 tok14",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok15 tok14 tok3 tok15 tok14 tok3 tok15 tok14",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 0.15504684135044874,
+            "min_cosine": -0.015042526857209866,
+            "max_absolute_logit_error": 1.4366803169250488,
+            "max_relative_ppl_change": 0.351229760848332,
+            "min_relative_ppl_change": -0.055179646421802786,
+            "matched_ids": 2,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 8738.901595007825,
+                "min_decode_tokens_per_second": 8207.244652217067,
+                "max_decode_tokens_per_second": 8974.56607959641,
+                "median_first_token_seconds": 0.00011229499997966741,
+                "min_first_token_seconds": 0.0001059600000132832,
+                "max_first_token_seconds": 0.00012862399998425644
+              },
+              "long": {
+                "median_decode_tokens_per_second": 8496.424219195776,
+                "min_decode_tokens_per_second": 8141.333550623579,
+                "max_decode_tokens_per_second": 8940.225651415352,
+                "median_first_token_seconds": 0.005424682000011671,
+                "min_first_token_seconds": 0.005343975000016599,
+                "max_first_token_seconds": 0.0055813619999867115
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 9119.748816184212,
+                "min_decode_tokens_per_second": 8938.353453268504,
+                "max_decode_tokens_per_second": 9690.00296265434,
+                "median_first_token_seconds": 0.00010151500001143177,
+                "min_first_token_seconds": 9.7872999987203e-05,
+                "max_first_token_seconds": 0.0001109510000105729
+              },
+              "long": {
+                "median_decode_tokens_per_second": 9294.099840106448,
+                "min_decode_tokens_per_second": 8819.10874100982,
+                "max_decode_tokens_per_second": 9541.048315926904,
+                "median_first_token_seconds": 0.005021784000007301,
+                "min_first_token_seconds": 0.004984212000010757,
+                "max_first_token_seconds": 0.005241237999996429
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 11072,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 96742,
+              "compile_seconds": 0.2631298369999797
+            },
+            "current": {
+              "loaded_weight_array_bytes": 11072,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 104804,
+              "compile_seconds": 5.144519968999987
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        },
+        {
+          "case": "negative-conv",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 4.342817584890027e-15,
+              "min_cosine": 0.9999999999999928,
+              "max_absolute_logit_error": 2.384185791015625e-07,
+              "max_relative_ppl_change": 3.757214343620176e-08,
+              "min_relative_ppl_change": -1.9818032796069674e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 2.9775910062847998e-15,
+              "min_cosine": 0.9999999999999866,
+              "max_absolute_logit_error": 1.7881393432617188e-07,
+              "max_relative_ppl_change": 1.6136862643093536e-08,
+              "min_relative_ppl_change": 6.133751286546013e-10,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 4.342817584890027e-15,
+            "min_cosine": 0.9999999999999866,
+            "max_absolute_logit_error": 2.384185791015625e-07,
+            "max_relative_ppl_change": 3.757214343620176e-08,
+            "min_relative_ppl_change": -1.9818032796069674e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok2 tok2 tok2 tok2 tok2 tok2 tok2",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok6 tok2 tok2 tok2 tok2 tok2 tok2 tok2",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 0.21927371169462975,
+            "min_cosine": -0.6683730627297643,
+            "max_absolute_logit_error": 1.5282461047172546,
+            "max_relative_ppl_change": 0.3788107595503833,
+            "min_relative_ppl_change": 0.20962601340348497,
+            "matched_ids": 2,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 8904.300395413153,
+                "min_decode_tokens_per_second": 8744.78592125526,
+                "max_decode_tokens_per_second": 9030.393724960806,
+                "median_first_token_seconds": 0.00010942599999452796,
+                "min_first_token_seconds": 0.00010382100001038452,
+                "max_first_token_seconds": 0.0001121150000074067
+              },
+              "long": {
+                "median_decode_tokens_per_second": 8504.723766542438,
+                "min_decode_tokens_per_second": 8347.613715347248,
+                "max_decode_tokens_per_second": 8940.785179474433,
+                "median_first_token_seconds": 0.00539321900001255,
+                "min_first_token_seconds": 0.005272384999983615,
+                "max_first_token_seconds": 0.005568600000003698
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 9742.708974000636,
+                "min_decode_tokens_per_second": 8941.37904159435,
+                "max_decode_tokens_per_second": 10123.82889008553,
+                "median_first_token_seconds": 9.96940000277391e-05,
+                "min_first_token_seconds": 9.780700000305842e-05,
+                "max_first_token_seconds": 0.00012528200002748235
+              },
+              "long": {
+                "median_decode_tokens_per_second": 9353.124544912554,
+                "min_decode_tokens_per_second": 8568.466330092082,
+                "max_decode_tokens_per_second": 9691.881249398184,
+                "median_first_token_seconds": 0.005004764999995359,
+                "min_first_token_seconds": 0.004903728000016372,
+                "max_first_token_seconds": 0.005141940000015666
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94146,
+              "compile_seconds": 0.26210292499999355
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102211,
+              "compile_seconds": 5.119945516000001
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        }
+      ]
+    },
+    "mamba1_control": {
+      "report_sha256": "c640745691b2a26bce8637328f71237bfa0cc03280edc4b1275f4eaa63506795",
+      "hardware": {
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "logical_cpus": 4,
+        "host_ram_bytes": 16765378560,
+        "available_ram_bytes_at_start": 15397167104
+      },
+      "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+      "python": "3.11.14",
+      "versions": {
+        "numpy": "1.26.4",
+        "torch": "2.9.1+cpu",
+        "transformers": "4.57.3",
+        "psutil": "7.2.2",
+        "safetensors": "0.8.0",
+        "tokenizers": "0.22.2"
+      },
+      "cases": [
+        {
+          "case": "default",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.3089019858178003e-15,
+              "min_cosine": 0.9999999999999893,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 1.210365586268048e-09,
+              "min_relative_ppl_change": -8.392544433663994e-10,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 2.071709363274561e-15,
+              "min_cosine": 0.9999999999999885,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": -8.152634123016107e-11,
+              "min_relative_ppl_change": -3.0445677044193395e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 2.071709363274561e-15,
+            "min_cosine": 0.9999999999999885,
+            "max_absolute_logit_error": 1.1920928955078125e-07,
+            "max_relative_ppl_change": 1.210365586268048e-09,
+            "min_relative_ppl_change": -3.0445677044193395e-09,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            },
+            "pytorch": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "expanded-biased",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.439845171438951e-15,
+              "min_cosine": 0.9999999999999929,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 3.2483712248083684e-08,
+              "min_relative_ppl_change": 6.255156856506381e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.3313086873378612e-15,
+              "min_cosine": 0.999999999999991,
+              "max_absolute_logit_error": 1.4901161193847656e-07,
+              "max_relative_ppl_change": 1.7143141275827245e-08,
+              "min_relative_ppl_change": 1.6620884362621045e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.439845171438951e-15,
+            "min_cosine": 0.999999999999991,
+            "max_absolute_logit_error": 1.4901161193847656e-07,
+            "max_relative_ppl_change": 3.2483712248083684e-08,
+            "min_relative_ppl_change": 6.255156856506381e-09,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok10 tok16",
+              "tokens": 2
+            },
+            "pytorch": {
+              "text": "tok10 tok16",
+              "tokens": 2
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "zero-epsilon",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.493063516151374e-15,
+              "min_cosine": 0.9999999999999911,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 3.697611618641246e-08,
+              "min_relative_ppl_change": -7.6237424971031e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.628729874118881e-15,
+              "min_cosine": 0.9999999999999931,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": -5.378431019411826e-09,
+              "min_relative_ppl_change": -8.911001674592732e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.628729874118881e-15,
+            "min_cosine": 0.9999999999999911,
+            "max_absolute_logit_error": 1.1920928955078125e-07,
+            "max_relative_ppl_change": 3.697611618641246e-08,
+            "min_relative_ppl_change": -8.911001674592732e-09,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            },
+            "pytorch": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "large-delta",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.7630025495934976e-15,
+              "min_cosine": 0.9999999999999851,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 1.8414709038425395e-08,
+              "min_relative_ppl_change": -1.2933178888585126e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.4102518172235497e-15,
+              "min_cosine": 0.9999999999999833,
+              "max_absolute_logit_error": 1.4901161193847656e-07,
+              "max_relative_ppl_change": 3.059236111267852e-08,
+              "min_relative_ppl_change": -1.8980267843812866e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.7630025495934976e-15,
+            "min_cosine": 0.9999999999999833,
+            "max_absolute_logit_error": 1.4901161193847656e-07,
+            "max_relative_ppl_change": 3.059236111267852e-08,
+            "min_relative_ppl_change": -1.8980267843812866e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok12 tok5 tok3 tok16",
+              "tokens": 5
+            },
+            "pytorch": {
+              "text": "tok6 tok12 tok5 tok3 tok16",
+              "tokens": 5
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "negative-gate",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 9.898341019645467e-16,
+              "min_cosine": 0.9999999999999925,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 3.3584739997901286e-08,
+              "min_relative_ppl_change": -1.5632764738193226e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.2165676043868677e-15,
+              "min_cosine": 0.9999999999999921,
+              "max_absolute_logit_error": 1.4901161193847656e-07,
+              "max_relative_ppl_change": 2.0566780490337405e-08,
+              "min_relative_ppl_change": -7.163454248548522e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.2165676043868677e-15,
+            "min_cosine": 0.9999999999999921,
+            "max_absolute_logit_error": 1.4901161193847656e-07,
+            "max_relative_ppl_change": 3.3584739997901286e-08,
+            "min_relative_ppl_change": -1.5632764738193226e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "negative-conv",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 9.898341019645467e-16,
+              "min_cosine": 0.9999999999999925,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 3.3584739997901286e-08,
+              "min_relative_ppl_change": -1.5632764738193226e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.2165676043868677e-15,
+              "min_cosine": 0.9999999999999921,
+              "max_absolute_logit_error": 1.4901161193847656e-07,
+              "max_relative_ppl_change": 2.0566780490337405e-08,
+              "min_relative_ppl_change": -7.163454248548522e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.2165676043868677e-15,
+            "min_cosine": 0.9999999999999921,
+            "max_absolute_logit_error": 1.4901161193847656e-07,
+            "max_relative_ppl_change": 3.3584739997901286e-08,
+            "min_relative_ppl_change": -1.5632764738193226e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "swish-alias",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.3089019858178003e-15,
+              "min_cosine": 0.9999999999999893,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 1.210365586268048e-09,
+              "min_relative_ppl_change": -8.392544433663994e-10,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 2.071709363274561e-15,
+              "min_cosine": 0.9999999999999885,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": -8.152634123016107e-11,
+              "min_relative_ppl_change": -3.0445677044193395e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 2.071709363274561e-15,
+            "min_cosine": 0.9999999999999885,
+            "max_absolute_logit_error": 1.1920928955078125e-07,
+            "max_relative_ppl_change": 1.210365586268048e-09,
+            "min_relative_ppl_change": -3.0445677044193395e-09,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            },
+            "pytorch": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "default-activation",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.3089019858178003e-15,
+              "min_cosine": 0.9999999999999893,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 1.210365586268048e-09,
+              "min_relative_ppl_change": -8.392544433663994e-10,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 2.071709363274561e-15,
+              "min_cosine": 0.9999999999999885,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": -8.152634123016107e-11,
+              "min_relative_ppl_change": -3.0445677044193395e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 2.071709363274561e-15,
+            "min_cosine": 0.9999999999999885,
+            "max_absolute_logit_error": 1.1920928955078125e-07,
+            "max_relative_ppl_change": 1.210365586268048e-09,
+            "min_relative_ppl_change": -3.0445677044193395e-09,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            },
+            "pytorch": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "multi-layer",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.5280401555894158e-15,
+              "min_cosine": 0.999999999999993,
+              "max_absolute_logit_error": 1.7881393432617188e-07,
+              "max_relative_ppl_change": 1.0993026105437486e-08,
+              "min_relative_ppl_change": 6.2844623036481266e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 2.3319066445273282e-15,
+              "min_cosine": 0.9999999999999901,
+              "max_absolute_logit_error": 1.7881393432617188e-07,
+              "max_relative_ppl_change": 1.8094654827222385e-08,
+              "min_relative_ppl_change": -1.4637823734790194e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 2.3319066445273282e-15,
+            "min_cosine": 0.9999999999999901,
+            "max_absolute_logit_error": 1.7881393432617188e-07,
+            "max_relative_ppl_change": 1.8094654827222385e-08,
+            "min_relative_ppl_change": -1.4637823734790194e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok13 tok6 tok13 tok6 tok13 tok6 tok13",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok6 tok13 tok6 tok13 tok6 tok13 tok6 tok13",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0
+        }
+      ]
+    }
+  },
+  "complete_suite": {
+    "tests": 5517,
+    "passed": 5466,
+    "skipped": 51,
+    "failures": 0,
+    "sha256": "d49061c288636e05681e22d84b57f8e43ee77da539ad22770b9cf154cac0164e",
+    "suites": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "51",
+        "tests": "5517",
+        "time": "145.439",
+        "timestamp": "2026-10-24T06:47:09.578691+00:00",
+        "hostname": "runnervm8k3b6"
+      }
+    ],
+    "skip_details": [
+      {
+        "class": "tests.integration.test_automatic_execution_dispatch",
+        "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[llama]",
+        "reason": "could not import 'accelerate': No module named 'accelerate'"
+      },
+      {
+        "class": "tests.integration.test_automatic_execution_dispatch",
+        "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[gpt2]",
+        "reason": "could not import 'accelerate': No module named 'accelerate'"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_compile_small_model",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_end_to_end_generate",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_chat_completion",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_compile_plan_dry_run",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_model_info",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_openai_compatible_server",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_model_list_and_remove",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_backend_detection",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_hardware_detection",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_benchmark_smoke",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_aeg_format_roundtrip",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_cross_hardware_portability",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_server_credentials_creation",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_server_credentials_mtls",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_channel_credentials_creation",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_helper",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_missing_file",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_none_passthrough",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+        "name": "test_require_grpc_no_error",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+        "name": "test_service_name_constant",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.tools.test_pass_audit",
+        "name": "test_real_public_compile_audit_smoke",
+        "reason": "Opt-in real subprocess compile/load/Runtime smoke, no timing"
+      },
+      {
+        "class": "tests.unit.test_adversarial.TestExecutionFidelity",
+        "name": "test_real_pretrained_model",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.unit.test_aeg_onnx_export",
+        "name": "test_real_directml_exported_aeg_operators",
+        "reason": "physical DirectML execution requires its optional installed runtime"
+      },
+      {
+        "class": "tests.unit.test_aeg_onnx_export",
+        "name": "test_actual_compiled_artifact_backend_generation_stream_and_unload[DmlExecutionProvider]",
+        "reason": "real DmlExecutionProvider is not installed"
+      },
+      {
+        "class": "tests.unit.test_artifact_publication",
+        "name": "test_real_member_handle_blocks_rename_then_retry_publishes",
+        "reason": "requires actual Windows file sharing"
+      },
+      {
+        "class": "tests.unit.test_artifact_publication",
+        "name": "test_real_persistent_member_lock_fails_after_bounded_attempts",
+        "reason": "requires actual Windows file sharing"
+      },
+      {
+        "class": "tests.unit.test_artifact_publication",
+        "name": "test_destination_created_during_real_lock_retry_is_preserved",
+        "reason": "requires actual Windows file sharing"
+      },
+      {
+        "class": "tests.unit.test_c2pa_signing",
+        "name": "test_pure_python_and_native_backends_agree",
+        "reason": "could not import 'cryptography': No module named 'cryptography'"
+      },
+      {
+        "class": "tests.unit.test_calibration.TestDatasets",
+        "name": "test_wikitext2",
+        "reason": "Real wikitext-2 data is unavailable locally; provide a calibration file or cache the 'wikitext' dataset before compiling (no local Hugging Face dataset cache at /home/runner/.cache/huggingface/datasets)"
+      },
+      {
+        "class": "tests.unit.test_calibration.TestDatasets",
+        "name": "test_hellaswag",
+        "reason": "Real hellaswag data is unavailable locally; provide a calibration file or cache the 'Rowan/hellaswag' dataset before compiling (no local Hugging Face dataset cache at /home/runner/.cache/huggingface/datasets)"
+      },
+      {
+        "class": "tests.unit.test_compiler_publication_transaction",
+        "name": "test_real_windows_old_member_lock_preserves_published_output",
+        "reason": "requires real Windows sharing semantics"
+      },
+      {
+        "class": "tests.unit.test_cpu_host_portability",
+        "name": "test_real_packaged_windows_aeg_can_be_removed_while_engine_is_live",
+        "reason": "Windows DLL lifetime regression"
+      },
+      {
+        "class": "tests.unit.test_device_placement.TestDeviceResolution",
+        "name": "test_cuda_spec_gains_an_explicit_index",
+        "reason": "no CUDA device on this host"
+      },
+      {
+        "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+        "name": "test_compiler_compile_produces_weight_blob",
+        "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+      },
+      {
+        "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+        "name": "test_compiled_package_is_loadable_and_runnable",
+        "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+      },
+      {
+        "class": "tests.unit.test_hardware_evidence",
+        "name": "test_real_cuda_aeg_execution_never_uses_cpu_fallback",
+        "reason": "No physical NVIDIA CUDA device and matching PyTorch runtime"
+      },
+      {
+        "class": "tests.unit.test_native_cpu_reproducibility",
+        "name": "test_two_cold_gnu_pe_builds_are_identical_and_execute",
+        "reason": "GNU PE linker regression"
+      },
+      {
+        "class": "tests.unit.test_onnx_provider_contract",
+        "name": "test_real_directml_offline_workload_requires_gpu_node_execution",
+        "reason": "physical DirectML runtime is not installed on this host"
+      },
+      {
+        "class": "tests.unit.test_onnx_provider_contract",
+        "name": "test_real_directml_runtime_routes_generation_and_stream_to_gpu",
+        "reason": "physical DirectML runtime is not installed on this host"
+      },
+      {
+        "class": "tests.unit.test_onnx_session_contract",
+        "name": "test_actual_onnx_session_reuses_only_bound_state[DmlExecutionProvider]",
+        "reason": "real DmlExecutionProvider is not installed"
+      },
+      {
+        "class": "tests.unit.test_otlp_conformance",
+        "name": "test_sdk_bridge_preserves_aether_trace_ids",
+        "reason": "could not import 'opentelemetry.sdk': No module named 'opentelemetry.sdk'"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_the_packaged_tokenizer_renders_the_checkpoints_own_template",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_templating_changes_the_token_sequence_the_model_sees",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_a_template_needing_undefined_names_still_renders",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_tokenize_true_is_refused_rather_than_silently_ignored",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_the_packaged_tokenizer_honours_add_special_tokens",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_a_missing_template_is_reported_not_guessed",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_an_override_also_works_through_the_packaged_tokenizer",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_v31_features",
+        "name": "test_compiled_package_contains_v31_artifacts",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      }
+    ]
+  },
+  "coverage": {
+    "version": "7.17.0",
+    "timestamp": "1792824566889",
+    "lines-valid": "57356",
+    "lines-covered": "45192",
+    "line-rate": "0.7879",
+    "branches-valid": "17290",
+    "branches-covered": "10842",
+    "branch-rate": "0.6271",
+    "complexity": "0"
+  },
+  "coverage_sha256": "102255a5641f54389cf9ddf45bbd0363ccc6b1de951067c4345327caeb9c22aa",
+  "line_coverage_percent": 78.79210544668386,
+  "freeze_sha256": "cb7b8798682016c120d3adfcf5b723daff40b25ca4fd358b672e96235838da99",
+  "scope": "Small untrained FP32 CPU contracts, fixed-label probes; no trained/corpus, peak RSS, accelerator, or general speed guarantee",
+  "local_traced_allocations": {
+    "report_sha256_lf": "c27c48fb1d6cfb2cb41ab81877c8f81afe51c2b672dc7b052d0cb9aa23c230c5",
+    "measurement_script_sha256": "e5a727fbc2f1aa91b344c539e0d5aea984b1c696b1af01afc2db2ffd49855669",
+    "source_files_byte_equal_to_hosted_default": {
+      "model.safetensors": true,
+      "tokenizer.json": true,
+      "tokenizer_config.json": true,
+      "special_tokens_map.json": true
+    },
+    "config_json_values_equal": true,
+    "config_equal_after_lf_normalization": true,
+    "note": "Local config has Windows CRLF; logical source is equal, not raw source identity or ordinary local numerical admission."
+  }
+}

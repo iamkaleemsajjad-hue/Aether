@@ -310,6 +310,8 @@ def test_real_cpu_aeg_validation_runs_prefill_and_decode():
     assert result.execution_scope == "aether_aeg_compile_load_prefill_decode"
     workload = result.details["workload"]
     assert workload["device"] == "cpu" and workload["kv_cache_length"] == 4
+    assert workload["compilation_quality_mode"] == "diagnostic"
+    assert workload["original_hf_quality_validated"] is False
     assert workload["max_absolute_errors"] and max(workload["max_absolute_errors"]) < 2e-4
     assert not result.production_validated
 

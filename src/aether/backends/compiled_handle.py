@@ -38,6 +38,8 @@ class CompiledAEGHandle:
     """
     session_contracts: dict[str, dict[str, Any]] = field(default_factory=dict)
     session_target_ids: dict[str, int] = field(default_factory=dict)
+    numerical_quality_admitted: bool = False
+    """Decision for these loaded weights; a later path replacement cannot promote them."""
 
     def clear_session_cache(self, session_id: str) -> None:
         """Release the incremental KV state owned by one session."""

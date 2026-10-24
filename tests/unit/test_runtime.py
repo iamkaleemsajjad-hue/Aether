@@ -6,10 +6,11 @@ from __future__ import annotations
 
 import pytest
 
+from aether.core.exceptions import SpeculativeDecodingError
 from aether.core.types import MemoryTier
 from aether.runtime.kv_cache import KVCacheManager
 from aether.runtime.scheduler import DisaggregatedScheduler
-from aether.runtime.speculative import TreeSpeculativeEngine
+from aether.runtime.speculative import DraftTreeNode, TreeSpeculativeEngine
 
 
 class TestKVCacheManager:
@@ -155,40 +156,45 @@ class TestTreeSpeculativeEngine:
 
     def test_build_draft_tree(self) -> None:
         engine = TreeSpeculativeEngine(target_model_id="test")
-        tree = engine.build_draft_tree([1, 2, 3], max_depth=2)
-        assert tree is not None
-        assert tree.depth == 0
+        with pytest.raises(SpeculativeDecodingError, match="draft executor"):
+            engine.build_draft_tree([1, 2, 3], max_depth=2)
 
     def test_verify_tree(self) -> None:
         engine = TreeSpeculativeEngine(target_model_id="test")
-        tree = engine.build_draft_tree([1, 2, 3], max_depth=2)
-        accepted = engine.verify_tree(tree, [])
-        assert len(accepted) > 0
-        assert accepted[0] == tree.token_id
+        tree = DraftTreeNode(token_id=3)
+        tree.add_child(1, probability=0.9).add_child(2, probability=0.8)
+        accepted = engine.verify_tree(tree, [[0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]])
+        assert accepted == [3, 1, 2]
 
     def test_acceptance_rate(self) -> None:
         engine = TreeSpeculativeEngine(target_model_id="test")
-        tree = engine.build_draft_tree([1], max_depth=2)
-        engine.verify_tree(tree, [])
-        rate = engine.acceptance_rate()
-        assert 0.0 <= rate <= 1.0
+        tree = DraftTreeNode(token_id=0)
+        tree.add_child(1, probability=0.9).add_child(2, probability=0.8)
+        assert engine.verify_tree(tree, [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]) == [0, 1]
+        assert engine.acceptance_rate() == 0.5
 
     def test_verify_tree_rejects_target_mismatch(self) -> None:
         engine = TreeSpeculativeEngine(target_model_id="test")
-        tree = engine.build_draft_tree([0], max_depth=2, branching_factor=2)
+        tree = DraftTreeNode(token_id=0)
+        tree.add_child(1, probability=0.9)
         accepted = engine.verify_tree(tree, [[10.0, 0.0, 0.0]])
         assert accepted == [0]
         assert engine.acceptance_rate() == 0.0
 
     def test_prune_tree_removes_low_probability_branches(self) -> None:
         engine = TreeSpeculativeEngine(target_model_id="test")
-        tree = engine.build_draft_tree([0], max_depth=1, branching_factor=3)
+        tree = DraftTreeNode(token_id=0)
+        kept = tree.add_child(1, probability=0.9)
+        tree.add_child(2, probability=0.1)
+        kept.add_child(3, probability=0.01)
+        kept.add_child(4, probability=0.8)
         engine.prune_tree(tree, min_probability=0.6)
-        assert all(child.probability >= 0.6 for child in tree.children)
+        assert [child.token_id for child in tree.children] == [1]
+        assert [child.token_id for child in kept.children] == [4]
 
     def test_should_use_speculation_initially(self) -> None:
         engine = TreeSpeculativeEngine(target_model_id="test")
-        assert engine.should_use_speculation()
+        assert not engine.should_use_speculation()
 
 
 class TestTorchBackendCompiledAEG:
@@ -200,7 +206,9 @@ class TestTorchBackendCompiledAEG:
         from aether.core.exceptions import BackendError
 
         backend = TorchBackend()
-        model = backend.load_model("test-model", str(minimal_aeg_package.root))
+        model = backend.load_model(
+            "test-model", str(minimal_aeg_package.root), allow_uncertified=True
+        )
         assert isinstance(model, CompiledAEGHandle)
         with pytest.raises(BackendError, match="tokenizer-backed generation adapter"):
             backend.generate(

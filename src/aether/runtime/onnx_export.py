@@ -510,7 +510,8 @@ def export_engine_to_onnx(
 
 
 def export_aeg_to_onnx(
-    aeg: Any, output_dir: str | Path, *, max_context: int | None = None
+    aeg: Any, output_dir: str | Path, *, max_context: int | None = None,
+    allow_uncertified: bool = False,
 ) -> ONNXExport:
     """Explicitly export an integrity-checked AEG into standard ONNX operators."""
     from aether.core.aeg_format import AEGPackage
@@ -519,7 +520,9 @@ def export_aeg_to_onnx(
     package = aeg if isinstance(aeg, AEGPackage) else AEGPackage(Path(aeg))
     if package.manifest is None:
         package.load()
-    engine = load_engine_from_package(package, prepare_native_kernels=False)
+    engine = load_engine_from_package(
+        package, prepare_native_kernels=False, allow_uncertified=allow_uncertified,
+    )
     return export_engine_to_onnx(engine, output_dir, max_context=max_context)
 
 

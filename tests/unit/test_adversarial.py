@@ -122,7 +122,7 @@ class TestFrameworkIndependence:
             "sys.meta_path.insert(0, _Block())\n"
             "import numpy as np\n"
             "from aether.runtime.aeg_loader import load_engine_from_path\n"
-            f"engine = load_engine_from_path(r'{valid_package.root}')\n"
+            f"engine = load_engine_from_path(r'{valid_package.root}', allow_uncertified=True)\n"
             "logits, _ = engine.forward(np.asarray([1, 2, 3], dtype=np.int64))\n"
             "assert logits.shape[-1] == 256\n"
             "assert 'transformers' not in sys.modules\n"
@@ -147,7 +147,7 @@ class TestFrameworkIndependence:
             "sys.meta_path.insert(0, _Block())\n"
             "import numpy as np\n"
             f"from aether.runtime.aeg_loader import load_engine_from_path\n"
-            f"engine = load_engine_from_path(r'{valid_package.root}')\n"
+            f"engine = load_engine_from_path(r'{valid_package.root}', allow_uncertified=True)\n"
             "ids = engine.generate(np.asarray([1, 2], dtype=np.int64), max_tokens=4, temperature=0.0)\n"
             "assert len(ids) > 0\n"
             "assert 'torch' not in sys.modules\n"
@@ -207,7 +207,8 @@ class TestFrameworkIndependence:
             "sys.meta_path.insert(0, _Block())\n"
             "from aether.compiler.compiler import Compiler\n"
             "from aether.compiler.config import CompilerConfig\n"
-            f"compiler = Compiler(CompilerConfig(targets=['cpu_avx512'], overwrite=True))\n"
+            "compiler = Compiler(CompilerConfig(quality_mode='diagnostic', "
+            "targets=['cpu_avx512'], overwrite=True))\n"
             f"pkg = compiler.compile(r'{model_dir}', output_path=r'{out}')\n"
             "assert pkg.manifest is not None\n"
             "assert 'torch' not in sys.modules\n"
@@ -241,7 +242,7 @@ class TestWeightCorruption:
         # fails on the missing required tensor. Silent success is the only
         # unacceptable outcome.
         with pytest.raises((AEGLoadError, AEGIntegrityError, AEGFormatError)):
-            load_engine_from_package(reloaded)
+            load_engine_from_package(reloaded, allow_uncertified=True)
 
     def test_corrupt_weight_blob(self, valid_package: AEGPackage) -> None:
         """Flipping bytes in the weight blob must be detected or rejected."""
@@ -253,7 +254,7 @@ class TestWeightCorruption:
         reloaded = AEGPackage(valid_package.root)
         reloaded.load()
         with pytest.raises((AEGLoadError, AEGIntegrityError, AEGFormatError)):
-            load_engine_from_package(reloaded)
+            load_engine_from_package(reloaded, allow_uncertified=True)
 
 
 # ── 7-11: manifest/hash corruption ────────────────────────────────────────────
@@ -264,21 +265,21 @@ class TestManifestCorruption:
         reloaded = AEGPackage(valid_package.root)
         reloaded.load()
         with pytest.raises((AEGLoadError, AEGFormatError)):
-            load_engine_from_package(reloaded)
+            load_engine_from_package(reloaded, allow_uncertified=True)
 
     def test_change_hidden_size(self, valid_package: AEGPackage) -> None:
         _rewrite_manifest(valid_package, lambda d: d["architecture"].__setitem__("hidden_size", 32))
         reloaded = AEGPackage(valid_package.root)
         reloaded.load()
         with pytest.raises(AEGLoadError, match="[Hh]idden"):
-            load_engine_from_package(reloaded)
+            load_engine_from_package(reloaded, allow_uncertified=True)
 
     def test_change_vocab_size(self, valid_package: AEGPackage) -> None:
         _rewrite_manifest(valid_package, lambda d: d["architecture"].__setitem__("vocab_size", 999))
         reloaded = AEGPackage(valid_package.root)
         reloaded.load()
         with pytest.raises(AEGLoadError, match="[Vv]ocabulary"):
-            load_engine_from_package(reloaded)
+            load_engine_from_package(reloaded, allow_uncertified=True)
 
     def test_corrupt_graph_hash(self, valid_package: AEGPackage) -> None:
         _rewrite_manifest(valid_package, lambda d: d.__setitem__("graph_hash", "sha256:" + "0" * 64))
@@ -318,14 +319,14 @@ class TestUnsupportedGGUF:
 
 class TestExecutionFidelity:
     def test_multi_layer_model_remains_multi_layer(self, valid_package: AEGPackage) -> None:
-        engine = load_engine_from_package(valid_package)
+        engine = load_engine_from_package(valid_package, allow_uncertified=True)
         assert len(engine.weights.layers) == 2
         assert valid_package.manifest.architecture.layers == 2  # type: ignore[union-attr]
 
     def test_logits_match_reference_forward(self, valid_package: AEGPackage) -> None:
         """Engine logits must match a direct ModelWeights forward (same weights
         modulo quantization error), proving no weight substitution happened."""
-        engine = load_engine_from_package(valid_package)
+        engine = load_engine_from_package(valid_package, allow_uncertified=True)
         tokens = np.asarray([1, 5, 9], dtype=np.int64)
         logits, _ = engine.forward(tokens)
         # The engine's own weights dequantized from the same package must
@@ -344,7 +345,7 @@ class TestExecutionFidelity:
         code = (
             "import numpy as np\n"
             f"from aether.runtime.aeg_loader import load_engine_from_path\n"
-            f"engine = load_engine_from_path(r'{valid_package.root}')\n"
+            f"engine = load_engine_from_path(r'{valid_package.root}', allow_uncertified=True)\n"
             "ids = engine.generate(np.asarray([3, 1, 4], dtype=np.int64), max_tokens=3, temperature=0.0)\n"
             "print(','.join(str(int(t)) for t in ids))\n"
         )
@@ -358,7 +359,7 @@ class TestExecutionFidelity:
         tokens = [int(t) for t in lines[-1].split(",")]
         assert len(tokens) == 3
         # Deterministic greedy generation must agree in-process.
-        engine = load_engine_from_package(valid_package)
+        engine = load_engine_from_package(valid_package, allow_uncertified=True)
         expected = engine.generate(np.asarray([3, 1, 4], dtype=np.int64), max_tokens=3, temperature=0.0)
         assert tokens == [int(t) for t in expected]
 
@@ -368,7 +369,7 @@ class TestExecutionFidelity:
 class TestBackendSelection:
     def test_cpu_native_backend_executes(self, valid_package: AEGPackage) -> None:
         """The Aether-native CPU backend is the execution path for .aeg."""
-        engine = load_engine_from_package(valid_package)
+        engine = load_engine_from_package(valid_package, allow_uncertified=True)
         assert type(engine).__name__ == "CPUExecutionEngine"
         ids = engine.generate(np.asarray([2], dtype=np.int64), max_tokens=3, temperature=0.0)
         assert all(0 <= int(t) < 256 for t in ids)
@@ -482,7 +483,7 @@ class TestBackendSelection:
             "import sys\n"
             "import numpy as np\n"
             f"from aether.runtime.aeg_loader import load_engine_from_path\n"
-            f"engine = load_engine_from_path(r'{valid_package.root}')\n"
+            f"engine = load_engine_from_path(r'{valid_package.root}', allow_uncertified=True)\n"
             "logits, _ = engine.forward(np.asarray([1], dtype=np.int64))\n"
             "engine.generate(np.asarray([1], dtype=np.int64), max_tokens=2, temperature=0.0)\n"
             "assert 'torch' not in sys.modules, 'native pipeline imported torch'\n"

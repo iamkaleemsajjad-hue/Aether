@@ -432,7 +432,9 @@ def test_process_exit_closes_a_paused_actual_stream(executable_artifact, tmp_pat
 
     code = (
         "from aether import Runtime,RuntimeConfig; "
-        f"rt=Runtime(RuntimeConfig(backend_name='aether_cpu',execution_devices=['cpu'],model_cache_dir={str(tmp_path / 'child-cache')!r},enable_semantic_cache=False,speculative_decoding=False)); "
+        "rt=Runtime(RuntimeConfig(allow_uncertified=True,backend_name='aether_cpu',"
+        f"execution_devices=['cpu'],model_cache_dir={str(tmp_path / 'child-cache')!r},"
+        "enable_semantic_cache=False,speculative_decoding=False)); "
         f"stream=rt.generate_stream({executable_artifact!r},'hello world',max_tokens=5,temperature=0); "
         "assert next(stream); print('actual stream paused')"
     )

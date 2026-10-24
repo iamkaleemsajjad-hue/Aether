@@ -1,0 +1,221 @@
+{
+  "source_revision": "54ca509f714b81e2a955ebca9d8941a1ee8c329d",
+  "measured_harness_revision": "d277e3ded1d2fb82daa80052966b70b32ee9f0e6",
+  "baseline_revision": "66f0e101d31f12121d07445c5ecb798ae155defd",
+  "temporary_merge_revision": "4438390c84baf7ca53e854dd4212a3975e8971d9",
+  "verified_merge_parents": [
+    "6aba5e8de08a117a2ab34610566317803f09266f",
+    "d277e3ded1d2fb82daa80052966b70b32ee9f0e6"
+  ],
+  "verified_merge_and_branch_git_tree": "546c5bcf5425d145fc2fb721d231803328f2b8ac",
+  "source_tree_at_both_revisions": "34c4466e06c64c4faafa8251d1ee7d870f8c95a4",
+  "ci": {
+    "run": 40121721368,
+    "all_jobs_passed": 24,
+    "security_run": 40121721404,
+    "security": "success"
+  },
+  "source_bytecode_control": {
+    "policy": "Both source trees precompiled with checked hashes before workers",
+    "trees": [
+      {
+        "prepared_modules": 302,
+        "source": "/home/runner/work/Aether/Aether/src/aether"
+      },
+      {
+        "prepared_modules": 302,
+        "source": "/home/runner/work/Aether/Aether/historical-dense/src/aether"
+      }
+    ]
+  },
+  "verification": {
+    "source_hashes": 528,
+    "workers": 44,
+    "paired_arrays": 16,
+    "retained_artifact_files": 52,
+    "omitted_artifact_files": 20,
+    "limitation": "Omitted payloads are worker-hashed, not independently reopened after download."
+  },
+  "controls": {
+    "mamba1": {
+      "current_contracts": 9,
+      "all_current_checks_passed": true,
+      "hardware": {
+        "cpu": "AMD EPYC 7763 64-Core Processor",
+        "logical_cpus": 4,
+        "host_ram_bytes": 16770748416,
+        "available_ram_bytes_at_start": 15518683136
+      }
+    },
+    "mamba2": {
+      "current_contracts": 14,
+      "all_current_checks_passed": true,
+      "hardware": {
+        "cpu": "AMD EPYC 7763 64-Core Processor",
+        "logical_cpus": 4,
+        "host_ram_bytes": 16770748416,
+        "available_ram_bytes_at_start": 15610707968
+      }
+    }
+  },
+  "local": {
+    "suite": {
+      "tests": 5610,
+      "failures": 3,
+      "errors": 0,
+      "skipped": 43,
+      "passed": 5564,
+      "seconds": 439.624,
+      "failed_cases": [
+        "tests.tools.test_pass_audit::test_worker_compiles_and_runs_unicode_paths_with_ascii_parent",
+        "tests.unit.test_mcp_transport_contracts::test_real_http_mcp_cli_handshake_session_and_tool[False]",
+        "tests.unit.test_mcp_transport_contracts::test_real_http_mcp_cli_handshake_session_and_tool[True]"
+      ]
+    },
+    "coverage": {
+      "lines-covered": 45285,
+      "lines-valid": 57445,
+      "branches-covered": 10882,
+      "branches-valid": 17330,
+      "line_percent": 78.83192619026896
+    },
+    "focused": {
+      "tests": 554,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 2,
+      "passed": 552,
+      "seconds": 51.412,
+      "failed_cases": []
+    },
+    "ruff": {
+      "before": 82,
+      "after": 82,
+      "added_code_message_findings": 0
+    },
+    "mypy": {
+      "before": 48,
+      "after": 48,
+      "added_code_message_findings": 0
+    },
+    "isolated_audit": {
+      "status": "blocked_before_worker_allocation",
+      "available_bytes": 354521088,
+      "estimated_worker_bytes": 406938624,
+      "required_headroom_bytes": 134217728
+    },
+    "limitation": "Two existing MCP HTTP framing failures and low-RAM admission remain; no guard or test weakened."
+  },
+  "hosted": {
+    "suite": {
+      "tests": 5611,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 51,
+      "passed": 5560,
+      "seconds": 169.6,
+      "failed_cases": []
+    },
+    "coverage": {
+      "lines-covered": 45274,
+      "lines-valid": 57445,
+      "branches-covered": 10885,
+      "branches-valid": 17330,
+      "line_percent": 78.81277743928976
+    },
+    "intermediate_54ca509": {
+      "suite": {
+        "tests": 5610,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 51,
+        "passed": 5559,
+        "seconds": 173.115,
+        "failed_cases": []
+      },
+      "coverage": {
+        "lines-covered": 45289,
+        "lines-valid": 57445,
+        "branches-covered": 10889,
+        "branches-valid": 17330,
+        "line_percent": 78.8388893724432
+      }
+    },
+    "coverage_variation_with_same_src_tree": {
+      "lost": [
+        [
+          "src/aether/runtime/disaggregated_execution.py",
+          448
+        ],
+        [
+          "src/aether/runtime/disaggregated_execution.py",
+          525
+        ],
+        [
+          "src/aether/runtime/disaggregated_execution.py",
+          526
+        ],
+        [
+          "src/aether/runtime/disaggregated_execution.py",
+          528
+        ],
+        [
+          "src/aether/runtime/disaggregated_execution.py",
+          529
+        ],
+        [
+          "src/aether/runtime/disaggregated_execution.py",
+          530
+        ],
+        [
+          "src/aether/runtime/disaggregated_execution.py",
+          531
+        ],
+        [
+          "src/aether/runtime/kernel_strategy.py",
+          311
+        ],
+        [
+          "src/aether/runtime/kernel_strategy.py",
+          545
+        ],
+        [
+          "src/aether/runtime/kernel_strategy.py",
+          546
+        ],
+        [
+          "src/aether/runtime/r9_diffusion_spec_engine.py",
+          613
+        ],
+        [
+          "src/aether/runtime/r9_diffusion_spec_engine.py",
+          614
+        ],
+        [
+          "src/aether/runtime/r9_diffusion_spec_engine.py",
+          615
+        ],
+        [
+          "src/aether/runtime/r9_diffusion_spec_engine.py",
+          616
+        ],
+        [
+          "src/aether/runtime/r9_diffusion_spec_engine.py",
+          619
+        ],
+        [
+          "src/aether/runtime/r9_diffusion_spec_engine.py",
+          620
+        ]
+      ],
+      "gained": [
+        [
+          "src/aether/provenance/ed25519.py",
+          120
+        ]
+      ],
+      "cause": "Unresolved execution-path variation in unchanged source; retained rather than called a new source regression or a clean non-reduction result."
+    }
+  },
+  "artifact_download": "GitHub CLI using original account; HTTP/1.1 retry succeeded after HTTP/2 timeouts. Per-file/array/source verification is recorded; archive SHA is not independently claimed."
+}

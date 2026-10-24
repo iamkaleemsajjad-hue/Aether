@@ -11,6 +11,7 @@ import pytest
 from aether import Compiler, CompilerConfig, Runtime, RuntimeConfig
 from aether.core.aeg_format import load_aeg_package
 from aether.runtime.aeg_loader import load_engine_from_path
+from aether.runtime.hybrid_engine import HybridExecutionEngine
 
 
 def _write_tokenizer(path: Path, vocab_size: int) -> None:
@@ -27,11 +28,15 @@ def _write_tokenizer(path: Path, vocab_size: int) -> None:
 
 
 @pytest.mark.integration
-def test_jamba_hybrid_compiles_reloads_and_reuses_cache(tmp_path: Path) -> None:
+@pytest.mark.parametrize("kernel", [1, 3])
+@pytest.mark.parametrize("projection_bias", [False, True])
+def test_jamba_hybrid_compiles_reloads_and_reuses_cache(
+    tmp_path: Path, kernel: int, projection_bias: bool,
+) -> None:
     safetensors = pytest.importorskip("safetensors.numpy")
     source = tmp_path / "jamba"
     source.mkdir()
-    vocab, hidden, inner, state, dt_rank, kernel = 16, 8, 16, 2, 1, 3
+    vocab, hidden, inner, state, dt_rank = 16, 8, 16, 2, 1
     heads = kv_heads = 2
     head_dim = hidden // heads
     intermediate = 16
@@ -79,12 +84,16 @@ def test_jamba_hybrid_compiles_reloads_and_reuses_cache(tmp_path: Path) -> None:
         "model.layers.1.mlp.up_proj.weight": matrix((intermediate, hidden)),
         "model.layers.1.mlp.down_proj.weight": matrix((hidden, intermediate)),
     }
+    if projection_bias:
+        tensors["model.layers.0.mamba.in_proj.bias"] = matrix((2 * inner,))
+        tensors["model.layers.0.mamba.out_proj.bias"] = matrix((hidden,))
     (source / "config.json").write_text(json.dumps(config), encoding="utf-8")
     safetensors.save_file(tensors, str(source / "model.safetensors"))
     _write_tokenizer(source, vocab)
 
     artifact = tmp_path / "jamba.aeg"
     Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
         overwrite=True, calibration_tokens=4,
         cache_dir=str(tmp_path / "cache"),
@@ -106,7 +115,14 @@ def test_jamba_hybrid_compiles_reloads_and_reuses_cache(tmp_path: Path) -> None:
     assert package.supports_runtime_target("metal_m3")
     assert "pytorch" in package.manifest.kernels.portable_backends
 
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
+    assert isinstance(engine, HybridExecutionEngine)
+    if projection_bias:
+        mamba = engine.weights.layers[0].mamba
+        assert mamba is not None
+        assert mamba.in_proj_bias is not None and mamba.in_proj_bias.shape == (2 * inner,)
+        assert mamba.out_proj_bias is not None and mamba.out_proj_bias.shape == (hidden,)
+        assert np.any(mamba.in_proj_bias != 0) and np.any(mamba.out_proj_bias != 0)
     full_logits, full_cache = engine.forward(np.asarray([1, 2, 3], dtype=np.int64))
     step_logits, step_cache = engine.forward(np.asarray([1, 2], dtype=np.int64))
     step_logits_2, step_cache = engine.forward(np.asarray([3], dtype=np.int64), step_cache)
@@ -124,9 +140,9 @@ def test_jamba_hybrid_compiles_reloads_and_reuses_cache(tmp_path: Path) -> None:
     mesh_logits, _ = mesh.forward(np.asarray([1, 2, 3], dtype=np.int64))
     np.testing.assert_allclose(full_logits, mesh_logits, rtol=2e-5, atol=2e-5)
 
-    result = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
-        str(artifact), prompt="hello", max_tokens=2, temperature=0.0
-    )
+    result = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2)
+    ).generate(str(artifact), prompt="hello", max_tokens=2, temperature=0.0)
     assert result.usage["completion_tokens"] == 2
     assert result.text
 
@@ -146,6 +162,6 @@ def test_jamba_hybrid_rejects_incomplete_schedule(tmp_path: Path) -> None:
     (source / "config.json").write_text(json.dumps(config), encoding="utf-8")
     safetensors.save_file({"model.embed_tokens.weight": np.zeros((8, 8), dtype="float32")}, str(source / "model.safetensors"))
     with pytest.raises(Exception, match="hybrid|schedule|layer"):
-        Compiler(CompilerConfig(targets=["cpu_avx2"], overwrite=True)).compile(
-            str(source), output_path=tmp_path / "invalid.aeg"
-        )
+        Compiler(
+            CompilerConfig(quality_mode="diagnostic", targets=["cpu_avx2"], overwrite=True)
+        ).compile(str(source), output_path=tmp_path / "invalid.aeg")

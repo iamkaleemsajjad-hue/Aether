@@ -78,9 +78,12 @@ def test_pipeline_registers_all_22_passes_in_prd_order() -> None:
 
 
 def test_real_graph_executes_without_failed_passes() -> None:
-    result, reports = OptimizerPipeline(CompilerConfig()).run(
-        _real_graph(), _architecture()
+    config = CompilerConfig(
+        enable_sensitivity=True,
+        enable_reasoning_graph=True,
+        enable_pruning=True,
     )
+    result, reports = OptimizerPipeline(config).run(_real_graph(), _architecture())
     assert len(reports) == 22
     assert not [report for report in reports if report.status == "failed"]
     assert "sensitivity_map" in result.metadata

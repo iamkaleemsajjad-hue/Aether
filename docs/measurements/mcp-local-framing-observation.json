@@ -1,0 +1,122 @@
+[
+  {
+    "sse": false,
+    "route": "/mcp",
+    "connected": false,
+    "events": [
+      "initialize"
+    ],
+    "responses": [
+      {
+        "status": 200,
+        "headers": {
+          "transfer-encoding": "chunked",
+          "Server": "BaseHTTP/0.6 Python/3.10.11",
+          "Date": "Thu, 22 Oct 2026 15:33:18 GMT",
+          "Content-Type": "application/json",
+          "MCP-Session-Id": "local-session"
+        },
+        "length": null,
+        "lines": [
+          {
+            "bytes": 194,
+            "prefix": "{\"jsonrpc\": \"2.0\", \"id\": \"eba80775-5524-4451-bacc-4b1b5639a823\", \"result\": {\"pro"
+          }
+        ]
+      }
+    ],
+    "server_sent_headers": [
+      "HTTP/1.0 200 OK\r\nServer: BaseHTTP/0.6 Python/3.10.11\r\nDate: Thu, 22 Oct 2026 15:33:18 GMT\r\nContent-Type: application/json\r\nMCP-Session-Id: local-session\r\nContent-Length: 194\r\n\r\n"
+    ]
+  },
+  {
+    "sse": true,
+    "route": "/mcp",
+    "connected": false,
+    "events": [
+      "initialize"
+    ],
+    "responses": [
+      {
+        "status": 200,
+        "headers": {
+          "transfer-encoding": "chunked",
+          "Server": "BaseHTTP/0.6 Python/3.10.11",
+          "Date": "Thu, 22 Oct 2026 15:33:19 GMT",
+          "Content-Type": "text/event-stream",
+          "MCP-Session-Id": "local-session"
+        },
+        "length": null,
+        "lines": [
+          {
+            "bytes": 201,
+            "prefix": "data: {\"jsonrpc\": \"2.0\", \"id\": \"a05c510e-68d1-4a8d-94c2-039a875d78cf\", \"result\":"
+          }
+        ]
+      }
+    ],
+    "server_sent_headers": [
+      "HTTP/1.0 200 OK\r\nServer: BaseHTTP/0.6 Python/3.10.11\r\nDate: Thu, 22 Oct 2026 15:33:19 GMT\r\nContent-Type: text/event-stream\r\nMCP-Session-Id: local-session\r\nContent-Length: 202\r\n\r\n"
+    ]
+  },
+  {
+    "sse": false,
+    "route": "/rpc",
+    "connected": false,
+    "events": [
+      "initialize"
+    ],
+    "responses": [
+      {
+        "status": 200,
+        "headers": {
+          "transfer-encoding": "chunked",
+          "Server": "BaseHTTP/0.6 Python/3.10.11",
+          "Date": "Thu, 22 Oct 2026 15:33:19 GMT",
+          "Content-Type": "application/json",
+          "MCP-Session-Id": "local-session"
+        },
+        "length": null,
+        "lines": [
+          {
+            "bytes": 194,
+            "prefix": "{\"jsonrpc\": \"2.0\", \"id\": \"158f5679-243d-48b2-88ef-15ae792c8939\", \"result\": {\"pro"
+          }
+        ]
+      }
+    ],
+    "server_sent_headers": [
+      "HTTP/1.0 200 OK\r\nServer: BaseHTTP/0.6 Python/3.10.11\r\nDate: Thu, 22 Oct 2026 15:33:19 GMT\r\nContent-Type: application/json\r\nMCP-Session-Id: local-session\r\nContent-Length: 194\r\n\r\n"
+    ]
+  },
+  {
+    "sse": true,
+    "route": "/rpc",
+    "connected": false,
+    "events": [
+      "initialize"
+    ],
+    "responses": [
+      {
+        "status": 200,
+        "headers": {
+          "transfer-encoding": "chunked",
+          "Server": "BaseHTTP/0.6 Python/3.10.11",
+          "Date": "Thu, 22 Oct 2026 15:33:20 GMT",
+          "Content-Type": "text/event-stream",
+          "MCP-Session-Id": "local-session"
+        },
+        "length": null,
+        "lines": [
+          {
+            "bytes": 201,
+            "prefix": "data: {\"jsonrpc\": \"2.0\", \"id\": \"fd02d174-6afe-4ee7-ac93-3eb28dc44a3b\", \"result\":"
+          }
+        ]
+      }
+    ],
+    "server_sent_headers": [
+      "HTTP/1.0 200 OK\r\nServer: BaseHTTP/0.6 Python/3.10.11\r\nDate: Thu, 22 Oct 2026 15:33:20 GMT\r\nContent-Type: text/event-stream\r\nMCP-Session-Id: local-session\r\nContent-Length: 202\r\n\r\n"
+    ]
+  }
+]

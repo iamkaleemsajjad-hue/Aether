@@ -1,0 +1,65 @@
+{
+  "corresponding_runtime_revision": "ad77e082da16d6393388500f58180a1e27acc6f9",
+  "platform": "Windows AMD64, Python 3.10.11",
+  "complete_suite": {
+    "sha256": "403a023f5eaea9ee39803d3e65c54293387f7ae2d6f857dfa1e20a8e88cac01b",
+    "tests": 5472,
+    "passed": 5427,
+    "skipped": 42,
+    "failures": [
+      {
+        "class": "tests.tools.test_pass_audit",
+        "name": "test_worker_compiles_and_runs_unicode_paths_with_ascii_parent",
+        "message": "AssertionError: {'status': 'blocked', 'available_bytes': 254238720, 'estimated_worker_bytes': 406938624, 'required_headroom_bytes': 134217728, ...}\nassert 'blocked' == 'ok'\n  \n  - ok\n  + blocked"
+      },
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[False]",
+        "message": "assert False\n +  where False = connect()\n +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x000002944A58A2C0>.connect"
+      },
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[True]",
+        "message": "assert False\n +  where False = connect()\n +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x00000294494563E0>.connect"
+      }
+    ],
+    "suites": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "3",
+        "skipped": "42",
+        "tests": "5472",
+        "time": "1140.052",
+        "timestamp": "2026-10-22T11:57:13.940627+05:00",
+        "hostname": "DESKTOP-MNGKA5K"
+      }
+    ]
+  },
+  "coverage": {
+    "version": "7.16.2",
+    "timestamp": "1792653356094",
+    "lines-valid": "57353",
+    "lines-covered": "45152",
+    "line-rate": "0.7873",
+    "branches-valid": "17290",
+    "branches-covered": "10822",
+    "branch-rate": "0.6259",
+    "complexity": "0"
+  },
+  "coverage_sha256": "ca55defa25920d19722ee7b2c53cc63556c5d98f74e5419c03772822c5b700db",
+  "line_coverage_percent": 78.72648335745296,
+  "static": {
+    "ruff": {
+      "before": 61,
+      "after": 61,
+      "new": []
+    },
+    "mypy": {
+      "before": 11,
+      "after": 11,
+      "new": []
+    }
+  },
+  "note": "Single complete run; not a union of focused reruns. No failure or resource guard waived."
+}

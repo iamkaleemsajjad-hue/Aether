@@ -88,7 +88,7 @@ def _compile_roundtrip(tmp_path: Path, n_layers: int) -> tuple[AEGPackage, objec
 
     loaded = AEGPackage(output)
     loaded.load()
-    engine = load_engine_from_package(loaded)
+    engine = load_engine_from_package(loaded, allow_uncertified=True)
     return loaded, engine
 
 
@@ -143,7 +143,7 @@ class TestCorruptedManifestFailsClosed:
         reloaded = AEGPackage(package.root)
         reloaded.load()
         with pytest.raises((AEGLoadError, AEGFormatError)):
-            load_engine_from_package(reloaded)
+            load_engine_from_package(reloaded, allow_uncertified=True)
 
     def test_vocab_mismatch_rejected(self, tmp_path: Path) -> None:
         """A manifest claiming a different vocab than the embedding must fail."""
@@ -163,7 +163,7 @@ class TestCorruptedManifestFailsClosed:
         reloaded = AEGPackage(package.root)
         reloaded.load()
         with pytest.raises(AEGLoadError, match="[Vv]ocabulary"):
-            load_engine_from_package(reloaded)
+            load_engine_from_package(reloaded, allow_uncertified=True)
 
     def test_hidden_mismatch_rejected(self, tmp_path: Path) -> None:
         package, _ = _compile_roundtrip(tmp_path, 2)
@@ -182,7 +182,7 @@ class TestCorruptedManifestFailsClosed:
         reloaded = AEGPackage(package.root)
         reloaded.load()
         with pytest.raises(AEGLoadError, match="[Hh]idden"):
-            load_engine_from_package(reloaded)
+            load_engine_from_package(reloaded, allow_uncertified=True)
 
 
 class TestSaveFailClosed:

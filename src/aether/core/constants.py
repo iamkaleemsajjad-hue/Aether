@@ -507,34 +507,34 @@ DEFAULT_CALIBRATION_TOKENS: int = 131072
 """Default number of tokens to draw from the calibration dataset."""
 
 DEFAULT_OPTIMIZATION_LEVEL: int = 2
-"""Default optimization level: 0=none, 1=basic, 2=full, 3=aggressive."""
+"""Default planning label; canonical pass flags independently select execution."""
 
-DEFAULT_FUSION_PASS: bool = True
-"""Whether operator fusion is enabled by default."""
+DEFAULT_FUSION_PASS: bool = False
+"""Experimental IR fusion is opt-in; engines do not execute its fused nodes."""
 
-DEFAULT_SENSITIVITY_PASS: bool = True
-"""Whether sensitivity analysis is enabled by default."""
+DEFAULT_SENSITIVITY_PASS: bool = False
+"""Reconstruction-proxy inspection is opt-in; it does not certify model quality."""
 
 DEFAULT_PRECISION_PASS: bool = True
 """Whether precision assignment is enabled by default."""
 
-DEFAULT_KV_CACHE_PASS: bool = True
-"""Whether KV cache structuring is enabled by default."""
+DEFAULT_KV_CACHE_PASS: bool = False
+"""Experimental KV graph annotations are opt-in; engine caches are independent."""
 
-DEFAULT_MOE_ROUTING_PASS: bool = True
-"""Whether MoE routing optimization is enabled by default."""
+DEFAULT_MOE_ROUTING_PASS: bool = False
+"""Experimental expert-tier hints are opt-in; source MoE routing remains available."""
 
-DEFAULT_PARALLELISM_PASS: bool = True
-"""Whether parallelism discovery is enabled by default."""
+DEFAULT_PARALLELISM_PASS: bool = False
+"""Experimental sharding-plan inspection is opt-in; it is not device execution."""
 
-DEFAULT_REASONING_GRAPH_PASS: bool = True
-"""Whether reasoning graph compilation is enabled by default."""
+DEFAULT_REASONING_GRAPH_PASS: bool = False
+"""Experimental reasoning annotations require explicit selection."""
 
-DEFAULT_SPARSE_ATTENTION_PASS: bool = True
+DEFAULT_SPARSE_ATTENTION_PASS: bool = False
 """Whether long-context sparse-attention planning is enabled by default.
 
-The runtime activates the persisted plan only at its recorded context
-threshold; ordinary short prompts therefore retain dense-reference behavior.
+The current CPU plan masks dense scores and can disable native decode attention
+even below its activation threshold. No default benefit is established.
 """
 
 DEFAULT_PRUNING_PASS: bool = False

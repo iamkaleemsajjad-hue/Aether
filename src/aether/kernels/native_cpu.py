@@ -57,6 +57,12 @@ class NativeKernelError(RuntimeError):
     """Raised when kernel compilation or loading fails."""
 
 
+# Version the Python build recipe as well as the embedded C++ source: changing
+# linker policy must never reuse a library produced by an older recipe.
+_BUILD_RECIPE_VERSION = 2
+_GNU_PE_LINK_FLAGS = ("-Wl,--disable-auto-image-base", "-Wl,--no-insert-timestamp")
+
+
 @dataclass(frozen=True)
 class CompilerToolchain:
     """A detected host C++ compiler and the flags needed to build a shared library."""
@@ -73,6 +79,9 @@ class CompilerToolchain:
     is_msvc: bool = False
     #: Compiler-specific environment obtained from a Visual Studio developer setup.
     environment: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    #: Driver arguments for the selected linker, separate from CPU codegen flags.
+    link_flags: tuple[str, ...] = ()
+    linker_policy: str = "platform-default"
 
     def subprocess_environment(self) -> dict[str, str] | None:
         """Use discovered SDK variables without mutating the caller's environment."""
@@ -101,6 +110,7 @@ class CompilerToolchain:
             self.executable,
             *self.base_flags,
             self.shared_flag,
+            *self.link_flags,
             self.output_flag,
             str(output),
             str(source),
@@ -109,6 +119,45 @@ class CompilerToolchain:
 
 def _is_macos() -> bool:
     return sysconfig.get_platform().startswith("macosx")
+
+
+def _configure_linker_policy(toolchain: CompilerToolchain) -> CompilerToolchain:
+    """Identify the driver's actual linker before selecting GNU PE options.
+
+    GNU ld hashes the absolute output filename when choosing a DLL image base;
+    our staging directory is random. Its fixed default preferred base preserves
+    ASLR and base relocations. Zero timestamps also remove wall-clock/epoch
+    variation. MSVC, LLD and non-Windows commands retain their existing policy.
+    The normal build/load probe subsequently verifies the selected flags.
+    See GNU ld's PE options:
+    https://sourceware.org/binutils/docs/ld/Options.html
+    """
+    if (
+        os.name != "nt"
+        or toolchain.is_msvc
+        or not toolchain.executable
+        or toolchain.linker_policy != "platform-default"
+    ):
+        return toolchain
+    try:
+        result = subprocess.run(
+            [toolchain.executable, *toolchain.base_flags, *toolchain.link_flags, "-Wl,--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            env=toolchain.subprocess_environment(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("Could not identify linker for %s: %s", toolchain.executable, exc)
+        return toolchain
+    if result.returncode == 0 and re.search(r"\bGNU ld\b", result.stdout + result.stderr):
+        return replace(
+            toolchain,
+            link_flags=toolchain.link_flags + _GNU_PE_LINK_FLAGS,
+            linker_policy="gnu-pe-deterministic-v1",
+        )
+    return toolchain
 
 
 def _open_shared_library(path: Path, toolchain: "CompilerToolchain | None" = None) -> ctypes.CDLL:
@@ -428,14 +477,15 @@ def detect_toolchain() -> CompilerToolchain | None:
         executable = _find_executable(name)
         if executable is None:
             continue
-        toolchain = CompilerToolchain(name=name, executable=executable, base_flags=flags)
+        toolchain = _configure_linker_policy(
+            CompilerToolchain(name=name, executable=executable, base_flags=flags)
+        )
         if _verify_toolchain(toolchain):
             logger.debug("Using C++ toolchain: %s (%s)", name, executable)
             return toolchain
         # Retry without -march=native, which some cross-compilers reject.
-        fallback = CompilerToolchain(
-            name=name,
-            executable=executable,
+        fallback = replace(
+            toolchain,
             base_flags=tuple(f for f in flags if f != "-march=native"),
         )
         if _verify_toolchain(fallback):
@@ -1361,6 +1411,7 @@ class NativeCPUKernels:
             self.toolchain = replace(
                 self.toolchain, base_flags=_process_codegen_flags(self.toolchain.base_flags)
             )
+            self.toolchain = _configure_linker_policy(self.toolchain)
 
     @classmethod
     def reference(cls) -> "NativeCPUKernels":
@@ -1439,6 +1490,8 @@ class NativeCPUKernels:
                 "executable": str(executable.resolve()),
                 "flags": list(flags),
                 "is_msvc": self.toolchain.is_msvc,
+                "link_flags": list(self.toolchain.link_flags),
+                "linker_policy": self.toolchain.linker_policy,
             }
             try:
                 info = executable.stat()
@@ -1447,6 +1500,7 @@ class NativeCPUKernels:
                 compiler["file_identity"] = "unavailable"
         return {
             "schema_version": 1,
+            "build_recipe": _BUILD_RECIPE_VERSION,
             "platform": platform.system().lower(),
             "machine": _normalized_machine(),
             "pointer_bits": struct.calcsize("P") * 8,

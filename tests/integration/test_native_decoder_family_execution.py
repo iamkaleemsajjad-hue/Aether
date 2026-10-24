@@ -284,6 +284,7 @@ def test_native_decoder_family_compiles_and_generates(tmp_path: Path, family: st
 
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx2"],
             overwrite=True,
             calibration_tokens=8,
@@ -302,9 +303,9 @@ def test_native_decoder_family_compiles_and_generates(tmp_path: Path, family: st
         assert "layer_0_v_proj_bias" in stored_names
     if family == "bloom":
         assert "embedding_norm_bias" in stored_names
-    response = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
-        str(artifact), prompt="hello", max_tokens=2, temperature=0.0
-    )
+    response = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2)
+    ).generate(str(artifact), prompt="hello", max_tokens=2, temperature=0.0)
     # A valid decoder may select the tokenizer's unknown/special token for a
     # random tiny fixture; the execution contract is the generated token
     # count, not non-empty detokenized prose.

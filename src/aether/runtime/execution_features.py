@@ -183,6 +183,11 @@ class RuntimeExecutionFeatures:
         """Measure, commit or restore tensors under exclusive model ownership."""
         if not self.config.dynamic_precision:
             raise ValueError("dynamic precision is disabled")
+        if not self.config.allow_uncertified:
+            raise ValueError(
+                "dynamic precision requires explicit diagnostic execution until the changed "
+                "execution has independent original-HF numerical admission"
+            )
         with self.gate(model_id).write():
             engine = getattr(handle, "engine", None)
             if engine is None:
@@ -225,6 +230,7 @@ class RuntimeExecutionFeatures:
             )
             self._last_adjustment[model_id] = time.monotonic()
             if report["execution_changed"]:
+                handle.numerical_quality_admitted = False
                 clear_sessions = getattr(handle, "clear_session_caches", None)
                 if callable(clear_sessions):
                     clear_sessions()
@@ -407,8 +413,9 @@ class RuntimeExecutionFeatures:
                 }
         return report
 
-    @staticmethod
-    def _precision_unsupported_reason(handle: Any) -> str | None:
+    def _precision_unsupported_reason(self, handle: Any) -> str | None:
+        if not self.config.allow_uncertified:
+            return "dynamic precision requires explicit diagnostic execution and reevaluation"
         engine = getattr(handle, "engine", None)
         architecture = getattr(handle, "manifest", {}).get("architecture", {})
         if architecture.get("is_encoder") or architecture.get("is_encoder_decoder"):

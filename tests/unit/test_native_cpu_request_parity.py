@@ -378,6 +378,7 @@ def test_public_runtime_set_task_weights_changes_stream_and_blocking(tmp_path):
     source = tmp_path / "source"
     _write_probe_checkpoint(source)
     config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_generic"],
         precision="FP32",
         optimization_level=0,
@@ -405,6 +406,7 @@ def test_public_runtime_set_task_weights_changes_stream_and_blocking(tmp_path):
     package.save()
     with Runtime(
         RuntimeConfig(
+            allow_uncertified=True,
             backend_name="aether_cpu",
             execution_devices=["cpu"],
             model_cache_dir=str(tmp_path / "runtime"),

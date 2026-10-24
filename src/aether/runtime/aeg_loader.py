@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -37,9 +37,13 @@ from aether.runtime.mamba_engine import MambaExecutionEngine, MambaLayerWeights,
 from aether.runtime.mamba2_engine import Mamba2ExecutionEngine, Mamba2LayerWeights, Mamba2ModelWeights
 from aether.runtime.rwkv_engine import RWKVExecutionEngine, RWKVLayerWeights, RWKVModelWeights
 from aether.runtime.hybrid_engine import HybridExecutionEngine, HybridLayerWeights, HybridModelWeights
+
 from aether.runtime.encoder_engine import EncoderExecutionEngine, EncoderLayerWeights, EncoderModelWeights
 from aether.runtime.seq2seq_engine import Seq2SeqDecoderLayer, Seq2SeqExecutionEngine, Seq2SeqLayer
 from aether.utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 logger = get_logger(__name__)
 
@@ -201,17 +205,23 @@ def package_is_runnable(package: Any) -> bool:
 
 
 def load_engine_from_path(
-    aeg_path: Path | str, *, prepare_native_kernels: bool = True
+    aeg_path: Path | str, *, prepare_native_kernels: bool = True,
+    allow_uncertified: bool = False,
 ) -> CPUExecutionEngine:
     """Open an authenticated AEG; optional accelerator bootstrap skips CPU builds."""
     from aether.core.aeg_format import AEGPackage
 
     package = AEGPackage(Path(aeg_path))
     package.load()
-    return load_engine_from_package(package, prepare_native_kernels=prepare_native_kernels)
+    return load_engine_from_package(
+        package, prepare_native_kernels=prepare_native_kernels,
+        allow_uncertified=allow_uncertified,
+    )
 
 
-def load_engine_from_package(package: Any, *, prepare_native_kernels: bool = True) -> CPUExecutionEngine:
+def load_engine_from_package(
+    package: Any, *, prepare_native_kernels: bool = True, allow_uncertified: bool = False,
+) -> CPUExecutionEngine:
     """Build a :class:`CPUExecutionEngine` from a loaded AEG package.
 
     Args:
@@ -219,6 +229,8 @@ def load_engine_from_package(package: Any, *, prepare_native_kernels: bool = Tru
         prepare_native_kernels: Prepare native CPU execution when true. False
             deserializes the identical authenticated model with an independent
             NumPy provider, for wrapping in an accelerator executor.
+        allow_uncertified: Explicit diagnostic execution of an artifact lacking
+            numerical evidence. Recorded failures and invalid reports still refuse.
 
     Returns:
         An engine ready to run :meth:`~CPUExecutionEngine.generate`.
@@ -231,6 +243,9 @@ def load_engine_from_package(package: Any, *, prepare_native_kernels: bool = Tru
     # before any weight or packaged-kernel data reaches execution. This also
     # protects callers that use the loader directly instead of Runtime.
     package.verify_integrity()
+    from aether.backends.artifact_validation import validate_aeg_evaluation
+
+    validate_aeg_evaluation(package, allow_uncertified=allow_uncertified)
     if not package.has_weights:
         msg = (
             f"AEG package at {package.root} contains no weights; it was compiled "
@@ -417,7 +432,7 @@ def load_engine_from_package(package: Any, *, prepare_native_kernels: bool = Tru
             if final_norm_bias is not None else None
         ),
         rope_theta=float(architecture.get("rope_theta", 10000.0) or 10000.0),
-        norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+        norm_eps=_normalization_epsilon(architecture),
         norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
         ffn_type=str(architecture.get("ffn_type", "SwiGLU") or "SwiGLU"),
         position_type=str(architecture.get("position_type", "RoPE") or "RoPE"),
@@ -543,7 +558,7 @@ def _load_mla_engine_from_package(
             layers=layers,
             final_norm=_norm_vector(final_norm, int(embedding.shape[1])),
             lm_head=np.asarray(lm_head, dtype=np.float32),
-            norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+            norm_eps=_normalization_epsilon(architecture),
             norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
             ffn_type=str(architecture.get("ffn_type", "SwiGLU") or "SwiGLU"),
         ),
@@ -560,12 +575,22 @@ def _load_mamba_engine_from_package(
     final_norm = _require(tensors, (None, "final_norm"), "final norm")
     lm_head = tensors.get((None, "lm_head"), embedding)
     hidden = int(embedding.shape[1])
+
+    def norm_vector(value: Any, description: str) -> NDArray[np.float32]:
+        vector = np.asarray(value, dtype=np.float32)
+        if vector.shape != (hidden,):
+            raise AEGLoadError(
+                f"Mamba-1 {description} has shape {vector.shape}; expected ({hidden},). "
+                "Recompile the original checkpoint to preserve its learned norms."
+            )
+        return vector
+
     layers: list[MambaLayerWeights] = []
     for index in range(int(architecture.get("layers", 0) or 0)):
         def required(component: str) -> np.ndarray:
             return _require(tensors, (index, component), f"Mamba layer {index} {component}")
         layers.append(MambaLayerWeights(
-            norm=_norm_vector(required("ssm_norm"), hidden),
+            norm=norm_vector(required("ssm_norm"), f"layer {index} input norm"),
             in_proj=required("ssm_in_proj"),
             conv1d=required("ssm_conv1d"),
             x_proj=required("ssm_x_proj"),
@@ -575,14 +600,16 @@ def _load_mamba_engine_from_package(
             out_proj=required("ssm_out_proj"),
             conv_bias=tensors.get((index, "ssm_conv1d_bias")),
             dt_bias=tensors.get((index, "ssm_dt_proj_bias")),
+            in_proj_bias=tensors.get((index, "ssm_in_proj_bias")),
+            out_proj_bias=tensors.get((index, "ssm_out_proj_bias")),
         ))
     return MambaExecutionEngine(
         MambaModelWeights(
             embedding=np.asarray(embedding, dtype=np.float32),
             layers=layers,
-            final_norm=_norm_vector(final_norm, hidden),
+            final_norm=norm_vector(final_norm, "final norm"),
             lm_head=np.asarray(lm_head, dtype=np.float32),
-            norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+            norm_eps=_normalization_epsilon(architecture),
             norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
         ),
         state_size=int(architecture.get("ssm_state_size") or 16),
@@ -676,6 +703,8 @@ def _load_hybrid_engine_from_package(
                 out_proj=required("ssm_out_proj"),
                 conv_bias=tensors.get((index, "ssm_conv1d_bias")),
                 dt_bias=tensors.get((index, "ssm_dt_proj_bias")),
+                in_proj_bias=tensors.get((index, "ssm_in_proj_bias")),
+                out_proj_bias=tensors.get((index, "ssm_out_proj_bias")),
             )
             layers.append(HybridLayerWeights(kind=kind, transformer=dummy_transformer(), mamba=actual))
 
@@ -709,7 +738,7 @@ def _load_hybrid_engine_from_package(
                 int(architecture["context_length"])
                 if architecture.get("context_length") else None
             ),
-            norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+            norm_eps=_normalization_epsilon(architecture),
             norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
             ffn_type=ffn_type,
         ),
@@ -728,16 +757,32 @@ def _load_mamba2_engine_from_package(
     package: Any, architecture: dict[str, Any]
 ) -> Mamba2ExecutionEngine:
     """Load a Mamba-2/SSD engine from the canonical AEG tensors."""
+    from aether.core.mamba2_parameters import Mamba2Parameters
+
+    parameters = Mamba2Parameters.from_dict(architecture.get("ssm_runtime_parameters", {}))
     tensors = _dequantized_by_key(package)
     embedding = _require(tensors, (None, "embedding"), "token embedding")
     final_norm = _require(tensors, (None, "final_norm"), "final norm")
     lm_head = tensors.get((None, "lm_head"), embedding)
+    hidden = int(embedding.shape[1])
+    inner = int(architecture.get("ssm_inner_size") or hidden * 2)
+
+    def norm_vector(value: Any, size: int, description: str) -> NDArray[np.float32]:
+        # Resizing a learned scale hides a lost/colliding checkpoint tensor.
+        vector = np.asarray(value, dtype=np.float32)
+        if vector.shape != (size,):
+            raise AEGLoadError(
+                f"Mamba-2 {description} has shape {vector.shape}; expected ({size},). "
+                "Recompile the original checkpoint to preserve both learned norms."
+            )
+        return vector
+
     layers: list[Mamba2LayerWeights] = []
     for index in range(int(architecture.get("layers", 0) or 0)):
         def required(component: str) -> np.ndarray:
             return _require(tensors, (index, component), f"Mamba-2 layer {index} {component}")
         layers.append(Mamba2LayerWeights(
-            norm=_norm_vector(required("ssm_norm"), int(embedding.shape[1])),
+            norm=norm_vector(required("ssm_norm"), hidden, f"layer {index} input norm"),
             in_proj=required("ssm_in_proj"),
             conv1d=required("ssm_conv1d"),
             a_log=required("ssm_a_log"),
@@ -746,9 +791,14 @@ def _load_mamba2_engine_from_package(
             out_proj=required("ssm_out_proj"),
             in_proj_bias=tensors.get((index, "ssm_in_proj_bias")),
             conv_bias=tensors.get((index, "ssm_conv1d_bias")),
+            output_norm=(
+                norm_vector(
+                    tensors[(index, "ssm_output_norm")], inner, f"layer {index} output norm"
+                )
+                if (index, "ssm_output_norm") in tensors else None
+            ),
+            out_proj_bias=tensors.get((index, "ssm_out_proj_bias")),
         ))
-    hidden = int(embedding.shape[1])
-    inner = int(architecture.get("ssm_inner_size") or hidden * 2)
     heads = int(architecture.get("ssm_num_heads") or 0)
     groups = int(architecture.get("ssm_num_groups") or 1)
     head_dim = int(architecture.get("ssm_head_dim") or (inner // max(heads, 1)))
@@ -758,10 +808,11 @@ def _load_mamba2_engine_from_package(
         Mamba2ModelWeights(
             embedding=np.asarray(embedding, dtype=np.float32),
             layers=layers,
-            final_norm=_norm_vector(final_norm, hidden),
+            final_norm=norm_vector(final_norm, hidden, "final norm"),
             lm_head=np.asarray(lm_head, dtype=np.float32),
-            norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+            norm_eps=_normalization_epsilon(architecture),
             norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
+            parameters=parameters,
         ),
         state_size=int(architecture.get("ssm_state_size") or 16),
         inner_size=inner,
@@ -801,7 +852,7 @@ def _load_rwkv_engine_from_package(
     return RWKVExecutionEngine(RWKVModelWeights(
         embedding=np.asarray(embedding, dtype=np.float32), layers=layers,
         final_norm=_norm_vector(final_norm, hidden), lm_head=np.asarray(lm_head, dtype=np.float32),
-        norm_eps=float(architecture.get("norm_eps", 1e-5) or 1e-5),
+        norm_eps=_normalization_epsilon(architecture),
     ))
 
 
@@ -958,7 +1009,7 @@ def _load_encoder_engine_from_package(
         layers=layers,
         embedding_norm_bias=optional("embedding_norm_bias"),
         pooler_bias=optional("pooler_bias"),
-        norm_eps=float(architecture.get("norm_eps", 1e-12) or 1e-12),
+        norm_eps=_normalization_epsilon(architecture, default=1e-12),
     )
     return EncoderExecutionEngine(weights, num_heads=num_heads)
 
@@ -1261,6 +1312,17 @@ def _rope_scaling_mapping(architecture: dict[str, Any]) -> dict[str, Any] | None
     return dict(value)
 
 
+def _normalization_epsilon(architecture: dict[str, Any], *, default: float = 1e-5) -> float:
+    """Preserve explicit epsilon, including zero; only absent/null uses a fallback.
+
+    This is a source-model constant in sqrt(variance + epsilon), not a flag.
+    See LlamaRMSNorm.forward in Transformers v4.57.3:
+    https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/llama/modeling_llama.py
+    """
+    value = architecture.get("norm_eps")
+    return default if value is None else float(value)
+
+
 def _architecture_dict(package: Any) -> dict[str, Any]:
     """Extract the architecture metadata from a package manifest."""
     manifest = package.manifest
@@ -1313,13 +1375,13 @@ def _validate_decoder_vocabulary_contract(
     if "embedding" not in store.entries:
         raise AEGLoadError("AEG package is missing required token embedding")
     embedding = np.asarray(
-        dequantize_tensor(store.load_tensor("embedding")), dtype=np.float32
+        dequantize_tensor(store.load_tensor("embedding"), copy=False), dtype=np.float32
     )
     _validate_embedding_shape(embedding, architecture)
     lm_head = None
     if "lm_head" in store.entries:
         lm_head = np.asarray(
-            dequantize_tensor(store.load_tensor("lm_head")), dtype=np.float32
+            dequantize_tensor(store.load_tensor("lm_head"), copy=False), dtype=np.float32
         )
     if lm_head is not None and (
         lm_head.ndim != 2
@@ -1408,7 +1470,7 @@ def _dequantized_by_key(package: Any) -> dict[tuple[int | None, str | None], np.
             r"attention_norm|ffn_norm|post_attention_norm|post_ffn_norm|"
             r"gate_proj|up_proj|down_proj|moe_router|"
             r"expert_\d+_(?:gate_proj|up_proj|down_proj)|q_a_proj|q_b_proj|"
-            r"kv_a_proj|kv_b_proj|k_rope_proj|q_a_norm|kv_a_norm|ssm_norm|"
+            r"kv_a_proj|kv_b_proj|k_rope_proj|q_a_norm|kv_a_norm|ssm_norm|ssm_output_norm|"
             r"ssm_in_proj|ssm_conv1d|ssm_x_proj|ssm_dt_proj|ssm_dt|ssm_a_log|ssm_d|"
             r"ssm_out_proj|ssm_time_decay|ssm_time_first|ssm_time_mix_k|"
             r"ssm_time_mix_v|ssm_time_mix_r|ssm_ffn_norm|ssm_ffn_time_mix_k|"
@@ -1436,7 +1498,9 @@ def _dequantized_by_key(package: Any) -> dict[tuple[int | None, str | None], np.
         if key[1] is None:
             continue
         # First writer wins, matching the ingestion side's fused-tensor handling.
-        result.setdefault(key, dequantize_tensor(store.load_tensor(name)))
+        # load_tensor owns a fresh writable payload. Retain it for FP32 rather
+        # than allocating a second full tensor; codec conversions still decode.
+        result.setdefault(key, dequantize_tensor(store.load_tensor(name), copy=False))
     if alias_lm_head and (None, "embedding") in result:
         result[(None, "lm_head")] = result[(None, "embedding")]
     return result

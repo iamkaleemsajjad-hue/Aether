@@ -283,7 +283,7 @@ def quantize_tensor(weights: np.ndarray, precision: str, block_size: int = 32) -
     )
 
 
-def dequantize_tensor(qt: QuantizedTensor) -> np.ndarray:
+def dequantize_tensor(qt: QuantizedTensor, *, copy: bool = True) -> np.ndarray:
     """Dequantize a quantized tensor back to approximate float32.
 
     Inverts :func:`quantize_tensor`: unpacks the bit-packed payload when needed,
@@ -292,9 +292,17 @@ def dequantize_tensor(qt: QuantizedTensor) -> np.ndarray:
 
     Args:
         qt: The tensor produced by :func:`quantize_tensor`.
+        copy: Keep independent output storage by default. False permits reuse
+            of an already-FP32 passthrough payload; conversion and block decoding
+            still allocate when required. An aliased result retains the input's
+            write protection and must only be mutated when the caller owns it.
 
     Returns:
         A float32 array with the same shape as the original weights.
+
+    The reuse rule follows NumPy's ``ndarray.astype(copy=False)`` contract:
+    https://numpy.org/doc/1.26/reference/generated/numpy.ndarray.astype.html
+    Reshaping may still require a copy for an incompatible strided layout.
     """
     codec = get_codec(qt.precision)
 
@@ -304,7 +312,7 @@ def dequantize_tensor(qt: QuantizedTensor) -> np.ndarray:
             # Re-expand the stored high 16 bits into a full float32 pattern.
             widened = (data.astype(np.uint32) << np.uint32(16)).view(np.float32)
             return widened.reshape(qt.shape)
-        return data.astype(np.float32).reshape(qt.shape)
+        return data.astype(np.float32, copy=copy).reshape(qt.shape)
 
     total_elements = qt.num_elements or int(np.prod(qt.shape))
     num_blocks = (total_elements + qt.block_size - 1) // qt.block_size

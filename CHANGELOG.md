@@ -5,6 +5,112 @@ All notable changes to Aether Runtime will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Validation
+
+- Add guarded tiny/27M dense load profiling and original-HF CPU/Torch/ONNX,
+  cached-decode, SDK and CLI checks. Record the confirmed redundant FP32 copy
+  before changing loader ownership; distinguish the locally refused 27M run
+  from executed evidence in the [measurement contract](docs/mission-dense-load.md).
+
+### Fixed
+
+- Reuse private FP32 payloads during AEG loading while preserving independent
+  output storage for existing decoder callers. Real artifact and codec
+  regressions cover ownership, lifetime and unchanged conversion values;
+  the [measurement record](docs/mission-dense-load.md#final-shared-artifact-measurements)
+  records lower 27M loading RSS, unchanged logits, mixed generation timings and
+  local failures. Balanced source caches remove an apparent load-speed gain.
+
+- Reduce generic NumPy dispatch during Mamba-2 time-step clamping while
+  preserving the declared bounds and numerical function. Existing source,
+  cached-state and integration controls pass; local A/B traced peaks decrease
+  with unchanged weights/cache geometry. Mixed timings and complete local
+  failures remain explicit. Hosted full-suite/admission/API/CLI validation passes
+  with byte-identical saved logits; bounded decode medians improve in 11/14
+  rows, with all losses and spreads in the
+  [profiling record](docs/mission-mamba2-source-parameters.md#clamp-dispatch-profiling-follow-up).
+
+- Preserve Mamba-2 source convolution activation and time-step bounds through
+  authenticated AEG architecture parameters and actual CPU/Torch execution.
+  Refuse unsupported or malformed settings before publication; default legacy
+  artifacts retain serialization and logits. Real source/matrix, cached decode,
+  worker-clone, tampering and old/new reader checks cover the correction. Local
+  failures and lower local coverage remain explicit; hosted admission and the
+  complete suite pass, with slower bounded execution retained in the
+  [validation record](docs/mission-mamba2-source-parameters.md).
+
+- Evaluate Mamba-2 CPU SiLU and softplus with stable identities instead of
+  clipping finite inputs. Original-HF and independent scalar/matrix regressions
+  cover large time steps and negative convolution/gate values through real AEG
+  execution and cached continuation. A profiling follow-up reduces NumPy
+  dispatches with an equivalent log-sigmoid identity. Hosted tiny-CPU decode
+  and first-output medians improve against the pre-fix runtime, with unchanged
+  logical weights/caches and lower local traced allocation peaks. Complete local
+  failures, timing spreads and the larger-model/RSS limits remain explicit. See
+  [numerical evidence and validation limits](docs/mission-mamba2-stability.md).
+- Preserve explicitly declared zero normalization epsilon across dense/MoE,
+  MLA, hybrid, Mamba-2, RWKV and encoder AEG loading. Retain existing null
+  fallbacks and Mamba-1/seq2seq behavior; real loader and original-HF
+  CPU/Torch/ONNX regressions cover the correction. See
+  [validation scope and resource limits](docs/mission-normalization-epsilon.md).
+- Restore declared AddedToken and special-token semantics when loading packaged
+  tokenizers, preserving flags and IDs without importing a model framework.
+  Actual HF tokenizer and CPU/Torch public-output regressions cover the former
+  literal-UNK output; see [executed checks and remaining scope](docs/mission-mamba1-fidelity.md#hosted-integration-finding-special-token-reconstruction).
+- Preserve source generation settings through both tokenizer packaging paths,
+  including a declared model-config EOS when no generation file exists. Actual
+  CPU/Torch API and streaming regressions cover the formerly lost stop boundary;
+  malformed generation files refuse publication. See the
+  [hosted finding and follow-up scope](docs/mission-mamba1-fidelity.md#hosted-integration-finding-generation-settings).
+- Preserve Mamba-1's HF normalization, expansion, projection biases and explicit
+  zero epsilon through real CPU/Torch execution; stabilize finite softplus/SiLU
+  inputs and refuse unsupported activations or malformed learned norms.
+  Independent matrix and actual SDK/CLI regressions cover the correction;
+  [measured HF results and validation scope](docs/mission-mamba1-fidelity.md)
+  distinguish executed checks from unverified trained-model behavior.
+- Validate dispatch convergence and ledger refresh with controlled clock inputs,
+  while preserving a live CPU evidence/thread-setting check. The former
+  cross-call timing assertion failed under changing host load despite valid
+  settled measurements; the runtime's 2x stale-value guard remains intact.
+  See [counterexample and validation scope](docs/mission-dispatch-validation.md).
+- Correct width-1 convolution history in the separate hybrid Torch SSM loop.
+  Independent convolution and real artifact regressions cover wrong logits
+  and growing history; see [measured results and timing limits](docs/mission-hybrid-convolution.md).
+- Verify authenticated native-library cache copies on POSIX as well as Windows
+  in the real compile/load/generate integration test. The loader already uses
+  this lifetime-safe path on every OS; the previous POSIX path assertion was stale.
+- Preserve Mamba-2's distinct input and learned post-gate RMSNorm scales,
+  expanded HF geometry and output-projection bias through AEG packaging and
+  actual CPU/Torch CPU execution. Add independent SSD-matrix regressions and
+  a blocking original-HF CPU admission/API/CLI check. See
+  [executed checks and remaining scope](docs/mission-mamba2-normalization.md).
+- Keep causal-convolution histories bounded for width-1 kernels in CPU and
+  Torch Mamba/Mamba-2 execution. Independent convolution-oracle and real cache
+  handoff tests reproduce the former wrong outputs and growing history.
+  See [memory, numerical and mixed timing observations](docs/mission-mamba-convolution.md);
+  whole-model HF parity and controlled speed validation remain open.
+- Make the resident-memory sampler probe use an explicitly closed anonymous
+  mapping and wait for a real parent RSS observation before releasing it.
+  Preserve its peak-size assertion across platforms without relying on malloc
+  returning a deleted bytearray or a fixed sampling window.
+- Preserve explicitly requested FP32 globals and projection biases through
+  precision assignment and packing. Real original-HF/CPU/Torch CPU probes
+  recovered 16/16 greedy agreement per executor; the tiny fixture's weight blob
+  costs 8,256 additional bytes. See [storage and numerical evidence](docs/mission-fp32-storage.md).
+- Require measured original-FP32 HF numerical admission before ordinary AEG
+  publication and execution, with explicit uncertified diagnostic mode, pinned
+  source identities, serial owned workers and bound CPU/Torch CPU evidence.
+  Authenticate/parse bounded report bytes once; invalidate numerical evidence on
+  merging. See [executed checks, compilation costs and remaining scope](docs/mission-numerical-admission.md).
+- Preserve existing AEG output when packaging or optional evaluation fails. Build
+  and verify private candidates, serialize cooperating writers with native locks,
+  and restore previous output on promotion failure. Evaluators receive the actual
+  candidate path. Crash/reader limits, regression evidence and incomplete
+  performance validation are documented in
+  [compiler publication safety](docs/mission-compiler-publication.md).
+
 ## [1.3.0] - 2026-09-15 -- Visual Benchmark Telemetry & Documentation Release
 
 ### Added
@@ -538,6 +644,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added a serial 22-pass audit with deterministic real checkpoint fixtures,
+  every-file artifact diffs, actual loader/public API execution, original-FP32 HF
+  comparisons, raw timing spread and worker-identified sampled RSS. Windows
+  workers pin UTF-8; admission refusals and unsupported paths remain explicit.
+  See `tools/README-pass-audit.md` and `docs/mission-pass-audit.md`.
+- Added a serial quality-validator comparison using hashed original-FP32 HF
+  evidence, actual AEG cache execution and verified-worker memory samples.
+  The report includes timing regressions and does not certify compiler quality.
 - Initial project structure and foundational packages.
 - `aether.core` package: AEG format, AEG-IR, computation graph, tensor types, and content-addressed hashing.
 - `aether.compiler` skeleton: `Compiler` and `CompilerConfig`, dry-run planning, quality reports, and optimizer pass manager.
@@ -573,7 +687,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - N/A
 
 ### Fixed
-- N/A
+
+- Made evaluation quality checks reject absent, mismatched and nonfinite
+  evidence, measure uncapped KL/PPL correctly, count greedy suffix mismatches,
+  and validate append-only engine histories against fixed labels. Mutable empty
+  reports cannot assert success. The subsequent compiler/admission integration is
+  scoped in `docs/mission-numerical-admission.md`; original validator measurements
+  remain in `docs/mission-quality-validation.md`.
+- Returned a one-dimensional FP32 vocabulary vector from Torch's public
+  last-position `forward_step`, preserving all-position output and append-only
+  caches. Real CPU/Torch prefill/decode regressions cover both cache modes.
+  See `docs/mission-forward-step-contract.md`.
+- Bounded calibration-ledger temporary creation and stopped retrying denied
+  writes as filename collisions. Failed writes preserve previous evidence and
+  clean owned temporary files/descriptors; real Torch CPU forwards keep working
+  with a denied advisory cache. See `docs/mission-calibration-persistence.md`.
+- Made unverified default passes P1/P2/P4/P5/P6/P7/P8 experimental opt-ins,
+  retaining default BF16 precision assignment and source MoE/KV execution.
+  Pipeline toggles now survive config synchronization and reach internal pass
+  gates. Packaging requires an applied sharding-plan producer; IR fusion reports
+  actual groups without claiming runtime launch or memory savings. Serial tiny
+  and MoE measurements, exact A/B numerics and mixed TTFT results are recorded
+  in `docs/mission-default-policy.md`; larger-model benefit remains unverified.
+- Rejected reported optimizer failures before targeting or AEG publication,
+  preserving their structured reasons, cleaning private staging and retaining an
+  existing destination even when overwrite is requested. Diagnostic pipeline
+  reports and benign skips remain available. Real SDK/CLI regressions cover it.
+- Removed fabricated candidate generation from the legacy public tree-speculation
+  API. Unsupported drafting now fails clearly; manual verification requires valid
+  target evidence and commits acceptance counters only after successful validation.
+  Existing imports and constructor signatures remain available. See
+  `docs/legacy-speculation.md` for migration and validation scope.
+- Made GNU PE native CPU builds reproducible across fresh staging directories,
+  retaining ASLR and relocations and invalidating caches from the older recipe.
+  Two cold native DLLs and complete repeated AEG builds were verified byte for byte.
+- Stopped emitting unrequested package templates and unsupported default feature,
+  watermark, kernel and certification claims. Explicit payloads and old packages
+  retain integrity checks. Unknown source-weight hashes and compliance remain
+  unknown. See `docs/mission-validation.md` and `docs/mission-pass-audit.md`.
 
 ### Security
 - N/A

@@ -172,7 +172,11 @@ def phase_d(workdir: Path, ctx: dict[str, Any]) -> dict[str, Any]:
     from aether.compiler.compiler import Compiler
     from aether.compiler.config import CompilerConfig
 
-    compiler = Compiler(CompilerConfig(targets=["cpu_avx512"], overwrite=True))
+    # Phase F inspects an explicitly requested IR transformation. This build
+    # exercises fusion without implying that fusion is part of the defaults.
+    compiler = Compiler(
+        CompilerConfig(targets=["cpu_avx512"], overwrite=True, enable_fusion=True)
+    )
     package = compiler.compile(str(ctx["model_dir"]), output_path=workdir / "compiled.aeg")
     arch = ctx["arch"]
     record(
@@ -207,8 +211,8 @@ def phase_f(workdir: Path, ctx: dict[str, Any]) -> None:
     fused = package_manifest.get("optimization", {}).get("fused_ops_count", 0)
     record(
         "PASS" if fused > 0 else "FAIL",
-        f"operator fusion applied to the graph (fused groups={fused})",
-        manifest_optimizer_summary := {
+        f"explicitly requested IR fusion (fused groups={fused}; no runtime speed claim)",
+        {
             "fusion_passes": package_manifest.get("optimization", {}).get("fusion_passes_applied", [])[:5],
             "fused_ops_count": fused,
         },

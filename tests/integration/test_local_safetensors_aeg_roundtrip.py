@@ -447,6 +447,7 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
 
     compiler = Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             # Request one AEG build covering the portable CPU contract and
             # accelerator destination profiles.  Accelerator entries must be
             # reported as portable/plan-only unless real device code exists.
@@ -488,12 +489,12 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
     archived = AEGPackage.load_from_archive(archive)
     archived.verify_integrity()
     assert archived.has_weights
-    archived_logits, _ = load_engine_from_path(archived.root).forward(
+    archived_logits, _ = load_engine_from_path(archived.root, allow_uncertified=True).forward(
         np.asarray([1], dtype=np.int64)
     )
     assert archived_logits.shape == (1, 32)
 
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
     logits, _ = engine.forward(np.asarray([1, 2], dtype=np.int64))
     assert logits.shape == (2, 32)
     packaged_kernels = package.metadata.get("kernel_artifacts", [])
@@ -501,16 +502,18 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
         packaged_path = artifact / packaged_kernels[0]["path"]
         assert packaged_path.is_file()
         loaded_path = Path(engine.kernels.library_path).resolve()
-        if os.name == "nt":
-            import hashlib
+        import hashlib
 
-            assert loaded_path != packaged_path.resolve()
-            assert loaded_path.name.startswith("aether_packaged_")
-            assert hashlib.sha256(loaded_path.read_bytes()).hexdigest() == hashlib.sha256(packaged_path.read_bytes()).hexdigest()
-        else:
-            assert loaded_path == packaged_path.resolve()
+        # Every host caches authenticated executable bytes so later emission
+        # and live engines survive removal of the original artifact.
+        assert engine.kernels.is_native
+        assert loaded_path != packaged_path.resolve()
+        assert loaded_path.name.startswith("aether_packaged_")
+        assert hashlib.sha256(loaded_path.read_bytes()).hexdigest() == hashlib.sha256(
+            packaged_path.read_bytes()
+        ).hexdigest()
 
-    runtime = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=3))
+    runtime = Runtime(RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=3))
     response = runtime.generate(str(artifact), prompt="hello world", max_tokens=3, temperature=0.0)
     assert response.usage["completion_tokens"] == 3
     assert response.text
@@ -523,6 +526,7 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
     # while a fresh Runtime process can reload the same persisted AEG.
     reusable = Runtime(
         RuntimeConfig(
+            allow_uncertified=True,
             hf_offline=True,
             default_max_tokens=1,
             enable_semantic_cache=False,
@@ -534,12 +538,19 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
     assert first_reuse.text and second_reuse.text
     assert reusable._loaded_models[str(artifact)] is loaded_handle
     reloaded = Runtime(
-        RuntimeConfig(hf_offline=True, default_max_tokens=1, enable_semantic_cache=False)
+        RuntimeConfig(
+            allow_uncertified=True,
+            hf_offline=True,
+            default_max_tokens=1,
+            enable_semantic_cache=False,
+        )
     )
     reloaded_response = reloaded.generate(str(artifact), prompt="reload", max_tokens=1, temperature=0.0)
     assert reloaded_response.text
     slo_runtime = Runtime(
-        RuntimeConfig(hf_offline=True, default_max_tokens=2, scheduler="slo_aware")
+        RuntimeConfig(
+            allow_uncertified=True, hf_offline=True, default_max_tokens=2, scheduler="slo_aware"
+        )
     )
     slo_response = slo_runtime.generate(
         str(artifact), prompt="hello world", max_tokens=2, temperature=0.0, slo_tier="latency"
@@ -570,7 +581,7 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
     from aether.server.app import create_app
 
-    app = create_app(RuntimeConfig(hf_offline=True, default_max_tokens=2))
+    app = create_app(RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2))
     api_response = TestClient(app).post(
         "/v1/generate",
         json={"model": str(artifact), "prompt": "hello world", "max_tokens": 2, "temperature": 0.0},
@@ -622,7 +633,7 @@ def test_local_safetensors_compile_reload_runtime(tmp_path: Path) -> None:
     weight_blob = package.weight_store().blob_path
     weight_blob.write_bytes(weight_blob.read_bytes() + b"tampered")
     with pytest.raises(BackendError, match="integrity"):
-        Runtime(RuntimeConfig(hf_offline=True)).generate(
+        Runtime(RuntimeConfig(allow_uncertified=True, hf_offline=True)).generate(
             str(artifact), prompt="hello", max_tokens=1, temperature=0.0
         )
 
@@ -640,6 +651,7 @@ def test_non_qwen_gemma_family_uses_generic_decoder_path(tmp_path: Path) -> None
     artifact = tmp_path / "tiny-gemma.aeg"
     compiler = Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx2"],
             overwrite=True,
             calibration_tokens=8,
@@ -651,10 +663,12 @@ def test_non_qwen_gemma_family_uses_generic_decoder_path(tmp_path: Path) -> None
     assert package.manifest.architecture.family == "gemma_family"
     assert package.manifest.architecture.ffn_type == "GeGLU"
     assert package.manifest.architecture.family != "qwen_family"
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
     logits, _ = engine.forward(np.asarray([1, 2], dtype=np.int64))
     assert logits.shape == (2, 32)
-    response = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
+    response = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2)
+    ).generate(
         str(artifact), prompt="hello world", max_tokens=2, temperature=0.0
     )
     assert response.text
@@ -668,6 +682,7 @@ def test_gpt2_conv1d_absolute_position_path_is_generic(tmp_path: Path) -> None:
     _write_tiny_gpt2(source)
     artifact = tmp_path / "tiny-gpt2.aeg"
     Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2"],
         overwrite=True,
         calibration_tokens=8,
@@ -679,7 +694,9 @@ def test_gpt2_conv1d_absolute_position_path_is_generic(tmp_path: Path) -> None:
     assert architecture.norm_type == "LayerNorm"
     assert architecture.ffn_type == "GELU"
     assert architecture.position_type == "absolute"
-    logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2], dtype=np.int64))
+    logits, _ = load_engine_from_path(artifact, allow_uncertified=True).forward(
+        np.asarray([1, 2], dtype=np.int64)
+    )
     assert logits.shape == (2, 32)
 
 
@@ -691,6 +708,7 @@ def test_t5_encoder_decoder_compiles_and_generates(tmp_path: Path) -> None:
     _write_tiny_t5(source)
     artifact = tmp_path / "tiny-t5.aeg"
     Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
         overwrite=True,
         calibration_tokens=8,
@@ -707,17 +725,21 @@ def test_t5_encoder_decoder_compiles_and_generates(tmp_path: Path) -> None:
     assert package.manifest.kernels.variant_status["rocm_cdna3"] == "portable"
     assert package.manifest.kernels.variant_status["metal_m3"] == "portable"
     assert "pytorch" in package.manifest.kernels.portable_backends
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
     logits, _ = engine.forward(np.asarray([3, 4], dtype=np.int64))
     assert logits.shape == (1, 32)
-    response = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
+    response = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2)
+    ).generate(
         str(artifact), prompt="hello world", max_tokens=2, temperature=0.0
     )
     assert response.text
     pytest.importorskip("torch")
     from aether.runtime.torch_transformer_engine import TorchSeq2SeqAEGEngine
 
-    cpu_logits, _ = load_engine_from_path(artifact).forward(np.asarray([3, 4], dtype=np.int64))
+    cpu_logits, _ = load_engine_from_path(artifact, allow_uncertified=True).forward(
+        np.asarray([3, 4], dtype=np.int64)
+    )
     portable_logits, _ = TorchSeq2SeqAEGEngine(engine, "cpu").forward(np.asarray([3, 4], dtype=np.int64))
     np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
     mesh_logits, _ = TorchSeq2SeqAEGEngine(engine, "cpu", devices=["cpu:0", "cpu:1"]).forward(
@@ -734,6 +756,7 @@ def test_mixtral_moe_compiles_serializes_experts_and_generates(tmp_path: Path) -
     _write_tiny_mixtral(source)
     artifact = tmp_path / "tiny-mixtral.aeg"
     Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
         overwrite=True,
         calibration_tokens=8,
@@ -752,17 +775,21 @@ def test_mixtral_moe_compiles_serializes_experts_and_generates(tmp_path: Path) -
         for projection in ("gate_proj", "up_proj", "down_proj"):
             assert f"layer_0_expert_{expert}_{projection}" in store_names
     assert "layer_0_moe_router" in store_names
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
     logits, _ = engine.forward(np.asarray([1, 2], dtype=np.int64))
     assert logits.shape == (2, 32)
     assert np.isfinite(logits).all()
     pytest.importorskip("torch")
     from aether.runtime.torch_engine import TorchAEGEngine
 
-    cpu_logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2, 3], dtype=np.int64))
+    cpu_logits, _ = load_engine_from_path(artifact, allow_uncertified=True).forward(
+        np.asarray([1, 2, 3], dtype=np.int64)
+    )
     portable_logits, _ = TorchAEGEngine(engine, "cpu").forward(np.asarray([1, 2, 3], dtype=np.int64))
     np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
-    response = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
+    response = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2)
+    ).generate(
         str(artifact), prompt="hello world", max_tokens=2, temperature=0.0
     )
     assert response.text
@@ -776,6 +803,7 @@ def test_deepseek_style_mla_compiles_and_runs_without_standard_qkv(tmp_path: Pat
     _write_tiny_mla(source)
     artifact = tmp_path / "tiny-mla.aeg"
     Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
         overwrite=True, calibration_tokens=8,
         cache_dir=str(tmp_path / "compiler-cache"),
@@ -791,7 +819,7 @@ def test_deepseek_style_mla_compiles_and_runs_without_standard_qkv(tmp_path: Pat
     entries = set(package.weight_store().entries)
     assert "layer_0_kv_a_proj" in entries
     assert "layer_0_kv_b_proj" in entries
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
     logits, _ = engine.forward(np.asarray([1, 2], dtype=np.int64))
     assert logits.shape == (2, 32)
     assert np.isfinite(logits).all()
@@ -800,7 +828,9 @@ def test_deepseek_style_mla_compiles_and_runs_without_standard_qkv(tmp_path: Pat
     pytest.importorskip("torch")
     from aether.runtime.torch_state_engine import TorchMLAAEGEngine
 
-    cpu_logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2, 3], dtype=np.int64))
+    cpu_logits, _ = load_engine_from_path(artifact, allow_uncertified=True).forward(
+        np.asarray([1, 2, 3], dtype=np.int64)
+    )
     portable_logits, _ = TorchMLAAEGEngine(engine, "cpu").forward(np.asarray([1, 2, 3], dtype=np.int64))
     np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
     mesh_logits, _ = TorchMLAAEGEngine(engine, "cpu", devices=["cpu:0", "cpu:1"]).forward(
@@ -817,6 +847,7 @@ def test_deepseek_style_mla_moe_compiles_and_runs_with_routed_ffn(tmp_path: Path
     _write_tiny_mla(source, moe=True)
     artifact = tmp_path / "tiny-mla-moe.aeg"
     Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
         overwrite=True, calibration_tokens=8,
         cache_dir=str(tmp_path / "compiler-cache"),
@@ -832,7 +863,7 @@ def test_deepseek_style_mla_moe_compiles_and_runs_with_routed_ffn(tmp_path: Path
     assert "layer_0_moe_router" in names
     assert "layer_0_expert_0_gate_proj" in names
     assert "layer_0_expert_1_down_proj" in names
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
     cpu_logits, _ = engine.forward(np.asarray([1, 2, 3], dtype=np.int64))
     assert cpu_logits.shape == (3, 32)
     pytest.importorskip("torch")
@@ -854,6 +885,7 @@ def test_mamba_selective_scan_compiles_and_runs_with_recurrent_state(tmp_path: P
     _write_tiny_mamba(source)
     artifact = tmp_path / "tiny-mamba.aeg"
     Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2", "cuda_sm90", "rocm_cdna3", "metal_m3"],
         overwrite=True, calibration_tokens=8,
         cache_dir=str(tmp_path / "compiler-cache"),
@@ -867,7 +899,7 @@ def test_mamba_selective_scan_compiles_and_runs_with_recurrent_state(tmp_path: P
     entries = set(package.weight_store().entries)
     assert "layer_0_ssm_a_log" in entries
     assert "layer_0_ssm_x_proj" in entries
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
     logits, cache = engine.forward(np.asarray([1, 2], dtype=np.int64))
     assert logits.shape == (2, 32)
     assert cache.length == 2
@@ -876,7 +908,9 @@ def test_mamba_selective_scan_compiles_and_runs_with_recurrent_state(tmp_path: P
     pytest.importorskip("torch")
     from aether.runtime.torch_state_engine import TorchMambaAEGEngine
 
-    cpu_logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2, 3], dtype=np.int64))
+    cpu_logits, _ = load_engine_from_path(artifact, allow_uncertified=True).forward(
+        np.asarray([1, 2, 3], dtype=np.int64)
+    )
     portable_logits, _ = TorchMambaAEGEngine(engine, "cpu").forward(np.asarray([1, 2, 3], dtype=np.int64))
     np.testing.assert_allclose(cpu_logits, portable_logits, rtol=2e-5, atol=2e-5)
     mesh_logits, _ = TorchMambaAEGEngine(engine, "cpu", devices=["cpu:0", "cpu:1"]).forward(
@@ -897,6 +931,7 @@ def test_generic_registry_decoder_family_compiles_and_runs(tmp_path: Path) -> No
     )
     artifact = tmp_path / "tiny-olmo.aeg"
     Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2"],
         overwrite=True,
         calibration_tokens=8,
@@ -904,7 +939,9 @@ def test_generic_registry_decoder_family_compiles_and_runs(tmp_path: Path) -> No
     )).compile(str(source), output_path=artifact)
     package = load_aeg_package(artifact)
     assert package.manifest.architecture.family == "generic_decoder_family"
-    logits, _ = load_engine_from_path(artifact).forward(np.asarray([1], dtype=np.int64))
+    logits, _ = load_engine_from_path(artifact, allow_uncertified=True).forward(
+        np.asarray([1], dtype=np.int64)
+    )
     assert logits.shape == (1, 32)
 
 
@@ -916,6 +953,7 @@ def test_olmo_fused_checkpoint_compiles_and_runs(tmp_path: Path) -> None:
     _write_tiny_olmo(source)
     artifact = tmp_path / "tiny-olmo-fused.aeg"
     Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2"],
         overwrite=True,
         calibration_tokens=8,
@@ -924,7 +962,9 @@ def test_olmo_fused_checkpoint_compiles_and_runs(tmp_path: Path) -> None:
     package = load_aeg_package(artifact)
     assert package.manifest.architecture.family == "generic_decoder_family"
     assert package.metadata["unbound_weight_names"] == []
-    logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2], dtype=np.int64))
+    logits, _ = load_engine_from_path(artifact, allow_uncertified=True).forward(
+        np.asarray([1, 2], dtype=np.int64)
+    )
     assert logits.shape == (2, 32)
 
 
@@ -940,6 +980,7 @@ def test_unknown_standard_decoder_contract_compiles_and_runs(tmp_path: Path) -> 
     )
     artifact = tmp_path / "tiny-acme.aeg"
     Compiler(CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx2"],
         overwrite=True,
         calibration_tokens=8,
@@ -947,7 +988,9 @@ def test_unknown_standard_decoder_contract_compiles_and_runs(tmp_path: Path) -> 
     )).compile(str(source), output_path=artifact)
     package = load_aeg_package(artifact)
     assert package.manifest.architecture.family == "generic_decoder_family"
-    logits, _ = load_engine_from_path(artifact).forward(np.asarray([1, 2], dtype=np.int64))
+    logits, _ = load_engine_from_path(artifact, allow_uncertified=True).forward(
+        np.asarray([1, 2], dtype=np.int64)
+    )
     assert logits.shape == (2, 32)
 
 
@@ -961,6 +1004,7 @@ def test_local_bitnet_sub2bit_aeg_roundtrip(tmp_path: Path) -> None:
 
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -981,10 +1025,12 @@ def test_local_bitnet_sub2bit_aeg_roundtrip(tmp_path: Path) -> None:
     assert manifest["weight_reconstruction"]["elements"] > 0
     assert any(value == "TERNARY" for value in package.get_precision_map().values())
 
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
     logits, _ = engine.forward(np.asarray([1, 2], dtype=np.int64))
     assert logits.shape == (2, 32)
-    response = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
+    response = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2)
+    ).generate(
         str(artifact), prompt="hello", max_tokens=2, temperature=0.0
     )
     assert response.text
@@ -1013,6 +1059,7 @@ def test_local_aeg_compiled_lora_is_consumed_by_runtime(tmp_path: Path) -> None:
     artifact = tmp_path / "tiny-lora.aeg"
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -1025,12 +1072,12 @@ def test_local_aeg_compiled_lora_is_consumed_by_runtime(tmp_path: Path) -> None:
     package = load_aeg_package(artifact)
     package.verify_integrity()
     assert "advanced_peft_compilation" in package.metadata.get("optimizer_passes", [])
-    base = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
-        str(artifact), prompt="hello", max_tokens=2, temperature=0.0
-    )
-    adapted = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
-        str(artifact), prompt="hello", max_tokens=2, temperature=0.0, adapter_id="adapter"
-    )
+    base = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2)
+    ).generate(str(artifact), prompt="hello", max_tokens=2, temperature=0.0)
+    adapted = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2)
+    ).generate(str(artifact), prompt="hello", max_tokens=2, temperature=0.0, adapter_id="adapter")
     assert base.text
     assert adapted.text
     assert adapted.metrics.extra["lora_adapter"]["adapter_id"] == "adapter"
@@ -1045,16 +1092,18 @@ def test_local_aeg_consumes_persisted_sparse_attention_plan(tmp_path: Path) -> N
     artifact = tmp_path / "tiny-sparse.aeg"
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
             cache_dir=str(tmp_path / "compiler-cache"),
+            enable_sparse_attention=True,
         )
     ).compile(str(source), output_path=artifact)
     package = load_aeg_package(artifact)
     plan = package.metadata["attention_head_patterns"]
     assert plan["enabled"] is True
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
     assert engine.sparse_attention_plan == plan
     logits, _ = engine.forward(np.asarray([1, 2, 3], dtype=np.int64))
     assert logits.shape == (3, 32)
@@ -1070,6 +1119,7 @@ def test_local_pytorch_checkpoint_compile_reload_runtime(tmp_path: Path) -> None
 
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -1080,9 +1130,9 @@ def test_local_pytorch_checkpoint_compile_reload_runtime(tmp_path: Path) -> None
     package = load_aeg_package(artifact)
     package.verify_integrity()
     assert package.has_weights
-    response = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
-        str(artifact), prompt="hello", max_tokens=2, temperature=0.0
-    )
+    response = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2)
+    ).generate(str(artifact), prompt="hello", max_tokens=2, temperature=0.0)
     assert response.text
     assert response.usage["completion_tokens"] == 2
 
@@ -1106,6 +1156,7 @@ def test_local_transformer_family_aliases_compile_reload_and_generate(tmp_path: 
         artifact = tmp_path / f"{model_type}.aeg"
         Compiler(
             CompilerConfig(
+                quality_mode="diagnostic",
                 targets=["cpu_avx512"],
                 overwrite=True,
                 calibration_tokens=8,
@@ -1115,9 +1166,9 @@ def test_local_transformer_family_aliases_compile_reload_and_generate(tmp_path: 
         package = load_aeg_package(artifact)
         assert package.manifest is not None
         assert package.manifest.architecture.family == expected_family
-        response = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2)).generate(
-            str(artifact), prompt="hello", max_tokens=2, temperature=0.0
-        )
+        response = Runtime(
+            RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=2)
+        ).generate(str(artifact), prompt="hello", max_tokens=2, temperature=0.0)
         assert response.text
 
 
@@ -1135,6 +1186,7 @@ def test_local_declared_mtp_checkpoint_reaches_runtime_speculation(tmp_path: Pat
     artifact = tmp_path / "tiny-mtp.aeg"
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -1147,7 +1199,7 @@ def test_local_declared_mtp_checkpoint_reaches_runtime_speculation(tmp_path: Pat
     assert package.manifest is not None
     assert package.manifest.architecture.mtp_heads == 2
     assert (package.root / "speculation" / "mtp_config.json").is_file()
-    runtime = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=3))
+    runtime = Runtime(RuntimeConfig(allow_uncertified=True, hf_offline=True, default_max_tokens=3))
     response = runtime.generate(str(artifact), prompt="hello", max_tokens=3, temperature=0.0)
     speculative = response.metrics.extra.get("speculative")
     assert isinstance(speculative, dict)
@@ -1164,6 +1216,7 @@ def test_cli_serve_exposes_real_tcp_api_for_local_aeg(
     artifact = tmp_path / "served.aeg"
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -1184,6 +1237,7 @@ def test_cli_serve_exposes_real_tcp_api_for_local_aeg(
             sys.executable,
             "-m",
             "aether.cli",
+            "--diagnostic",
             "serve",
             str(artifact),
             "--host",
@@ -1251,6 +1305,7 @@ def test_agentic_session_reuses_real_cpu_aeg_kv_prefix(
     artifact = tmp_path / "agentic.aeg"
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -1260,6 +1315,7 @@ def test_agentic_session_reuses_real_cpu_aeg_kv_prefix(
 
     runtime = Runtime(
         RuntimeConfig(
+            allow_uncertified=True,
             hf_offline=True,
             default_max_tokens=2,
             enable_semantic_cache=False,
@@ -1290,6 +1346,7 @@ def test_multi_agent_session_reuses_real_shared_cpu_prefix_kv(
     artifact = tmp_path / "multi-agent.aeg"
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -1298,6 +1355,7 @@ def test_multi_agent_session_reuses_real_shared_cpu_prefix_kv(
     ).compile(str(tiny_local_safetensors_model), output_path=artifact)
     runtime = Runtime(
         RuntimeConfig(
+            allow_uncertified=True,
             hf_offline=True,
             default_max_tokens=2,
             enable_semantic_cache=False,
@@ -1335,6 +1393,7 @@ def test_enabled_optimizer_artifacts_are_persisted(tmp_path: Path) -> None:
     artifact = tmp_path / "features.aeg"
     compiler = Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -1370,7 +1429,9 @@ def test_enabled_optimizer_artifacts_are_persisted(tmp_path: Path) -> None:
     reloaded = AEGPackage(package.root).load()
     assert reloaded.format_version == "AEG/2.0"
 
-    runtime = Runtime(RuntimeConfig(hf_offline=True, enable_semantic_cache=False))
+    runtime = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, enable_semantic_cache=False)
+    )
     runtime._load_model(str(package.root))  # noqa: SLF001 - verify persisted layer reachability
     assert runtime.grammar_engine is not None
     assert runtime.ttt_engine is not None
@@ -1413,7 +1474,7 @@ def test_enabled_optimizer_artifacts_are_persisted(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
     from aether.server.app import create_app
 
-    client = TestClient(create_app(RuntimeConfig(hf_offline=True)))
+    client = TestClient(create_app(RuntimeConfig(allow_uncertified=True, hf_offline=True)))
     constrained_api = client.post(
         "/v1/generate",
         json={
@@ -1460,6 +1521,7 @@ def test_local_aeg_grpc_generate_and_stream(tmp_path: Path) -> None:
     artifact = tmp_path / "grpc.aeg"
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -1469,7 +1531,14 @@ def test_local_aeg_grpc_generate_and_stream(tmp_path: Path) -> None:
 
     from aether.server.grpc_service import AetherGrpcClient, start_grpc_server
 
-    runtime = Runtime(RuntimeConfig(hf_offline=True, default_max_tokens=2, enable_semantic_cache=False))
+    runtime = Runtime(
+        RuntimeConfig(
+            allow_uncertified=True,
+            hf_offline=True,
+            default_max_tokens=2,
+            enable_semantic_cache=False,
+        )
+    )
     server = start_grpc_server(runtime, port=0, auth_token="test-token")
     client = AetherGrpcClient(f"127.0.0.1:{server.aether_port}", auth_token="test-token")
     try:
@@ -1507,6 +1576,7 @@ def test_local_aeg_evaluation_gate_measures_runtime_output(tmp_path: Path) -> No
     artifact = tmp_path / "eval.aeg"
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -1529,7 +1599,12 @@ def test_local_aeg_evaluation_gate_measures_runtime_output(tmp_path: Path) -> No
     from aether.observability.ci_pipeline import JsonlBenchmarkEvaluator
 
     runtime = Runtime(
-        RuntimeConfig(hf_offline=True, default_max_tokens=2, enable_semantic_cache=False)
+        RuntimeConfig(
+            allow_uncertified=True,
+            hf_offline=True,
+            default_max_tokens=2,
+            enable_semantic_cache=False,
+        )
     )
     evaluator = JsonlBenchmarkEvaluator(
         {"mmlu": dataset},
@@ -1569,9 +1644,10 @@ def test_compiler_rejects_and_runtime_blocks_failed_eval_artifact(
             "latency_ms": 1.0,
         }
 
-    with pytest.raises(CompilationError, match="Evaluation gate failed"):
+    with pytest.raises(CompilationError, match="Evaluation gate failed") as rejected:
         Compiler(
             CompilerConfig(
+                quality_mode="diagnostic",
                 targets=["cpu_avx512"],
                 overwrite=True,
                 calibration_tokens=8,
@@ -1585,14 +1661,23 @@ def test_compiler_rejects_and_runtime_blocks_failed_eval_artifact(
             eval_baselines={"mmlu": 1.0},
         )
 
-    report_path = artifact / "observability" / "eval_report.json"
-    assert report_path.is_file()
-    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert not artifact.exists()
+    report = rejected.value.details
     assert report["gate"]["passed"] is False
+    # Admission must still reject an independently persisted failed policy.
+    # Failed compilation itself must no longer publish that artifact.
+    control = Compiler(CompilerConfig(
+        quality_mode="diagnostic",
+        targets=["cpu_avx512"], cache_dir=str(tmp_path / "control-cache"),
+    )).compile(str(tiny_local_safetensors_model), output_path=tmp_path / "policy-control.aeg")
+    control.metadata["evaluation_status"] = "rejected"
+    control.metadata["eval_report"] = report
+    control.save()
+    control.verify_integrity()
     with pytest.raises(BackendError, match="rejected by its persisted evaluation gate"):
-        Runtime(RuntimeConfig(hf_offline=True, enable_semantic_cache=False)).generate(
-            str(artifact), "hello", max_tokens=1, temperature=0.0
-        )
+        Runtime(
+            RuntimeConfig(allow_uncertified=True, hf_offline=True, enable_semantic_cache=False)
+        ).generate(str(control.root), "hello", max_tokens=1, temperature=0.0)
 
 
 @pytest.mark.integration
@@ -1604,6 +1689,7 @@ def test_runtime_merge_writes_and_reloads_real_aeg(tmp_path: Path) -> None:
     base_path = tmp_path / "base.aeg"
     task_path = tmp_path / "task.aeg"
     compiler_config = CompilerConfig(
+        quality_mode="diagnostic",
         targets=["cpu_avx512"],
         overwrite=True,
         calibration_tokens=8,
@@ -1621,7 +1707,9 @@ def test_runtime_merge_writes_and_reloads_real_aeg(tmp_path: Path) -> None:
         task.weights[name] = quantize_tensor((tensor + 0.01).astype("float32"), task.weight_store().entries[name].precision)
     task.save()
 
-    runtime = Runtime(RuntimeConfig(hf_offline=True, enable_semantic_cache=False))
+    runtime = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, enable_semantic_cache=False)
+    )
     result = runtime.merge(
         str(base_path),
         task_vectors=[{"name": "task", "path": str(task_path), "coefficient": 1.0}],
@@ -1654,6 +1742,7 @@ def test_semantic_kv_plan_survives_aeg_reload_and_changes_real_cache(tmp_path: P
     artifact = tmp_path / "semantic-kv.aeg"
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -1671,7 +1760,7 @@ def test_semantic_kv_plan_survives_aeg_reload_and_changes_real_cache(tmp_path: P
     assert plan["format"] == "aether_kv_compression_v1"
     assert "semantic_kv_compression" in package.metadata["optimizer_passes"]
 
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
     _, cache = engine.forward(np.asarray([1, 2, 3, 4], dtype=np.int64))
     assert cache.length == 4
     assert cache.positions[0] is not None
@@ -1692,6 +1781,7 @@ def test_cross_layer_kv_plan_survives_aeg_reload_and_aliases_cpu_cache(tmp_path:
     artifact = tmp_path / "cross-layer-kv.aeg"
     Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -1707,7 +1797,7 @@ def test_cross_layer_kv_plan_survives_aeg_reload_and_aliases_cpu_cache(tmp_path:
     assert isinstance(plan, dict)
     assert plan["format"] == "aether_cross_layer_kv_v1"
     assert plan["sharing_groups"]
-    engine = load_engine_from_path(artifact)
+    engine = load_engine_from_path(artifact, allow_uncertified=True)
     _, cache = engine.forward(np.asarray([1, 2, 3], dtype=np.int64))
     assert cache.keys[0] is cache.keys[1]
     assert cache.values[0] is cache.values[1]
@@ -1733,6 +1823,7 @@ def test_mdlm_bundle_compiles_into_aeg_and_reloads_r9(tmp_path: Path) -> None:
     artifact = tmp_path / "mdlm.aeg"
     package = Compiler(
         CompilerConfig(
+            quality_mode="diagnostic",
             targets=["cpu_avx512"],
             overwrite=True,
             calibration_tokens=8,
@@ -1748,7 +1839,9 @@ def test_mdlm_bundle_compiles_into_aeg_and_reloads_r9(tmp_path: Path) -> None:
     package.verify_integrity()
     assert (artifact / "graph" / "mdlm_draft_head.npz").is_file()
 
-    runtime = Runtime(RuntimeConfig(hf_offline=True, enable_semantic_cache=False))
+    runtime = Runtime(
+        RuntimeConfig(allow_uncertified=True, hf_offline=True, enable_semantic_cache=False)
+    )
     runtime._load_model(str(artifact))  # noqa: SLF001 - verify restart path
     engine = runtime._diffusion_engine  # noqa: SLF001 - inspect loaded R9 layer
     assert engine is not None and engine.is_ready()
