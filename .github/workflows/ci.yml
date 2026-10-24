@@ -173,6 +173,51 @@ jobs:
             hf-full-coverage.xml
           if-no-files-found: error
 
+  hf-dense-parity:
+    name: Original-HF dense CPU load and parity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      AETHER_TORCH_DTYPE: "float32"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: 66f0e101d31f12121d07445c5ecb798ae155defd
+          path: historical-dense
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.14"
+      - name: Install pinned CPU reference stack
+        run: |
+          python -m pip install 'torch==2.9.1+cpu' --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e '.[test,server,formats]' 'numpy==1.26.4' 'transformers==4.57.3' 'safetensors==0.8.0' 'tokenizers==0.22.2' 'psutil==7.2.2' 'onnxruntime==1.23.2'
+          python -m pip freeze > dense-hf-freeze.txt
+      - name: Measure tiny and 27M load and validate actual CPU, Torch, ONNX, API and CLI
+        run: python tools/validate_dense_hf.py --output dense-hf-results --baseline-src historical-dense/src
+      - name: Upload reports, reference arrays and profiles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hf-dense-parity
+          # Complete payload hashes are in the report; regenerate deterministic
+          # fixtures rather than upload repeated 109 MB model/ONNX payloads.
+          path: |
+            dense-hf-freeze.txt
+            dense-hf-results/**/*.json
+            dense-hf-results/**/*.jsonl
+            dense-hf-results/**/*.npy
+            dense-hf-results/**/*.log
+            dense-hf-results/**/*.txt
+            dense-hf-results/**/cli.stdout
+            dense-hf-results/**/cli.stderr
+          if-no-files-found: error
+
   docs-build:
     name: Build documentation
     runs-on: ubuntu-latest

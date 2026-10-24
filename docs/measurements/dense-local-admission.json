@@ -1,0 +1,36 @@
+{
+  "all_optimizer_passes_disabled": true,
+  "cases": [
+    {
+      "fixture_admission": {
+        "available_bytes": 681508864,
+        "estimated_worker_bytes": 948086784,
+        "reason": "RAM admission estimate; no worker launched when blocked",
+        "required_headroom_bytes": 536870912,
+        "status": "blocked"
+      },
+      "fixture_name": "mid"
+    }
+  ],
+  "cpu": "Intel64 Family 6 Model 186 Stepping 3, GenuineIntel",
+  "fixture_sha256": "fbe148845ef12390fd753c968ffeaf9c35f6ce8e71cdb6e3b19ce5c1a1fe3e63",
+  "host_ram_bytes": 8259321856,
+  "load_sampling": "Two warmup processes, then alternating role order for each sample",
+  "logical_cpus": 12,
+  "platform": "Windows-10-10.0.26200-SP0",
+  "python": "3.10.11",
+  "scope": "Untrained dense FP32 source parity and load/decode measurements",
+  "source_revisions": {
+    "current": "66f0e101d31f12121d07445c5ecb798ae155defd"
+  },
+  "started_utc": "2026-10-24T11:04:40.449057+00:00",
+  "versions": {
+    "numpy": "1.26.4",
+    "onnxruntime": "1.23.2",
+    "psutil": "7.2.2",
+    "safetensors": "0.8.0",
+    "tokenizers": "0.22.2",
+    "torch": "2.9.1",
+    "transformers": "4.57.3"
+  }
+}

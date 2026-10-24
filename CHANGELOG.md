@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Validation
+
+- Add guarded tiny/27M dense load profiling and original-HF CPU/Torch/ONNX,
+  cached-decode, SDK and CLI checks. Record the confirmed redundant FP32 copy
+  before changing loader ownership; distinguish the locally refused 27M run
+  from executed evidence in the [measurement contract](docs/mission-dense-load.md).
+
 ### Fixed
 
 - Reduce generic NumPy dispatch during Mamba-2 time-step clamping while
