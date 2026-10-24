@@ -257,6 +257,98 @@ with current numerical admission and therefore perform different work.
 | relu-convolution | 10672 | 512 / 384 | 94149 → 102420 | 0.27971 → 5.48522 |
 | relu-bounded | 10672 | 512 / 384 | 94099 → 102469 | 0.280962 → 5.4238 |
 
+## Clamp dispatch profiling follow-up
+
+The correctly bounded runtime at `299d662` was profiled before editing.
+Reviewed the complete CPU engine, parameter validator, source-parameter,
+normalization, convolution and stability tests, plus the unchanged loader,
+admission, session, worker and Torch caller contracts. The architecture remains
+engine-owned. NumPy 1.26.4's public `clip` dispatch and its reference
+`core/_methods.py` implementation were inspected alongside the
+[clip](https://numpy.org/doc/1.26/reference/generated/numpy.clip.html),
+[minimum](https://numpy.org/doc/1.26/reference/generated/numpy.minimum.html)
+and [maximum](https://numpy.org/doc/1.26/reference/generated/numpy.maximum.html)
+definitions. No recurrence equation or source bound is changed.
+
+For 500 eight-ID generations, the upper-bound contract made **4,500** clip
+calls, with **0.0159634 seconds cumulative** inside `np.clip` out of **0.572838
+seconds total profiled** (about **2.8%**). Timings from cProfile include profiler
+overhead. The original logging attempt failed to serialize pstats caller keys;
+its raw profiles were retained locally and no microbenchmark numbers from that
+failed logger are reported. The complete corrected
+[profile and API microbenchmarks](measurements/mamba2-bounds-profile.json)
+retain all samples. The [upper-limit call profile](measurements/mamba2-bounds-upper-limit-cprofile.txt)
+shows the actual forward path.
+
+Interleaved public-API microbenchmarks used 4/32/128 heads. Array-method clip
+was faster than generic `np.clip` for two finite bounds; a direct public
+minimum/maximum ufunc was faster for one open endpoint. The candidate uses
+those exact branches, in place on the fresh delta array. It preserves inverted
+bounds, NaN propagation, output dtype and the NumPy clamp function. The public
+AEG schema, learned weights, cache layout and Torch arithmetic are unchanged.
+The committed strict HF tool will compare against the already-correct bounded
+runtime, preserving the earlier source-fidelity results separately.
+
+Existing numerical/integration controls passed **151 cases**. Scoped module
+Ruff remains **18 findings** and mypy **30 errors**, with no added code/message
+diagnostics. A separate same-artifact A/B run executed all **14** source
+contracts with one/64-ID prompts. Logits, prefix states/history and continuation
+logits were exactly equal; all eight-ID generated sequences matched. Seven
+warmups preceded 45 randomized interleaved samples, five generations each.
+Traced peaks used 19 separate samples. Both engines shared the same immutable
+weights and owned their caches. Loaded weight/cache geometry is unchanged.
+
+The [complete local raw series](measurements/mamba2-bounds-local-observations.json)
+retains mixed timing results and broad, changing spreads. No general speedup
+or timing non-regression is assigned to that run. Bounded-request traced peak
+medians decreased **8,712 to 8,544 bytes** for one-ID prompts and **38,048 to
+37,712 bytes** for 64-ID prompts; unbounded controls were unchanged. These
+traces exclude loaded weights, prompts and untraced native allocations; they
+do not establish a peak-RSS improvement.
+
+The complete local run returned **5,542 passed, 42 skipped, three failures** in
+747.89 seconds. Two failures are the previously recorded MCP HTTP cases. The
+third was the audit worker's unchanged RAM guard, before worker execution:
+509,079,552 bytes available versus a 406,938,624-byte worker estimate plus
+134,217,728-byte headroom. The same check passed separately in **8.38 seconds**,
+with no assertion or memory guard changed. That isolated pass does not replace
+the complete run's failure. The complete run covered **45,282/57,445 lines =
+78.8267038%**, above the preceding local **45,244/57,440 = 78.7674095%**.
+[Full-run failures, coverage, isolated result and scoped diagnostics](measurements/mamba2-bounds-local-validation.json)
+retain the evidence. Hosted validation is pending. The pass dispositions and
+hardware tiers below remain in force.
+
+| Source / prompt IDs | Old generation ms median [min,max] | Candidate generation ms median [min,max] | Decode median change | Old → candidate traced peak bytes median |
+|---|---:|---:|---:|---:|
+| default / 1 | 0.65712 [0.62086,1.92568] | 0.67674 [0.62882,1.11732] | -2.900% | 8544 → 8544 |
+| default / 64 | 4.76962 [4.36514,8.4415] | 4.83012 [4.39556,8.62482] | -1.382% | 37712 → 37712 |
+| expanded-biased / 1 | 0.68926 [0.66056,0.9976] | 0.69432 [0.66094,0.98534] | -1.143% | 11392 → 11392 |
+| expanded-biased / 64 | 5.61614 [4.68256,9.48368] | 5.52292 [4.69542,8.47632] | +0.887% | 38608 → 38608 |
+| zero-epsilon / 1 | 1.07212 [0.93284,1.37816] | 1.06136 [0.92166,1.62876] | +0.847% | 8544 → 8544 |
+| zero-epsilon / 64 | 6.59466 [6.2096,7.36174] | 6.6258 [6.15196,7.25812] | -0.170% | 37712 → 37712 |
+| large-delta / 1 | 0.93222 [0.90144,1.06948] | 0.93312 [0.88862,1.26786] | +0.516% | 8544 → 8544 |
+| large-delta / 64 | 6.7228 [6.2447,7.11328] | 6.6365 [6.33734,7.2378] | +0.618% | 37712 → 37712 |
+| negative-gate / 1 | 0.94486 [0.87798,1.26004] | 0.9574 [0.88702,1.22348] | -1.261% | 8448 → 8448 |
+| negative-gate / 64 | 7.20576 [6.59824,9.41546] | 7.17998 [6.50734,9.8929] | +3.127% | 37712 → 37712 |
+| negative-conv / 1 | 0.99968 [0.92186,1.50754] | 0.97792 [0.91724,1.63732] | +1.706% | 8544 → 8544 |
+| negative-conv / 64 | 7.021 [6.43558,9.0017] | 7.22838 [6.45116,8.60206] | -3.041% | 37712 → 37712 |
+| upper-limit / 1 | 0.96454 [0.9258,1.2097] | 0.96754 [0.90864,1.28068] | +1.246% | 8712 → 8544 |
+| upper-limit / 64 | 6.9749 [6.65228,8.37912] | 6.84692 [6.43732,7.62112] | -0.159% | 38048 → 37712 |
+| lower-limit / 1 | 1.00744 [0.94568,1.47554] | 0.98486 [0.92404,1.32216] | +2.111% | 8712 → 8544 |
+| lower-limit / 64 | 7.99972 [6.63346,10.967] | 7.79926 [6.50972,10.742] | -1.412% | 38048 → 37712 |
+| zero-limit / 1 | 1.26782 [1.00396,1.647] | 1.21262 [1.00588,1.83918] | +0.927% | 8712 → 8544 |
+| zero-limit / 64 | 9.12536 [7.07154,22.1717] | 8.86486 [7.32764,22.3652] | +1.964% | 38048 → 37712 |
+| open-upper-limit / 1 | 1.16232 [1.02078,1.53952] | 1.13894 [0.9755,1.49142] | +1.241% | 8712 → 8544 |
+| open-upper-limit / 64 | 8.9414 [7.07206,13.1119] | 8.8687 [7.04106,12.5662] | -2.459% | 38048 → 37712 |
+| open-lower-limit / 1 | 1.13512 [1.01798,1.54274] | 1.14482 [0.98342,1.60418] | -1.408% | 8712 → 8544 |
+| open-lower-limit / 64 | 42.5153 [7.17198,124.743] | 36.5775 [7.24232,83.7443] | +8.176% | 38048 → 37712 |
+| inverted-limits / 1 | 2.7272 [2.11344,5.2918] | 2.68046 [1.92148,5.20506] | -0.871% | 8712 → 8544 |
+| inverted-limits / 64 | 21.7603 [13.4049,35.2473] | 22.9353 [15.1548,35.2656] | -8.757% | 38048 → 37712 |
+| relu-convolution / 1 | 2.39384 [1.75176,4.22484] | 2.55222 [1.7495,4.71168] | -2.462% | 8544 → 8544 |
+| relu-convolution / 64 | 21.2199 [14.2442,44.3343] | 21.316 [13.8855,44.5827] | +0.245% | 37712 → 37712 |
+| relu-bounded / 1 | 2.62394 [1.85668,5.58062] | 2.79998 [1.81102,5.55314] | -5.759% | 8712 → 8544 |
+| relu-bounded / 64 | 18.3938 [13.9625,26.5212] | 18.3664 [12.9079,31.5263] | -1.018% | 38048 → 37712 |
+
 ## Pass and hardware disposition
 
 No pass is promoted by this runtime correction.

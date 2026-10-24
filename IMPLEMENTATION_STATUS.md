@@ -2,6 +2,18 @@
 
 Reviewed 2026-10-24. The runtime/compiler mission is in progress.
 
+A [Mamba-2 clamp-dispatch follow-up](docs/mission-mamba2-source-parameters.md#clamp-dispatch-profiling-follow-up)
+targets measured NumPy wrapper overhead while preserving the correct source
+bounds. All 151 focused controls pass; all 14 same-artifact A/B contracts retain
+exact logits, prefix state/history and continuation logits. Local bounded
+traced peaks decrease by **168/336 bytes** for short/long prompts. Local timing
+is mixed with broad spreads; no general speed claim is assigned. The complete
+local run returned **5,542 passed, 42 skipped, three failures**: two existing
+MCP HTTP cases and RAM admission before audit-worker execution. That worker
+check passed separately without relaxing its guard. Coverage rose to
+**78.8267038%**; module Ruff/mypy diagnostics are unchanged. Hosted validation
+against the already-correct bounded runtime is pending.
+
 The [Mamba-2 source-parameter correction](docs/mission-mamba2-source-parameters.md)
 preserves declared convolution activation and time-step bounds through the
 authenticated AEG header and actual CPU/Torch execution. The final regression

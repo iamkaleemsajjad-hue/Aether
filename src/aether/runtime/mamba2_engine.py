@@ -175,7 +175,16 @@ class Mamba2ExecutionEngine:
         delta = np.logaddexp(0.0, dt + layer.dt.reshape(1, -1))
         if self._time_step_limit is not None:
             # Source torch_forward clamps AFTER softplus for decay and input.
-            np.clip(delta, *self._time_step_limit, out=delta)
+            # Preserve NumPy's one-sided ufuncs and two-sided clip semantics,
+            # avoiding generic array-function dispatch on this owned ndarray.
+            # https://numpy.org/doc/1.26/reference/generated/numpy.clip.html
+            minimum, maximum = self._time_step_limit
+            if minimum is None and maximum is not None:
+                np.minimum(delta, maximum, out=delta)
+            elif maximum is None and minimum is not None:
+                np.maximum(delta, minimum, out=delta)
+            else:
+                delta.clip(minimum, maximum, out=delta)
         a = -np.exp(np.asarray(layer.a_log, dtype=np.float32).reshape(1, -1))
         decay = np.exp(delta[:, :, None, None] * a[:, :, None, None])
         state = cache.states[index]

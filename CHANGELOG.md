@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reduce generic NumPy dispatch during Mamba-2 time-step clamping while
+  preserving the declared bounds and numerical function. Existing source,
+  cached-state and integration controls pass; local A/B traced peaks decrease
+  with unchanged weights/cache geometry. Mixed timings and complete local
+  failures remain in the [profiling record](docs/mission-mamba2-source-parameters.md#clamp-dispatch-profiling-follow-up).
+
 - Preserve Mamba-2 source convolution activation and time-step bounds through
   authenticated AEG architecture parameters and actual CPU/Torch execution.
   Refuse unsupported or malformed settings before publication; default legacy

@@ -1,0 +1,30 @@
+         654501 function calls in 0.845 seconds
+
+   Ordered by: cumulative time
+   List reduced from 67 to 24 due to restriction <24>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      500    0.002    0.000    0.845    0.002 mamba2_engine.py:255(generate)
+     4500    0.014    0.000    0.843    0.000 mamba2_engine.py:229(generate_iter)
+     4500    0.055    0.000    0.811    0.000 mamba2_engine.py:199(forward)
+     4500    0.186    0.000    0.574    0.000 mamba2_engine.py:150(_step)
+    13500    0.010    0.000    0.219    0.000 {method 'mean' of 'numpy.ndarray' objects}
+     9000    0.074    0.000    0.218    0.000 mamba2_engine.py:123(_norm)
+    13500    0.088    0.000    0.210    0.000 _methods.py:101(_mean)
+     4500    0.040    0.000    0.098    0.000 mamba2_engine.py:137(_conv)
+    31500    0.070    0.000    0.070    0.000 {method 'reduce' of 'numpy.ufunc' objects}
+     9000    0.011    0.000    0.057    0.000 fromnumeric.py:2177(sum)
+     9000    0.013    0.000    0.044    0.000 fromnumeric.py:71(_wrapreduction)
+     9000    0.042    0.000    0.042    0.000 mamba2_engine.py:107(_silu)
+    17500    0.010    0.000    0.039    0.000 fromnumeric.py:53(_wrapfunc)
+     4500    0.022    0.000    0.031    0.000 shape_base.py:372(stack)
+    13500    0.023    0.000    0.027    0.000 _methods.py:67(_count_reduce_items)
+    27000    0.009    0.000    0.027    0.000 {built-in method builtins.next}
+    13500    0.008    0.000    0.022    0.000 contextlib.py:139(__exit__)
+     9000    0.005    0.000    0.020    0.000 fromnumeric.py:423(repeat)
+     4500    0.003    0.000    0.019    0.000 fromnumeric.py:2100(clip)
+    13500    0.006    0.000    0.019    0.000 contextlib.py:130(__enter__)
+    13500    0.007    0.000    0.019    0.000 contextlib.py:279(helper)
+    27000    0.011    0.000    0.018    0.000 _ufunc_config.py:452(_no_nep50_warning)
+    40500    0.016    0.000    0.016    0.000 {method 'reshape' of 'numpy.ndarray' objects}
+     4500    0.002    0.000    0.014    0.000 {method 'min' of 'numpy.ndarray' objects}
