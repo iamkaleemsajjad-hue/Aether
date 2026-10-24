@@ -210,3 +210,21 @@ larger-model performance, resident memory attribution/soak, pass composition,
 archive/download hardening and blocking core/runtime type checks remain open.
 The [hardware matrix](../hardware_validation_matrix.json), generated README
 table and [pass audit](mission-pass-audit.md) retain their existing scopes.
+
+## Follow-up audit: MLA latent normalization
+
+The apparent need to replace MLA's latent-normalizer `1e-6` with the global
+architecture epsilon is a **false positive for the Transformers 4.57.3
+DeepSeek-V2 source contract**. In the pinned
+[reference implementation](https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/deepseek_v2/modeling_deepseek_v2.py),
+`DeepseekV2RMSNorm` defaults to `eps=1e-6`; `DeepseekV2Attention` constructs
+`q_a_layernorm` and `kv_a_layernorm` without passing a configured epsilon.
+The decoder's input/post-attention normalizers separately pass
+`config.rms_norm_eps`. The installed 4.57.3 source confirms these constructors.
+
+Consequently the fixed latent epsilon in `MLAAttention._rms_norm` and
+`TorchMLAAEGEngine._rms` matches this reference, including when its outer
+epsilon differs. No runtime change is justified by that suspicion. This
+code-path finding does not establish full MLA checkpoint parity, correctness of
+its projection/RoPE/cache paths, or other source implementations' contracts;
+those require their own source-specific reproduction and numerical evidence.
