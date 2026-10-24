@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reuse private FP32 payloads during AEG loading while preserving independent
+  output storage for existing decoder callers. Real artifact and codec
+  regressions cover ownership, lifetime and unchanged conversion values;
+  the [measurement record](docs/mission-dense-load.md#owned-buffer-change)
+  distinguishes isolated allocation savings from pending full-model results.
+
 - Reduce generic NumPy dispatch during Mamba-2 time-step clamping while
   preserving the declared bounds and numerical function. Existing source,
   cached-state and integration controls pass; local A/B traced peaks decrease

@@ -91,3 +91,55 @@ include that additional discovery and must not be labeled as pure warmed load.
 No pass or hardware tier is promoted by adding this measurement. All 22 pass
 dispositions and backend limits remain those in the
 [latest pass and hardware tables](mission-mamba2-source-parameters.md).
+
+## Owned-buffer change
+
+`dequantize_tensor` now accepts keyword-only `copy=False`. Its default still
+produces independent storage. The vocabulary validator and tensor-loading loop
+opt in because `WeightStore.load_tensor` returns fresh writable allocations.
+The engine retains those allocations through NumPy views. Separate model loads
+remain independent, and closing or removing the weight file cannot invalidate
+the loaded arrays. This does not introduce mapped inference weights or remove
+resident decoded FP32 arrays for compressed codecs.
+
+This uses the existing [NumPy `astype` ownership contract](https://numpy.org/doc/1.26/reference/generated/numpy.ndarray.astype.html).
+FP16 conversion, uint16 BF16 expansion, block decoding and padding retain their
+previous arithmetic. Read-only input stays read-only only when reuse is
+explicitly requested; byte-order or dtype conversion still allocates. The
+shared decoder, direct source/kernel/merge callers, their tests and smoke
+scripts were read before the change. The similarly named GGUF reader method
+does not import this shared function.
+
+Before the change, six default-ownership checks passed and eleven ownership/
+integration checks failed. Afterward all 17 pass, including a real compiled AEG
+whose loaded weights survive closing and deleting the blob. The related codec,
+loader, source ingestion, pruning and merge selection passes: 552 passed,
+2 skipped. The new test module and benchmark pass Ruff and mypy. For the two
+edited core modules, diagnostic comparison retains the existing 82 Ruff and
+48 mypy findings with no added messages; this is not a clean core typecheck.
+
+The first hosted baseline (`bdf20e3`, CI run `40089097194`) passes all 24 jobs:
+the complete pinned-dependency suite has 5,541 passed, 51 skipped, zero failures,
+and 45,277/57,445 covered lines. Actual tiny/27M CPU, Torch CPU, ONNX CPU, cached
+continuation, SDK generation/streaming and CLI outputs pass the source checks.
+Independent download verification reopens 16 paired arrays and checks 528
+worker source hashes, 44 owned worker identities and 50 retained artifact files.
+Twenty omitted payload files were hashed and verified inside the worker, and
+were not independently reopened after download. The earlier compiler-discovery
+timings remain historical measurements rather than warmed-load claims.
+
+The local paired probe on the same Windows host uses one actual 8,388,608-byte
+FP32 payload, seven warmups and 31 alternating samples per mode. Separate traced
+measurements have 11 samples. Outputs match the input's uint32 bits in both modes.
+
+| Isolated decoder observation | Default copy | Explicit reuse |
+| --- | ---: | ---: |
+| Median time | 6.0033 ms | 0.0489 ms |
+| Minimum / maximum time | 5.0215 / 9.5545 ms | 0.0294 / 0.1320 ms |
+| Traced current allocation range | 8,389,144 B | 440–5,072 B |
+| Traced peak allocation range | 8,389,285 B | 581–5,072 B |
+
+This establishes removal of the redundant payload allocation. It is not a
+generation speedup, process peak-RSS reduction, or result for quantized matrix
+execution. Full-suite validation of this change and the corrected fresh-process
+27M A/B measurements remain pending until their runs finish.

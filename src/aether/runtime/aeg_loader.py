@@ -1375,13 +1375,13 @@ def _validate_decoder_vocabulary_contract(
     if "embedding" not in store.entries:
         raise AEGLoadError("AEG package is missing required token embedding")
     embedding = np.asarray(
-        dequantize_tensor(store.load_tensor("embedding")), dtype=np.float32
+        dequantize_tensor(store.load_tensor("embedding"), copy=False), dtype=np.float32
     )
     _validate_embedding_shape(embedding, architecture)
     lm_head = None
     if "lm_head" in store.entries:
         lm_head = np.asarray(
-            dequantize_tensor(store.load_tensor("lm_head")), dtype=np.float32
+            dequantize_tensor(store.load_tensor("lm_head"), copy=False), dtype=np.float32
         )
     if lm_head is not None and (
         lm_head.ndim != 2
@@ -1498,7 +1498,9 @@ def _dequantized_by_key(package: Any) -> dict[tuple[int | None, str | None], np.
         if key[1] is None:
             continue
         # First writer wins, matching the ingestion side's fused-tensor handling.
-        result.setdefault(key, dequantize_tensor(store.load_tensor(name)))
+        # load_tensor owns a fresh writable payload. Retain it for FP32 rather
+        # than allocating a second full tensor; codec conversions still decode.
+        result.setdefault(key, dequantize_tensor(store.load_tensor(name), copy=False))
     if alias_lm_head and (None, "embedding") in result:
         result[(None, "lm_head")] = result[(None, "embedding")]
     return result
