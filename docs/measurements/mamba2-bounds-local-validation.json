@@ -313,5 +313,12 @@
     }
   },
   "current_engine_sha256_lf": "d2040c12f742a16a7116f9d48264f3aa1166864cffecefaa8b8a5b68a2d46b4c",
-  "scope": "One complete local Windows CPU run, existing 151 focused controls; no failed assertion or RAM guard waived"
+  "scope": "One complete local Windows CPU run, existing 151 focused controls; no failed assertion or RAM guard waived",
+  "hardware": {
+    "cpu": "13th Gen Intel(R) Core(TM) i5-1334U",
+    "logical_cpus": 12,
+    "host_ram_bytes": 8259321856,
+    "identity_collected_utc": "2026-10-24T09:48:01.843028+00:00",
+    "scope": "Hardware identity collected after the timed run; no retrospective load/free-RAM claim"
+  }
 }

@@ -315,8 +315,8 @@ with no assertion or memory guard changed. That isolated pass does not replace
 the complete run's failure. The complete run covered **45,282/57,445 lines =
 78.8267038%**, above the preceding local **45,244/57,440 = 78.7674095%**.
 [Full-run failures, coverage, isolated result and scoped diagnostics](measurements/mamba2-bounds-local-validation.json)
-retain the evidence. Hosted validation is pending. The pass dispositions and
-hardware tiers below remain in force.
+retain the evidence. The hosted follow-up below retains its separate results. The pass dispositions
+and hardware tiers below remain in force.
 
 | Source / prompt IDs | Old generation ms median [min,max] | Candidate generation ms median [min,max] | Decode median change | Old → candidate traced peak bytes median |
 |---|---:|---:|---:|---:|
@@ -348,6 +348,115 @@ hardware tiers below remain in force.
 | relu-convolution / 64 | 21.2199 [14.2442,44.3343] | 21.316 [13.8855,44.5827] | +0.245% | 37712 → 37712 |
 | relu-bounded / 1 | 2.62394 [1.85668,5.58062] | 2.79998 [1.81102,5.55314] | -5.759% | 8712 → 8544 |
 | relu-bounded / 64 | 18.3938 [13.9625,26.5212] | 18.3664 [12.9079,31.5263] | -1.018% | 38048 → 37712 |
+
+### Hosted clamp-dispatch results
+
+[CI at `621e84b`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40083133823)
+passed all **23 jobs**, and [security](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40083133834)
+passed separately. Its complete suite returned **5,536 passed, 51 skipped,
+zero failures**. Line coverage was **45,275/57,445 = 78.8145182%**, slightly
+above the prior hosted **45,271/57,440 = 78.8144150%**, with the same blocking
+78.6% floor. The full local red run remains recorded separately.
+
+All 14 Mamba-2 contracts and nine Mamba-1 controls passed ordinary original-HF
+admission, actual CPU/Torch CPU, public generation/streaming and CLI checks.
+Every Mamba-2 saved fixed-label logit array was byte-identical to the already
+correct `299d662` baseline. All matched **16/16 greedy IDs per executor**.
+Worst current KL was **2.02566e-14**, minimum cosine **0.9999999999997126**,
+maximum absolute error **4.76837e-7**, and worst relative fixed-label PPL
+increase **1.11583e-7** (**0.0000111583%**). These are small untrained fixtures
+and two fixed probes, rather than trained-model or corpus-quality evidence.
+
+Verified **510 implementation hashes**, **161 source/reference files** and
+reopened/reverified **43 downloaded packages**. Three historical Mamba-1
+candidates failed and remain recorded; every current candidate executed and
+passed. GitHub's temporary PR merge checkout `1cc8151` has exactly the same
+whole Git tree as pushed `621e84b`, checked through the GitHub commit API and
+local Git objects. The [raw Mamba-2 report](measurements/mamba2-bounds-hf.json),
+[Mamba-1 control report](measurements/mamba1-control-during-mamba2-bounds.json),
+[provenance](measurements/mamba2-bounds-provenance.json) and
+[dependency freeze](measurements/mamba2-bounds-freeze.txt) retain the evidence.
+
+The physical hosted worker was **AMD EPYC 7763**, four logical CPUs,
+16,766,414,848 bytes RAM, Linux 6.17.0-1022-azure x86_64, Python 3.11.14,
+NumPy 1.26.4, Torch 2.9.1+cpu, Transformers 4.57.3, SafeTensors 0.8.0,
+Tokenizers 0.22.2 and psutil 7.2.2. One numerical thread, two warmups and seven
+repeats were used. Absolute speeds from the earlier Xeon worker are not a
+cross-run performance comparison.
+
+Of 14 bounded-case decode rows, **11 improved**; observed median changes
+range **-1.24% to +6.25%**. First-output medians improved in **12/14** bounded
+rows, ranging **-13.78% to +0.85%**. Default decode medians changed
+**+1.19% / +0.15%**, with first output **+0.86% / +0.84%** for one/64-ID
+prompts. Other unclamped controls include losses; all rows and spreads follow.
+Small shared-worker changes do not prove general non-regression. This tuning
+removes measured dispatch and traced allocation overhead, with unchanged
+numerics; broader performance validation remains open.
+
+The local tracing host was an **i5-1334U**, 12 logical CPUs, 8,259,321,856
+bytes RAM, Windows build 26200, Python 3.10.11 and NumPy 1.26.4. Hardware
+identity was recorded after timing; no retrospective free-memory/load value
+is assigned. [Post-tuning call profiles](measurements/mamba2-bounds-after-dispatch.json)
+confirm zero generic `np.clip` calls: closed bounds retain the ndarray method,
+and open bounds execute public minimum/maximum ufuncs. Ufunc slot calls do
+not appear as separate cProfile call entries; exact A/B and reference checks
+establish the executed clamp function. Profile totals from different local
+times are not treated as speed comparisons.
+
+Logical weight/state/history bytes remain unchanged. Local traced peaks
+decrease as recorded above; peak RSS and separate activation/overhead memory
+remain unmeasured. Artifact size and compile time compare historical diagnostic
+compilation with current mandatory admission, which perform different work.
+First output is measured inside the engine, excluding load/tokenization;
+it is not public API TTFT.
+
+| Contract / prompt IDs | Baseline decode IDs/s median [min,max] | Tuned decode IDs/s median [min,max] | Baseline first-output ms median [min,max] | Tuned first-output ms median [min,max] |
+|---|---:|---:|---:|---:|
+| default / 1 | 5620.72 [5359.48,5732.96] | 5687.7 [5105.13,5718.09] | 0.165128 [0.162563,0.205093] | 0.16655 [0.160309,0.199873] |
+| default / 64 | 5654.87 [5427.21,5707.26] | 5663.36 [5231.35,5705.35] | 7.92896 [7.90821,8.00183] | 7.99546 [7.97847,8.11026] |
+| expanded-biased / 1 | 5466.68 [5376.57,5531.38] | 5460 [5181.19,5486.62] | 0.176129 [0.169876,0.226843] | 0.170797 [0.166931,0.174124] |
+| expanded-biased / 64 | 5413.65 [5331.36,5483.06] | 5420.35 [5339.94,5476.64] | 8.3682 [8.33271,8.4797] | 8.42464 [8.29378,8.62819] |
+| zero-epsilon / 1 | 5675.64 [5626.33,5734.43] | 5606.82 [5409.27,5758.96] | 0.162874 [0.157434,0.183352] | 0.166511 [0.162753,0.233025] |
+| zero-epsilon / 64 | 5792.38 [5727,5826.68] | 5664.23 [5550.52,5752.65] | 7.76216 [7.72731,7.84996] | 7.99292 [7.9329,8.03157] |
+| large-delta / 1 | 5573.59 [5315.49,5649.66] | 5558.38 [5347.46,5618.59] | 0.168754 [0.163925,0.234528] | 0.168605 [0.16605,0.200444] |
+| large-delta / 64 | 5503 [5419.34,5580.62] | 5595.19 [5311,5650.12] | 8.14007 [8.11945,8.17124] | 8.11289 [8.0336,8.15663] |
+| negative-gate / 1 | 5480.67 [5237.56,5574.64] | 5555.93 [5227.34,5696.49] | 0.175439 [0.166923,0.195707] | 0.169348 [0.162705,0.204544] |
+| negative-gate / 64 | 5369.55 [5105.37,5499.08] | 5489.58 [5334.01,5595.09] | 8.20587 [8.12615,8.31836] | 8.31973 [8.1359,8.47854] |
+| negative-conv / 1 | 5584.48 [5415.03,5737.55] | 5602.94 [5369.93,5678.9] | 0.16592 [0.161031,0.200245] | 0.169165 [0.163926,0.201576] |
+| negative-conv / 64 | 5651.83 [5111.31,5706.12] | 5424.5 [5124.78,5637.98] | 8.02611 [7.98763,8.28126] | 8.00838 [7.92515,8.4312] |
+| upper-limit / 1 | 5233.06 [5182.22,5436.91] | 5560 [5389.06,5627.85] | 0.172813 [0.170789,0.177722] | 0.168475 [0.165589,0.193983] |
+| upper-limit / 64 | 5501.08 [5320.61,5557.26] | 5541 [5483.34,5626.72] | 8.19548 [8.15546,8.23908] | 8.20135 [8.12062,8.33524] |
+| lower-limit / 1 | 5487.68 [5269.05,5540.29] | 5419.71 [5189.46,5562.53] | 0.170096 [0.16693,0.196465] | 0.17154 [0.168204,0.177171] |
+| lower-limit / 64 | 5406.37 [5307.52,5490.01] | 5451.81 [5332.27,5508.33] | 8.37311 [8.3206,8.46859] | 8.3353 [8.24709,8.40288] |
+| zero-limit / 1 | 5407.43 [5101.93,5511.29] | 5415.48 [5301.81,5532.41] | 0.194463 [0.17116,0.206145] | 0.168976 [0.165138,0.201797] |
+| zero-limit / 64 | 5391.36 [5301.01,5477.63] | 5385.67 [5054.86,5574.39] | 8.39987 [8.32442,8.73704] | 8.25076 [8.14624,8.2799] |
+| open-upper-limit / 1 | 5401.63 [5190.29,5492.76] | 5438.59 [5343.58,5627.46] | 0.174574 [0.169034,0.178551] | 0.169405 [0.163133,0.197386] |
+| open-upper-limit / 64 | 5296.27 [4991.93,5501.1] | 5435.75 [5176.94,5562.32] | 8.3567 [8.22616,8.59141] | 8.23115 [8.19528,10.7666] |
+| open-lower-limit / 1 | 5435.24 [5297.88,5507.61] | 5555.34 [5463.59,5701.72] | 0.194661 [0.170637,0.229125] | 0.167832 [0.162261,0.201464] |
+| open-lower-limit / 64 | 5434.9 [5366.07,5509.87] | 5560.42 [5218.47,5589.74] | 8.33323 [8.24555,8.36174] | 8.16006 [8.12282,8.34097] |
+| inverted-limits / 1 | 5464.63 [5369.3,5520.37] | 5502.24 [5316.88,5624.17] | 0.17676 [0.164597,0.199091] | 0.167823 [0.166971,0.173784] |
+| inverted-limits / 64 | 5392.84 [5280.99,5513.92] | 5389.84 [5104.22,5479.8] | 8.29451 [8.2441,10.4487] | 8.24084 [8.20788,11.1841] |
+| relu-convolution / 1 | 5765.84 [5627.09,5872.12] | 5768.42 [5369.04,5891.33] | 0.16145 [0.158424,0.191587] | 0.158837 [0.155019,0.201496] |
+| relu-convolution / 64 | 5759.48 [5730.85,5792.47] | 5879.73 [5786.63,5891.33] | 7.76742 [7.74238,7.82006] | 7.65188 [7.61389,7.71578] |
+| relu-bounded / 1 | 5445.92 [5324.2,5647.66] | 5727.19 [5425.24,5751.33] | 0.168903 [0.163003,0.173462] | 0.164435 [0.148205,0.19909] |
+| relu-bounded / 64 | 5447.45 [5352.75,5498.45] | 5614.08 [5537.77,5689.79] | 8.27679 [8.19993,8.35314] | 8.04614 [7.94748,8.1635] |
+
+| Contract | Logical weights, baseline = tuned | State / history bytes, baseline = tuned | Diagnostic baseline → admitted tuned artifact bytes | Diagnostic baseline → admitted tuned compile seconds |
+|---|---:|---:|---:|---:|
+| default | 10672 | 512 / 384 | 93902 → 101969 | 0.298957 → 6.98254 |
+| expanded-biased | 18112 | 1024 / 640 | 103568 → 111626 | 0.307662 → 5.85322 |
+| zero-epsilon | 10672 | 512 / 384 | 93901 → 101965 | 0.302893 → 5.78703 |
+| large-delta | 10672 | 512 / 384 | 93906 → 101968 | 0.300519 → 5.84104 |
+| negative-gate | 11072 | 512 / 384 | 96504 → 104527 | 0.300965 → 5.78591 |
+| negative-conv | 10672 | 512 / 384 | 93862 → 101966 | 0.299412 → 5.81399 |
+| upper-limit | 10672 | 512 / 384 | 94174 → 102253 | 0.300684 → 5.8158 |
+| lower-limit | 10672 | 512 / 384 | 94170 → 102240 | 0.29868 → 5.78876 |
+| zero-limit | 10672 | 512 / 384 | 94169 → 102226 | 0.299132 → 5.82889 |
+| open-upper-limit | 10672 | 512 / 384 | 94177 → 102247 | 0.299695 → 5.82777 |
+| open-lower-limit | 10672 | 512 / 384 | 94181 → 102260 | 0.299307 → 5.80582 |
+| inverted-limits | 10672 | 512 / 384 | 94174 → 102197 | 0.307644 → 5.93825 |
+| relu-convolution | 10672 | 512 / 384 | 94115 → 102183 | 0.298577 → 5.85492 |
+| relu-bounded | 10672 | 512 / 384 | 94171 → 102181 | 0.298515 → 5.84851 |
 
 ## Pass and hardware disposition
 

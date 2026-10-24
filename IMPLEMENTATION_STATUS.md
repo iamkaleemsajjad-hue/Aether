@@ -12,7 +12,15 @@ local run returned **5,542 passed, 42 skipped, three failures**: two existing
 MCP HTTP cases and RAM admission before audit-worker execution. That worker
 check passed separately without relaxing its guard. Coverage rose to
 **78.8267038%**; module Ruff/mypy diagnostics are unchanged. Hosted validation
-against the already-correct bounded runtime is pending.
+against the already-correct bounded runtime passed all 23
+[CI jobs at `621e84b`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40083133823),
+with security passing separately. The complete hosted run returned **5,536
+passed, 51 skipped, zero failures**, with **78.8145182%** line coverage.
+All 14 Mamba-2 and nine Mamba-1 contracts passed original-HF admission and
+actual API/CLI checks. Every Mamba-2 saved logit array is byte-identical to the
+correct baseline. Bounded-case decode medians improved in **11/14** rows,
+with observed changes **-1.24% to +6.25%**; full spreads and control losses are
+retained. Broader timing non-regression and peak-RSS validation remain open.
 
 The [Mamba-2 source-parameter correction](docs/mission-mamba2-source-parameters.md)
 preserves declared convolution activation and time-step bounds through the

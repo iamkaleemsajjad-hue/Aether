@@ -1,0 +1,66 @@
+{
+  "scope": "Actual engine call counts after tuning; overall times are not compared across changing local host load. Direct ufunc slot calls are not exposed as cProfile call entries.",
+  "engine_sha256_lf": "d2040c12f742a16a7116f9d48264f3aa1166864cffecefaa8b8a5b68a2d46b4c",
+  "samples": {
+    "default": {
+      "generic_np_clip_calls": 0,
+      "ndarray_clip_calls": 0,
+      "profiled_seconds": 1.1481367,
+      "generated_ids": [
+        2,
+        2,
+        15,
+        2,
+        15,
+        6,
+        6,
+        6
+      ]
+    },
+    "upper-limit": {
+      "generic_np_clip_calls": 0,
+      "ndarray_clip_calls": 4500,
+      "profiled_seconds": 1.0070142000000004,
+      "generated_ids": [
+        2,
+        2,
+        15,
+        2,
+        15,
+        6,
+        6,
+        6
+      ]
+    },
+    "open-upper-limit": {
+      "generic_np_clip_calls": 0,
+      "ndarray_clip_calls": 0,
+      "profiled_seconds": 0.9119231000000003,
+      "generated_ids": [
+        2,
+        2,
+        15,
+        2,
+        15,
+        6,
+        6,
+        6
+      ]
+    },
+    "open-lower-limit": {
+      "generic_np_clip_calls": 0,
+      "ndarray_clip_calls": 0,
+      "profiled_seconds": 0.8960707000000003,
+      "generated_ids": [
+        2,
+        2,
+        15,
+        2,
+        15,
+        6,
+        6,
+        6
+      ]
+    }
+  }
+}

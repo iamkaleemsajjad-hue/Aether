@@ -1359,5 +1359,12 @@
         }
       }
     }
-  ]
+  ],
+  "hardware": {
+    "cpu": "13th Gen Intel(R) Core(TM) i5-1334U",
+    "logical_cpus": 12,
+    "host_ram_bytes": 8259321856,
+    "identity_collected_utc": "2026-10-24T09:48:01.843028+00:00",
+    "scope": "Hardware identity collected after the timed run; no retrospective load/free-RAM claim"
+  }
 }

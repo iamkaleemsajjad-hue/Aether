@@ -13,7 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserving the declared bounds and numerical function. Existing source,
   cached-state and integration controls pass; local A/B traced peaks decrease
   with unchanged weights/cache geometry. Mixed timings and complete local
-  failures remain in the [profiling record](docs/mission-mamba2-source-parameters.md#clamp-dispatch-profiling-follow-up).
+  failures remain explicit. Hosted full-suite/admission/API/CLI validation passes
+  with byte-identical saved logits; bounded decode medians improve in 11/14
+  rows, with all losses and spreads in the
+  [profiling record](docs/mission-mamba2-source-parameters.md#clamp-dispatch-profiling-follow-up).
 
 - Preserve Mamba-2 source convolution activation and time-step bounds through
   authenticated AEG architecture parameters and actual CPU/Torch execution.
