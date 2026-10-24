@@ -1,0 +1,458 @@
+{
+  "scope": "Physical Windows CPU source-contract correction; untrained FP32; no trained/corpus/accelerator claim",
+  "baseline_revision": "19dad4ef58137ea6f2db0f277bfd4ee261b05ca3",
+  "retained_baseline": {
+    "source_tree": "3ec3e20f659ec143d58c73b500000fe9ac2b8922",
+    "archive_sha256": "c9b32aff0727007330a8ced21c5ac1cf38df5ae580507f0bf9c8f311828e58f7",
+    "git_blob_files_verified": 304
+  },
+  "platform": "Windows-10-10.0.26200-SP0",
+  "python": "3.10.11",
+  "versions": {
+    "numpy": "1.26.4",
+    "torch": "2.9.1",
+    "transformers": "4.57.3",
+    "psutil": "7.2.2",
+    "safetensors": "0.8.0",
+    "tokenizers": "0.22.2"
+  },
+  "before": {
+    "tests": 33,
+    "passed": 15,
+    "failures": [
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[cpu-upper-limit]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa1')\noptions = {'time_step_limit': (0.0, 0.001)}, backend = 'cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x000002599594AB00>, array([[ 0.21880467,  0.40860674,  0.7107869 , -0....10952232,\n        -0.60312568, -0.26336479, -0.5310597 ,  0.28957665,  0.16951385,\n         0.85131062,  0.14016749]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 105 / 119 (88.2%)\nE           Max absolute difference: 0.00071894\nE           Max relative difference: 0.04408128\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218806,  0.408605,  0.710812, -0.007517,  0.224085, -0.196469,\nE                    0.501065,  0.014505, -0.079656, -0.388777,  0.147269,  0.083865,\nE                    0.603469, -0.430728,  0.266536,  0.607285,  0.3132  ],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[cpu-lower-limit]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa2')\noptions = {'time_step_limit': (1.0, 2.0)}, backend = 'cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998ABE320>, array([[ 0.21880467,  0.40860674,  0.7107869 , -0....10977472,\n        -0.60305153, -0.26269834, -0.52999032,  0.28871871,  0.17005279,\n         0.84987255,  0.13932585]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 116 / 119 (97.5%)\nE           Max absolute difference: 0.00556236\nE           Max relative difference: 0.28530984\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218856,  0.408628,  0.710889, -0.007257,  0.224134, -0.196344,\nE                    0.500671,  0.015309, -0.079664, -0.389201,  0.147335,  0.084128,\nE                    0.603092, -0.430781,  0.266518,  0.607956,  0.313719],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[cpu-equal-limits]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa3')\noptions = {'time_step_limit': (0.03, 0.03)}, backend = 'cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998ABE680>, array([[ 0.21880467,  0.40860674,  0.7107869 , -0....1094986 ,\n        -0.60313328, -0.2634214 , -0.53096595,  0.28957205,  0.16956149,\n         0.8511918 ,  0.14020534]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 98 / 119 (82.4%)\nE           Max absolute difference: 0.00046575\nE           Max relative difference: 0.02686698\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218808,  0.408605,  0.710815, -0.007509,  0.224086, -0.196465,\nE                    0.501053,  0.014528, -0.079656, -0.388789,  0.147271,  0.083873,\nE                    0.603458, -0.43073 ,  0.266536,  0.607304,  0.313215],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[cpu-zero-limit]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa4')\noptions = {'time_step_limit': (0.0, 0.0)}, backend = 'cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998ABEDD0>, array([[ 0.21880467,  0.40860674,  0.7107869 , -0....10952351,\n        -0.60312525, -0.26336227, -0.53106301,  0.2895764 ,  0.16951187,\n         0.85131519,  0.14016567]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 105 / 119 (88.2%)\nE           Max absolute difference: 0.0007285\nE           Max relative difference: 0.04474711\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218806,  0.408605,  0.710812, -0.007517,  0.224085, -0.196469,\nE                    0.501065,  0.014504, -0.079656, -0.388777,  0.147269,  0.083865,\nE                    0.603469, -0.430728,  0.266536,  0.607284,  0.3132  ],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[cpu-open-upper-limit]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa6')\noptions = {'time_step_limit': (1.0, None)}, backend = 'cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998ABDC60>, array([[ 0.21880467,  0.40860674,  0.7107869 , -0....10977472,\n        -0.60305153, -0.26269834, -0.52999032,  0.28871871,  0.17005279,\n         0.84987255,  0.13932585]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 116 / 119 (97.5%)\nE           Max absolute difference: 0.00556236\nE           Max relative difference: 0.28530984\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218856,  0.408628,  0.710889, -0.007257,  0.224134, -0.196344,\nE                    0.500671,  0.015309, -0.079664, -0.389201,  0.147335,  0.084128,\nE                    0.603092, -0.430781,  0.266518,  0.607956,  0.313719],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[cpu-open-lower-limit]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa7')\noptions = {'time_step_limit': (None, 0.001)}, backend = 'cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998ABFD00>, array([[ 0.21880467,  0.40860674,  0.7107869 , -0....10952232,\n        -0.60312568, -0.26336479, -0.5310597 ,  0.28957665,  0.16951385,\n         0.85131062,  0.14016749]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 105 / 119 (88.2%)\nE           Max absolute difference: 0.00071894\nE           Max relative difference: 0.04408128\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218806,  0.408605,  0.710812, -0.007517,  0.224085, -0.196469,\nE                    0.501065,  0.014505, -0.079656, -0.388777,  0.147269,  0.083865,\nE                    0.603469, -0.430728,  0.266536,  0.607285,  0.3132  ],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[cpu-inverted-limits]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa8')\noptions = {'time_step_limit': (0.2, 0.1)}, backend = 'cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998ABD510>, array([[ 0.21880467,  0.40860674,  0.7107869 , -0....10948531,\n        -0.60313156, -0.26345997, -0.53076918,  0.2895086 ,  0.16964703,\n         0.8509968 ,  0.14021987]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 102 / 119 (85.7%)\nE           Max absolute difference: 0.00027086\nE           Max relative difference: 0.01014632\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218811,  0.408607,  0.71082 , -0.007491,  0.22409 , -0.196456,\nE                    0.501025,  0.014585, -0.079657, -0.388819,  0.147276,  0.083891,\nE                    0.603432, -0.430734,  0.266534,  0.607351,  0.313252],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[cpu-relu-convolution]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa9')\noptions = {'activation': 'relu'}, backend = 'cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998ABCCA0>, array([[ 0.21880467,  0.40860674,  0.7107869 , -0....19422599,\n        -0.21774147, -0.15880493, -0.00110487,  0.39594972, -0.17148781,\n         0.67083542,  0.23165801]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 119 / 119 (100%)\nE           Max absolute difference: 0.58969083\nE           Max relative difference: 479.61927771\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.220665,  0.335418,  0.718228,  0.123497,  0.190572, -0.169186,\nE                    0.467764,  0.076234, -0.186094, -0.493391,  0.206198,  0.104195,\nE                    0.819479, -0.457533,  0.190522,  0.382164,  0.449927],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[cpu-relu-bounded]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa10')\noptions = {'activation': 'relu', 'time_step_limit': (0.1, 0.2)}, backend = 'cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998ABF880>, array([[ 0.21880467,  0.40860674,  0.7107869 , -0....1940973 ,\n        -0.21774899, -0.15875411, -0.00147347,  0.39608377, -0.17163865,\n         0.67124378,  0.23161194]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 119 / 119 (100%)\nE           Max absolute difference: 0.58942169\nE           Max relative difference: 359.38953353\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.220683,  0.335436,  0.718359,  0.123539,  0.190554, -0.169215,\nE                    0.467704,  0.076383, -0.186071, -0.493572,  0.206214,  0.104159,\nE                    0.819337, -0.457477,  0.190465,  0.382414,  0.450228],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[torch_cpu-upper-limit]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa12')\noptions = {'time_step_limit': (0.0, 0.001)}, backend = 'torch_cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998B95750>, array([[ 0.21880469,  0.40860677,  0.7107869 , -0....10952232,\n        -0.60312568, -0.26336479, -0.5310597 ,  0.28957665,  0.16951385,\n         0.85131062,  0.14016749]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 105 / 119 (88.2%)\nE           Max absolute difference: 0.00071898\nE           Max relative difference: 0.04409936\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218806,  0.408605,  0.710812, -0.007517,  0.224085, -0.196469,\nE                    0.501065,  0.014505, -0.079656, -0.388777,  0.147269,  0.083865,\nE                    0.603469, -0.430728,  0.266536,  0.607285,  0.3132  ],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[torch_cpu-lower-limit]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa13')\noptions = {'time_step_limit': (1.0, 2.0)}, backend = 'torch_cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998B5A8C0>, array([[ 0.21880469,  0.40860677,  0.7107869 , -0....10977472,\n        -0.60305153, -0.26269834, -0.52999032,  0.28871871,  0.17005279,\n         0.84987255,  0.13932585]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 116 / 119 (97.5%)\nE           Max absolute difference: 0.00556232\nE           Max relative difference: 0.28529747\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218856,  0.408628,  0.710889, -0.007257,  0.224134, -0.196344,\nE                    0.500671,  0.015309, -0.079664, -0.389201,  0.147335,  0.084128,\nE                    0.603092, -0.430781,  0.266518,  0.607956,  0.313719],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[torch_cpu-equal-limits]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa14')\noptions = {'time_step_limit': (0.03, 0.03)}, backend = 'torch_cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998B5B0A0>, array([[ 0.21880469,  0.40860677,  0.7107869 , -0....1094986 ,\n        -0.60313328, -0.2634214 , -0.53096595,  0.28957205,  0.16956149,\n         0.8511918 ,  0.14020534]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 98 / 119 (82.4%)\nE           Max absolute difference: 0.00046579\nE           Max relative difference: 0.02688475\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218808,  0.408605,  0.710815, -0.007509,  0.224086, -0.196465,\nE                    0.501053,  0.014528, -0.079656, -0.388789,  0.147271,  0.083873,\nE                    0.603458, -0.43073 ,  0.266536,  0.607304,  0.313215],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[torch_cpu-zero-limit]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa15')\noptions = {'time_step_limit': (0.0, 0.0)}, backend = 'torch_cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998B59E10>, array([[ 0.21880469,  0.40860677,  0.7107869 , -0....10952351,\n        -0.60312525, -0.26336227, -0.53106301,  0.2895764 ,  0.16951187,\n         0.85131519,  0.14016567]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 105 / 119 (88.2%)\nE           Max absolute difference: 0.00072854\nE           Max relative difference: 0.04476519\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218806,  0.408605,  0.710812, -0.007517,  0.224085, -0.196469,\nE                    0.501065,  0.014504, -0.079656, -0.388777,  0.147269,  0.083865,\nE                    0.603469, -0.430728,  0.266536,  0.607284,  0.3132  ],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[torch_cpu-open-upper-limit]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa17')\noptions = {'time_step_limit': (1.0, None)}, backend = 'torch_cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998B58CA0>, array([[ 0.21880469,  0.40860677,  0.7107869 , -0....10977472,\n        -0.60305153, -0.26269834, -0.52999032,  0.28871871,  0.17005279,\n         0.84987255,  0.13932585]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 116 / 119 (97.5%)\nE           Max absolute difference: 0.00556232\nE           Max relative difference: 0.28529747\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218856,  0.408628,  0.710889, -0.007257,  0.224134, -0.196344,\nE                    0.500671,  0.015309, -0.079664, -0.389201,  0.147335,  0.084128,\nE                    0.603092, -0.430781,  0.266518,  0.607956,  0.313719],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[torch_cpu-open-lower-limit]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa18')\noptions = {'time_step_limit': (None, 0.001)}, backend = 'torch_cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998B5BAC0>, array([[ 0.21880469,  0.40860677,  0.7107869 , -0....10952232,\n        -0.60312568, -0.26336479, -0.5310597 ,  0.28957665,  0.16951385,\n         0.85131062,  0.14016749]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 105 / 119 (88.2%)\nE           Max absolute difference: 0.00071898\nE           Max relative difference: 0.04409936\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218806,  0.408605,  0.710812, -0.007517,  0.224085, -0.196469,\nE                    0.501065,  0.014505, -0.079656, -0.388777,  0.147269,  0.083865,\nE                    0.603469, -0.430728,  0.266536,  0.607285,  0.3132  ],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[torch_cpu-inverted-limits]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa19')\noptions = {'time_step_limit': (0.2, 0.1)}, backend = 'torch_cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998B588B0>, array([[ 0.21880469,  0.40860677,  0.7107869 , -0....10948531,\n        -0.60313156, -0.26345997, -0.53076918,  0.2895086 ,  0.16964703,\n         0.8509968 ,  0.14021987]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 102 / 119 (85.7%)\nE           Max absolute difference: 0.00027074\nE           Max relative difference: 0.01014368\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.218811,  0.408607,  0.71082 , -0.007491,  0.22409 , -0.196456,\nE                    0.501025,  0.014585, -0.079657, -0.388819,  0.147276,  0.083891,\nE                    0.603432, -0.430734,  0.266534,  0.607351,  0.313252],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[torch_cpu-relu-convolution]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa20')\noptions = {'activation': 'relu'}, backend = 'torch_cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998B5B400>, array([[ 0.21880469,  0.40860677,  0.7107869 , -0....19422599,\n        -0.21774147, -0.15880493, -0.00110487,  0.39594972, -0.17148781,\n         0.67083542,  0.23165801]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 119 / 119 (100%)\nE           Max absolute difference: 0.58969089\nE           Max relative difference: 479.6193856\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.220665,  0.335418,  0.718228,  0.123497,  0.190572, -0.169186,\nE                    0.467764,  0.076234, -0.186094, -0.493391,  0.206198,  0.104195,\nE                    0.819479, -0.457533,  0.190522,  0.382164,  0.449927],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mamba2_source_parameters",
+        "name": "test_packaged_mamba2_source_parameters_and_cached_continuation[torch_cpu-relu-bounded]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2577/test_packaged_mamba2_source_pa21')\noptions = {'activation': 'relu', 'time_step_limit': (0.1, 0.2)}\nbackend = 'torch_cpu'\n\n    @pytest.mark.parametrize(\"options\", CASES)\n    @pytest.mark.parametrize(\"backend\", [\"cpu\", \"torch_cpu\"])\n    def test_packaged_mamba2_source_parameters_and_cached_continuation(\n        tmp_path: Path, options: dict[str, Any], backend: str,\n    ) -> None:\n        \"\"\"Compile real source parameters; check full rows and an owned cache fork.\"\"\"\n        if backend == \"torch_cpu\":\n            pytest.importorskip(\"torch\")\n        source = tmp_path / \"source\"\n        config = write_checkpoint(source, **options)\n        _, tensors = checkpoint_data(**options)\n        artifact = tmp_path / \"model.aeg\"\n        Compiler(CompilerConfig(\n            quality_mode=\"diagnostic\", targets=[\"cpu_generic\"], skip_download=True,\n            precision_assignment_mode=\"uniform\", precision=\"FP32\", calibration_tokens=4,\n            cache_dir=str(tmp_path / \"cache\"),\n        )).compile(str(source), output_path=artifact)\n        engine: Any = load_engine_from_path(\n            artifact, allow_uncertified=True, prepare_native_kernels=False,\n        )\n        if backend == \"torch_cpu\":\n            from aether.runtime.torch_state_engine import TorchMamba2AEGEngine\n    \n            engine = TorchMamba2AEGEngine(engine, \"cpu\")\n        ids = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)\n        expected = matrix_logits(config, tensors, ids)\n        actual, _ = engine.forward_step(ids, return_all_logits=True)\n        assert np.isfinite(actual).all()\n>       np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)\n\ntests\\unit\\test_mamba2_source_parameters.py:89: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<function assert_allclose.<locals>.compare at 0x0000025998B58940>, array([[ 0.21880469,  0.40860677,  0.7107869 , -0....1940973 ,\n        -0.21774899, -0.15875411, -0.00147347,  0.39608377, -0.17163865,\n         0.67124378,  0.23161194]]))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Not equal to tolerance rtol=3e-05, atol=3e-06', 'equal_nan': True}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Not equal to tolerance rtol=3e-05, atol=3e-06\nE           \nE           Mismatched elements: 119 / 119 (100%)\nE           Max absolute difference: 0.58942176\nE           Max relative difference: 359.38961443\nE            x: array([[ 0.218805,  0.408607,  0.710787, -0.007484,  0.224108, -0.196447,\nE                    0.501046,  0.014592, -0.07966 , -0.388792,  0.147256,  0.083898,\nE                    0.603421, -0.430729,  0.266555,  0.607351,  0.313205],...\nE            y: array([[ 0.220683,  0.335436,  0.718359,  0.123539,  0.190554, -0.169215,\nE                    0.467704,  0.076383, -0.186071, -0.493572,  0.206214,  0.104159,\nE                    0.819337, -0.457477,  0.190465,  0.382414,  0.450228],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      }
+    ],
+    "skipped": 0,
+    "skip_details": [],
+    "suites": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "18",
+        "skipped": "0",
+        "tests": "33",
+        "time": "17.261",
+        "timestamp": "2026-10-24T12:45:02.922571+05:00",
+        "hostname": "DESKTOP-MNGKA5K"
+      }
+    ],
+    "sha256": "7bea31babfcd473a9670f04a4af727ffc7219ddc81646516794ac09bf9bfe31e"
+  },
+  "focused": {
+    "tests": 70,
+    "passed": 70,
+    "failures": [],
+    "skipped": 0,
+    "skip_details": [],
+    "suites": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "0",
+        "tests": "70",
+        "time": "22.363",
+        "timestamp": "2026-10-24T12:42:23.620780+05:00",
+        "hostname": "DESKTOP-MNGKA5K"
+      }
+    ],
+    "sha256": "ba48a5d31a26562a4b1dd49712e6cfacac11a9079032c37aa876653d756fe274"
+  },
+  "final_controls": {
+    "tests": 151,
+    "passed": 151,
+    "failures": [],
+    "skipped": 0,
+    "skip_details": [],
+    "suites": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "0",
+        "tests": "151",
+        "time": "27.069",
+        "timestamp": "2026-10-24T12:56:59.394454+05:00",
+        "hostname": "DESKTOP-MNGKA5K"
+      }
+    ],
+    "sha256": "75aba9ab6645f1047ec2b93b40ea83090f899148622643905ba419271f892ef5"
+  },
+  "complete_suite": {
+    "tests": 5587,
+    "passed": 5543,
+    "failures": [
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[False]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2578/test_real_http_mcp_cli_handsha0')\nminimal_aeg_package = AEGPackage(C:\\Users\\pc\\AppData\\Local\\Temp\\pytest-of-kaleem\\pytest-2578\\test_real_http_mcp_cli_handsha0\\test_model.aeg, model_id=test-model, loaded=False)\nsse = False\n\n    @pytest.mark.parametrize(\"sse\", [False, True])\n    def test_real_http_mcp_cli_handshake_session_and_tool(tmp_path, minimal_aeg_package, sse):\n        from click.testing import CliRunner\n        from aether.cli import cli\n    \n        events = []\n    \n        class Handler(BaseHTTPRequestHandler):\n            def log_message(self, *args):\n                pass\n    \n            def do_POST(self):\n                message = json.loads(self.rfile.read(int(self.headers[\"Content-Length\"])))\n                events.append(message[\"method\"])\n                assert \"text/event-stream\" in self.headers[\"Accept\"]\n                if message[\"method\"] == \"initialize\":\n                    result = {\"protocolVersion\": message[\"params\"][\"protocolVersion\"], \"capabilities\": {\"tools\": {}}, \"serverInfo\": {\"name\": \"local-http\", \"version\": \"1\"}}\n                else:\n                    assert self.headers[\"MCP-Session-Id\"] == \"local-session\"\n                    if message[\"method\"] == \"notifications/initialized\":\n                        self.send_response(202)\n                        self.end_headers()\n                        return\n                    if message[\"method\"] == \"tools/list\":\n                        result = {\"tools\": [{\"name\": \"echo\", \"inputSchema\": {\"type\": \"object\"}}]}\n                    else:\n                        result = {\"content\": [{\"type\": \"text\", \"text\": message[\"params\"][\"arguments\"][\"text\"]}]}\n                response = json.dumps({\"jsonrpc\": \"2.0\", \"id\": message[\"id\"], \"result\": result})\n                body = (\"data: \" + response + \"\\n\\n\" if sse else response).encode(\"utf-8\")\n                self.send_response(200)\n                self.send_header(\"Content-Type\", \"text/event-stream\" if sse else \"application/json\")\n                self.send_header(\"MCP-Session-Id\", \"local-session\")\n                self.send_header(\"Content-Length\", str(len(body)))\n                self.end_headers()\n                self.wfile.write(body)\n    \n        server = ThreadingHTTPServer((\"127.0.0.1\", 0), Handler)\n        thread = threading.Thread(target=server.serve_forever, daemon=True)\n        thread.start()\n        client = MCPClient(\"local\", \"http\", f\"http://127.0.0.1:{server.server_port}/mcp\", timeout_s=3)\n        try:\n>           assert client.connect()\nE           assert False\nE            +  where False = connect()\nE            +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x00000184C5995D80>.connect\n\ntests\\unit\\test_mcp_transport_contracts.py:119: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[True]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2578/test_real_http_mcp_cli_handsha1')\nminimal_aeg_package = AEGPackage(C:\\Users\\pc\\AppData\\Local\\Temp\\pytest-of-kaleem\\pytest-2578\\test_real_http_mcp_cli_handsha1\\test_model.aeg, model_id=test-model, loaded=False)\nsse = True\n\n    @pytest.mark.parametrize(\"sse\", [False, True])\n    def test_real_http_mcp_cli_handshake_session_and_tool(tmp_path, minimal_aeg_package, sse):\n        from click.testing import CliRunner\n        from aether.cli import cli\n    \n        events = []\n    \n        class Handler(BaseHTTPRequestHandler):\n            def log_message(self, *args):\n                pass\n    \n            def do_POST(self):\n                message = json.loads(self.rfile.read(int(self.headers[\"Content-Length\"])))\n                events.append(message[\"method\"])\n                assert \"text/event-stream\" in self.headers[\"Accept\"]\n                if message[\"method\"] == \"initialize\":\n                    result = {\"protocolVersion\": message[\"params\"][\"protocolVersion\"], \"capabilities\": {\"tools\": {}}, \"serverInfo\": {\"name\": \"local-http\", \"version\": \"1\"}}\n                else:\n                    assert self.headers[\"MCP-Session-Id\"] == \"local-session\"\n                    if message[\"method\"] == \"notifications/initialized\":\n                        self.send_response(202)\n                        self.end_headers()\n                        return\n                    if message[\"method\"] == \"tools/list\":\n                        result = {\"tools\": [{\"name\": \"echo\", \"inputSchema\": {\"type\": \"object\"}}]}\n                    else:\n                        result = {\"content\": [{\"type\": \"text\", \"text\": message[\"params\"][\"arguments\"][\"text\"]}]}\n                response = json.dumps({\"jsonrpc\": \"2.0\", \"id\": message[\"id\"], \"result\": result})\n                body = (\"data: \" + response + \"\\n\\n\" if sse else response).encode(\"utf-8\")\n                self.send_response(200)\n                self.send_header(\"Content-Type\", \"text/event-stream\" if sse else \"application/json\")\n                self.send_header(\"MCP-Session-Id\", \"local-session\")\n                self.send_header(\"Content-Length\", str(len(body)))\n                self.end_headers()\n                self.wfile.write(body)\n    \n        server = ThreadingHTTPServer((\"127.0.0.1\", 0), Handler)\n        thread = threading.Thread(target=server.serve_forever, daemon=True)\n        thread.start()\n        client = MCPClient(\"local\", \"http\", f\"http://127.0.0.1:{server.server_port}/mcp\", timeout_s=3)\n        try:\n>           assert client.connect()\nE           assert False\nE            +  where False = connect()\nE            +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x00000184C59C08E0>.connect\n\ntests\\unit\\test_mcp_transport_contracts.py:119: AssertionError"
+      }
+    ],
+    "skipped": 42,
+    "skip_details": [
+      {
+        "class": "tests.integration.test_automatic_execution_dispatch",
+        "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[llama]",
+        "reason": "could not import 'accelerate': No module named 'accelerate'"
+      },
+      {
+        "class": "tests.integration.test_automatic_execution_dispatch",
+        "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[gpt2]",
+        "reason": "could not import 'accelerate': No module named 'accelerate'"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_compile_small_model",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_end_to_end_generate",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_chat_completion",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_compile_plan_dry_run",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_model_info",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_openai_compatible_server",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_model_list_and_remove",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_backend_detection",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_hardware_detection",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_benchmark_smoke",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_aeg_format_roundtrip",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_cross_hardware_portability",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_server_credentials_creation",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_server_credentials_mtls",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_channel_credentials_creation",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_helper",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_missing_file",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_none_passthrough",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+        "name": "test_require_grpc_no_error",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+        "name": "test_service_name_constant",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.tools.test_pass_audit",
+        "name": "test_real_public_compile_audit_smoke",
+        "reason": "Opt-in real subprocess compile/load/Runtime smoke, no timing"
+      },
+      {
+        "class": "tests.unit.test_adversarial.TestExecutionFidelity",
+        "name": "test_real_pretrained_model",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.unit.test_aeg_onnx_export",
+        "name": "test_real_directml_exported_aeg_operators",
+        "reason": "physical DirectML execution requires its optional installed runtime"
+      },
+      {
+        "class": "tests.unit.test_aeg_onnx_export",
+        "name": "test_actual_compiled_artifact_backend_generation_stream_and_unload[DmlExecutionProvider]",
+        "reason": "real DmlExecutionProvider is not installed"
+      },
+      {
+        "class": "tests.unit.test_c2pa_signing",
+        "name": "test_pure_python_and_native_backends_agree",
+        "reason": "could not import 'cryptography': No module named 'cryptography'"
+      },
+      {
+        "class": "tests.unit.test_calibration.TestDatasets",
+        "name": "test_wikitext2",
+        "reason": "Real wikitext-2 data is unavailable locally; provide a calibration file or cache the 'wikitext' dataset before compiling (no local Hugging Face dataset cache at C:\\Users\\pc\\.cache\\huggingface\\datasets)"
+      },
+      {
+        "class": "tests.unit.test_calibration.TestDatasets",
+        "name": "test_hellaswag",
+        "reason": "Real hellaswag data is unavailable locally; provide a calibration file or cache the 'Rowan/hellaswag' dataset before compiling (no local Hugging Face dataset cache at C:\\Users\\pc\\.cache\\huggingface\\datasets)"
+      },
+      {
+        "class": "tests.unit.test_device_placement.TestDeviceResolution",
+        "name": "test_cuda_spec_gains_an_explicit_index",
+        "reason": "no CUDA device on this host"
+      },
+      {
+        "class": "tests.unit.test_distributed_complete.TestMultiProcessDistributed",
+        "name": "test_single_process_all_reduce",
+        "reason": "process IPC is unavailable in this Windows environment: [WinError 5] Access is denied"
+      },
+      {
+        "class": "tests.unit.test_distributed_complete.TestMultiProcessDistributed",
+        "name": "test_ring_collectives_across_real_processes[2]",
+        "reason": "process IPC is unavailable in this environment: [WinError 5] Access is denied"
+      },
+      {
+        "class": "tests.unit.test_distributed_complete.TestMultiProcessDistributed",
+        "name": "test_ring_collectives_across_real_processes[4]",
+        "reason": "process IPC is unavailable in this environment: [WinError 5] Access is denied"
+      },
+      {
+        "class": "tests.unit.test_distributed_complete.TestMultiProcessDistributed",
+        "name": "test_ring_moves_the_bandwidth_optimal_volume",
+        "reason": "process IPC is unavailable in this environment: [WinError 5] Access is denied"
+      },
+      {
+        "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+        "name": "test_compiler_compile_produces_weight_blob",
+        "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+      },
+      {
+        "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+        "name": "test_compiled_package_is_loadable_and_runnable",
+        "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+      },
+      {
+        "class": "tests.unit.test_hardware_evidence",
+        "name": "test_real_cuda_aeg_execution_never_uses_cpu_fallback",
+        "reason": "No physical NVIDIA CUDA device and matching PyTorch runtime"
+      },
+      {
+        "class": "tests.unit.test_onnx_provider_contract",
+        "name": "test_real_directml_offline_workload_requires_gpu_node_execution",
+        "reason": "physical DirectML runtime is not installed on this host"
+      },
+      {
+        "class": "tests.unit.test_onnx_provider_contract",
+        "name": "test_real_directml_runtime_routes_generation_and_stream_to_gpu",
+        "reason": "physical DirectML runtime is not installed on this host"
+      },
+      {
+        "class": "tests.unit.test_onnx_session_contract",
+        "name": "test_actual_onnx_session_reuses_only_bound_state[DmlExecutionProvider]",
+        "reason": "real DmlExecutionProvider is not installed"
+      },
+      {
+        "class": "tests.unit.test_otlp_conformance",
+        "name": "test_sdk_bridge_preserves_aether_trace_ids",
+        "reason": "could not import 'opentelemetry.sdk': No module named 'opentelemetry.sdk'"
+      },
+      {
+        "class": "tests.unit.test_v31_features",
+        "name": "test_compiled_package_contains_v31_artifacts",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      }
+    ],
+    "suites": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "2",
+        "skipped": "42",
+        "tests": "5587",
+        "time": "601.047",
+        "timestamp": "2026-10-24T12:46:37.903608+05:00",
+        "hostname": "DESKTOP-MNGKA5K"
+      }
+    ],
+    "sha256": "9c636ea2e662b487e3bafa5ec35ce4f0a94614c5f1ce6608a78e09c45b20b230"
+  },
+  "coverage": {
+    "version": "7.16.2",
+    "timestamp": "1792828576057",
+    "lines-valid": "57440",
+    "lines-covered": "45244",
+    "line-rate": "0.7877",
+    "branches-valid": "17326",
+    "branches-covered": "10851",
+    "branch-rate": "0.6263",
+    "complexity": "0"
+  },
+  "coverage_sha256": "1e2b514ef0cbcf21448dc793b1ec4a3a1a0434dc1cb4db5cc3093b561b86b4d1",
+  "line_coverage_percent": 78.76740947075209,
+  "static": {
+    "ruff_existing": {
+      "before": 250,
+      "after": 249,
+      "added": [],
+      "removed": [
+        [
+          "mamba2_engine.py",
+          "UP035",
+          "Import from `collections.abc` instead: `Iterator`"
+        ]
+      ]
+    },
+    "mypy_existing": {
+      "before": 110,
+      "after": 110,
+      "added": [],
+      "removed": []
+    },
+    "ruff_contract": {
+      "before": 13,
+      "after": 13,
+      "added": [],
+      "removed": []
+    },
+    "mypy_new_and_contract": {
+      "before": 0,
+      "after": 0,
+      "added": [],
+      "removed": []
+    }
+  },
+  "note": "One complete run; separate focused/baseline runs do not replace its failures or coverage."
+}

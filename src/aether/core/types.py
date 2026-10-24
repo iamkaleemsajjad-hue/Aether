@@ -1146,6 +1146,14 @@ class ModelArchitecture:
     logits after accumulating over depth.
     """
 
+    ssm_runtime_parameters: dict[str, Any] | None = None
+    """Required nondefault SSM execution parameters, when declared by the source.
+
+    Omitted for legacy/default contracts. Keeping these in the architecture
+    header makes an older reader reject unsupported semantics through manifest
+    integrity verification instead of silently ignoring an opaque payload.
+    """
+
     def __post_init__(self) -> None:
         """Auto-compute derived fields."""
         if self.head_dim is None:
@@ -1260,11 +1268,16 @@ class ModelArchitecture:
             payload["rope_scaling"] = dict(self.rope_scaling)
         if self.original_context_length is not None:
             payload["original_context_length"] = self.original_context_length
+        if self.ssm_runtime_parameters is not None:
+            payload["ssm_runtime_parameters"] = dict(self.ssm_runtime_parameters)
         return payload
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> ModelArchitecture:
         """Deserialize from a dictionary."""
+        parameters = data.get("ssm_runtime_parameters")
+        if parameters is not None and not isinstance(parameters, dict):
+            raise ValueError("SSM runtime parameters must be a JSON object")
         return ModelArchitecture(
             family=data["family"],
             params_billion=data.get("params_billion", 0.0),
@@ -1356,6 +1369,7 @@ class ModelArchitecture:
             ),
             gelu_approximate=bool(data.get("gelu_approximate", True)),
             moe_renormalize_topk=bool(data.get("moe_renormalize_topk", True)),
+            ssm_runtime_parameters=dict(parameters) if parameters is not None else None,
         )
 
     def __repr__(self) -> str:

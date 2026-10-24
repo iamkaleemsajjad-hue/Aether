@@ -10,13 +10,16 @@ changing the AEG artifact contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterator
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+from aether.core.mamba2_parameters import Mamba2Parameters
 from aether.runtime.stopping import stop_token_set
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
     from numpy.typing import NDArray
 
 
@@ -43,6 +46,7 @@ class Mamba2ModelWeights:
     lm_head: np.ndarray
     norm_eps: float = 1e-5
     norm_type: str = "RMSNorm"
+    parameters: Mamba2Parameters = field(default_factory=Mamba2Parameters)
 
 
 @dataclass
@@ -76,6 +80,10 @@ class Mamba2ExecutionEngine:
         head_dim: int | None = None,
     ) -> None:
         self.weights = weights
+        self._conv_activation: Callable[[NDArray[np.float32]], NDArray[np.float32]] = (
+            self._relu if weights.parameters.conv_activation == "relu" else self._silu
+        )
+        self._time_step_limit = weights.parameters.time_step_limit
         self.state_size = int(state_size)
         self.inner_size = int(inner_size)
         self.num_heads = int(num_heads)
@@ -108,6 +116,10 @@ class Mamba2ExecutionEngine:
         """
         return value * np.exp(-np.logaddexp(0.0, -value))
 
+    @staticmethod
+    def _relu(value: NDArray[np.float32]) -> NDArray[np.float32]:
+        return np.maximum(value, 0)
+
     def _norm(self, value: np.ndarray, weight: np.ndarray) -> np.ndarray:
         if self.weights.norm_type.lower() == "layernorm":
             mean = value.mean(axis=-1, keepdims=True)
@@ -133,7 +145,7 @@ class Mamba2ExecutionEngine:
         if layer.conv_bias is not None:
             result = result + np.asarray(layer.conv_bias, dtype=np.float32).reshape(1, -1)
         # The window contains k columns; keep k-1, including an empty k=1 history.
-        return self._silu(result), window[:, :, 1:]
+        return self._conv_activation(result), window[:, :, 1:]
 
     def _step(self, hidden: np.ndarray, index: int, cache: Mamba2Cache) -> np.ndarray:
         layer = self.weights.layers[index]
@@ -161,6 +173,9 @@ class Mamba2ExecutionEngine:
         # logaddexp(0, x)=log(1+exp(x)) evaluates the same function without
         # clipping valid time steps or overflowing exp for large positive x.
         delta = np.logaddexp(0.0, dt + layer.dt.reshape(1, -1))
+        if self._time_step_limit is not None:
+            # Source torch_forward clamps AFTER softplus for decay and input.
+            np.clip(delta, *self._time_step_limit, out=delta)
         a = -np.exp(np.asarray(layer.a_log, dtype=np.float32).reshape(1, -1))
         decay = np.exp(delta[:, :, None, None] * a[:, :, None, None])
         state = cache.states[index]

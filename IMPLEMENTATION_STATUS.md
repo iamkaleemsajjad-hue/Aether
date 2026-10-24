@@ -2,6 +2,20 @@
 
 Reviewed 2026-10-24. The runtime/compiler mission is in progress.
 
+The [Mamba-2 source-parameter correction](docs/mission-mamba2-source-parameters.md)
+preserves declared convolution activation and time-step bounds through the
+authenticated AEG header and actual CPU/Torch execution. The final regression
+fails 18 cases on the retained old source; corrected validation passes 70 cases
+and 151 broader controls. Six actual old/new compiler/reader jobs preserve
+default logits and refuse unsupported new semantics in the older reader. The
+complete local run returned **5,543 passed, 42 skipped, two existing MCP HTTP
+failures**. Coverage was **78.7674095%**, slightly below the prior local run;
+local non-reduction remains open. Local default generation medians were
+**0.17% and 2.13% longer** with overlapping spreads; traced allocation peaks
+were unchanged. Strict hosted original-HF/API/CLI measurements are pending.
+The linked record retains scope, losses, all 22 pass dispositions and hardware
+tiers; no trained-model or accelerator promotion is implied.
+
 The Mamba-2 activation profiling follow-up replaces masked piecewise sigmoid
 evaluation with the equivalent stable log-sigmoid identity. A randomized
 interleaved local comparison favored it; all 112 focused checks pass with no

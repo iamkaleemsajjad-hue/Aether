@@ -152,7 +152,10 @@ Every AEG file is content-addressed using SHA-256. The `graph_hash` is the hash 
 
 1. The AEG/1.0 package layout is frozen.
 2. AEG-IR v1.0 operations are backward-compatible within the 1.x line.
-3. New optional fields may be added; unknown fields are ignored by older readers.
+3. New optional fields may be added. Backward compatibility preserves existing
+   artifacts. An older reader can reject a new execution-required architecture
+   field through manifest verification; unknown execution semantics must not be
+   silently ignored.
 4. Required fields never change semantics within the same major version.
 
 ## Distribution
@@ -177,6 +180,19 @@ evidence. Post-hoc mutations can invalidate the binding and require reevaluation
 See [the exact thresholds, supported reference and limitations](mission-numerical-admission.md).
 
 ## Optional extension payloads
+
+Mamba-2 sources can declare `hidden_act` and `time_step_limit`. Nondefault
+execution settings are stored in `architecture.ssm_runtime_parameters`, for
+example `{"conv_activation":"relu","time_step_limit":[0.1,0.2]}`. Both CPU and
+Torch engines consume this authenticated header: the convolution uses the
+declared activation; the output gate remains SiLU; time-step bounds clamp
+`softplus(dt+bias)` before decay and input injection. Supported activations are
+SiLU, its `swish` alias, and ReLU. Other activations fail compilation clearly.
+Unbounded endpoints use JSON `null`, never nonfinite JSON numbers. An absent
+header retains legacy SiLU/unbounded execution and serialization. A reader that
+predates this field refuses a nondefault artifact during manifest verification;
+use a reader supporting these source settings. This is required execution
+information, not an optional inspection hint.
 
 Older AEGs and explicit experimental producers may include grammar, speculation,
 TTT, cache, adapter, merge, safety or provenance payloads. Each emitted payload

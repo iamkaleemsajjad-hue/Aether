@@ -143,6 +143,12 @@ class TorchMamba2AEGEngine(_TorchStateBase):
         self.num_groups = int(source_engine.num_groups)
         self.head_dim = int(source_engine.head_dim)
         self.conv_kernel = int(source_engine.conv_kernel)
+        self._time_step_limit = self.weights.parameters.time_step_limit
+        self._conv_activation = (
+            self.torch.nn.functional.relu
+            if self.weights.parameters.conv_activation == "relu"
+            else self.torch.nn.functional.silu
+        )
         self.layers: list[dict[str, Any | None]] = []
         for index, layer in enumerate(self.weights.layers):
             layer_device = self.layer_devices[index]
@@ -191,13 +197,15 @@ class TorchMamba2AEGEngine(_TorchStateBase):
             xbc = xbc + layer["conv_bias"].reshape(1, -1)
         # Drop the oldest column, also when k=1 leaves no history.
         cache.conv_history[index] = window[..., 1:].detach()
-        xbc = self._silu(xbc, torch)
+        xbc = self._conv_activation(xbc)
         x = xbc[:, :self.inner_size].reshape(-1, self.num_heads, self.head_dim)
         b = xbc[:, self.inner_size:self.inner_size + groups].reshape(-1, self.num_groups, self.state_size)
         c = xbc[:, self.inner_size + groups:].reshape(-1, self.num_groups, self.state_size)
         repeat = self.num_heads // self.num_groups
         b, c = b.repeat_interleave(repeat, dim=1), c.repeat_interleave(repeat, dim=1)
         delta = torch.nn.functional.softplus(dt + layer["dt"].reshape(1, -1))
+        if self._time_step_limit is not None:
+            delta.clamp_(min=self._time_step_limit[0], max=self._time_step_limit[1])
         a = -torch.exp(layer["a_log"].reshape(1, -1))
         state = cache.states[index] * torch.exp(delta[:, :, None, None] * a[:, :, None, None])
         state = state + delta[:, :, None, None] * x[:, :, :, None] * b[:, :, None, :]

@@ -757,6 +757,9 @@ def _load_mamba2_engine_from_package(
     package: Any, architecture: dict[str, Any]
 ) -> Mamba2ExecutionEngine:
     """Load a Mamba-2/SSD engine from the canonical AEG tensors."""
+    from aether.core.mamba2_parameters import Mamba2Parameters
+
+    parameters = Mamba2Parameters.from_dict(architecture.get("ssm_runtime_parameters", {}))
     tensors = _dequantized_by_key(package)
     embedding = _require(tensors, (None, "embedding"), "token embedding")
     final_norm = _require(tensors, (None, "final_norm"), "final norm")
@@ -809,6 +812,7 @@ def _load_mamba2_engine_from_package(
             lm_head=np.asarray(lm_head, dtype=np.float32),
             norm_eps=_normalization_epsilon(architecture),
             norm_type=str(architecture.get("norm_type", "RMSNorm") or "RMSNorm"),
+            parameters=parameters,
         ),
         state_size=int(architecture.get("ssm_state_size") or 16),
         inner_size=inner,

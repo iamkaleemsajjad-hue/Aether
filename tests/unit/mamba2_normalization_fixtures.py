@@ -26,12 +26,14 @@ def checkpoint_data(
     epsilon: float = 1e-5,
     large_delta: bool = False,
     large_silu: str | None = None,
+    activation: str = "silu",
+    time_step_limit: tuple[float | None, float | None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """Return distinct learned norm scales and all real source parameter arrays."""
     hidden, heads, state, groups, width, vocab = 16, 4, 4, 2, 3, 17
     inner = expansion * hidden
     channels = inner + 2 * groups * state
-    config = {
+    config: dict[str, Any] = {
         "architectures": ["Mamba2ForCausalLM"],
         "model_type": "mamba2",
         "hidden_size": hidden,
@@ -46,7 +48,7 @@ def checkpoint_data(
         "chunk_size": 4,
         "layer_norm_epsilon": epsilon,
         "rms_norm": rms_norm,
-        "hidden_act": "silu",
+        "hidden_act": activation,
         "use_bias": with_bias,
         "use_conv_bias": True,
         "tie_word_embeddings": False,
@@ -55,6 +57,8 @@ def checkpoint_data(
         "pad_token_id": 0,
         "torch_dtype": "float32",
     }
+    if time_step_limit is not None:
+        config["time_step_limit"] = list(time_step_limit)
     rng = np.random.default_rng(20261020)
 
     def matrix(*shape: int) -> np.ndarray:
@@ -159,13 +163,21 @@ def matrix_logits(
             for channel in range(xbc.shape[-1])
         ]
     )
-    convolved = silu(convolved + weight("conv1d.bias"))
+    convolved += weight("conv1d.bias")
+    if config["hidden_act"] in {"silu", "swish"}:
+        convolved = silu(convolved)
+    elif config["hidden_act"] == "relu":
+        convolved = np.maximum(convolved, 0)
+    else:
+        raise ValueError("The matrix oracle supports SiLU/swish and ReLU convolution")
     x, b, c = np.split(convolved, [inner, inner + groups * state], axis=-1)
     x = x.reshape(length, heads, head_dim)
     b, c = (
         np.repeat(value.reshape(length, groups, state), heads // groups, axis=1) for value in (b, c)
     )
     delta = np.logaddexp(0, dt + weight("dt_bias"))
+    if "time_step_limit" in config:
+        delta = np.clip(delta, *config["time_step_limit"])
     rates = delta * (-np.exp(weight("A_log")))
     cumulative = np.cumsum(rates, axis=0)
     log_decay = cumulative[:, None, :] - cumulative[None, :, :]

@@ -132,6 +132,13 @@ class IngestionPipeline:
                         f"Unsupported Mamba-1 hidden_act activation {activation!r}; "
                         "the runtime currently supports only 'silu' and 'swish'."
                     )
+            if architecture.ssm_variant == "ssd":
+                from aether.core.mamba2_parameters import Mamba2Parameters
+
+                parameters = Mamba2Parameters.from_source_config(source_config)
+                architecture.ssm_runtime_parameters = (
+                    None if parameters == Mamba2Parameters() else parameters.to_dict()
+                )
         return graph
 
     def _try_specialised_loader(

@@ -59,6 +59,12 @@ def _compile(job: dict[str, Any]) -> None:
     package_dir = Path(aether.__file__).resolve().parent
     if not package_dir.is_relative_to(Path(job["expected_src"]).resolve()):
         raise RuntimeError(f"Wrong checkout imported: {package_dir}")
+    parameter_module = package_dir / "core/mamba2_parameters.py"
+    parameter_hash = (
+        {"core/mamba2_parameters.py": hashlib.sha256(parameter_module.read_bytes()).hexdigest()}
+        if parameter_module.is_file()
+        else {}
+    )
     output = Path(job["output"])
     output.mkdir()
     artifact = output / "model.aeg"
@@ -187,19 +193,23 @@ def _compile(job: dict[str, Any]) -> None:
             ]
         },
         "code_sha256": {
-            name: hashlib.sha256((package_dir / name).read_bytes()).hexdigest()
-            for name in (
-                f"runtime/{family}_engine.py",
-                "runtime/torch_state_engine.py",
-                "runtime/torch_engine.py",
-                "hybrid/state.py",
-                "runtime/aeg_loader.py",
-                "compiler/compiler.py",
-                "compiler/stage1_ingestion/ingestion.py",
-                "compiler/stage1_ingestion/architecture_detector.py",
-                "evaluation/admission_worker.py",
-                "backends/native_cpu_backend.py",
-            )
+            **parameter_hash,
+            **{
+                name: hashlib.sha256((package_dir / name).read_bytes()).hexdigest()
+                for name in (
+                    f"runtime/{family}_engine.py",
+                    "runtime/torch_state_engine.py",
+                    "runtime/torch_engine.py",
+                    "hybrid/state.py",
+                    "core/types.py",
+                    "runtime/aeg_loader.py",
+                    "compiler/compiler.py",
+                    "compiler/stage1_ingestion/ingestion.py",
+                    "compiler/stage1_ingestion/architecture_detector.py",
+                    "evaluation/admission_worker.py",
+                    "backends/native_cpu_backend.py",
+                )
+            },
         },
     }
     _write(output / "result.json", result)
@@ -320,6 +330,14 @@ def main() -> None:
             ("large-delta", {"large_delta": True}),
             ("negative-gate", {"with_bias": True, "large_silu": "gate"}),
             ("negative-conv", {"large_silu": "conv"}),
+            ("upper-limit", {"time_step_limit": (0.0, 0.001)}),
+            ("lower-limit", {"time_step_limit": (1.0, 2.0)}),
+            ("zero-limit", {"time_step_limit": (0.0, 0.0)}),
+            ("open-upper-limit", {"time_step_limit": (1.0, None)}),
+            ("open-lower-limit", {"time_step_limit": (None, 0.001)}),
+            ("inverted-limits", {"time_step_limit": (0.2, 0.1)}),
+            ("relu-convolution", {"activation": "relu"}),
+            ("relu-bounded", {"activation": "relu", "time_step_limit": (0.1, 0.2)}),
         ])
     for case_name, options in fixture_cases:
         case = work / case_name

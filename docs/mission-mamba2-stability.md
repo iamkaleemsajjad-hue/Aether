@@ -385,8 +385,9 @@ benefit or sparse/quantized/accelerator kernel claim.
 | ONNX | Existing general controls; no Mamba-2 ONNX claim |
 | CUDA, ROCm, MPS, DirectML and other targets | No new physical-device execution; existing matrix tiers unchanged |
 
-Source-defined nondefault time-step limits and convolution activations remain
-separate correctness work. Trained Mamba-2, other model families, larger-model
+Source-defined nondefault time-step limits and convolution activations are
+covered by a subsequent [source-parameter correction](mission-mamba2-source-parameters.md).
+Trained Mamba-2, other model families, larger-model
 speed, quantized weight execution, bounded serving memory, pass composition,
 hardware validation, archive hardening and blocking core/runtime type checks
 remain open. The [hardware matrix](../hardware_validation_matrix.json),

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve Mamba-2 source convolution activation and time-step bounds through
+  authenticated AEG architecture parameters and actual CPU/Torch execution.
+  Refuse unsupported or malformed settings before publication; default legacy
+  artifacts retain serialization and logits. Real source/matrix, cached decode,
+  worker-clone, tampering and old/new reader checks cover the correction. Local
+  suite failures, coverage reduction and timing losses remain explicit in the
+  [validation record](docs/mission-mamba2-source-parameters.md).
+
 - Evaluate Mamba-2 CPU SiLU and softplus with stable identities instead of
   clipping finite inputs. Original-HF and independent scalar/matrix regressions
   cover large time steps and negative convolution/gate values through real AEG
