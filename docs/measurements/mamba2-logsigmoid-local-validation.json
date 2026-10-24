@@ -1,0 +1,677 @@
+{
+  "scope": "Physical Windows CPU, complete FP32 checkpoints; no trained/corpus or peak-RSS claim",
+  "previous_runtime_revision": "5dbe26d5673f75257d5d50092ea091cd0c9e8a1f",
+  "pre_stability_revision": "c7af1b6331681b9e8e6b337cb5c06368825143b2",
+  "focused": {
+    "tests": 112,
+    "passed": 112,
+    "failures": [],
+    "skipped": 0,
+    "skip_details": [],
+    "suites": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "0",
+        "tests": "112",
+        "time": "27.650",
+        "timestamp": "2026-10-23T10:25:17.025660+05:00",
+        "hostname": "DESKTOP-MNGKA5K"
+      }
+    ],
+    "sha256": "fea1eea49e279403c7a94cca6c92c56c91867195504b29a6fa78a45ac86ff7bb"
+  },
+  "complete_suite": {
+    "tests": 5517,
+    "passed": 5470,
+    "failures": [
+      {
+        "class": "tests.tools.test_pass_audit",
+        "name": "test_worker_compiles_and_runs_unicode_paths_with_ascii_parent",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2570/test_worker_compiles_and_runs_0')\nmonkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000025DD826D9C0>\n\n    def test_worker_compiles_and_runs_unicode_paths_with_ascii_parent(\n        tmp_path: Path, monkeypatch: pytest.MonkeyPatch\n    ) -> None:\n        \"\"\"Worker logs must be UTF-8 even when the parent requests ASCII pipes.\"\"\"\n        pytest.importorskip(\"safetensors.numpy\")\n        pytest.importorskip(\"tokenizers\")\n        fixture = create_fixture(tmp_path / \"source_\u03bb_\u6a21\u578b\", \"tiny\")\n        monkeypatch.setenv(\"PYTHONIOENCODING\", \"ascii\")\n        monkeypatch.setenv(\"PYTHONUTF8\", \"0\")\n        args = argparse.Namespace(\n            min_free_mib=128, native=False, epoch=1700000000, threads=1, timeout=120\n        )\n        job = {\"fixture_name\": \"tiny\", \"fixture\": fixture, \"passes\": [12], \"tokens\": 2}\n        compiled = run_worker({**job, \"action\": \"compile\"}, tmp_path / \"compile_\u03bb\", args)\n>       assert compiled[\"status\"] == \"ok\", compiled\nE       AssertionError: {'status': 'blocked', 'available_bytes': 458153984, 'estimated_worker_bytes': 406938624, 'required_headroom_bytes': 134217728, ...}\nE       assert 'blocked' == 'ok'\nE         \nE         - ok\nE         + blocked\n\ntests\\tools\\test_pass_audit.py:223: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_execution_precision",
+        "name": "test_portable_torch_precision_executes_and_restores[bfloat16]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2570/test_portable_torch_precision_1')\ndtype = 'bfloat16'\n\n    @pytest.mark.parametrize(\"dtype\", [\"float16\", \"bfloat16\"])\n    def test_portable_torch_precision_executes_and_restores(tmp_path, dtype):\n        \"\"\"Actual CPU Torch operators run after both FP16 and BF16 transformations.\"\"\"\n        torch = pytest.importorskip(\"torch\")\n        from aether.runtime.torch_engine import TorchAEGEngine\n    \n        engine = TorchAEGEngine(_reference_engine(), \"cpu\")\n        original_dtype = engine.compute_dtype\n        original_logits = engine.forward(IDS)[0]\n        controller = ExecutionPrecisionController(\n            TorchPrecisionAdapter(engine),\n            tmp_path,\n            PrecisionPolicy(\n                storage_dtype=dtype,\n                allow_lossy=True,\n                max_logit_error=0.1,\n                require_same_argmax=False,\n                measurements=1,\n                max_slowdown=1000,\n            ),\n        )\n        result = controller.downgrade([IDS.tolist()])\n        assert result[\"action\"] == \"downgrade\", result\n        assert engine.compute_dtype == getattr(torch, dtype)\n        assert engine.embedding.dtype == getattr(torch, dtype)\n        assert np.all(np.isfinite(engine.forward(IDS)[0]))\n        controller.restore()\n        assert engine.compute_dtype == original_dtype\n>       np.testing.assert_array_equal(engine.forward(IDS)[0], original_logits)\n\ntests\\unit\\test_execution_precision.py:156: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<built-in function eq>, array([[-0.01298291, -0.17845401, -0.09760696, -0.21779625, -0.00726918,\n         0.22222613,...    0.1245837 ,  0.05666124, -0.11171013, -0.18740441,  0.00204435,\n         0.17443989, -0.153937  ]], dtype=float32))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Arrays are not equal', 'strict': False}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Arrays are not equal\nE           \nE           Mismatched elements: 10 / 68 (14.7%)\nE           Max absolute difference: 2.9802322e-08\nE           Max relative difference: 9.74565e-07\nE            x: array([[-0.012983, -0.178454, -0.097607, -0.217796, -0.007269,  0.222226,\nE                    0.073786, -0.493169,  0.292389,  0.121275,  0.138442,  0.080092,\nE                   -0.27685 ,  0.232641, -0.004021,  0.224758,  0.129364],...\nE            y: array([[-0.012983, -0.178454, -0.097607, -0.217796, -0.007269,  0.222226,\nE                    0.073786, -0.493169,  0.292389,  0.121275,  0.138442,  0.080092,\nE                   -0.27685 ,  0.232641, -0.004021,  0.224758,  0.129364],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[False]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2570/test_real_http_mcp_cli_handsha0')\nminimal_aeg_package = AEGPackage(C:\\Users\\pc\\AppData\\Local\\Temp\\pytest-of-kaleem\\pytest-2570\\test_real_http_mcp_cli_handsha0\\test_model.aeg, model_id=test-model, loaded=False)\nsse = False\n\n    @pytest.mark.parametrize(\"sse\", [False, True])\n    def test_real_http_mcp_cli_handshake_session_and_tool(tmp_path, minimal_aeg_package, sse):\n        from click.testing import CliRunner\n        from aether.cli import cli\n    \n        events = []\n    \n        class Handler(BaseHTTPRequestHandler):\n            def log_message(self, *args):\n                pass\n    \n            def do_POST(self):\n                message = json.loads(self.rfile.read(int(self.headers[\"Content-Length\"])))\n                events.append(message[\"method\"])\n                assert \"text/event-stream\" in self.headers[\"Accept\"]\n                if message[\"method\"] == \"initialize\":\n                    result = {\"protocolVersion\": message[\"params\"][\"protocolVersion\"], \"capabilities\": {\"tools\": {}}, \"serverInfo\": {\"name\": \"local-http\", \"version\": \"1\"}}\n                else:\n                    assert self.headers[\"MCP-Session-Id\"] == \"local-session\"\n                    if message[\"method\"] == \"notifications/initialized\":\n                        self.send_response(202)\n                        self.end_headers()\n                        return\n                    if message[\"method\"] == \"tools/list\":\n                        result = {\"tools\": [{\"name\": \"echo\", \"inputSchema\": {\"type\": \"object\"}}]}\n                    else:\n                        result = {\"content\": [{\"type\": \"text\", \"text\": message[\"params\"][\"arguments\"][\"text\"]}]}\n                response = json.dumps({\"jsonrpc\": \"2.0\", \"id\": message[\"id\"], \"result\": result})\n                body = (\"data: \" + response + \"\\n\\n\" if sse else response).encode(\"utf-8\")\n                self.send_response(200)\n                self.send_header(\"Content-Type\", \"text/event-stream\" if sse else \"application/json\")\n                self.send_header(\"MCP-Session-Id\", \"local-session\")\n                self.send_header(\"Content-Length\", str(len(body)))\n                self.end_headers()\n                self.wfile.write(body)\n    \n        server = ThreadingHTTPServer((\"127.0.0.1\", 0), Handler)\n        thread = threading.Thread(target=server.serve_forever, daemon=True)\n        thread.start()\n        client = MCPClient(\"local\", \"http\", f\"http://127.0.0.1:{server.server_port}/mcp\", timeout_s=3)\n        try:\n>           assert client.connect()\nE           assert False\nE            +  where False = connect()\nE            +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x0000025DCC9C7B20>.connect\n\ntests\\unit\\test_mcp_transport_contracts.py:119: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_mcp_transport_contracts",
+        "name": "test_real_http_mcp_cli_handshake_session_and_tool[True]",
+        "detail": "tmp_path = WindowsPath('C:/Users/pc/AppData/Local/Temp/pytest-of-kaleem/pytest-2570/test_real_http_mcp_cli_handsha1')\nminimal_aeg_package = AEGPackage(C:\\Users\\pc\\AppData\\Local\\Temp\\pytest-of-kaleem\\pytest-2570\\test_real_http_mcp_cli_handsha1\\test_model.aeg, model_id=test-model, loaded=False)\nsse = True\n\n    @pytest.mark.parametrize(\"sse\", [False, True])\n    def test_real_http_mcp_cli_handshake_session_and_tool(tmp_path, minimal_aeg_package, sse):\n        from click.testing import CliRunner\n        from aether.cli import cli\n    \n        events = []\n    \n        class Handler(BaseHTTPRequestHandler):\n            def log_message(self, *args):\n                pass\n    \n            def do_POST(self):\n                message = json.loads(self.rfile.read(int(self.headers[\"Content-Length\"])))\n                events.append(message[\"method\"])\n                assert \"text/event-stream\" in self.headers[\"Accept\"]\n                if message[\"method\"] == \"initialize\":\n                    result = {\"protocolVersion\": message[\"params\"][\"protocolVersion\"], \"capabilities\": {\"tools\": {}}, \"serverInfo\": {\"name\": \"local-http\", \"version\": \"1\"}}\n                else:\n                    assert self.headers[\"MCP-Session-Id\"] == \"local-session\"\n                    if message[\"method\"] == \"notifications/initialized\":\n                        self.send_response(202)\n                        self.end_headers()\n                        return\n                    if message[\"method\"] == \"tools/list\":\n                        result = {\"tools\": [{\"name\": \"echo\", \"inputSchema\": {\"type\": \"object\"}}]}\n                    else:\n                        result = {\"content\": [{\"type\": \"text\", \"text\": message[\"params\"][\"arguments\"][\"text\"]}]}\n                response = json.dumps({\"jsonrpc\": \"2.0\", \"id\": message[\"id\"], \"result\": result})\n                body = (\"data: \" + response + \"\\n\\n\" if sse else response).encode(\"utf-8\")\n                self.send_response(200)\n                self.send_header(\"Content-Type\", \"text/event-stream\" if sse else \"application/json\")\n                self.send_header(\"MCP-Session-Id\", \"local-session\")\n                self.send_header(\"Content-Length\", str(len(body)))\n                self.end_headers()\n                self.wfile.write(body)\n    \n        server = ThreadingHTTPServer((\"127.0.0.1\", 0), Handler)\n        thread = threading.Thread(target=server.serve_forever, daemon=True)\n        thread.start()\n        client = MCPClient(\"local\", \"http\", f\"http://127.0.0.1:{server.server_port}/mcp\", timeout_s=3)\n        try:\n>           assert client.connect()\nE           assert False\nE            +  where False = connect()\nE            +    where connect = <aether.runtime.r6_mcp_integration.MCPClient object at 0x0000025DCCA0DE10>.connect\n\ntests\\unit\\test_mcp_transport_contracts.py:119: AssertionError"
+      },
+      {
+        "class": "tests.unit.test_ttft_efficiency",
+        "name": "test_skipping_the_derivation_does_not_change_the_logits",
+        "detail": "def test_skipping_the_derivation_does_not_change_the_logits() -> None:\n        \"\"\"Memoization is a latency change; it must not be an arithmetic one.\"\"\"\n        pytest.importorskip(\"torch\")\n        memoized = _engine()\n        always = _engine()\n        # Forcing the flag makes ``always`` take the pre-memoization path on every pass.\n        always._rope_length_sensitive = True\n    \n        for length in (1, 3, PROMPT.size):\n            prompt = PROMPT[:length]\n>           np.testing.assert_array_equal(\n                memoized.forward(prompt)[0], always.forward(prompt)[0]\n            )\n\ntests\\unit\\test_ttft_efficiency.py:442: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nargs = (<built-in function eq>, array([[-0.01298292, -0.17845403, -0.09760696, -0.21779631, -0.00726915,\n         0.22222614,...    0.11134335, -0.09752251, -0.05571811, -0.36156705, -0.0927384 ,\n         0.14207293, -0.19754706]], dtype=float32))\nkwds = {'err_msg': '', 'verbose': True, 'header': 'Arrays are not equal', 'strict': False}\n\n    @wraps(func)\n    def inner(*args, **kwds):\n        with self._recreate_cm():\n>           return func(*args, **kwds)\nE           AssertionError: \nE           Arrays are not equal\nE           \nE           Mismatched elements: 80 / 102 (78.4%)\nE           Max absolute difference: 5.9604645e-08\nE           Max relative difference: 5.8896103e-06\nE            x: array([[-0.012983, -0.178454, -0.097607, -0.217796, -0.007269,  0.222226,\nE                    0.073786, -0.493169,  0.292389,  0.121275,  0.138442,  0.080092,\nE                   -0.27685 ,  0.232641, -0.004021,  0.224758,  0.129364],...\nE            y: array([[-0.012983, -0.178454, -0.097607, -0.217796, -0.007269,  0.222226,\nE                    0.073786, -0.493169,  0.292389,  0.121275,  0.138442,  0.080092,\nE                   -0.27685 ,  0.232641, -0.004021,  0.224758,  0.129364],...\n\nC:\\Program Files\\Python310\\lib\\contextlib.py:79: AssertionError"
+      }
+    ],
+    "skipped": 42,
+    "skip_details": [
+      {
+        "class": "tests.integration.test_automatic_execution_dispatch",
+        "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[llama]",
+        "reason": "could not import 'accelerate': No module named 'accelerate'"
+      },
+      {
+        "class": "tests.integration.test_automatic_execution_dispatch",
+        "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[gpt2]",
+        "reason": "could not import 'accelerate': No module named 'accelerate'"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_compile_small_model",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_end_to_end_generate",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_chat_completion",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_compile_plan_dry_run",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_model_info",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_openai_compatible_server",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_model_list_and_remove",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_backend_detection",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_hardware_detection",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_benchmark_smoke",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_aeg_format_roundtrip",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_cross_hardware_portability",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_server_credentials_creation",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_server_credentials_mtls",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_channel_credentials_creation",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_helper",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_missing_file",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_none_passthrough",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+        "name": "test_require_grpc_no_error",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+        "name": "test_service_name_constant",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.tools.test_pass_audit",
+        "name": "test_real_public_compile_audit_smoke",
+        "reason": "Opt-in real subprocess compile/load/Runtime smoke, no timing"
+      },
+      {
+        "class": "tests.unit.test_adversarial.TestExecutionFidelity",
+        "name": "test_real_pretrained_model",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.unit.test_aeg_onnx_export",
+        "name": "test_real_directml_exported_aeg_operators",
+        "reason": "physical DirectML execution requires its optional installed runtime"
+      },
+      {
+        "class": "tests.unit.test_aeg_onnx_export",
+        "name": "test_actual_compiled_artifact_backend_generation_stream_and_unload[DmlExecutionProvider]",
+        "reason": "real DmlExecutionProvider is not installed"
+      },
+      {
+        "class": "tests.unit.test_c2pa_signing",
+        "name": "test_pure_python_and_native_backends_agree",
+        "reason": "could not import 'cryptography': No module named 'cryptography'"
+      },
+      {
+        "class": "tests.unit.test_calibration.TestDatasets",
+        "name": "test_wikitext2",
+        "reason": "Real wikitext-2 data is unavailable locally; provide a calibration file or cache the 'wikitext' dataset before compiling (no local Hugging Face dataset cache at C:\\Users\\pc\\.cache\\huggingface\\datasets)"
+      },
+      {
+        "class": "tests.unit.test_calibration.TestDatasets",
+        "name": "test_hellaswag",
+        "reason": "Real hellaswag data is unavailable locally; provide a calibration file or cache the 'Rowan/hellaswag' dataset before compiling (no local Hugging Face dataset cache at C:\\Users\\pc\\.cache\\huggingface\\datasets)"
+      },
+      {
+        "class": "tests.unit.test_device_placement.TestDeviceResolution",
+        "name": "test_cuda_spec_gains_an_explicit_index",
+        "reason": "no CUDA device on this host"
+      },
+      {
+        "class": "tests.unit.test_distributed_complete.TestMultiProcessDistributed",
+        "name": "test_single_process_all_reduce",
+        "reason": "process IPC is unavailable in this Windows environment: [WinError 5] Access is denied"
+      },
+      {
+        "class": "tests.unit.test_distributed_complete.TestMultiProcessDistributed",
+        "name": "test_ring_collectives_across_real_processes[2]",
+        "reason": "process IPC is unavailable in this environment: [WinError 5] Access is denied"
+      },
+      {
+        "class": "tests.unit.test_distributed_complete.TestMultiProcessDistributed",
+        "name": "test_ring_collectives_across_real_processes[4]",
+        "reason": "process IPC is unavailable in this environment: [WinError 5] Access is denied"
+      },
+      {
+        "class": "tests.unit.test_distributed_complete.TestMultiProcessDistributed",
+        "name": "test_ring_moves_the_bandwidth_optimal_volume",
+        "reason": "process IPC is unavailable in this environment: [WinError 5] Access is denied"
+      },
+      {
+        "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+        "name": "test_compiler_compile_produces_weight_blob",
+        "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+      },
+      {
+        "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+        "name": "test_compiled_package_is_loadable_and_runnable",
+        "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+      },
+      {
+        "class": "tests.unit.test_hardware_evidence",
+        "name": "test_real_cuda_aeg_execution_never_uses_cpu_fallback",
+        "reason": "No physical NVIDIA CUDA device and matching PyTorch runtime"
+      },
+      {
+        "class": "tests.unit.test_onnx_provider_contract",
+        "name": "test_real_directml_offline_workload_requires_gpu_node_execution",
+        "reason": "physical DirectML runtime is not installed on this host"
+      },
+      {
+        "class": "tests.unit.test_onnx_provider_contract",
+        "name": "test_real_directml_runtime_routes_generation_and_stream_to_gpu",
+        "reason": "physical DirectML runtime is not installed on this host"
+      },
+      {
+        "class": "tests.unit.test_onnx_session_contract",
+        "name": "test_actual_onnx_session_reuses_only_bound_state[DmlExecutionProvider]",
+        "reason": "real DmlExecutionProvider is not installed"
+      },
+      {
+        "class": "tests.unit.test_otlp_conformance",
+        "name": "test_sdk_bridge_preserves_aether_trace_ids",
+        "reason": "could not import 'opentelemetry.sdk': No module named 'opentelemetry.sdk'"
+      },
+      {
+        "class": "tests.unit.test_v31_features",
+        "name": "test_compiled_package_contains_v31_artifacts",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      }
+    ],
+    "suites": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "5",
+        "skipped": "42",
+        "tests": "5517",
+        "time": "511.711",
+        "timestamp": "2026-10-23T10:27:00.738818+05:00",
+        "hostname": "DESKTOP-MNGKA5K"
+      }
+    ],
+    "sha256": "dc99daa1b2fa1c0072391fa09d43f311713e27be1036a946ffc637014f7b4ab5"
+  },
+  "coverage": {
+    "version": "7.16.2",
+    "timestamp": "1792733719019",
+    "lines-valid": "57356",
+    "lines-covered": "45190",
+    "line-rate": "0.7879",
+    "branches-valid": "17290",
+    "branches-covered": "10839",
+    "branch-rate": "0.6269",
+    "complexity": "0"
+  },
+  "separate_extra_failure_checks": {
+    "current": {
+      "tests": 3,
+      "passed": 3,
+      "failures": [],
+      "skipped": 0,
+      "skip_details": [],
+      "suites": [
+        {
+          "name": "pytest",
+          "errors": "0",
+          "failures": "0",
+          "skipped": "0",
+          "tests": "3",
+          "time": "16.407",
+          "timestamp": "2026-10-23T10:37:23.830378+05:00",
+          "hostname": "DESKTOP-MNGKA5K"
+        }
+      ],
+      "sha256": "2bc7c9d7fd7f5bd6b2d94d957bc2d297e95082214d762bb5485a0d65c517978d"
+    },
+    "unchanged_pre_stability_torch": {
+      "tests": 2,
+      "passed": 2,
+      "failures": [],
+      "skipped": 0,
+      "skip_details": [],
+      "suites": [
+        {
+          "name": "pytest",
+          "errors": "0",
+          "failures": "0",
+          "skipped": "0",
+          "tests": "2",
+          "time": "4.683",
+          "timestamp": "2026-10-23T10:38:23.090008+05:00",
+          "hostname": "DESKTOP-MNGKA5K"
+        }
+      ],
+      "sha256": "e4d54ae3dd836e85df9c06f092806a8b1444b2a472c931f56b886d90db2ff68a"
+    }
+  },
+  "coverage_sha256": "9741b59501b8dc27495eb27ab27e561b4dfd556bc8468088ee8b2f4724d48bd3",
+  "line_coverage_percent": 78.78861845316968,
+  "static": {
+    "ruff_before": 19,
+    "ruff_after": 19,
+    "new_ruff": [],
+    "mypy_before": 30,
+    "mypy_after": 30,
+    "new_mypy": []
+  },
+  "runtime_sha256_lf": "de40846daa9420f157d3e7b972eb66d8c1bf0176eb2faa97c90b015e367d7e55",
+  "profile": {
+    "scope": "Default untrained FP32, owned caches; random interleaving, 45 samples, five generations/sample, five warmups; eight generated IDs; original profile used the previous runtime",
+    "profile_script_sha256": "c496c18c46315d5b2b8627b4b31007ff1c4d2cde9c48aa4776d94073454b0b2a",
+    "baseline_module_sha256": "5afe5c7aeba26672414659c6b80a24e96c2326e9e7833fe2fb8b290c620200e6",
+    "previous_module_sha256": "8933dff95146e3fc66e5e67aa67253220ff6d72ef26dcac3d523916c0c66f56d",
+    "measurements": {
+      "scope": "Interleaved single-process default untrained FP32 engine generate; no load/tokenization/RSS claim",
+      "numpy": "1.26.4",
+      "baseline_git": "c7af1b6331681b9e8e6b337cb5c06368825143b2",
+      "candidate": "value * exp(-logaddexp(0, -value))",
+      "timings": {
+        "short": {
+          "baseline": {
+            "samples_seconds": [
+              0.00162162,
+              0.00159182,
+              0.00218338,
+              0.0010969,
+              0.00147276,
+              0.00117438,
+              0.00110612,
+              0.00127532,
+              0.001243,
+              0.00134894,
+              0.00161628,
+              0.00106932,
+              0.00108998,
+              0.0010146999999999999,
+              0.00125826,
+              0.00120506,
+              0.00153418,
+              0.0016920799999999999,
+              0.00107762,
+              0.0013307,
+              0.0011769999999999999,
+              0.00118438,
+              0.00108892,
+              0.0012281800000000002,
+              0.00114174,
+              0.00102774,
+              0.00128944,
+              0.0012937600000000001,
+              0.00144342,
+              0.00111614,
+              0.0011189799999999999,
+              0.0012864600000000001,
+              0.00109404,
+              0.0010666200000000001,
+              0.00103462,
+              0.00108932,
+              0.00136144,
+              0.00123754,
+              0.0018248799999999999,
+              0.00127898,
+              0.0014597,
+              0.0011249200000000002,
+              0.00119906,
+              0.00126978,
+              0.00119736
+            ],
+            "median_seconds": 0.0012281800000000002,
+            "min_seconds": 0.0010146999999999999,
+            "max_seconds": 0.00218338
+          },
+          "piecewise": {
+            "samples_seconds": [
+              0.0011147000000000002,
+              0.00119906,
+              0.0011614,
+              0.0012503,
+              0.00123554,
+              0.00120336,
+              0.00112008,
+              0.0016187799999999998,
+              0.00108188,
+              0.00180614,
+              0.0012909199999999999,
+              0.0017507000000000002,
+              0.00171212,
+              0.00139876,
+              0.00117136,
+              0.00131276,
+              0.00128138,
+              0.00117464,
+              0.00127588,
+              0.00192962,
+              0.0013039800000000002,
+              0.00101716,
+              0.00150484,
+              0.00123358,
+              0.00123454,
+              0.0012706,
+              0.00121912,
+              0.00125936,
+              0.00100908,
+              0.0013472,
+              0.00107036,
+              0.0019076,
+              0.00107704,
+              0.00155406,
+              0.0011496599999999998,
+              0.0011062799999999999,
+              0.0011253,
+              0.002111,
+              0.00183538,
+              0.00132732,
+              0.00100422,
+              0.0013006200000000002,
+              0.0012169,
+              0.00103054,
+              0.0012048200000000001
+            ],
+            "median_seconds": 0.00123554,
+            "min_seconds": 0.00100422,
+            "max_seconds": 0.002111
+          },
+          "log_sigmoid_candidate": {
+            "samples_seconds": [
+              0.00099526,
+              0.00099474,
+              0.00128768,
+              0.0009977200000000001,
+              0.00153772,
+              0.00101038,
+              0.00099594,
+              0.00101794,
+              0.0010609600000000001,
+              0.0009504200000000001,
+              0.00110786,
+              0.0010321,
+              0.0010974,
+              0.00101528,
+              0.00166206,
+              0.0009695999999999999,
+              0.0012206,
+              0.00108104,
+              0.00097708,
+              0.00132676,
+              0.00111148,
+              0.00124854,
+              0.00098496,
+              0.0013135199999999999,
+              0.0017756,
+              0.00121378,
+              0.002216,
+              0.00107912,
+              0.00101338,
+              0.00188006,
+              0.00173798,
+              0.0017876199999999997,
+              0.0010241999999999999,
+              0.00116488,
+              0.00099562,
+              0.00092976,
+              0.0017573600000000001,
+              0.00101716,
+              0.00124828,
+              0.00104992,
+              0.00117704,
+              0.00134432,
+              0.0010396000000000001,
+              0.00232874,
+              0.0012836
+            ],
+            "median_seconds": 0.0010974,
+            "min_seconds": 0.00092976,
+            "max_seconds": 0.00232874
+          }
+        },
+        "long": {
+          "baseline": {
+            "samples_seconds": [
+              0.00876624,
+              0.00834736,
+              0.01025742,
+              0.009626,
+              0.01038296,
+              0.010579620000000001,
+              0.01011518,
+              0.00753362,
+              0.0097921,
+              0.0094959,
+              0.011258559999999999,
+              0.00972348,
+              0.00857406,
+              0.0097145,
+              0.00900986,
+              0.009034440000000001,
+              0.00906816,
+              0.008636099999999999,
+              0.009713280000000001,
+              0.007998420000000001,
+              0.009422999999999999,
+              0.00900626,
+              0.01070946,
+              0.008565380000000001,
+              0.01087246,
+              0.00861216,
+              0.014061979999999998,
+              0.01292924,
+              0.00822026,
+              0.009523460000000001,
+              0.0088595,
+              0.00809824,
+              0.00857886,
+              0.0087134,
+              0.008769639999999999,
+              0.00810164,
+              0.01006694,
+              0.00811078,
+              0.00853868,
+              0.009130820000000001,
+              0.008401160000000001,
+              0.00843206,
+              0.00885004,
+              0.00938388,
+              0.01021
+            ],
+            "median_seconds": 0.009034440000000001,
+            "min_seconds": 0.00753362,
+            "max_seconds": 0.014061979999999998
+          },
+          "piecewise": {
+            "samples_seconds": [
+              0.009488340000000001,
+              0.00882748,
+              0.01000734,
+              0.00875866,
+              0.01035426,
+              0.00991784,
+              0.01045898,
+              0.00903346,
+              0.00847558,
+              0.00843916,
+              0.009059580000000001,
+              0.00998952,
+              0.01004672,
+              0.01003578,
+              0.01040988,
+              0.0089882,
+              0.00947176,
+              0.008669699999999999,
+              0.00925334,
+              0.0089619,
+              0.00946326,
+              0.00951162,
+              0.010105260000000001,
+              0.0094774,
+              0.0108065,
+              0.00989936,
+              0.0124156,
+              0.010523399999999999,
+              0.00936178,
+              0.0089853,
+              0.0085408,
+              0.00916142,
+              0.00792412,
+              0.008469500000000001,
+              0.00860054,
+              0.00957552,
+              0.00894678,
+              0.0088515,
+              0.01065522,
+              0.0096211,
+              0.00822764,
+              0.0088908,
+              0.00972918,
+              0.00891566,
+              0.00866966
+            ],
+            "median_seconds": 0.00936178,
+            "min_seconds": 0.00792412,
+            "max_seconds": 0.0124156
+          },
+          "log_sigmoid_candidate": {
+            "samples_seconds": [
+              0.00865166,
+              0.008109040000000001,
+              0.00761008,
+              0.00809106,
+              0.010257800000000001,
+              0.00752884,
+              0.007897640000000001,
+              0.00794312,
+              0.00794692,
+              0.0079612,
+              0.008496,
+              0.008192000000000001,
+              0.01065932,
+              0.008881759999999999,
+              0.00985084,
+              0.00808364,
+              0.0090858,
+              0.007871640000000001,
+              0.00958368,
+              0.0074288800000000006,
+              0.008087500000000001,
+              0.00915656,
+              0.00869148,
+              0.00822976,
+              0.00863978,
+              0.00925288,
+              0.01049506,
+              0.009221459999999999,
+              0.0084339,
+              0.0088094,
+              0.00854768,
+              0.00876106,
+              0.0077179,
+              0.00912448,
+              0.00867256,
+              0.008552859999999999,
+              0.0074407399999999995,
+              0.00783416,
+              0.00759246,
+              0.00851244,
+              0.008649460000000001,
+              0.0073274,
+              0.00868868,
+              0.00840228,
+              0.008857460000000001
+            ],
+            "median_seconds": 0.00851244,
+            "min_seconds": 0.0073274,
+            "max_seconds": 0.01065932
+          }
+        }
+      }
+    }
+  },
+  "note": "One complete run, not combined coverage; no failing test/resource admission waived."
+}

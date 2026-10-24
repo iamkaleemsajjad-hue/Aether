@@ -1,6 +1,17 @@
 # Aether Runtime implementation status
 
-Reviewed 2026-10-23. The runtime/compiler mission is in progress.
+Reviewed 2026-10-24. The runtime/compiler mission is in progress.
+
+The Mamba-2 activation profiling follow-up replaces masked piecewise sigmoid
+evaluation with the equivalent stable log-sigmoid identity. A randomized
+interleaved local comparison favored it; all 112 focused checks pass with no
+new module lint/type diagnostics. Its complete local run returned **5,470
+passed, 42 skipped, five failures**: the two existing HTTP cases, RAM admission
+and two small exact-equality differences in unchanged Torch paths. The latter
+three passed separately, without relaxing tests; their full-run failures remain
+recorded. Local coverage was **78.7886185%**. Hosted validation and the coverage
+non-reduction criterion remain open. See the
+[profile, raw series and limits](docs/mission-mamba2-stability.md#profiling-follow-up-stable-log-sigmoid).
 
 The [Mamba-2 finite-input correction](docs/mission-mamba2-stability.md) removes
 CPU SiLU/softplus clipping that changed valid source equations. Five final

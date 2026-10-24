@@ -38,8 +38,9 @@ Complete deterministic, untrained HF checkpoints isolate large delta, negative
 gate and negative X-convolution inputs alongside a default control. B/C weights
 and convolution channels remain nonzero; no fabricated target logits or zero
 recurrence replaces execution. The independent FP64 oracle constructs the full
-semiseparable matrix and full causal convolution. Its log-sigmoid formulation
-is independent of the runtime's new piecewise sigmoid evaluation.
+semiseparable matrix and full causal convolution, without calling a runtime
+recurrence or activation. Comparisons against the original HF model separately
+validate this FP64 oracle.
 
 The initial pre-fix regression returned **five failures, nine passes** in 75.72
 seconds. Replaying the final tests against the exact retained Git archive
@@ -52,7 +53,7 @@ matrix oracle were **2.10043** (large delta), **1.89717** (negative gate), and
 **1.56770** (negative convolution). This distinguishes the CPU defect from an
 incorrect source fixture or oracle.
 
-The correction uses `logaddexp(0, x)` for softplus. For SiLU, set
+The initial correction uses `logaddexp(0, x)` for softplus. For SiLU, set
 `t = exp(-abs(x))`; the sigmoid is `t/(1+t)` for negative x and its complement
 for nonnegative x. The exponential never receives a positive argument.
 Temporary results are owned arrays, and the input is not modified. Scalar
@@ -199,6 +200,58 @@ increased from 134 to 139; six previously covered lines in the unchanged R9
 speculative rejection path were not hit, with one-line differences in two other
 unchanged runtime modules. These runs are retained separately, not combined
 into a more favorable coverage number.
+
+## Profiling follow-up: stable log-sigmoid
+
+The first implementation's timing losses motivated profiling before another
+runtime edit. A local `cProfile` run of 300 default tiny-model generations
+recorded 376,501 calls in 0.696 seconds; 5,400 SiLU calls accounted for about
+0.068 seconds. The
+[profile](measurements/mamba2-logsigmoid-cprofile.txt) is retained, with its
+[measurement and validation record](measurements/mamba2-logsigmoid-local-validation.json).
+
+The follow-up evaluates
+`SiLU(x) = x * exp(-logaddexp(0, -x))`. The exponential argument remains
+nonpositive for every finite x. This reduces NumPy dispatches and removes the
+per-call sign mask while preserving the original function, dtype and input
+ownership. Softplus, cache layouts and weights are unchanged.
+
+Before adopting it, a single-process, randomized interleaved comparison used
+the exact pre-fix engine module, the initial piecewise engine and a subclass
+containing only the proposed activation. They shared identical loaded weights
+and owned independent caches. All three produced identical eight-ID greedy
+outputs on both default control prompts. Each had five warmups, 45 samples and
+five complete generations per sample, with one BLAS/OpenMP thread.
+
+| Default prompt | Pre-fix clipped generation ms | Initial piecewise generation ms | Log-sigmoid candidate generation ms |
+|---|---:|---:|---:|
+| One ID | 1.22818 [1.01470,2.18338] | 1.23554 [1.00422,2.11100] | 1.09740 [0.92976,2.32874] |
+| 64 IDs | 9.03444 [7.53362,14.06198] | 9.36178 [7.92412,12.41560] | 8.51244 [7.32740,10.65932] |
+
+Values are median [minimum, maximum] for complete eight-ID engine generation,
+excluding artifact loading and tokenization. These local results support
+testing the candidate; they do not replace hosted decode/first-output A/Bs,
+larger-model profiling, peak RSS or activation/overhead attribution. The raw
+45-sample series and exact module hashes are retained in the record.
+
+The adopted identity passes all **112 focused checks**, including all 14
+endpoint/original-HF/matrix/compiled-cache regressions, in 28.70 seconds.
+Critical Ruff passes; the touched module retains **19** existing Ruff findings
+and **30** existing mypy errors, with no new diagnostic messages. The complete
+local run returned **5,470 passed, 42 skipped, five failures** in 543.62 seconds:
+two existing MCP HTTP cases, a Unicode-worker RAM refusal (458,153,984 available
+bytes versus 406,938,624 estimated worker bytes plus 134,217,728 headroom), and
+two exact-equality Torch assertions outside the Mamba-2 execution path. Their
+maximum differences were 2.9802322e-8 and 5.9604645e-8. All 14 Mamba-2 stability
+cases passed.
+
+A separate run of the three additional failures passed all three in 16.65
+seconds. The two Torch cases also passed against the unchanged pre-stability
+runtime in 6.89 seconds. This does not explain or erase their complete-run
+failures. No numerical tolerance, failing test or resource guard was relaxed.
+Coverage was **45,190 / 57,356 = 78.7886185%**, below the initial correction's
+local **78.8040446%**; the non-reduction criterion remains open. Hosted
+validation of this follow-up is pending.
 
 ## Unchanged passes and hardware scope
 

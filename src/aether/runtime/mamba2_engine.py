@@ -103,14 +103,10 @@ class Mamba2ExecutionEngine:
         Dao & Gu (2024), section 7.1, and Mamba2Simple v2.2.4 use SiLU:
         https://arxiv.org/html/2405.21060v1
         https://github.com/state-spaces/mamba/blob/95d8aba8a8c75aedcaa6143713b11e745e7cd0d9/mamba_ssm/modules/mamba2_simple.py
-        With t=exp(-abs(x)), sigmoid is t/(1+t) for negative x and its
-        complement for nonnegative x. The exponential cannot overflow.
+        sigmoid(x)=exp(-logaddexp(0, -x)) keeps the exponential argument
+        nonpositive, without clipping inputs or dispatching masked ufuncs.
         """
-        result = np.exp(-np.abs(value))
-        np.divide(result, 1.0 + result, out=result)
-        np.subtract(1.0, result, out=result, where=value >= 0)
-        np.multiply(value, result, out=result)
-        return result
+        return value * np.exp(-np.logaddexp(0.0, -value))
 
     def _norm(self, value: np.ndarray, weight: np.ndarray) -> np.ndarray:
         if self.weights.norm_type.lower() == "layernorm":

@@ -1,0 +1,33 @@
+         376501 function calls in 0.696 seconds
+
+   Ordered by: cumulative time
+   List reduced from 63 to 25 due to restriction <25>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      300    0.003    0.000    0.696    0.002 mamba2_engine.py:244(generate)
+     2700    0.012    0.000    0.693    0.000 mamba2_engine.py:218(generate_iter)
+     2700    0.046    0.000    0.667    0.000 mamba2_engine.py:188(forward)
+     2700    0.147    0.000    0.475    0.000 mamba2_engine.py:142(_step)
+     8100    0.009    0.000    0.173    0.000 {method 'mean' of 'numpy.ndarray' objects}
+     5400    0.055    0.000    0.169    0.000 mamba2_engine.py:115(_norm)
+     8100    0.070    0.000    0.164    0.000 _methods.py:101(_mean)
+     2700    0.034    0.000    0.100    0.000 mamba2_engine.py:129(_conv)
+     5400    0.068    0.000    0.068    0.000 mamba2_engine.py:99(_silu)
+    18900    0.051    0.000    0.051    0.000 {method 'reduce' of 'numpy.ufunc' objects}
+     5400    0.009    0.000    0.047    0.000 fromnumeric.py:2177(sum)
+     5400    0.011    0.000    0.036    0.000 fromnumeric.py:71(_wrapreduction)
+     2700    0.018    0.000    0.026    0.000 shape_base.py:372(stack)
+    16200    0.008    0.000    0.023    0.000 {built-in method builtins.next}
+     8100    0.017    0.000    0.020    0.000 _methods.py:67(_count_reduce_items)
+     7800    0.007    0.000    0.018    0.000 fromnumeric.py:53(_wrapfunc)
+     8100    0.007    0.000    0.018    0.000 contextlib.py:139(__exit__)
+     5400    0.005    0.000    0.017    0.000 fromnumeric.py:423(repeat)
+     8100    0.005    0.000    0.017    0.000 contextlib.py:130(__enter__)
+     8100    0.005    0.000    0.015    0.000 contextlib.py:279(helper)
+    16200    0.010    0.000    0.015    0.000 _ufunc_config.py:452(_no_nep50_warning)
+     2700    0.002    0.000    0.012    0.000 {method 'min' of 'numpy.ndarray' objects}
+    24300    0.012    0.000    0.012    0.000 {method 'reshape' of 'numpy.ndarray' objects}
+     2400    0.004    0.000    0.010    0.000 fromnumeric.py:1140(argmax)
+     2700    0.002    0.000    0.010    0.000 _methods.py:43(_amin)
+
+
