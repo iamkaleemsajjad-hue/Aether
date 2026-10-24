@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from aether import CompilerConfig
+
 if __package__:
     from .pass_audit import (
         PASSES,
@@ -107,27 +109,33 @@ def _array_bytes(value: Any) -> int:
     return total
 
 
+def _compiler_config(job: dict[str, Any], work: Path) -> CompilerConfig:
+    from aether import CompilerConfig
+
+    selected: dict[str, Any] = {entry.flag: entry.number == 3 for entry in PASSES}
+    return CompilerConfig(
+        **selected,
+        quality_mode="diagnostic" if job["diagnostic"] else "require_hf",
+        quality_dataset=job["dataset"],
+        quality_greedy_tokens=8,
+        precision="FP32",
+        precision_assignment_mode="uniform",
+        targets=["cpu_generic"],
+        skip_download=True,
+        calibration_tokens=4,
+        cache_dir=str(work / "compile-cache"),
+    )
+
+
 def _compile(job: dict[str, Any], work: Path) -> dict[str, Any]:
-    from aether import Compiler, CompilerConfig
+    from aether import Compiler
     from aether.core.quality_gate import read_gate
 
-    disabled: dict[str, Any] = {entry.flag: False for entry in PASSES}
     mark_phase(work, "compile")
     began = time.perf_counter()
-    package = Compiler(
-        CompilerConfig(
-            **disabled,
-            quality_mode="diagnostic" if job["diagnostic"] else "require_hf",
-            quality_dataset=job["dataset"],
-            quality_greedy_tokens=8,
-            precision="FP32",
-            precision_assignment_mode="uniform",
-            targets=["cpu_generic"],
-            skip_download=True,
-            calibration_tokens=4,
-            cache_dir=str(work / "compile-cache"),
-        )
-    ).compile(job["fixture"]["model"], output_path=job["artifact"])
+    package = Compiler(_compiler_config(job, work)).compile(
+        job["fixture"]["model"], output_path=job["artifact"]
+    )
     seconds = time.perf_counter() - began
     package.verify_integrity()
     return {
@@ -370,7 +378,8 @@ def main() -> int:
     report: dict[str, Any] = {
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "scope": "Untrained dense FP32 source parity and load/decode measurements",
-        "all_optimizer_passes_disabled": True,
+        "enabled_optimizer_passes": [3],
+        "precision_policy": "Uniform FP32; P3 is required for explicit precision",
         "load_sampling": "Two warmup processes, then alternating role order for each sample",
         "source_revisions": {
             role: subprocess.check_output(

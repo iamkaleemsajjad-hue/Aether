@@ -1,10 +1,11 @@
 """Protect benchmark byte accounting against alias inflation and undercounting."""
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pytest
-from tools.validate_dense_hf import _array_bytes
+from tools.validate_dense_hf import PASSES, _array_bytes, _compiler_config
 
 
 def test_overlapping_views_count_only_their_union() -> None:
@@ -44,3 +45,14 @@ def test_strided_storage_refuses_misleading_contiguous_accounting() -> None:
     storage = np.zeros(32, dtype=np.float32)
     with pytest.raises(ValueError, match="contiguous array spans"):
         _array_bytes(storage[::2])
+
+
+def test_dense_benchmark_config_accepts_fp32_and_disables_unrelated_passes(tmp_path: Path) -> None:
+    """An explicit precision needs P3; validate with the actual compiler config."""
+    config = _compiler_config(
+        {"diagnostic": False, "dataset": str(tmp_path / "probe.jsonl")}, tmp_path
+    )
+    assert [entry.number for entry in PASSES if getattr(config, entry.flag)] == [3]
+    assert config.precision == "FP32"
+    assert config.precision_assignment_mode == "uniform"
+    assert config.quality_mode == "require_hf"

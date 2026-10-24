@@ -50,7 +50,7 @@ python tools/validate_dense_hf.py --output dense-results --baseline-src historic
 The historical checkout must contain the intended baseline `src` tree. The tool
 records both Git revisions and worker source-file hashes. It uses deterministic,
 complete untrained tiny and 27M Llama checkpoints from `pass_audit_fixtures.py`,
-with all 22 optimizer passes explicitly disabled and FP32 packaging. Current
+with only P3 enabled for uniform FP32 packaging. Current
 compilation requires the normal original-Transformers quality admission;
 historical compilation is explicitly diagnostic.
 
@@ -75,6 +75,12 @@ payload hashes are retained; repeated 109 MB fixture/AEG/ONNX payloads are
 regenerated instead of uploaded. The job is not evidence of success until it
 has actually completed. Hosted measurements and before/after results remain
 pending at this checkpoint.
+
+The first hosted attempt on revision `7d5cab5` stopped at configuration
+validation: all passes off plus an explicit FP32 request is deliberately
+invalid. Its original-HF reference ran, but compilation, load and generation
+did not run. The corrected harness selects only P3, preserving the compiler's
+precision contract, and tests this configuration against real validation.
 
 No pass or hardware tier is promoted by adding this measurement. All 22 pass
 dispositions and backend limits remain those in the
