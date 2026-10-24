@@ -1,0 +1,36 @@
+         120341 function calls in 0.132 seconds
+
+   Ordered by: cumulative time
+   List reduced from 93 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       20    0.000    0.000    0.132    0.007 cpu_engine.py:2012(generate)
+       20    0.000    0.000    0.132    0.007 cpu_engine.py:2054(generate_with_cache)
+       20    0.000    0.000    0.132    0.007 {method 'extend' of 'list' objects}
+      180    0.001    0.000    0.131    0.001 cpu_engine.py:2103(generate_iter)
+      180    0.014    0.000    0.126    0.001 cpu_engine.py:1481(forward)
+     8740    0.018    0.000    0.025    0.000 ctypeslib.py:182(from_param)
+     2380    0.009    0.000    0.024    0.000 cpu_engine.py:1012(_linear)
+      900    0.001    0.000    0.024    0.000 cpu_engine.py:1137(_norm)
+      900    0.007    0.000    0.022    0.000 native_cpu.py:1684(rmsnorm)
+     8740    0.003    0.000    0.021    0.000 _internal.py:345(_as_parameter_)
+      720    0.001    0.000    0.020    0.000 cpu_engine.py:676(_apply_rope)
+      720    0.005    0.000    0.018    0.000 native_cpu.py:1929(rope)
+     8740    0.006    0.000    0.017    0.000 _internal.py:267(data_as)
+     2380    0.011    0.000    0.013    0.000 native_cpu.py:1736(sgemm)
+     8740    0.012    0.000    0.012    0.000 __init__.py:511(cast)
+      320    0.004    0.000    0.012    0.000 native_cpu.py:1861(flash_attn)
+      320    0.004    0.000    0.011    0.000 native_cpu.py:1812(rmsnorm_linear)
+      360    0.001    0.000    0.010    0.000 cpu_engine.py:1198(_ffn_activation)
+      360    0.003    0.000    0.009    0.000 native_cpu.py:1709(swiglu)
+     8740    0.006    0.000    0.006    0.000 _internal.py:250(__init__)
+      360    0.003    0.000    0.004    0.000 cpu_engine.py:373(append)
+       40    0.002    0.000    0.003    0.000 cpu_engine.py:1298(_attention)
+    10320    0.003    0.000    0.003    0.000 {method 'reshape' of 'numpy.ndarray' objects}
+      160    0.000    0.000    0.002    0.000 cpu_engine.py:2242(_sample)
+    10760    0.002    0.000    0.002    0.000 {built-in method numpy.ascontiguousarray}
+     2560    0.002    0.000    0.002    0.000 {method 'astype' of 'numpy.ndarray' objects}
+      160    0.001    0.000    0.002    0.000 native_cpu.py:1968(argmax)
+    16100    0.001    0.000    0.001    0.000 {built-in method builtins.isinstance}
+       20    0.000    0.000    0.001    0.000 {numpy.random._generator.default_rng}
+      360    0.001    0.000    0.001    0.000 {method 'reduce' of 'numpy.ufunc' objects}

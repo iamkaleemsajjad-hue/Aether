@@ -1,6 +1,32 @@
 # Aether Runtime implementation status
 
-Reviewed 2026-10-24. The runtime/compiler mission is in progress.
+Reviewed 2026-10-25. The runtime/compiler mission is in progress.
+
+The [dense FP32 loader follow-up](docs/mission-dense-load.md) reuses private
+payloads while keeping existing decoder callers independent. All 17 ownership
+checks and 552 related tests pass. A controlled 27M source comparison uses the
+same certified artifact and checked-hash bytecode caches for both readers:
+observed RSS load delta decreases by **10,244,096 bytes** and sampled load-phase
+peak RSS by **6,393,856 bytes**. Logical weight/KV size and CPU saved logits are
+unchanged. Load time is effectively flat; an earlier apparent **14.79%** gain
+was confounded by source-cache state and is not claimed. All four decode
+medians are lower in the final run, with 27M changes **-3.11%/-0.80%**. General
+generation timing non-regression remains open.
+
+[All 24 CI jobs at `d277e3d`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40121721368)
+pass; security passes separately. The complete hosted suite returns **5,560
+passed, 51 skipped, zero failures**, with **78.812777439%** line coverage. This
+is three covered lines below the initial dense baseline and fifteen below an
+intermediate run on the same production source tree; the variation is retained
+and unexplained. Actual tiny/27M CPU, Torch CPU and ONNX CPU source checks,
+cached continuation, SDK/streaming and CLI pass. All 14 current Mamba-2 and
+nine current Mamba-1 controls also pass. The complete local run returns
+**5,564 passed, 43 skipped, three failures** (two existing MCP HTTP cases and
+unchanged RAM admission), with **78.831926190%** covered lines. The isolated
+RAM check remains blocked before allocation; no guard or test was relaxed.
+The linked report retains raw data, losses, all 22 dispositions and hardware
+tiers. Packed execution, mapped inference weights and trained-model quality
+are not established by this change.
 
 A [Mamba-2 clamp-dispatch follow-up](docs/mission-mamba2-source-parameters.md#clamp-dispatch-profiling-follow-up)
 targets measured NumPy wrapper overhead while preserving the correct source
