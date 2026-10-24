@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from tools.validate_dense_hf import PASSES, _array_bytes, _compiler_config
+from tools.validate_dense_hf import PASSES, _array_bytes, _compiler_config, _load_profile
 
 
 def test_overlapping_views_count_only_their_union() -> None:
@@ -56,3 +56,34 @@ def test_dense_benchmark_config_accepts_fp32_and_disables_unrelated_passes(tmp_p
     assert config.precision == "FP32"
     assert config.precision_assignment_mode == "uniform"
     assert config.quality_mode == "require_hf"
+
+
+def test_load_warms_the_actual_shared_provider(
+    tmp_path: Path, tiny_local_safetensors_model: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Actual artifact loading must not discover another compiler after warmup."""
+    from aether import Compiler
+    from aether.kernels import native_cpu
+
+    job = {"diagnostic": True, "dataset": None}
+    destination = tmp_path / "model.aeg"
+    Compiler(_compiler_config(job, tmp_path)).compile(
+        str(tiny_local_safetensors_model), output_path=destination
+    )
+    discoveries = 0
+
+    def no_compiler() -> None:
+        nonlocal discoveries
+        discoveries += 1
+
+    # A fresh worker starts with no shared provider. Simulate a host without a
+    # compiler; the artifact and real loader still execute their normal paths.
+    monkeypatch.setattr(native_cpu, "_INSTANCE", None)
+    monkeypatch.setattr(native_cpu, "detect_toolchain", no_compiler)
+    work = tmp_path / "load"
+    work.mkdir()
+    result = _load_profile(
+        {"artifact": str(destination), "diagnostic": True, "exercise": False}, work
+    )
+    assert result["status"] == "ok"
+    assert discoveries == 1

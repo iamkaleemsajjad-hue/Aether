@@ -82,6 +82,12 @@ invalid. Its original-HF reference ran, but compilation, load and generation
 did not run. The corrected harness selects only P3, preserving the compiler's
 precision contract, and tests this configuration against real validation.
 
+A real-artifact regression also found two compiler discoveries per load worker:
+warming a standalone provider left the loader's process-wide provider cold.
+The harness now warms `get_native_kernels()` itself. The regression observes
+one discovery; it failed with two before this correction. Any earlier timings
+include that additional discovery and must not be labeled as pure warmed load.
+
 No pass or hardware tier is promoted by adding this measurement. All 22 pass
 dispositions and backend limits remain those in the
 [latest pass and hardware tables](mission-mamba2-source-parameters.md).

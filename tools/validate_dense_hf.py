@@ -175,12 +175,12 @@ def _rows_and_tokens(engine: Any, job: dict[str, Any], work: Path) -> dict[str, 
 def _load_profile(job: dict[str, Any], work: Path) -> dict[str, Any]:
     import numpy as np
 
-    from aether.kernels.native_cpu import NativeCPUKernels
+    from aether.kernels.native_cpu import get_native_kernels
     from aether.runtime.aeg_loader import load_engine_from_path
     from aether.runtime.cpu_engine import CPUExecutionEngine
 
     # Warm code/native-library preparation, not model tensors or a prior model.
-    provider = NativeCPUKernels()
+    provider = get_native_kernels()
     provider.ensure_compiled()
     gc.collect()
     before = mark_phase(work, "load")
