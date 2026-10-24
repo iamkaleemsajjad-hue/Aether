@@ -34,29 +34,25 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from aether import CompilerConfig
-
-if __package__:
-    from .pass_audit import (
-        PASSES,
-        admission,
-        inventory,
-        mark_phase,
-        memory_point,
-        reserve_bytes,
-        run_worker,
-    )
-    from .pass_audit_fixtures import CONTINUATION, PROMPTS, create_fixture, prompt_text, write_json
+    from tools import pass_audit as _audit
+    from tools import pass_audit_fixtures as _fixtures
 else:
-    from pass_audit import (
-        PASSES,
-        admission,
-        inventory,
-        mark_phase,
-        memory_point,
-        reserve_bytes,
-        run_worker,
-    )
-    from pass_audit_fixtures import CONTINUATION, PROMPTS, create_fixture, prompt_text, write_json
+    _prefix = f"{__package__}." if __package__ else ""
+    _audit = importlib.import_module(_prefix + "pass_audit")
+    _fixtures = importlib.import_module(_prefix + "pass_audit_fixtures")
+
+PASSES = _audit.PASSES
+admission = _audit.admission
+inventory = _audit.inventory
+mark_phase = _audit.mark_phase
+memory_point = _audit.memory_point
+reserve_bytes = _audit.reserve_bytes
+run_worker = _audit.run_worker
+CONTINUATION = _fixtures.CONTINUATION
+PROMPTS = _fixtures.PROMPTS
+create_fixture = _fixtures.create_fixture
+prompt_text = _fixtures.prompt_text
+write_json = _fixtures.write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 CODE_FILES = (

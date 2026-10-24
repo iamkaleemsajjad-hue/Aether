@@ -1,5 +1,7 @@
 """Protect benchmark byte accounting against alias inflation and undercounting."""
 
+from __future__ import annotations
+
 import hashlib
 import importlib.util
 import json
@@ -8,16 +10,20 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
+from tools.pass_audit import PASSES
 from tools.validate_dense_hf import (
-    PASSES,
     _array_bytes,
     _compiler_config,
     _load_profile,
     _prepare_source_bytecode,
 )
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 
 def test_overlapping_views_count_only_their_union() -> None:
@@ -25,7 +31,7 @@ def test_overlapping_views_count_only_their_union() -> None:
 
     @dataclass
     class Weights:
-        projection: np.ndarray
+        projection: NDArray[np.generic]
 
     storage = np.zeros(32, dtype=np.float32)
     separate = np.zeros(4, dtype=np.float32)
