@@ -250,8 +250,103 @@ seconds. The two Torch cases also passed against the unchanged pre-stability
 runtime in 6.89 seconds. This does not explain or erase their complete-run
 failures. No numerical tolerance, failing test or resource guard was relaxed.
 Coverage was **45,190 / 57,356 = 78.7886185%**, below the initial correction's
-local **78.8040446%**; the non-reduction criterion remains open. Hosted
-validation of this follow-up is pending.
+local **78.8040446%**; local non-reduction remains open. The hosted follow-up
+below is a separate complete run.
+
+## Hosted optimized result at `bd3db30`
+
+[All 23 CI jobs passed](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40071277073)
+and [security passed separately](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40071277054).
+The complete hosted run returned **5,466 passed, 51 skipped, zero failures**
+in 145.439 JUnit seconds. All six Mamba-2 contracts and nine Mamba-1 controls
+passed original-HF/CPU/Torch CPU admission, public API/streaming and CLI checks.
+Coverage was **45,192 / 57,356 = 78.7921054%**, equal to the recorded epsilon
+hosted run and above the initial piecewise run's **78.7848675%**. The local
+failures and local coverage decrease are retained above.
+
+The [raw optimized Mamba-2 measurements](measurements/mamba2-logsigmoid-hf.json),
+[Mamba-1 controls](measurements/mamba1-control-during-mamba2-logsigmoid.json),
+[provenance](measurements/mamba2-logsigmoid-provenance.json) and
+[dependency freeze](measurements/mamba2-logsigmoid-freeze.txt) retain all cases.
+Again, verification matched **270** implementation-file hashes, both fixture
+hashes and **105** source/reference files against actual bytes and Git revisions.
+
+This worker was **Intel Xeon Platinum 8573C**, four logical CPUs and
+16,765,378,560 host RAM bytes, with Linux 6.17.0-1022 Azure x86_64. Python
+3.11.14, NumPy 1.26.4, Torch 2.9.1+cpu, Transformers 4.57.3, SafeTensors 0.8.0,
+Tokenizers 0.22.2 and psutil 7.2.2 were pinned. Compare current and pre-fix
+`c7af1b6` within this worker; absolute rates from the earlier EPYC run are
+not a controlled comparison against this Xeon run.
+
+Across all six corrected contracts and both executors, worst KL was
+**1.58106e-14**, minimum cosine **0.999999999999793**, maximum absolute logit
+error **3.87430e-7**, greedy agreement **16/16 per executor per contract**,
+and worst relative fixed-label PPL increase **0.00000413237%**.
+
+| Stress contract | Worst KL, pre-fix → optimized | Max absolute logit error, pre-fix → optimized | Greedy IDs, CPU pre-fix → each optimized executor |
+|---|---:|---:|---:|
+| Large delta | 0.328273 → 1.04175e-14 | 1.87893 → 3.57628e-7 | 4/16 → 16/16 |
+| Negative gate | 0.155047 → 1.55532e-15 | 1.43668 → 1.19209e-7 | 2/16 → 16/16 |
+| Negative convolution | 0.219274 → 4.34282e-15 | 1.52825 → 2.38419e-7 | 2/16 → 16/16 |
+
+Timing follows the same two-warmup, seven-repeat, one-thread, eight-ID protocol
+as the initial hosted run. These are tiny, untrained 2,668–4,528-parameter
+FP32 fixtures; first output is an engine measurement, not API TTFT.
+
+| Contract / prompt IDs | Decode IDs/s pre-fix | Decode IDs/s optimized | First output ms pre-fix | First output ms optimized |
+|---|---:|---:|---:|---:|
+| Default / 1 | 8591 [8384,9051] | 9665 [8383,10029] | 0.109026 [0.105117,0.112548] | 0.107827 [0.098962,0.153011] |
+| Default / 64 | 8421 [7702,8729] | 9032 [8553,9814] | 5.41704 [5.37742,5.63994] | 4.99575 [4.87679,5.03639] |
+| Expanded/biased / 1 | 8742 [8574,8924] | 9225 [8581,9781] | 0.111479 [0.106463,0.141661] | 0.104953 [0.102857,0.115971] |
+| Expanded/biased / 64 | 8134 [7733,8549] | 9161 [8585,9269] | 5.70316 [5.61278,5.92421] | 5.22402 [5.19318,5.40503] |
+| Zero epsilon / 1 | 8935 [8798,9043] | 9602 [9197,9974] | 0.106950 [0.102795,0.109735] | 0.103945 [0.099568,0.142300] |
+| Zero epsilon / 64 | 8651 [7637,8944] | 9579 [8510,9762] | 5.32293 [5.24010,6.56933] | 4.87388 [4.79839,5.06074] |
+| Large delta / 1 | 8902 [8612,9010] | 9423 [8856,9850] | 0.108799 [0.105781,0.146753] | 0.106629 [0.097531,0.149792] |
+| Large delta / 64 | 8683 [8475,8780] | 9108 [8795,9545] | 5.39401 [5.28945,5.61247] | 5.01133 [4.90482,5.23032] |
+| Negative gate / 1 | 8739 [8207,8975] | 9120 [8938,9690] | 0.112295 [0.105960,0.128624] | 0.101515 [0.097873,0.110951] |
+| Negative gate / 64 | 8496 [8141,8940] | 9294 [8819,9541] | 5.42468 [5.34398,5.58136] | 5.02178 [4.98421,5.24124] |
+| Negative convolution / 1 | 8904 [8745,9030] | 9743 [8941,10124] | 0.109426 [0.103821,0.112115] | 0.099694 [0.097807,0.125282] |
+| Negative convolution / 64 | 8505 [8348,8941] | 9353 [8568,9692] | 5.39322 [5.27238,5.56860] | 5.00476 [4.90373,5.14194] |
+
+All twelve observed decode medians increased **4.36–12.63%** and first-output
+medians decreased **1.10–9.60%**. Shared-host spreads still matter. The stress
+cases correct different generated sequences, while the three ordinary controls
+retain greedy agreement. These results support this tiny CPU workload; they do
+not certify larger/trained models, accelerators or every serving workload.
+
+| Contract | Logical weights, pre-fix = optimized | SSM state / history bytes, pre-fix = optimized | Artifact bytes, pre-fix → optimized | Compile seconds, diagnostic pre-fix → admitted optimized |
+|---|---:|---:|---:|---:|
+| Default | 10672 | 512 / 384 | 94140 → 102204 | 0.262625 → 6.67577 |
+| Expanded/biased | 18112 | 1024 / 640 | 103806 → 111874 | 0.264225 → 5.24044 |
+| Zero epsilon | 10672 | 512 / 384 | 94139 → 102204 | 0.262455 → 5.13885 |
+| Large delta | 10672 | 512 / 384 | 94144 → 102204 | 0.264175 → 5.15229 |
+| Negative gate | 11072 | 512 / 384 | 96742 → 104804 | 0.263130 → 5.14452 |
+| Negative convolution | 10672 | 512 / 384 | 94146 → 102211 | 0.262103 → 5.11995 |
+
+The admitted build includes numerical-evidence files and reference execution;
+artifact growth and compile time are not a like-for-like performance loss
+attributable to activation arithmetic. Logical weight/cache bytes are unchanged.
+
+A separate physical Windows CPU
+[allocation probe](measurements/mamba2-logsigmoid-traced-allocations.json)
+measured warmed generation after weights and prompt allocation. Five warmups
+and 19 samples produced the following peak traced Python/NumPy bytes:
+
+| Default prompt | Pre-fix median [min,max] | Optimized median [min,max] |
+|---|---:|---:|
+| One ID | 19120 [19120,19300] | 14128 [14128,16615] |
+| 64 IDs | 52496 [52496,55828] | 52040 [52040,55301] |
+
+All sampled generations retained identical eight-ID greedy outputs. An explicit
+4,194,304-byte NumPy allocation produced 4,194,400 traced bytes, verifying that
+the installed NumPy path exposes array-data allocations to this tracer. The
+source weights/tokenizer bytes match the hosted default fixture; source config
+values and LF-normalized bytes match, while the local raw config uses Windows
+CRLF. This is diagnostic local execution, not a new local numerical admission.
+These traced peaks combine transient arrays, caches, outputs and Python objects;
+they exclude loaded weights, prompt and untraced native allocations. Process
+RSS, BLAS-native memory, independent activation/overhead attribution and soak
+behavior remain unmeasured here.
 
 ## Unchanged passes and hardware scope
 

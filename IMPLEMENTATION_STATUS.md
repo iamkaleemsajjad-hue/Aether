@@ -9,8 +9,15 @@ new module lint/type diagnostics. Its complete local run returned **5,470
 passed, 42 skipped, five failures**: the two existing HTTP cases, RAM admission
 and two small exact-equality differences in unchanged Torch paths. The latter
 three passed separately, without relaxing tests; their full-run failures remain
-recorded. Local coverage was **78.7886185%**. Hosted validation and the coverage
-non-reduction criterion remain open. See the
+recorded. Local coverage was **78.7886185%**; local non-reduction remains open.
+[Hosted CI at `bd3db30`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40071277073)
+passed all 23 jobs, and security passed separately. Its complete run returned
+**5,466 passed, 51 skipped, zero failures**, with **78.7921054%** line coverage,
+matching the recorded epsilon hosted run. On that same Xeon worker, six tiny
+Mamba-2 contracts passed original-HF/CPU/Torch CPU admission and API/CLI checks;
+decode medians increased **4.36–12.63%** and first-output medians decreased
+**1.10–9.60%** against the pre-fix runtime. Logical weights/caches are unchanged;
+local traced allocation medians also decreased, without a peak-RSS claim. See the
 [profile, raw series and limits](docs/mission-mamba2-stability.md#profiling-follow-up-stable-log-sigmoid).
 
 The [Mamba-2 finite-input correction](docs/mission-mamba2-stability.md) removes

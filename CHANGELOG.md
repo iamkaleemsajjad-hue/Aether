@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clipping finite inputs. Original-HF and independent scalar/matrix regressions
   cover large time steps and negative convolution/gate values through real AEG
   execution and cached continuation. A profiling follow-up reduces NumPy
-  dispatches with an equivalent log-sigmoid identity; preliminary interleaved
-  timings and complete-run failures remain explicit. See
+  dispatches with an equivalent log-sigmoid identity. Hosted tiny-CPU decode
+  and first-output medians improve against the pre-fix runtime, with unchanged
+  logical weights/caches and lower local traced allocation peaks. Complete local
+  failures, timing spreads and the larger-model/RSS limits remain explicit. See
   [numerical evidence and validation limits](docs/mission-mamba2-stability.md).
 - Preserve explicitly declared zero normalization epsilon across dense/MoE,
   MLA, hybrid, Mamba-2, RWKV and encoder AEG loading. Retain existing null
