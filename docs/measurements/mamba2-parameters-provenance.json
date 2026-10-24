@@ -1,0 +1,2299 @@
+{
+  "current_revision": "5c149735127cd84e4418707c1a7f1f3a00fcf1c2",
+  "baseline_revision": "19dad4ef58137ea6f2db0f277bfd4ee261b05ca3",
+  "ci_run": "https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40076617018",
+  "security_run": "https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40076617020",
+  "fixture_code_hashes_verified": true,
+  "reported_code_hashes_verified": 496,
+  "source_and_reference_files_verified": 161,
+  "artifact_packages_reverified": 43,
+  "measurements": {
+    "mamba2": {
+      "report_sha256": "b1f8faee3f6acfbc94fb84621a95646c109efacfd5f2e2542f28f9fdbfbde843",
+      "hardware": {
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "logical_cpus": 4,
+        "host_ram_bytes": 16765378560,
+        "available_ram_bytes_at_start": 15602483200
+      },
+      "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+      "python": "3.11.14",
+      "versions": {
+        "numpy": "1.26.4",
+        "torch": "2.9.1+cpu",
+        "transformers": "4.57.3",
+        "psutil": "7.2.2",
+        "safetensors": "0.8.0",
+        "tokenizers": "0.22.2"
+      },
+      "cases": [
+        {
+          "case": "default",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 5.2045951653226326e-15,
+              "min_cosine": 0.9999999999999462,
+              "max_absolute_logit_error": 2.384185791015625e-07,
+              "max_relative_ppl_change": 3.890274134120157e-08,
+              "min_relative_ppl_change": -5.2245480353876114e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 9.184767273429185e-15,
+              "min_cosine": 0.9999999999999107,
+              "max_absolute_logit_error": 2.980232238769531e-07,
+              "max_relative_ppl_change": 3.021278561898173e-08,
+              "min_relative_ppl_change": -4.321285191790652e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 9.184767273429185e-15,
+            "min_cosine": 0.9999999999999107,
+            "max_absolute_logit_error": 2.980232238769531e-07,
+            "max_relative_ppl_change": 3.890274134120157e-08,
+            "min_relative_ppl_change": -5.2245480353876114e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 5.2045951653226326e-15,
+            "min_cosine": 0.9999999999999462,
+            "max_absolute_logit_error": 2.384185791015625e-07,
+            "max_relative_ppl_change": 3.890274134120157e-08,
+            "min_relative_ppl_change": -5.2245480353876114e-08,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7376.325367627413,
+                "min_decode_tokens_per_second": 7278.724185318249,
+                "max_decode_tokens_per_second": 7486.783153879594,
+                "median_first_token_seconds": 0.0001297470000025669,
+                "min_first_token_seconds": 0.00012553100000900486,
+                "max_first_token_seconds": 0.0001388409999947271
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7312.316343350377,
+                "min_decode_tokens_per_second": 7230.568363919476,
+                "max_decode_tokens_per_second": 7364.506236223693,
+                "median_first_token_seconds": 0.00629508999999473,
+                "min_first_token_seconds": 0.006272809999998685,
+                "max_first_token_seconds": 0.006346384000011085
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 7291.226155056217,
+                "min_decode_tokens_per_second": 6628.800433345289,
+                "max_decode_tokens_per_second": 7337.88002359342,
+                "median_first_token_seconds": 0.00012886599999717419,
+                "min_first_token_seconds": 0.00012488400000165711,
+                "max_first_token_seconds": 0.00015847100000598857
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7339.518800259365,
+                "min_decode_tokens_per_second": 6818.418691804917,
+                "max_decode_tokens_per_second": 7427.615236866191,
+                "median_first_token_seconds": 0.006327784999996311,
+                "min_first_token_seconds": 0.00627355000000307,
+                "max_first_token_seconds": 0.00664767299998914
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94140,
+              "compile_seconds": 0.2857700910000034
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102204,
+              "compile_seconds": 8.214684588000011
+            }
+          },
+          "saved_fixed_label_logits_identical": true
+        },
+        {
+          "case": "expanded-biased",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 9.894570466542835e-15,
+              "min_cosine": 0.9999999999998972,
+              "max_absolute_logit_error": 2.980232238769531e-07,
+              "max_relative_ppl_change": -4.08058725144233e-08,
+              "min_relative_ppl_change": -4.1457327377660625e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 8.708161554822174e-15,
+              "min_cosine": 0.9999999999999145,
+              "max_absolute_logit_error": 2.8312206268310547e-07,
+              "max_relative_ppl_change": -4.253232342465936e-08,
+              "min_relative_ppl_change": -6.863277621626887e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 9.894570466542835e-15,
+            "min_cosine": 0.9999999999998972,
+            "max_absolute_logit_error": 2.980232238769531e-07,
+            "max_relative_ppl_change": -4.08058725144233e-08,
+            "min_relative_ppl_change": -6.863277621626887e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok12 tok7 tok2 tok7 tok15 tok9 tok15 tok9",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok12 tok7 tok2 tok7 tok15 tok9 tok15 tok9",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 9.894570466542835e-15,
+            "min_cosine": 0.9999999999998972,
+            "max_absolute_logit_error": 2.980232238769531e-07,
+            "max_relative_ppl_change": -4.08058725144233e-08,
+            "min_relative_ppl_change": -4.1457327377660625e-08,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7002.044597058573,
+                "min_decode_tokens_per_second": 6847.378774461004,
+                "max_decode_tokens_per_second": 7091.968649463175,
+                "median_first_token_seconds": 0.00013544299999068699,
+                "min_first_token_seconds": 0.0001319969999968862,
+                "max_first_token_seconds": 0.00014525099999218583
+              },
+              "long": {
+                "median_decode_tokens_per_second": 6988.9783810168765,
+                "min_decode_tokens_per_second": 6899.807889621845,
+                "max_decode_tokens_per_second": 6996.683572027049,
+                "median_first_token_seconds": 0.006702512000003935,
+                "min_first_token_seconds": 0.006685380999996937,
+                "max_first_token_seconds": 0.0068306659999990416
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 6974.424784272808,
+                "min_decode_tokens_per_second": 6852.607270242027,
+                "max_decode_tokens_per_second": 7112.064805099237,
+                "median_first_token_seconds": 0.00013324999999042575,
+                "min_first_token_seconds": 0.00013097599999412068,
+                "max_first_token_seconds": 0.00016221499998891886
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7003.761019671604,
+                "min_decode_tokens_per_second": 6580.951342319095,
+                "max_decode_tokens_per_second": 7070.321416819012,
+                "median_first_token_seconds": 0.006693259000002172,
+                "min_first_token_seconds": 0.0066465740000012374,
+                "max_first_token_seconds": 0.006799798000002966
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 18112,
+              "ssm_state_logical_bytes": 1024,
+              "convolution_history_logical_bytes": 640,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 103806,
+              "compile_seconds": 0.2796780740000031
+            },
+            "current": {
+              "loaded_weight_array_bytes": 18112,
+              "ssm_state_logical_bytes": 1024,
+              "convolution_history_logical_bytes": 640,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 111868,
+              "compile_seconds": 5.534802966000001
+            }
+          },
+          "saved_fixed_label_logits_identical": true
+        },
+        {
+          "case": "zero-epsilon",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 2.070067322470409e-14,
+              "min_cosine": 0.9999999999997122,
+              "max_absolute_logit_error": 3.7532299757003784e-07,
+              "max_relative_ppl_change": 8.764564436387233e-08,
+              "min_relative_ppl_change": -1.0834180876184486e-07,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.0227739689192818e-14,
+              "min_cosine": 0.9999999999998372,
+              "max_absolute_logit_error": 3.8743019104003906e-07,
+              "max_relative_ppl_change": 1.179612681164395e-08,
+              "min_relative_ppl_change": -4.156137036978238e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 2.070067322470409e-14,
+            "min_cosine": 0.9999999999997122,
+            "max_absolute_logit_error": 3.8743019104003906e-07,
+            "max_relative_ppl_change": 8.764564436387233e-08,
+            "min_relative_ppl_change": -1.0834180876184486e-07,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 2.070067322470409e-14,
+            "min_cosine": 0.9999999999997122,
+            "max_absolute_logit_error": 3.7532299757003784e-07,
+            "max_relative_ppl_change": 8.764564436387233e-08,
+            "min_relative_ppl_change": -1.0834180876184486e-07,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7221.497779931371,
+                "min_decode_tokens_per_second": 7192.773523190787,
+                "max_decode_tokens_per_second": 7280.957591578633,
+                "median_first_token_seconds": 0.00013028799999403873,
+                "min_first_token_seconds": 0.00012704200000257515,
+                "max_first_token_seconds": 0.00016830500000253323
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7277.702574886945,
+                "min_decode_tokens_per_second": 7214.018280337667,
+                "max_decode_tokens_per_second": 7370.3839021845115,
+                "median_first_token_seconds": 0.006323693000013009,
+                "min_first_token_seconds": 0.006310946999988687,
+                "max_first_token_seconds": 0.00637640200000078
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 7387.543124766142,
+                "min_decode_tokens_per_second": 7163.595019446756,
+                "max_decode_tokens_per_second": 7501.505659282848,
+                "median_first_token_seconds": 0.00012850699999944482,
+                "min_first_token_seconds": 0.000125810000000115,
+                "max_first_token_seconds": 0.00018054600000994014
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7344.015728690297,
+                "min_decode_tokens_per_second": 7302.658689405308,
+                "max_decode_tokens_per_second": 7379.684782005134,
+                "median_first_token_seconds": 0.006331623000008335,
+                "min_first_token_seconds": 0.006291373999999905,
+                "max_first_token_seconds": 0.006428585999998404
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94093,
+              "compile_seconds": 0.2791078260000006
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102208,
+              "compile_seconds": 5.631813455
+            }
+          },
+          "saved_fixed_label_logits_identical": true
+        },
+        {
+          "case": "large-delta",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.1371277629581429e-14,
+              "min_cosine": 0.9999999999999354,
+              "max_absolute_logit_error": 3.5762786865234375e-07,
+              "max_relative_ppl_change": 4.280564128178994e-08,
+              "min_relative_ppl_change": 2.6812433522057356e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.028359461125828e-14,
+              "min_cosine": 0.9999999999999054,
+              "max_absolute_logit_error": 2.980232238769531e-07,
+              "max_relative_ppl_change": 1.8633641914312557e-08,
+              "min_relative_ppl_change": 6.526001538254271e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.1371277629581429e-14,
+            "min_cosine": 0.9999999999999054,
+            "max_absolute_logit_error": 3.5762786865234375e-07,
+            "max_relative_ppl_change": 4.280564128178994e-08,
+            "min_relative_ppl_change": 6.526001538254271e-09,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok15 tok10 tok7 tok2 tok14 tok7 tok15 tok12",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok15 tok10 tok7 tok2 tok14 tok7 tok15 tok12",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 1.1371277629581429e-14,
+            "min_cosine": 0.9999999999999354,
+            "max_absolute_logit_error": 3.5762786865234375e-07,
+            "max_relative_ppl_change": 4.280564128178994e-08,
+            "min_relative_ppl_change": 2.6812433522057356e-08,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7188.04648419899,
+                "min_decode_tokens_per_second": 6819.255629547845,
+                "max_decode_tokens_per_second": 7332.24606606905,
+                "median_first_token_seconds": 0.00013085399999113179,
+                "min_first_token_seconds": 0.00012701500000389387,
+                "max_first_token_seconds": 0.00015757700001017838
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7268.453044777091,
+                "min_decode_tokens_per_second": 7218.868885846557,
+                "max_decode_tokens_per_second": 7296.340885142141,
+                "median_first_token_seconds": 0.006337331999986873,
+                "min_first_token_seconds": 0.00631843499999718,
+                "max_first_token_seconds": 0.006416205000022046
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 7273.8608613658125,
+                "min_decode_tokens_per_second": 6974.237167966577,
+                "max_decode_tokens_per_second": 7403.004773893895,
+                "median_first_token_seconds": 0.00012961699999891607,
+                "min_first_token_seconds": 0.00012569800000505893,
+                "max_first_token_seconds": 0.00014487600000734346
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7277.573947946961,
+                "min_decode_tokens_per_second": 7123.695854798737,
+                "max_decode_tokens_per_second": 7304.87631786378,
+                "median_first_token_seconds": 0.006393541000022651,
+                "min_first_token_seconds": 0.0063614190000009785,
+                "max_first_token_seconds": 0.006451660999999831
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94144,
+              "compile_seconds": 0.28154497700001
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102204,
+              "compile_seconds": 5.348972855000028
+            }
+          },
+          "saved_fixed_label_logits_identical": true
+        },
+        {
+          "case": "negative-gate",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.3046524266913043e-15,
+              "min_cosine": 0.9999999999999938,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 2.0798237126763104e-08,
+              "min_relative_ppl_change": 1.4258264892716234e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.1152511406198482e-15,
+              "min_cosine": 0.9999999999999947,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 1.9859703412478657e-08,
+              "min_relative_ppl_change": 6.835233735725817e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.3046524266913043e-15,
+            "min_cosine": 0.9999999999999938,
+            "max_absolute_logit_error": 1.1920928955078125e-07,
+            "max_relative_ppl_change": 2.0798237126763104e-08,
+            "min_relative_ppl_change": 6.835233735725817e-09,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok15 tok14 tok3 tok15 tok14 tok3 tok15 tok14",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok15 tok14 tok3 tok15 tok14 tok3 tok15 tok14",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 1.3046524266913043e-15,
+            "min_cosine": 0.9999999999999938,
+            "max_absolute_logit_error": 1.1920928955078125e-07,
+            "max_relative_ppl_change": 2.0798237126763104e-08,
+            "min_relative_ppl_change": 1.4258264892716234e-08,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7184.387300092008,
+                "min_decode_tokens_per_second": 7032.85044458759,
+                "max_decode_tokens_per_second": 7233.684167122147,
+                "median_first_token_seconds": 0.00013224799999989045,
+                "min_first_token_seconds": 0.00012902299999950628,
+                "max_first_token_seconds": 0.00014849500001901106
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7101.862006755196,
+                "min_decode_tokens_per_second": 7022.049234691345,
+                "max_decode_tokens_per_second": 7158.847670878146,
+                "median_first_token_seconds": 0.006474219000011772,
+                "min_first_token_seconds": 0.006437734999991562,
+                "max_first_token_seconds": 0.006537253999994164
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 7059.283865911945,
+                "min_decode_tokens_per_second": 6837.28626151011,
+                "max_decode_tokens_per_second": 7295.4663885786695,
+                "median_first_token_seconds": 0.00013194100000646358,
+                "min_first_token_seconds": 0.0001270949999820914,
+                "max_first_token_seconds": 0.00014563400000611182
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7202.00174483356,
+                "min_decode_tokens_per_second": 6865.6865735625315,
+                "max_decode_tokens_per_second": 7281.3817149578945,
+                "median_first_token_seconds": 0.00647878000000901,
+                "min_first_token_seconds": 0.006441862999992054,
+                "max_first_token_seconds": 0.006532932999988361
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 11072,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 96742,
+              "compile_seconds": 0.280310959000019
+            },
+            "current": {
+              "loaded_weight_array_bytes": 11072,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 104814,
+              "compile_seconds": 5.441332915000004
+            }
+          },
+          "saved_fixed_label_logits_identical": true
+        },
+        {
+          "case": "negative-conv",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 3.971226550137208e-15,
+              "min_cosine": 0.9999999999999883,
+              "max_absolute_logit_error": 2.384185791015625e-07,
+              "max_relative_ppl_change": 3.89311865884671e-08,
+              "min_relative_ppl_change": -1.9595530339554092e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 2.9775910062847998e-15,
+              "min_cosine": 0.9999999999999865,
+              "max_absolute_logit_error": 1.7881393432617188e-07,
+              "max_relative_ppl_change": 1.6136862643093536e-08,
+              "min_relative_ppl_change": 6.133751286546013e-10,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 3.971226550137208e-15,
+            "min_cosine": 0.9999999999999865,
+            "max_absolute_logit_error": 2.384185791015625e-07,
+            "max_relative_ppl_change": 3.89311865884671e-08,
+            "min_relative_ppl_change": -1.9595530339554092e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok2 tok2 tok2 tok2 tok2 tok2 tok2",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok6 tok2 tok2 tok2 tok2 tok2 tok2 tok2",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 3.971226550137208e-15,
+            "min_cosine": 0.9999999999999883,
+            "max_absolute_logit_error": 2.384185791015625e-07,
+            "max_relative_ppl_change": 3.89311865884671e-08,
+            "min_relative_ppl_change": -1.9595530339554092e-08,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7324.190650789212,
+                "min_decode_tokens_per_second": 7131.178019518644,
+                "max_decode_tokens_per_second": 7423.637285371467,
+                "median_first_token_seconds": 0.00012932600000681305,
+                "min_first_token_seconds": 0.00012533199998188138,
+                "max_first_token_seconds": 0.0001444270000092729
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7278.799871415554,
+                "min_decode_tokens_per_second": 6975.738381899221,
+                "max_decode_tokens_per_second": 7339.826633402358,
+                "median_first_token_seconds": 0.006337860000002138,
+                "min_first_token_seconds": 0.006292535999989468,
+                "max_first_token_seconds": 0.006403420999987475
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 7309.674354070146,
+                "min_decode_tokens_per_second": 7232.944201007347,
+                "max_decode_tokens_per_second": 7454.421536955702,
+                "median_first_token_seconds": 0.00012926700000548408,
+                "min_first_token_seconds": 0.00012460700000360703,
+                "max_first_token_seconds": 0.00015221399999632013
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7305.768321518598,
+                "min_decode_tokens_per_second": 7250.257125284481,
+                "max_decode_tokens_per_second": 7404.704102805526,
+                "median_first_token_seconds": 0.00637347399998589,
+                "min_first_token_seconds": 0.006330125999994607,
+                "max_first_token_seconds": 0.006483671000012237
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94146,
+              "compile_seconds": 0.278379354000009
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102204,
+              "compile_seconds": 5.4304297529999985
+            }
+          },
+          "saved_fixed_label_logits_identical": true
+        },
+        {
+          "case": "upper-limit",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 5.831899841668899e-15,
+              "min_cosine": 0.999999999999955,
+              "max_absolute_logit_error": 2.384185791015625e-07,
+              "max_relative_ppl_change": -1.866609531865173e-09,
+              "min_relative_ppl_change": -2.265138761995066e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 5.524430392576903e-15,
+              "min_cosine": 0.9999999999999323,
+              "max_absolute_logit_error": 2.980232238769531e-07,
+              "max_relative_ppl_change": -2.074764338792604e-08,
+              "min_relative_ppl_change": -3.370072741816066e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 5.831899841668899e-15,
+            "min_cosine": 0.9999999999999323,
+            "max_absolute_logit_error": 2.980232238769531e-07,
+            "max_relative_ppl_change": -1.866609531865173e-09,
+            "min_relative_ppl_change": -3.370072741816066e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 1.698785564369322e-07,
+            "min_cosine": 0.9999976914611833,
+            "max_absolute_logit_error": 0.0012505948543548584,
+            "max_relative_ppl_change": -0.00013564213107972281,
+            "min_relative_ppl_change": -0.00019402323306304256,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7383.872778131759,
+                "min_decode_tokens_per_second": 7244.022129377662,
+                "max_decode_tokens_per_second": 7427.000542020711,
+                "median_first_token_seconds": 0.00012849699999151198,
+                "min_first_token_seconds": 0.00012471299999106122,
+                "max_first_token_seconds": 0.00012968699999760247
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7340.365403487122,
+                "min_decode_tokens_per_second": 7209.552863467671,
+                "max_decode_tokens_per_second": 7400.156037687163,
+                "median_first_token_seconds": 0.006297182999986717,
+                "min_first_token_seconds": 0.006261692000009589,
+                "max_first_token_seconds": 0.006911792000011019
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 7125.146065589936,
+                "min_decode_tokens_per_second": 6891.29668591214,
+                "max_decode_tokens_per_second": 7208.699045975173,
+                "median_first_token_seconds": 0.00013388900001132242,
+                "min_first_token_seconds": 0.00013105299998983355,
+                "max_first_token_seconds": 0.0001437630000111767
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7024.430970858157,
+                "min_decode_tokens_per_second": 6853.861955484521,
+                "max_decode_tokens_per_second": 7089.598343946018,
+                "median_first_token_seconds": 0.006675107000006619,
+                "min_first_token_seconds": 0.006614350000006652,
+                "max_first_token_seconds": 0.006791012999997292
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94144,
+              "compile_seconds": 0.28113873099999864
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102443,
+              "compile_seconds": 5.425851175999981
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        },
+        {
+          "case": "lower-limit",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 8.527474901054094e-15,
+              "min_cosine": 0.999999999999939,
+              "max_absolute_logit_error": 2.980232238769531e-07,
+              "max_relative_ppl_change": 2.632604524613532e-08,
+              "min_relative_ppl_change": -2.3030283636962013e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.0135766118309913e-14,
+              "min_cosine": 0.9999999999999102,
+              "max_absolute_logit_error": 4.172325134277344e-07,
+              "max_relative_ppl_change": -4.766065752914607e-09,
+              "min_relative_ppl_change": -3.244860860652842e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.0135766118309913e-14,
+            "min_cosine": 0.9999999999999102,
+            "max_absolute_logit_error": 4.172325134277344e-07,
+            "max_relative_ppl_change": 2.632604524613532e-08,
+            "min_relative_ppl_change": -3.244860860652842e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 4.111519135034495e-06,
+            "min_cosine": 0.9999369052516011,
+            "max_absolute_logit_error": 0.0062219202518463135,
+            "max_relative_ppl_change": 0.000502025730422848,
+            "min_relative_ppl_change": -0.00036053375244304685,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7364.436505022344,
+                "min_decode_tokens_per_second": 7332.24606606905,
+                "max_decode_tokens_per_second": 7403.07523738941,
+                "median_first_token_seconds": 0.00012781300000597184,
+                "min_first_token_seconds": 0.0001257950000024266,
+                "max_first_token_seconds": 0.00014933900001778966
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7278.845284087606,
+                "min_decode_tokens_per_second": 6795.73383247845,
+                "max_decode_tokens_per_second": 7368.157350167125,
+                "median_first_token_seconds": 0.006332619999994904,
+                "min_first_token_seconds": 0.006308183000015788,
+                "max_first_token_seconds": 0.006378130000001647
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 7022.028102074247,
+                "min_decode_tokens_per_second": 6837.232835084969,
+                "max_decode_tokens_per_second": 7108.309309004839,
+                "median_first_token_seconds": 0.00013489699998103788,
+                "min_first_token_seconds": 0.00013251799998670322,
+                "max_first_token_seconds": 0.000151536000004171
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7034.490104880355,
+                "min_decode_tokens_per_second": 6957.600383331477,
+                "max_decode_tokens_per_second": 7062.838070384003,
+                "median_first_token_seconds": 0.006657833000019764,
+                "min_first_token_seconds": 0.006645404000011013,
+                "max_first_token_seconds": 0.006757503999978098
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94144,
+              "compile_seconds": 0.279138004999993
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102472,
+              "compile_seconds": 5.3771628169999985
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        },
+        {
+          "case": "zero-limit",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 6.990908814152131e-15,
+              "min_cosine": 0.999999999999952,
+              "max_absolute_logit_error": 2.384185791015625e-07,
+              "max_relative_ppl_change": 3.984145937038798e-08,
+              "min_relative_ppl_change": -6.760371767026884e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 8.240533696001018e-15,
+              "min_cosine": 0.9999999999998745,
+              "max_absolute_logit_error": 3.5762786865234375e-07,
+              "max_relative_ppl_change": 3.7476102479629684e-08,
+              "min_relative_ppl_change": -4.6665742180768034e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 8.240533696001018e-15,
+            "min_cosine": 0.9999999999998745,
+            "max_absolute_logit_error": 3.5762786865234375e-07,
+            "max_relative_ppl_change": 3.984145937038798e-08,
+            "min_relative_ppl_change": -6.760371767026884e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 2.409419693733973e-07,
+            "min_cosine": 0.9999967208162018,
+            "max_absolute_logit_error": 0.0014320015907287598,
+            "max_relative_ppl_change": -0.000137856346198204,
+            "min_relative_ppl_change": -0.000190324337675803,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7227.410470464865,
+                "min_decode_tokens_per_second": 7189.914399033671,
+                "max_decode_tokens_per_second": 7264.568313347825,
+                "median_first_token_seconds": 0.00012984400001414542,
+                "min_first_token_seconds": 0.00012590400001499802,
+                "max_first_token_seconds": 0.00015416000002232977
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7301.32571208069,
+                "min_decode_tokens_per_second": 7225.351487492775,
+                "max_decode_tokens_per_second": 7347.446027869319,
+                "median_first_token_seconds": 0.006314131000010548,
+                "min_first_token_seconds": 0.006302603999984058,
+                "max_first_token_seconds": 0.006333252000018774
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 6984.598959351776,
+                "min_decode_tokens_per_second": 6878.0656521620285,
+                "max_decode_tokens_per_second": 7097.001820708309,
+                "median_first_token_seconds": 0.00013309999999933098,
+                "min_first_token_seconds": 0.00013071000000763888,
+                "max_first_token_seconds": 0.00014191500000038104
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7010.18580000465,
+                "min_decode_tokens_per_second": 6923.399507771796,
+                "max_decode_tokens_per_second": 7063.265670618218,
+                "median_first_token_seconds": 0.006727941999997711,
+                "min_first_token_seconds": 0.0067098760000021684,
+                "max_first_token_seconds": 0.006817171999983884
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94143,
+              "compile_seconds": 0.2798903380000013
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102467,
+              "compile_seconds": 5.428695869999984
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        },
+        {
+          "case": "open-upper-limit",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 8.527474901054094e-15,
+              "min_cosine": 0.999999999999939,
+              "max_absolute_logit_error": 2.980232238769531e-07,
+              "max_relative_ppl_change": 2.632604524613532e-08,
+              "min_relative_ppl_change": -2.3030283636962013e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.0135766118309913e-14,
+              "min_cosine": 0.9999999999999102,
+              "max_absolute_logit_error": 4.172325134277344e-07,
+              "max_relative_ppl_change": -4.766065752914607e-09,
+              "min_relative_ppl_change": -3.244860860652842e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.0135766118309913e-14,
+            "min_cosine": 0.9999999999999102,
+            "max_absolute_logit_error": 4.172325134277344e-07,
+            "max_relative_ppl_change": 2.632604524613532e-08,
+            "min_relative_ppl_change": -3.244860860652842e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 4.111519135034495e-06,
+            "min_cosine": 0.9999369052516011,
+            "max_absolute_logit_error": 0.0062219202518463135,
+            "max_relative_ppl_change": 0.000502025730422848,
+            "min_relative_ppl_change": -0.00036053375244304685,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7381.311152865832,
+                "min_decode_tokens_per_second": 7313.622771678207,
+                "max_decode_tokens_per_second": 7454.659694815199,
+                "median_first_token_seconds": 0.0001264260000084505,
+                "min_first_token_seconds": 0.00012522699998385178,
+                "max_first_token_seconds": 0.00012926599998763777
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7367.001935302649,
+                "min_decode_tokens_per_second": 7301.0744052503105,
+                "max_decode_tokens_per_second": 7385.6568434953415,
+                "median_first_token_seconds": 0.006317999999993162,
+                "min_first_token_seconds": 0.0063018689999978506,
+                "max_first_token_seconds": 0.006342818000007355
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 7008.54341447318,
+                "min_decode_tokens_per_second": 6805.88261594102,
+                "max_decode_tokens_per_second": 7082.926908326421,
+                "median_first_token_seconds": 0.00013556499999367588,
+                "min_first_token_seconds": 0.00013190300001042488,
+                "max_first_token_seconds": 0.00017167800001516298
+              },
+              "long": {
+                "median_decode_tokens_per_second": 6910.583954272509,
+                "min_decode_tokens_per_second": 6831.541029779767,
+                "max_decode_tokens_per_second": 6976.447513196223,
+                "median_first_token_seconds": 0.0068067619999965245,
+                "min_first_token_seconds": 0.006717449000007036,
+                "max_first_token_seconds": 0.006861448999984532
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94149,
+              "compile_seconds": 0.28133437200000344
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102433,
+              "compile_seconds": 5.399943983000014
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        },
+        {
+          "case": "open-lower-limit",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 5.831899841668899e-15,
+              "min_cosine": 0.999999999999955,
+              "max_absolute_logit_error": 2.384185791015625e-07,
+              "max_relative_ppl_change": -1.866609531865173e-09,
+              "min_relative_ppl_change": -2.265138761995066e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 5.524430392576903e-15,
+              "min_cosine": 0.9999999999999323,
+              "max_absolute_logit_error": 2.980232238769531e-07,
+              "max_relative_ppl_change": -2.074764338792604e-08,
+              "min_relative_ppl_change": -3.370072741816066e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 5.831899841668899e-15,
+            "min_cosine": 0.9999999999999323,
+            "max_absolute_logit_error": 2.980232238769531e-07,
+            "max_relative_ppl_change": -1.866609531865173e-09,
+            "min_relative_ppl_change": -3.370072741816066e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 1.698785564369322e-07,
+            "min_cosine": 0.9999976914611833,
+            "max_absolute_logit_error": 0.0012505948543548584,
+            "max_relative_ppl_change": -0.00013564213107972281,
+            "min_relative_ppl_change": -0.00019402323306304256,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7446.856043822673,
+                "min_decode_tokens_per_second": 7329.5129119479425,
+                "max_decode_tokens_per_second": 7483.413548544496,
+                "median_first_token_seconds": 0.00012980799999695591,
+                "min_first_token_seconds": 0.00012520699999640783,
+                "max_first_token_seconds": 0.00013615299999969466
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7346.420456628808,
+                "min_decode_tokens_per_second": 7258.888249476118,
+                "max_decode_tokens_per_second": 7351.7442013648315,
+                "median_first_token_seconds": 0.006319598999994014,
+                "min_first_token_seconds": 0.006289587999987134,
+                "max_first_token_seconds": 0.006337969000014709
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 7024.614248332693,
+                "min_decode_tokens_per_second": 6953.460488991165,
+                "max_decode_tokens_per_second": 7153.967692834874,
+                "median_first_token_seconds": 0.00013369200001989157,
+                "min_first_token_seconds": 0.0001296240000101534,
+                "max_first_token_seconds": 0.00016887999998971281
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7052.42774782191,
+                "min_decode_tokens_per_second": 6957.911592696154,
+                "max_decode_tokens_per_second": 7092.874093317591,
+                "median_first_token_seconds": 0.006666890000019521,
+                "min_first_token_seconds": 0.00660933199998226,
+                "max_first_token_seconds": 0.006731607999995504
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94149,
+              "compile_seconds": 0.28113000999999826
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102496,
+              "compile_seconds": 5.4159130960000255
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        },
+        {
+          "case": "inverted-limits",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 6.339183502957143e-15,
+              "min_cosine": 0.9999999999999469,
+              "max_absolute_logit_error": 2.980232238769531e-07,
+              "max_relative_ppl_change": 1.5289303168550527e-09,
+              "min_relative_ppl_change": -6.606257278386524e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 7.766076647691104e-15,
+              "min_cosine": 0.9999999999998996,
+              "max_absolute_logit_error": 3.5762786865234375e-07,
+              "max_relative_ppl_change": -2.856360033304924e-09,
+              "min_relative_ppl_change": -4.871573781172788e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 7.766076647691104e-15,
+            "min_cosine": 0.9999999999998996,
+            "max_absolute_logit_error": 3.5762786865234375e-07,
+            "max_relative_ppl_change": 1.5289303168550527e-09,
+            "min_relative_ppl_change": -6.606257278386524e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok2 tok2 tok15 tok2 tok15 tok6 tok6 tok6",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 1.929612836020786e-08,
+            "min_cosine": 0.9999996868700548,
+            "max_absolute_logit_error": 0.0005602575838565826,
+            "max_relative_ppl_change": 0.00010851583583155768,
+            "min_relative_ppl_change": 9.437552670620028e-06,
+            "matched_ids": 16,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7210.028119085248,
+                "min_decode_tokens_per_second": 7183.944909509563,
+                "max_decode_tokens_per_second": 7460.356200113886,
+                "median_first_token_seconds": 0.00013181599999256832,
+                "min_first_token_seconds": 0.00012697500000058426,
+                "max_first_token_seconds": 0.00015070500001002074
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7298.562287450017,
+                "min_decode_tokens_per_second": 7042.033900317724,
+                "max_decode_tokens_per_second": 7349.513462159566,
+                "median_first_token_seconds": 0.006300542999980507,
+                "min_first_token_seconds": 0.006259246000013263,
+                "max_first_token_seconds": 0.006371209999997518
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 7044.131483684313,
+                "min_decode_tokens_per_second": 6865.646169951595,
+                "max_decode_tokens_per_second": 7122.702801126192,
+                "median_first_token_seconds": 0.00013284900001053757,
+                "min_first_token_seconds": 0.0001314929999978176,
+                "max_first_token_seconds": 0.00015398499999719206
+              },
+              "long": {
+                "median_decode_tokens_per_second": 6995.124398329736,
+                "min_decode_tokens_per_second": 6954.275637744303,
+                "max_decode_tokens_per_second": 7057.269743837076,
+                "median_first_token_seconds": 0.00666469700001926,
+                "min_first_token_seconds": 0.006630507000011221,
+                "max_first_token_seconds": 0.0068514989999926
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94148,
+              "compile_seconds": 0.27505492399998843
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102477,
+              "compile_seconds": 5.4787758090000125
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        },
+        {
+          "case": "relu-convolution",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 4.945311563372663e-15,
+              "min_cosine": 0.9999999999999406,
+              "max_absolute_logit_error": 3.2782554626464844e-07,
+              "max_relative_ppl_change": 3.260896450517393e-08,
+              "min_relative_ppl_change": -2.1749065423037777e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 6.130440627335177e-15,
+              "min_cosine": 0.9999999999999253,
+              "max_absolute_logit_error": 2.384185791015625e-07,
+              "max_relative_ppl_change": 2.2834403073737263e-08,
+              "min_relative_ppl_change": -3.945296988993942e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 6.130440627335177e-15,
+            "min_cosine": 0.9999999999999253,
+            "max_absolute_logit_error": 3.2782554626464844e-07,
+            "max_relative_ppl_change": 3.260896450517393e-08,
+            "min_relative_ppl_change": -3.945296988993942e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok12 tok6 tok2 tok6 tok6 tok6 tok6 tok6",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok12 tok6 tok2 tok6 tok6 tok6 tok6 tok6",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 0.04521880697997864,
+            "min_cosine": 0.3837516833509111,
+            "max_absolute_logit_error": 0.7269037961959839,
+            "max_relative_ppl_change": 0.07790958174457849,
+            "min_relative_ppl_change": -0.02298591991453506,
+            "matched_ids": 10,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7386.966225725949,
+                "min_decode_tokens_per_second": 7252.150003401356,
+                "max_decode_tokens_per_second": 7430.05926002044,
+                "median_first_token_seconds": 0.00012714299998606293,
+                "min_first_token_seconds": 0.00012603099997932077,
+                "max_first_token_seconds": 0.00012967999998636515
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7248.320201887244,
+                "min_decode_tokens_per_second": 7013.086419161331,
+                "max_decode_tokens_per_second": 7346.18145499323,
+                "median_first_token_seconds": 0.006320477999992136,
+                "min_first_token_seconds": 0.006299558999984356,
+                "max_first_token_seconds": 0.006354698000023973
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 7578.7677574457675,
+                "min_decode_tokens_per_second": 7322.849802112929,
+                "max_decode_tokens_per_second": 7647.874382587521,
+                "median_first_token_seconds": 0.00012570900000241636,
+                "min_first_token_seconds": 0.00012332599999353988,
+                "max_first_token_seconds": 0.0001615600000093309
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7529.2781357160475,
+                "min_decode_tokens_per_second": 7124.043851547448,
+                "max_decode_tokens_per_second": 7575.995350571051,
+                "median_first_token_seconds": 0.0061764659999994365,
+                "min_first_token_seconds": 0.006145200999981171,
+                "max_first_token_seconds": 0.0062185170000077505
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94149,
+              "compile_seconds": 0.27971021400000495
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102420,
+              "compile_seconds": 5.485223472999991
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        },
+        {
+          "case": "relu-bounded",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 5.529163504945885e-15,
+              "min_cosine": 0.9999999999999628,
+              "max_absolute_logit_error": 3.5762786865234375e-07,
+              "max_relative_ppl_change": 7.013819016186725e-08,
+              "min_relative_ppl_change": -6.957878693422281e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.2520288602633166e-14,
+              "min_cosine": 0.9999999999998791,
+              "max_absolute_logit_error": 3.725290298461914e-07,
+              "max_relative_ppl_change": -2.597057676648144e-09,
+              "min_relative_ppl_change": -5.765974908945836e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.2520288602633166e-14,
+            "min_cosine": 0.9999999999998791,
+            "max_absolute_logit_error": 3.725290298461914e-07,
+            "max_relative_ppl_change": 7.013819016186725e-08,
+            "min_relative_ppl_change": -5.765974908945836e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok12 tok6 tok2 tok6 tok6 tok6 tok6 tok6",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok12 tok6 tok2 tok6 tok6 tok6 tok6 tok6",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0,
+          "baseline_summary": {
+            "max_kl": 0.04514795271097109,
+            "min_cosine": 0.38420417139797186,
+            "max_absolute_logit_error": 0.7264009267091751,
+            "max_relative_ppl_change": 0.07808862527364183,
+            "min_relative_ppl_change": -0.02295141686436088,
+            "matched_ids": 10,
+            "reference_ids": 16
+          },
+          "timings": {
+            "baseline": {
+              "public": {
+                "median_decode_tokens_per_second": 7259.59588947518,
+                "min_decode_tokens_per_second": 7197.950846225533,
+                "max_decode_tokens_per_second": 7319.220482008648,
+                "median_first_token_seconds": 0.00012967800000751595,
+                "min_first_token_seconds": 0.00012461899999038906,
+                "max_first_token_seconds": 0.000153008000012278
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7316.565854985856,
+                "min_decode_tokens_per_second": 7202.765038424584,
+                "max_decode_tokens_per_second": 7400.860191410171,
+                "median_first_token_seconds": 0.0062934999999981756,
+                "min_first_token_seconds": 0.006270591999992803,
+                "max_first_token_seconds": 0.006421797999990986
+              }
+            },
+            "current": {
+              "public": {
+                "median_decode_tokens_per_second": 7146.999485355665,
+                "min_decode_tokens_per_second": 6909.710808844484,
+                "max_decode_tokens_per_second": 7229.873838758305,
+                "median_first_token_seconds": 0.00013151199999583696,
+                "min_first_token_seconds": 0.00012864800001466392,
+                "max_first_token_seconds": 0.00016847800000618918
+              },
+              "long": {
+                "median_decode_tokens_per_second": 7125.175075725361,
+                "min_decode_tokens_per_second": 6992.322430048426,
+                "max_decode_tokens_per_second": 7207.511462522069,
+                "median_first_token_seconds": 0.006524307999995926,
+                "min_first_token_seconds": 0.006509486999988212,
+                "max_first_token_seconds": 0.006641024000003881
+              }
+            }
+          },
+          "memory_and_artifact": {
+            "baseline": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 94099,
+              "compile_seconds": 0.28096162599999275
+            },
+            "current": {
+              "loaded_weight_array_bytes": 10672,
+              "ssm_state_logical_bytes": 512,
+              "convolution_history_logical_bytes": 384,
+              "activation_peak_bytes": null,
+              "runtime_overhead_bytes": null,
+              "artifact_bytes": 102469,
+              "compile_seconds": 5.4238047540000025
+            }
+          },
+          "saved_fixed_label_logits_identical": false
+        }
+      ]
+    },
+    "mamba1_control": {
+      "report_sha256": "55eb9f3e2ee9c668ac165c1d685cf55536139e5c70ff8b7eb9663c4124c22d39",
+      "hardware": {
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "logical_cpus": 4,
+        "host_ram_bytes": 16765378560,
+        "available_ram_bytes_at_start": 15423307776
+      },
+      "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+      "python": "3.11.14",
+      "versions": {
+        "numpy": "1.26.4",
+        "torch": "2.9.1+cpu",
+        "transformers": "4.57.3",
+        "psutil": "7.2.2",
+        "safetensors": "0.8.0",
+        "tokenizers": "0.22.2"
+      },
+      "cases": [
+        {
+          "case": "default",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.5645554733895369e-15,
+              "min_cosine": 0.9999999999999915,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 6.651873296545114e-09,
+              "min_relative_ppl_change": -1.6605392602710786e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 2.071709363274561e-15,
+              "min_cosine": 0.9999999999999886,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": -8.152634123016107e-11,
+              "min_relative_ppl_change": -3.0445677044193395e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 2.071709363274561e-15,
+            "min_cosine": 0.9999999999999886,
+            "max_absolute_logit_error": 1.1920928955078125e-07,
+            "max_relative_ppl_change": 6.651873296545114e-09,
+            "min_relative_ppl_change": -3.0445677044193395e-09,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            },
+            "pytorch": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "expanded-biased",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 2.013665358537886e-15,
+              "min_cosine": 0.9999999999999941,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 1.9395957472830672e-08,
+              "min_relative_ppl_change": 1.4196235843269504e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.3313086873378612e-15,
+              "min_cosine": 0.999999999999991,
+              "max_absolute_logit_error": 1.4901161193847656e-07,
+              "max_relative_ppl_change": 1.7143141275827245e-08,
+              "min_relative_ppl_change": 1.6620884362621045e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 2.013665358537886e-15,
+            "min_cosine": 0.999999999999991,
+            "max_absolute_logit_error": 1.4901161193847656e-07,
+            "max_relative_ppl_change": 1.9395957472830672e-08,
+            "min_relative_ppl_change": 1.4196235843269504e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok10 tok16",
+              "tokens": 2
+            },
+            "pytorch": {
+              "text": "tok10 tok16",
+              "tokens": 2
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "zero-epsilon",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 4.212435310235453e-15,
+              "min_cosine": 0.9999999999999925,
+              "max_absolute_logit_error": 2.384185791015625e-07,
+              "max_relative_ppl_change": 4.810110514564277e-08,
+              "min_relative_ppl_change": -8.095704074321493e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.628729874118881e-15,
+              "min_cosine": 0.9999999999999928,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": -5.378431019411826e-09,
+              "min_relative_ppl_change": -8.911001674592732e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 4.212435310235453e-15,
+            "min_cosine": 0.9999999999999925,
+            "max_absolute_logit_error": 2.384185791015625e-07,
+            "max_relative_ppl_change": 4.810110514564277e-08,
+            "min_relative_ppl_change": -8.911001674592732e-09,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            },
+            "pytorch": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "large-delta",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.7930058022013064e-15,
+              "min_cosine": 0.9999999999999891,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": -4.022883351674843e-09,
+              "min_relative_ppl_change": -8.786155764310712e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.4102518172235497e-15,
+              "min_cosine": 0.9999999999999833,
+              "max_absolute_logit_error": 1.4901161193847656e-07,
+              "max_relative_ppl_change": 3.059236111267852e-08,
+              "min_relative_ppl_change": -1.8980267843812866e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.7930058022013064e-15,
+            "min_cosine": 0.9999999999999833,
+            "max_absolute_logit_error": 1.4901161193847656e-07,
+            "max_relative_ppl_change": 3.059236111267852e-08,
+            "min_relative_ppl_change": -1.8980267843812866e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok12 tok5 tok3 tok16",
+              "tokens": 5
+            },
+            "pytorch": {
+              "text": "tok6 tok12 tok5 tok3 tok16",
+              "tokens": 5
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "negative-gate",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.12369606096513e-15,
+              "min_cosine": 0.9999999999999903,
+              "max_absolute_logit_error": 1.4901161193847656e-07,
+              "max_relative_ppl_change": 1.9355590651051586e-08,
+              "min_relative_ppl_change": -1.0852970463385808e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.2165676043868677e-15,
+              "min_cosine": 0.9999999999999919,
+              "max_absolute_logit_error": 1.4901161193847656e-07,
+              "max_relative_ppl_change": 2.0566780490337405e-08,
+              "min_relative_ppl_change": -7.163454248548522e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.2165676043868677e-15,
+            "min_cosine": 0.9999999999999903,
+            "max_absolute_logit_error": 1.4901161193847656e-07,
+            "max_relative_ppl_change": 2.0566780490337405e-08,
+            "min_relative_ppl_change": -1.0852970463385808e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "negative-conv",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.12369606096513e-15,
+              "min_cosine": 0.9999999999999903,
+              "max_absolute_logit_error": 1.4901161193847656e-07,
+              "max_relative_ppl_change": 1.9355590651051586e-08,
+              "min_relative_ppl_change": -1.0852970463385808e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 1.2165676043868677e-15,
+              "min_cosine": 0.9999999999999919,
+              "max_absolute_logit_error": 1.4901161193847656e-07,
+              "max_relative_ppl_change": 2.0566780490337405e-08,
+              "min_relative_ppl_change": -7.163454248548522e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 1.2165676043868677e-15,
+            "min_cosine": 0.9999999999999903,
+            "max_absolute_logit_error": 1.4901161193847656e-07,
+            "max_relative_ppl_change": 2.0566780490337405e-08,
+            "min_relative_ppl_change": -1.0852970463385808e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "swish-alias",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.5645554733895369e-15,
+              "min_cosine": 0.9999999999999915,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 6.651873296545114e-09,
+              "min_relative_ppl_change": -1.6605392602710786e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 2.071709363274561e-15,
+              "min_cosine": 0.9999999999999886,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": -8.152634123016107e-11,
+              "min_relative_ppl_change": -3.0445677044193395e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 2.071709363274561e-15,
+            "min_cosine": 0.9999999999999886,
+            "max_absolute_logit_error": 1.1920928955078125e-07,
+            "max_relative_ppl_change": 6.651873296545114e-09,
+            "min_relative_ppl_change": -3.0445677044193395e-09,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            },
+            "pytorch": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "default-activation",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.5645554733895369e-15,
+              "min_cosine": 0.9999999999999915,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": 6.651873296545114e-09,
+              "min_relative_ppl_change": -1.6605392602710786e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 2.071709363274561e-15,
+              "min_cosine": 0.9999999999999886,
+              "max_absolute_logit_error": 1.1920928955078125e-07,
+              "max_relative_ppl_change": -8.152634123016107e-11,
+              "min_relative_ppl_change": -3.0445677044193395e-09,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 2.071709363274561e-15,
+            "min_cosine": 0.9999999999999886,
+            "max_absolute_logit_error": 1.1920928955078125e-07,
+            "max_relative_ppl_change": 6.651873296545114e-09,
+            "min_relative_ppl_change": -3.0445677044193395e-09,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            },
+            "pytorch": {
+              "text": "tok6 tok7 tok12 tok5 tok3 tok16",
+              "tokens": 6
+            }
+          },
+          "cli_exit": 0
+        },
+        {
+          "case": "multi-layer",
+          "current_by_executor": {
+            "cpu": {
+              "max_kl": 1.3289440601385586e-15,
+              "min_cosine": 0.9999999999999901,
+              "max_absolute_logit_error": 1.7881393432617188e-07,
+              "max_relative_ppl_change": 2.6910459112337508e-08,
+              "min_relative_ppl_change": -1.279073017093053e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            },
+            "torch_cpu": {
+              "max_kl": 2.3319066445273282e-15,
+              "min_cosine": 0.9999999999999899,
+              "max_absolute_logit_error": 1.7881393432617188e-07,
+              "max_relative_ppl_change": 1.8094654827222385e-08,
+              "min_relative_ppl_change": -1.4637823734790194e-08,
+              "matched_ids": 16,
+              "reference_ids": 16
+            }
+          },
+          "current_summary": {
+            "max_kl": 2.3319066445273282e-15,
+            "min_cosine": 0.9999999999999899,
+            "max_absolute_logit_error": 1.7881393432617188e-07,
+            "max_relative_ppl_change": 2.6910459112337508e-08,
+            "min_relative_ppl_change": -1.4637823734790194e-08,
+            "matched_ids": 32,
+            "reference_ids": 32
+          },
+          "current_public": {
+            "aether_cpu": {
+              "text": "tok6 tok13 tok6 tok13 tok6 tok13 tok6 tok13",
+              "tokens": 8
+            },
+            "pytorch": {
+              "text": "tok6 tok13 tok6 tok13 tok6 tok13 tok6 tok13",
+              "tokens": 8
+            }
+          },
+          "cli_exit": 0
+        }
+      ]
+    }
+  },
+  "complete_suite": {
+    "tests": 5587,
+    "passed": 5536,
+    "skipped": 51,
+    "failures": 0,
+    "sha256": "ab56aa655831e6d46d9b2cc439f35fda16cf8c08c7565d3c0c5cb8081c469554",
+    "suites": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "51",
+        "tests": "5587",
+        "time": "161.321",
+        "timestamp": "2026-10-24T08:10:15.318549+00:00",
+        "hostname": "runnervm8k3b6"
+      }
+    ],
+    "skip_details": [
+      {
+        "class": "tests.integration.test_automatic_execution_dispatch",
+        "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[llama]",
+        "reason": "could not import 'accelerate': No module named 'accelerate'"
+      },
+      {
+        "class": "tests.integration.test_automatic_execution_dispatch",
+        "name": "test_raw_local_sources_fall_back_to_real_cpu_and_match_transformers[gpt2]",
+        "reason": "could not import 'accelerate': No module named 'accelerate'"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_compile_small_model",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_end_to_end_generate",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_chat_completion",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_compile_plan_dry_run",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_model_info",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_openai_compatible_server",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_model_list_and_remove",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_backend_detection",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_hardware_detection",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_benchmark_smoke",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_aeg_format_roundtrip",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_end_to_end",
+        "name": "test_cross_hardware_portability",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_server_credentials_creation",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_server_credentials_mtls",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_ssl_channel_credentials_creation",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_helper",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_missing_file",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCTLSCredentials",
+        "name": "test_credential_bytes_none_passthrough",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+        "name": "test_require_grpc_no_error",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.integration.test_grpc_tls.TestGRPCServiceHelper",
+        "name": "test_service_name_constant",
+        "reason": "cryptography not installed"
+      },
+      {
+        "class": "tests.tools.test_pass_audit",
+        "name": "test_real_public_compile_audit_smoke",
+        "reason": "Opt-in real subprocess compile/load/Runtime smoke, no timing"
+      },
+      {
+        "class": "tests.unit.test_adversarial.TestExecutionFidelity",
+        "name": "test_real_pretrained_model",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      },
+      {
+        "class": "tests.unit.test_aeg_onnx_export",
+        "name": "test_real_directml_exported_aeg_operators",
+        "reason": "physical DirectML execution requires its optional installed runtime"
+      },
+      {
+        "class": "tests.unit.test_aeg_onnx_export",
+        "name": "test_actual_compiled_artifact_backend_generation_stream_and_unload[DmlExecutionProvider]",
+        "reason": "real DmlExecutionProvider is not installed"
+      },
+      {
+        "class": "tests.unit.test_artifact_publication",
+        "name": "test_real_member_handle_blocks_rename_then_retry_publishes",
+        "reason": "requires actual Windows file sharing"
+      },
+      {
+        "class": "tests.unit.test_artifact_publication",
+        "name": "test_real_persistent_member_lock_fails_after_bounded_attempts",
+        "reason": "requires actual Windows file sharing"
+      },
+      {
+        "class": "tests.unit.test_artifact_publication",
+        "name": "test_destination_created_during_real_lock_retry_is_preserved",
+        "reason": "requires actual Windows file sharing"
+      },
+      {
+        "class": "tests.unit.test_c2pa_signing",
+        "name": "test_pure_python_and_native_backends_agree",
+        "reason": "could not import 'cryptography': No module named 'cryptography'"
+      },
+      {
+        "class": "tests.unit.test_calibration.TestDatasets",
+        "name": "test_wikitext2",
+        "reason": "Real wikitext-2 data is unavailable locally; provide a calibration file or cache the 'wikitext' dataset before compiling (no local Hugging Face dataset cache at /home/runner/.cache/huggingface/datasets)"
+      },
+      {
+        "class": "tests.unit.test_calibration.TestDatasets",
+        "name": "test_hellaswag",
+        "reason": "Real hellaswag data is unavailable locally; provide a calibration file or cache the 'Rowan/hellaswag' dataset before compiling (no local Hugging Face dataset cache at /home/runner/.cache/huggingface/datasets)"
+      },
+      {
+        "class": "tests.unit.test_compiler_publication_transaction",
+        "name": "test_real_windows_old_member_lock_preserves_published_output",
+        "reason": "requires real Windows sharing semantics"
+      },
+      {
+        "class": "tests.unit.test_cpu_host_portability",
+        "name": "test_real_packaged_windows_aeg_can_be_removed_while_engine_is_live",
+        "reason": "Windows DLL lifetime regression"
+      },
+      {
+        "class": "tests.unit.test_device_placement.TestDeviceResolution",
+        "name": "test_cuda_spec_gains_an_explicit_index",
+        "reason": "no CUDA device on this host"
+      },
+      {
+        "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+        "name": "test_compiler_compile_produces_weight_blob",
+        "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+      },
+      {
+        "class": "tests.unit.test_e2e_compile_run_cpu.TestFullCompilePipelineToCPU",
+        "name": "test_compiled_package_is_loadable_and_runnable",
+        "reason": "Compiler raised on synthetic model (expected without HF weights): AEG packaging failed for llama_test_1B: Weight quantization failed; refusing to create a graph-only runnable package: No model weights were attached during ingestion; refusing to create a runnable AEG. Provide a local checkpoint or enable a supported model download path."
+      },
+      {
+        "class": "tests.unit.test_hardware_evidence",
+        "name": "test_real_cuda_aeg_execution_never_uses_cpu_fallback",
+        "reason": "No physical NVIDIA CUDA device and matching PyTorch runtime"
+      },
+      {
+        "class": "tests.unit.test_native_cpu_reproducibility",
+        "name": "test_two_cold_gnu_pe_builds_are_identical_and_execute",
+        "reason": "GNU PE linker regression"
+      },
+      {
+        "class": "tests.unit.test_onnx_provider_contract",
+        "name": "test_real_directml_offline_workload_requires_gpu_node_execution",
+        "reason": "physical DirectML runtime is not installed on this host"
+      },
+      {
+        "class": "tests.unit.test_onnx_provider_contract",
+        "name": "test_real_directml_runtime_routes_generation_and_stream_to_gpu",
+        "reason": "physical DirectML runtime is not installed on this host"
+      },
+      {
+        "class": "tests.unit.test_onnx_session_contract",
+        "name": "test_actual_onnx_session_reuses_only_bound_state[DmlExecutionProvider]",
+        "reason": "real DmlExecutionProvider is not installed"
+      },
+      {
+        "class": "tests.unit.test_otlp_conformance",
+        "name": "test_sdk_bridge_preserves_aether_trace_ids",
+        "reason": "could not import 'opentelemetry.sdk': No module named 'opentelemetry.sdk'"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_the_packaged_tokenizer_renders_the_checkpoints_own_template",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_templating_changes_the_token_sequence_the_model_sees",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_a_template_needing_undefined_names_still_renders",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_tokenize_true_is_refused_rather_than_silently_ignored",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_the_packaged_tokenizer_honours_add_special_tokens",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_a_missing_template_is_reported_not_guessed",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_prompt_format",
+        "name": "test_an_override_also_works_through_the_packaged_tokenizer",
+        "reason": "the Qwen artifact is not present"
+      },
+      {
+        "class": "tests.unit.test_v31_features",
+        "name": "test_compiled_package_contains_v31_artifacts",
+        "reason": "network tests disabled; set AETHER_RUN_NETWORK_TESTS=1 to enable"
+      }
+    ]
+  },
+  "coverage": {
+    "version": "7.17.0",
+    "timestamp": "1792829568523",
+    "lines-valid": "57440",
+    "lines-covered": "45271",
+    "line-rate": "0.7881",
+    "branches-valid": "17326",
+    "branches-covered": "10880",
+    "branch-rate": "0.628",
+    "complexity": "0"
+  },
+  "coverage_sha256": "ae4ec6b5ea3644d5127b4d7cdda9ee62f1203439e384f3692b61c830bf29439e",
+  "line_coverage_percent": 78.81441504178272,
+  "freeze_sha256": "dedd2e6de0e3f94946b0ea24c25bd93c5dac7f8d95ba43c56e235bd9bcf4f954",
+  "scope": "Small untrained FP32 CPU contracts; fixed labels, no trained/corpus/peak-RSS/accelerator/general-speed claim",
+  "ci_checkout": {
+    "revision": "bba28232ca1945d068f1d97e5c2fb6688459523a",
+    "parents": [
+      "6aba5e8de08a117a2ab34610566317803f09266f",
+      "5c149735127cd84e4418707c1a7f1f3a00fcf1c2"
+    ],
+    "tree": "8b39d9ff5ef7d495fc9a1a070f92535140d13393",
+    "whole_git_tree_identical_to_pushed_head": true,
+    "src_tree": "1d39c28c3d5eda19cd2fa6692f7a227d40cff4ea",
+    "tests_tree": "7ff38120193f2430b9dea0678f5fd70a8ce4e249",
+    "tools_tree": "6d2bcb9701e5771ffce2ee318b53d5971202d7e4",
+    "verification": "GitHub Git-tree/commit API compared with local git rev-parse; freeze records GitHub's temporary PR merge checkout, whose entire tree equals the pushed commit."
+  }
+}

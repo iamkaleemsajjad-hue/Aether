@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Refuse unsupported or malformed settings before publication; default legacy
   artifacts retain serialization and logits. Real source/matrix, cached decode,
   worker-clone, tampering and old/new reader checks cover the correction. Local
-  suite failures, coverage reduction and timing losses remain explicit in the
+  failures and lower local coverage remain explicit; hosted admission and the
+  complete suite pass, with slower bounded execution retained in the
   [validation record](docs/mission-mamba2-source-parameters.md).
 
 - Evaluate Mamba-2 CPU SiLU and softplus with stable identities instead of

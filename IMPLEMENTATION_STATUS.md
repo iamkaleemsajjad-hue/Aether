@@ -12,9 +12,16 @@ complete local run returned **5,543 passed, 42 skipped, two existing MCP HTTP
 failures**. Coverage was **78.7674095%**, slightly below the prior local run;
 local non-reduction remains open. Local default generation medians were
 **0.17% and 2.13% longer** with overlapping spreads; traced allocation peaks
-were unchanged. Strict hosted original-HF/API/CLI measurements are pending.
-The linked record retains scope, losses, all 22 pass dispositions and hardware
-tiers; no trained-model or accelerator promotion is implied.
+were unchanged. [Hosted CI at `5c14973`](https://github.com/iamkaleemsajjad-hue/Aether/actions/runs/40076617018)
+passed all 23 jobs, and security passed separately. Its complete run returned
+**5,536 passed, 51 skipped, zero failures**, with **78.8144150%** line coverage.
+All 14 Mamba-2 contracts and nine Mamba-1 controls passed original-HF admission,
+actual CPU/Torch CPU, public API/streaming and CLI checks. ReLU contracts
+recovered **16/16 greedy IDs per executor**; logical weight/state/history bytes
+are unchanged. The six bounded-SiLU contracts decoded **2.30–6.20% slower**
+while executing the formerly omitted clamp; timing non-regression remains open.
+The linked record retains every spread, losses, all 22 pass dispositions and
+hardware tiers; no trained-model or accelerator promotion is implied.
 
 The Mamba-2 activation profiling follow-up replaces masked piecewise sigmoid
 evaluation with the equivalent stable log-sigmoid identity. A randomized
