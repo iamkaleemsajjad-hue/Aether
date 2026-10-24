@@ -1,12 +1,23 @@
 """Protect benchmark byte accounting against alias inflation and undercounting."""
 
 import hashlib
+import importlib.util
+import json
+import py_compile
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pytest
-from tools.validate_dense_hf import PASSES, _array_bytes, _compiler_config, _load_profile
+from tools.validate_dense_hf import (
+    PASSES,
+    _array_bytes,
+    _compiler_config,
+    _load_profile,
+    _prepare_source_bytecode,
+)
 
 
 def test_overlapping_views_count_only_their_union() -> None:
@@ -93,3 +104,52 @@ def test_load_warms_the_actual_shared_provider(
         == hashlib.sha256((destination / "manifest.json").read_bytes()).hexdigest()
     )
     assert discoveries == 1
+
+
+def test_both_reader_caches_are_warm_even_when_workers_cannot_write(tmp_path: Path) -> None:
+    """Reproduce -B reading one parent's cache and compiling the cold baseline."""
+    roots = [tmp_path / "current", tmp_path / "baseline"]
+    for source in roots:
+        package = source / "aether"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "probe.py").write_text("VALUE = 1729\n", encoding="utf-8")
+    py_compile.compile(str(roots[0] / "aether/probe.py"), doraise=True)
+    script = """
+import importlib.util, json, sys
+from pathlib import Path
+source = Path(sys.argv[1])
+target = (source / 'aether/probe.py').resolve()
+events = []
+def audit(event, args):
+    if event == 'compile' and len(args) > 1 and Path(args[1]).resolve() == target:
+        events.append(event)
+sys.addaudithook(audit)
+spec = importlib.util.spec_from_file_location('cache_probe', target)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(json.dumps({
+    'compilations': len(events), 'value': module.VALUE,
+    'dont_write': sys.dont_write_bytecode,
+}))
+"""
+
+    def observed(source: Path) -> dict[str, int]:
+        result = subprocess.check_output(
+            [sys.executable, "-B", "-c", script, str(source)], text=True
+        )
+        value = json.loads(result)
+        assert isinstance(value, dict)
+        return value
+
+    before = [observed(source) for source in roots]
+    assert [row["compilations"] for row in before] == [0, 1]
+    policy = _prepare_source_bytecode(roots)
+    assert [tree["prepared_modules"] for tree in policy["trees"]] == [2, 2]
+    after = [observed(source) for source in roots]
+    assert [row["compilations"] for row in after] == [0, 0]
+    assert all(row["value"] == 1729 and row["dont_write"] for row in after)
+    assert all(
+        Path(importlib.util.cache_from_source(str(source / "aether/probe.py"))).is_file()
+        for source in roots
+    )

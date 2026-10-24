@@ -8,15 +8,18 @@ artifact. Process ownership and RAM guards reuse the pass audit.
 from __future__ import annotations
 
 import argparse
+import compileall
 import cProfile
 import gc
 import hashlib
 import importlib.metadata
+import importlib.util
 import io
 import json
 import os
 import platform
 import pstats
+import py_compile
 import subprocess
 import sys
 import time
@@ -107,6 +110,38 @@ def _array_bytes(value: Any) -> int:
         total += max(0, stop - max(start, end))
         end = max(end, stop)
     return total
+
+
+def _prepare_source_bytecode(sources: list[Path]) -> dict[str, Any]:
+    """Give both readers usable checked-hash caches before timing imports.
+
+    Python -B suppresses writes, not reads of existing caches. The parent
+    imports only current Aether modules, so its caches must not warm one side
+    alone. compileall performs compilation without executing optional backends.
+    https://docs.python.org/3.11/library/compileall.html#compileall.compile_dir
+    """
+    trees = []
+    for source in sources:
+        package = source.resolve() / "aether"
+        modules = sorted(package.rglob("*.py"))
+        if not modules or any(not module.resolve().is_relative_to(package) for module in modules):
+            raise ValueError(f"Expected an ordinary Aether source tree: {package}")
+        if not compileall.compile_dir(
+            str(package),
+            force=True,
+            quiet=1,
+            optimize=sys.flags.optimize,
+            invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
+        ):
+            raise RuntimeError(f"Could not prepare source bytecode: {package}")
+        caches = [Path(importlib.util.cache_from_source(str(module))) for module in modules]
+        if not all(cache.is_file() for cache in caches):
+            raise RuntimeError(f"Source bytecode cache is incomplete: {package}")
+        trees.append({"source": str(package), "prepared_modules": len(modules)})
+    return {
+        "policy": "Both source trees precompiled with checked hashes before workers",
+        "trees": trees,
+    }
 
 
 def _compiler_config(job: dict[str, Any], work: Path) -> CompilerConfig:
@@ -338,6 +373,14 @@ def _worker(path: Path) -> int:
         result["code_sha256"] = {
             name: hashlib.sha256((package / name).read_bytes()).hexdigest() for name in CODE_FILES
         }
+        result["source_bytecode_cache_present"] = {
+            name: Path(importlib.util.cache_from_source(str(package / name))).is_file()
+            for name in (
+                *CODE_FILES,
+                "backends/artifact_validation.py",
+                "evaluation/quality_validator.py",
+            )
+        }
         code = 0
     except Exception as exc:
         traceback.print_exc()
@@ -441,6 +484,12 @@ def main() -> int:
         write_json(work / "report.json", report)
         if check["status"] != "ok":
             raise RuntimeError(f"Fixture RAM admission refused before allocation: {check}")
+        if "source_bytecode" not in report:
+            sources = [ROOT / "src"]
+            if args.baseline_src is not None:
+                sources.append(args.baseline_src)
+            report["source_bytecode"] = _prepare_source_bytecode(sources)
+            write_json(work / "report.json", report)
         from transformers import AutoTokenizer
 
         from aether import CompilerConfig

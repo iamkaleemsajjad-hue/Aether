@@ -94,6 +94,15 @@ artifacts. It is retained as historical evidence; the final command requires
 ordinary admission for both compilers and times one shared artifact, so their
 reader comparison cannot be explained by different certification payloads.
 
+A further import-cache control reproduces Python `-B` reading the parent's
+existing bytecode while compiling a cache-cold baseline. A real subprocess
+audit observes compile counts `[0, 1]` before cache preparation and `[0, 0]`
+after it. The tool precompiles both source trees with checked hashes before
+launching workers, and records actual cache presence for each reader.
+Earlier load timings can include unequal source-compilation work; their
+loading speed and allocation comparisons remain provisional until this
+control has run. The runtime ownership and numerical regressions are separate.
+
 No pass or hardware tier is promoted by adding this measurement. All 22 pass
 dispositions and backend limits remain those in the
 [latest pass and hardware tables](mission-mamba2-source-parameters.md).
